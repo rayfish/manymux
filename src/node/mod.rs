@@ -176,7 +176,23 @@ impl Node {
             bail!("expected a request, got tag {:#x}", frame.tag);
         }
 
-        match proto::decode(&frame.body)? {
+        // A machine that is behind gets requests it has never heard of, which is
+        // normal in a fleet updated one host at a time. Say so, rather than
+        // hanging up and leaving the caller to report a closed connection.
+        let request = match proto::decode::<Request>(&frame.body) {
+            Ok(request) => request,
+            Err(e) => {
+                debug!("undecodable request: {e:#}");
+                let complaint = anyhow::anyhow!(
+                    "this machine runs tiles {}, which does not understand that request: \
+                     update it",
+                    env!("CARGO_PKG_VERSION")
+                );
+                return reply(&mut write, Err(complaint)).await;
+            }
+        };
+
+        match request {
             Request::Attach { name, size } => {
                 let Some(session) = self.registry.get(&name) else {
                     return reply(&mut write, Err(anyhow::anyhow!("no session named {name}")))

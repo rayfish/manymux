@@ -2,7 +2,8 @@
 //!
 //! Whoever can reach one of these sockets can run commands as this user, so
 //! they are owner-only and there is no further authentication behind them.
-//! Remote access is a different thing entirely, authorized by iroh identity.
+//! Reaching one from another machine means going through sshd first, which is
+//! where access is decided.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -68,6 +69,59 @@ async fn listen(socket: &Path) -> Result<UnixListener> {
     Ok(listener)
 }
 
+/// The pid of the process on the other end of a connection.
+///
+/// The way to reach a node that will not answer: it is whatever process is
+/// holding this socket, and the kernel already knows which one that is. Only
+/// Linux and macOS are covered, which is what tiles publishes builds for.
+pub fn peer_pid(stream: &tokio::net::UnixStream) -> Option<u32> {
+    use std::os::fd::AsRawFd;
+
+    let fd = stream.as_raw_fd();
+    #[cfg(target_os = "linux")]
+    {
+        let mut cred = libc::ucred {
+            pid: 0,
+            uid: 0,
+            gid: 0,
+        };
+        let mut len = size_of::<libc::ucred>() as libc::socklen_t;
+        // SAFETY: the fd is open for the length of this call, and the buffer
+        // matches the size handed to the kernel.
+        let got = unsafe {
+            libc::getsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                (&raw mut cred).cast(),
+                &mut len,
+            )
+        };
+        (got == 0 && cred.pid > 0).then_some(cred.pid as u32)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let mut pid: libc::pid_t = 0;
+        let mut len = size_of::<libc::pid_t>() as libc::socklen_t;
+        // SAFETY: as above.
+        let got = unsafe {
+            libc::getsockopt(
+                fd,
+                libc::SOL_LOCAL,
+                libc::LOCAL_PEERPID,
+                (&raw mut pid).cast(),
+                &mut len,
+            )
+        };
+        (got == 0 && pid > 0).then_some(pid as u32)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = fd;
+        None
+    }
+}
+
 fn set_mode(socket: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o600))
@@ -102,5 +156,29 @@ where
                 return Ok(());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The fallback in `tiles update` leans on this: a node that will not answer
+    /// is still identifiable by the socket it holds.
+    #[tokio::test]
+    async fn a_connection_names_the_process_on_the_other_end() {
+        let dir = std::env::temp_dir().join(format!("tiles-peer-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket = dir.join("t.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+
+        let client = tokio::net::UnixStream::connect(&socket).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+
+        // Both ends are this test process, so both readings have to name it.
+        assert_eq!(peer_pid(&client), Some(std::process::id()));
+        assert_eq!(peer_pid(&server), Some(std::process::id()));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

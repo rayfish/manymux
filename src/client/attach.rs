@@ -185,7 +185,11 @@ mod terminal {
         "\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l", // mouse reporting off
         "\x1b[?2004l", // bracketed paste off
         "\x1b[?7h",    // autowrap on
-        "\r\n",
+        // Column zero, but no newline: leaving the alternate screen already put
+        // the cursor back where the shell left it, on the line after the command
+        // you typed. A newline here would print the detach message one blank
+        // line further down for no reason.
+        "\r",
     );
 
     pub fn terminal_size() -> Size {

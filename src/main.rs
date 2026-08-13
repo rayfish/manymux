@@ -44,7 +44,7 @@ enum Command {
     Agent,
 
     /// List sessions, on every added machine by default.
-    #[command(alias = "list")]
+    #[command(visible_alias = "l", alias = "list")]
     Ls {
         /// Limit to one machine.
         host: Option<String>,
@@ -54,6 +54,7 @@ enum Command {
     /// A first argument naming a machine you have added runs it there; anything
     /// else is the command, run here. `tiles new local <cmd>` forces this
     /// machine, for a program that shares a name with one of your hosts.
+    #[command(visible_alias = "n")]
     New {
         /// Session name. Defaults to the command's name.
         #[arg(short, long)]
@@ -66,21 +67,27 @@ enum Command {
         args: Vec<String>,
     },
     /// Attach to a session, as `name` or `host/name`.
+    #[command(visible_alias = "a")]
     Attach { target: String },
     /// Send SIGHUP to a session's process group.
+    #[command(visible_alias = "k")]
     Kill { target: String },
     /// Set a session's title, overriding whatever the program sets.
+    #[command(visible_alias = "r")]
     Rename { target: String, title: String },
 
     /// Watch a machine without starting a session on it. Starting one adds it
     /// anyway; this is for machines you only want to see in `tiles ls`.
     Add { host: String },
     /// List the machines being watched.
+    #[command(visible_alias = "h")]
     Hosts,
     /// Stop watching a machine.
+    #[command(alias = "remove")]
     Rm { host: String },
 
     /// Replace this binary with the published one.
+    #[command(visible_alias = "up")]
     Update {
         /// Say what would change, without changing it.
         #[arg(long)]
