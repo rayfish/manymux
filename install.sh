@@ -8,6 +8,7 @@
 #   INSTALL_DIR         target dir (default: /usr/local/bin)
 #   MM_VERSION       pin a release tag, e.g. v0.1.0 (default: latest)
 #   MM_SKIP_VERIFY   set to 1 to install without checksum verification
+#   MM_SKIP_LINGER   set to 1 to leave systemd lingering alone
 #
 # The same line works on the machines you want to manage: manymux needs to be on
 # PATH there, and nothing else.
@@ -187,6 +188,57 @@ existing_ancestor() {
   echo "$d"
 }
 
+# Keep a systemd user instance running for this account whether or not anyone is
+# logged in.
+#
+# Two things go wrong without it, and one command fixes both. A user service is
+# killed with the rest of the user slice at logout, which is the opposite of what
+# a persistent session is for. And an ssh login on a host whose PAM stack has no
+# pam_systemd never gets a user instance at all, so there is no $XDG_RUNTIME_DIR,
+# no session bus, and `mm service install` has nothing to talk to.
+#
+# Only ever an addition: lingering is left alone when it is already on, and
+# MM_SKIP_LINGER=1 skips the whole thing.
+enable_linger() {
+  local user priv=""
+  [ "$OS" = "linux" ] || return 0
+  [ "${MM_SKIP_LINGER:-0}" = "1" ] && return 0
+  # systemd as init, and a logind to ask. Neither holds on Alpine, WSL without
+  # systemd, or a container, where there is nothing to enable.
+  [ -d /run/systemd/system ] || return 0
+  command -v loginctl >/dev/null 2>&1 || return 0
+
+  # Under sudo, the account being installed for is the one that invoked it, not
+  # root. root's services run without lingering anyway.
+  user="${SUDO_USER:-$(id -un)}"
+  [ "$user" != "root" ] || return 0
+
+  # `--value` is too new to rely on, and show-user exits non-zero for a user with
+  # neither a session nor lingering, which is exactly the case being fixed here.
+  if loginctl show-user "$user" --property=Linger 2>/dev/null | grep -q '^Linger=yes'; then
+    return 0
+  fi
+
+  if [ "$(id -u)" = "0" ]; then
+    priv=""
+  elif command -v sudo >/dev/null 2>&1; then
+    priv="sudo"
+  else
+    err "sessions here will stop at logout, and sudo is unavailable to fix it.
+Run this as root, then \`mm service install\`:
+    loginctl enable-linger $user"
+    return 0
+  fi
+
+  info "Enabling systemd lingering for ${user}, so sessions outlive your login ..."
+  if $priv loginctl enable-linger "$user"; then
+    ok "lingering enabled"
+  else
+    err "could not enable lingering; sessions will stop at logout. Run:
+    sudo loginctl enable-linger $user"
+  fi
+}
+
 main() {
   local asset base url sudo=""
   detect_asset
@@ -243,6 +295,8 @@ ${SYSTEM_DIR} when you can."
   $sudo install -m 0755 "$TMP/$BIN" "$INSTALL_DIR/$BIN"
 
   ok "Installed $("$INSTALL_DIR/$BIN" --version 2>/dev/null || echo "$BIN") to $INSTALL_DIR/$BIN"
+
+  enable_linger
 
   case ":$PATH:" in
     *":$INSTALL_DIR:"*) ;;
