@@ -39,6 +39,30 @@ pub fn shell() -> String {
         .unwrap_or_else(|| "/bin/sh".to_string())
 }
 
+/// The account named `name`, or `None` if the passwd database has no entry.
+///
+/// Installing a system-wide service as root has to fill in someone else's
+/// account: the sessions belong to whoever ran `sudo`, not to root, so the unit
+/// needs that user's home rather than `/root`.
+pub fn named(name: &str) -> Option<User> {
+    let name = std::ffi::CString::new(name).ok()?;
+    // SAFETY: getpwnam returns a pointer into static storage, valid until the
+    // next getpw* call. Every field is copied out before returning, and nothing
+    // else here calls getpw*.
+    unsafe {
+        let entry = libc::getpwnam(name.as_ptr());
+        if entry.is_null() {
+            return None;
+        }
+        let entry = &*entry;
+        Some(User {
+            name: string(entry.pw_name),
+            home: string(entry.pw_dir),
+            shell: string(entry.pw_shell),
+        })
+    }
+}
+
 fn lookup() -> Option<User> {
     // SAFETY: getpwuid returns a pointer into static storage, valid until the
     // next getpw* call. This runs once, behind a OnceLock, and every field is

@@ -281,6 +281,9 @@ async fn run(cli: Cli) -> Result<u8> {
                         installed.manager.label(),
                         installed.path.display()
                     );
+                    if installed.scope == tiles::service::Scope::System {
+                        println!("it is a system service and runs as {}", installed.user);
+                    }
                 }
                 ServiceAction::Uninstall => {
                     let path = tiles::service::uninstall()?;

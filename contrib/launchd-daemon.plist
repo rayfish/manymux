@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>@LABEL@</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>@BIN@</string>
+    <string>@COMMAND@</string>
+  </array>
+  <!-- Installed by root, so the job has to say whose sessions these are. -->
+  <key>UserName</key><string>@USER@</string>
+  <!-- A launchd job inherits almost no environment, so the config directory is
+       passed explicitly rather than left to be discovered. -->
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>TILES_CONFIG_DIR</key><string>@CONFIG@</string>
+  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <!-- tiles writes its own rolling logs under that user's Library/Logs; these
+       files are opened by launchd as root, so they go somewhere root owns. -->
+  <key>StandardOutPath</key><string>/var/log/@NAME@.out</string>
+  <key>StandardErrorPath</key><string>/var/log/@NAME@.out</string>
+</dict>
+</plist>

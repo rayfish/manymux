@@ -26,6 +26,17 @@ pub fn log_dir() -> PathBuf {
         .unwrap_or_else(|| crate::config::config_dir().join("logs"))
 }
 
+/// The log directory belonging to `home`, for a system-wide unit that will run
+/// as someone else. Same answer [`log_dir`] would give in that account, worked
+/// out without their environment to ask.
+pub fn log_dir_for(home: &std::path::Path) -> PathBuf {
+    if cfg!(target_os = "macos") {
+        home.join("Library/Logs/tiles")
+    } else {
+        home.join(".local/state/tiles")
+    }
+}
+
 /// Start logging. `file` names the rolling log file for a long-running process,
 /// or `None` for a command that just prints and exits.
 ///

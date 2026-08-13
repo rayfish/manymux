@@ -38,6 +38,17 @@ pub fn config_dir() -> PathBuf {
         .join("tiles")
 }
 
+/// The config directory belonging to `home`, for a system-wide unit that will
+/// run as someone else. Same answer [`config_dir`] would give in that account,
+/// worked out without their environment to ask.
+pub fn config_dir_for(home: &std::path::Path) -> PathBuf {
+    if cfg!(target_os = "macos") {
+        home.join("Library/Application Support/tiles")
+    } else {
+        home.join(".config/tiles")
+    }
+}
+
 /// Create a directory only its owner can enter. Sockets and keys live in these,
 /// so the mode is load-bearing rather than tidiness.
 ///

@@ -35,8 +35,10 @@ afterwards `tiles update` replaces the binary in place.
 
 Optionally run the node as a service, so it survives logging out and keeps
 watching for bells: `tiles service install`. It writes the right unit for
-launchd, systemd, OpenRC, SysV init or rc.d. The first two are per-user and need
-no root; the others are system-wide and need `sudo`.
+launchd, systemd, OpenRC, SysV init or rc.d. Run as yourself on launchd or
+systemd you get a per-user unit and no root is involved; run it with `sudo`, or
+on a manager with no per-user services, and it becomes a system unit naming the
+account it runs as.
 
 ## Why not tmux
 

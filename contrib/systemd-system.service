@@ -1,0 +1,15 @@
+[Unit]
+Description=@DESC@
+After=network-online.target
+
+[Service]
+# Installed by root, so the unit has to say whose sessions these are. systemd
+# fills in HOME, USER and SHELL from that account's passwd entry.
+User=@USER@
+ExecStart=@BIN@ @COMMAND@
+Environment=TILES_CONFIG_DIR=@CONFIG@
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

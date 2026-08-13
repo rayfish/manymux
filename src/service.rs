@@ -4,11 +4,12 @@
 //! right unit for whatever the machine runs and starts it, rather than asking
 //! you to copy a template out of a README.
 //!
-//! Where the platform has per-user services (launchd, systemd) they are used:
-//! sessions run as you, with your shell and your environment, and installing
-//! needs no root. OpenRC, SysV init and BSD rc.d have no such thing, so there
-//! the unit is a system service that drops to your account before running, and
-//! installing it needs root.
+//! Where the platform has per-user services (launchd, systemd) they are used
+//! when you install as yourself: sessions run as you, with your shell and your
+//! environment, and it needs no root. Installing as root there is no user
+//! session to hang a unit off, so it goes where the machine's units go and
+//! names the account to run as. OpenRC, SysV init and BSD rc.d have no per-user
+//! services at all, so they are always the second shape and always need root.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -31,9 +32,10 @@ const RC_NAME: &str = NAME;
 /// The service manager this machine runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Manager {
-    /// macOS. Per-user agents, no root needed.
+    /// macOS. A per-user agent, or a system daemon when installed as root.
     Launchd,
-    /// systemd user units. No root, but they stop at logout without lingering.
+    /// systemd. A user unit, which stops at logout without lingering, or a
+    /// system unit when installed as root.
     Systemd,
     /// Alpine, Gentoo. System-wide, so root and a `command_user` drop.
     OpenRc,
@@ -41,6 +43,15 @@ pub enum Manager {
     SysVInit,
     /// FreeBSD and friends. System-wide, same again.
     Rc,
+}
+
+/// Whether a unit belongs to one account or to the whole machine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scope {
+    /// Installed by you, for you. No root, and it runs as you by construction.
+    User,
+    /// Installed by root, naming the account it runs as.
+    System,
 }
 
 impl Manager {
@@ -80,35 +91,48 @@ impl Manager {
         }
     }
 
-    /// Whether the unit is system-wide, and so needs root to install and has to
-    /// drop privileges to run as the right user.
-    fn system_wide(self) -> bool {
-        matches!(self, Self::OpenRc | Self::SysVInit | Self::Rc)
+    /// Which shape of unit to install here.
+    ///
+    /// Root gets the system one even where a per-user unit exists: there is no
+    /// login session to bootstrap it into, and root's own node is rarely what
+    /// was meant by `sudo tiles service install`.
+    pub fn scope(self) -> Scope {
+        match self {
+            Self::Launchd | Self::Systemd if uid() != 0 => Scope::User,
+            _ => Scope::System,
+        }
     }
 
     /// Where this manager's service definition lives.
-    pub fn path(self) -> Result<PathBuf> {
-        Ok(match self {
-            Self::Launchd => dirs::home_dir()
+    pub fn path(self, scope: Scope) -> Result<PathBuf> {
+        let plist = format!("{LAUNCHD_LABEL}.plist");
+        Ok(match (self, scope) {
+            (Self::Launchd, Scope::User) => dirs::home_dir()
                 .context("no home directory")?
                 .join("Library/LaunchAgents")
-                .join(format!("{LAUNCHD_LABEL}.plist")),
-            Self::Systemd => dirs::config_dir()
+                .join(plist),
+            (Self::Launchd, Scope::System) => PathBuf::from("/Library/LaunchDaemons").join(plist),
+            (Self::Systemd, Scope::User) => dirs::config_dir()
                 .context("no config directory")?
                 .join("systemd/user")
                 .join(format!("{NAME}.service")),
-            Self::OpenRc | Self::SysVInit => PathBuf::from("/etc/init.d").join(NAME),
-            Self::Rc => PathBuf::from("/usr/local/etc/rc.d").join(RC_NAME),
+            (Self::Systemd, Scope::System) => {
+                PathBuf::from("/etc/systemd/system").join(format!("{NAME}.service"))
+            }
+            (Self::OpenRc | Self::SysVInit, _) => PathBuf::from("/etc/init.d").join(NAME),
+            (Self::Rc, _) => PathBuf::from("/usr/local/etc/rc.d").join(RC_NAME),
         })
     }
 
-    fn template(self) -> &'static str {
-        match self {
-            Self::Launchd => include_str!("../contrib/launchd.plist"),
-            Self::Systemd => include_str!("../contrib/systemd.service"),
-            Self::OpenRc => include_str!("../contrib/openrc"),
-            Self::SysVInit => include_str!("../contrib/sysvinit"),
-            Self::Rc => include_str!("../contrib/rc.d"),
+    fn template(self, scope: Scope) -> &'static str {
+        match (self, scope) {
+            (Self::Launchd, Scope::User) => include_str!("../contrib/launchd.plist"),
+            (Self::Launchd, Scope::System) => include_str!("../contrib/launchd-daemon.plist"),
+            (Self::Systemd, Scope::User) => include_str!("../contrib/systemd.service"),
+            (Self::Systemd, Scope::System) => include_str!("../contrib/systemd-system.service"),
+            (Self::OpenRc, _) => include_str!("../contrib/openrc"),
+            (Self::SysVInit, _) => include_str!("../contrib/sysvinit"),
+            (Self::Rc, _) => include_str!("../contrib/rc.d"),
         }
     }
 }
@@ -117,44 +141,59 @@ impl Manager {
 pub struct Installed {
     pub manager: Manager,
     pub path: PathBuf,
+    pub scope: Scope,
+    /// The account the node will run as, which is worth saying out loud when
+    /// root installed it on someone else's behalf.
+    pub user: String,
 }
 
 pub fn install() -> Result<Installed> {
     let manager = Manager::detect()?;
-    let path = manager.path()?;
-    let fields = Fields::new()?;
+    let scope = manager.scope();
+    let path = manager.path(scope)?;
+    let fields = Fields::new(scope)?;
 
-    if manager.system_wide() && uid() != 0 {
+    if scope == Scope::System && uid() != 0 {
         bail!(
             "{} services are system-wide, so installing one needs root: \
              re-run with sudo",
             manager.label()
         );
     }
+    // Fail before writing anything, rather than leaving a unit behind that
+    // nothing ever loaded.
+    if manager == Manager::Systemd && scope == Scope::User {
+        user_runtime_dir()?;
+    }
 
-    std::fs::create_dir_all(&fields.logs).ok();
-    write_unit(&path, &fields.render(manager.template()), manager)?;
+    // Only for a unit that runs as us: as root this would put a root-owned
+    // directory in someone else's home, and the node makes its own anyway.
+    if scope == Scope::User {
+        std::fs::create_dir_all(&fields.logs).ok();
+    }
+    write_unit(&path, &fields.render(manager.template(scope)), manager)?;
 
     match manager {
         Manager::Launchd => {
-            let target = format!("gui/{}", uid());
+            let domain = launchd_domain(scope);
             // Replacing an agent means booting the old one out first, which
             // fails harmlessly when there is nothing loaded.
             let _ = run(
                 "launchctl",
-                &["bootout", &format!("{target}/{LAUNCHD_LABEL}")],
+                &["bootout", &format!("{domain}/{LAUNCHD_LABEL}")],
             );
             run(
                 "launchctl",
-                &["bootstrap", &target, &path.display().to_string()],
+                &["bootstrap", &domain, &path.display().to_string()],
             )
-            .context("loading the launchd agent")?;
+            .context("loading the launchd job")?;
         }
         Manager::Systemd => {
-            run("systemctl", &["--user", "daemon-reload"]).context("reloading systemd")?;
-            run("systemctl", &["--user", "enable", "--now", NAME])
-                .context("enabling the service")?;
-            warn_about_linger(&fields.user);
+            systemctl(scope, &["daemon-reload"]).context("reloading systemd")?;
+            systemctl(scope, &["enable", "--now", NAME]).context("enabling the service")?;
+            if scope == Scope::User {
+                warn_about_linger(&fields.user);
+            }
         }
         Manager::OpenRc => {
             run("rc-update", &["add", NAME, "default"]).context("enabling the service")?;
@@ -173,14 +212,20 @@ pub fn install() -> Result<Installed> {
         }
     }
 
-    Ok(Installed { manager, path })
+    Ok(Installed {
+        manager,
+        path,
+        scope,
+        user: fields.user,
+    })
 }
 
 pub fn uninstall() -> Result<PathBuf> {
     let manager = Manager::detect()?;
-    let path = manager.path()?;
+    let scope = manager.scope();
+    let path = manager.path(scope)?;
 
-    if manager.system_wide() && uid() != 0 {
+    if scope == Scope::System && uid() != 0 {
         bail!(
             "{} services are system-wide, so removing one needs root: re-run with sudo",
             manager.label()
@@ -194,11 +239,14 @@ pub fn uninstall() -> Result<PathBuf> {
         Manager::Launchd => {
             let _ = run(
                 "launchctl",
-                &["bootout", &format!("gui/{}/{LAUNCHD_LABEL}", uid())],
+                &[
+                    "bootout",
+                    &format!("{}/{LAUNCHD_LABEL}", launchd_domain(scope)),
+                ],
             );
         }
         Manager::Systemd => {
-            let _ = run("systemctl", &["--user", "disable", "--now", NAME]);
+            let _ = systemctl(scope, &["disable", "--now", NAME]);
         }
         Manager::OpenRc => {
             let _ = run("rc-service", &[NAME, "stop"]);
@@ -219,7 +267,7 @@ pub fn uninstall() -> Result<PathBuf> {
         std::fs::remove_file(&path).with_context(|| format!("removing {}", path.display()))?;
     }
     if manager == Manager::Systemd {
-        let _ = run("systemctl", &["--user", "daemon-reload"]);
+        let _ = systemctl(scope, &["daemon-reload"]);
     }
     Ok(path)
 }
@@ -233,15 +281,31 @@ struct Fields {
 }
 
 impl Fields {
-    fn new() -> Result<Self> {
+    fn new(scope: Scope) -> Result<Self> {
+        let user = username();
+        // A system unit runs as someone else, so its paths are theirs. Under
+        // sudo our own environment points at root's home, which would give the
+        // node an empty config directory and hide the machines you added.
+        let home = match scope {
+            Scope::System => crate::user::named(&user).map(|user| PathBuf::from(user.home)),
+            Scope::User => None,
+        };
         Ok(Self {
             bin: std::env::current_exe()
                 .context("finding the tiles binary")?
                 .display()
                 .to_string(),
-            user: username(),
-            config: crate::config::config_dir().display().to_string(),
-            logs: crate::log::log_dir(),
+            user,
+            config: match &home {
+                Some(home) => crate::config::config_dir_for(home),
+                None => crate::config::config_dir(),
+            }
+            .display()
+            .to_string(),
+            logs: match &home {
+                Some(home) => crate::log::log_dir_for(home),
+                None => crate::log::log_dir(),
+            },
         })
     }
 
@@ -292,9 +356,73 @@ fn warn_about_linger(user: &str) {
 
 const LAUNCHD_LABEL: &str = "xyz.rayfish.tiles";
 
-fn run(program: &str, args: &[&str]) -> Result<()> {
-    let output = Command::new(program)
+/// Where launchd keeps this scope's jobs.
+fn launchd_domain(scope: Scope) -> String {
+    match scope {
+        Scope::User => format!("gui/{}", uid()),
+        Scope::System => "system".to_string(),
+    }
+}
+
+/// systemctl, in the right instance and with a way to reach it.
+///
+/// A user instance is addressed through `XDG_RUNTIME_DIR` and the session bus,
+/// and an ssh login whose PAM stack has no `pam_systemd` sets neither, so the
+/// command fails complaining about `$DBUS_SESSION_BUS_ADDRESS`. The directory is
+/// usually there regardless, so point systemctl at it instead of giving up.
+fn systemctl(scope: Scope, args: &[&str]) -> Result<()> {
+    let mut command = Command::new("systemctl");
+    if scope == Scope::System {
+        command.args(args);
+        return output(command, "systemctl", args);
+    }
+    let runtime = user_runtime_dir()?;
+    command
+        .arg("--user")
         .args(args)
+        .env("XDG_RUNTIME_DIR", &runtime)
+        .env(
+            "DBUS_SESSION_BUS_ADDRESS",
+            format!("unix:path={}/bus", runtime.display()),
+        );
+    output(command, "systemctl", args)
+}
+
+/// Where this user's systemd instance keeps its sockets.
+///
+/// The error is the useful part: no runtime directory means no user instance is
+/// running for this account, and lingering both starts one and is what a service
+/// meant to outlive your login needs anyway.
+fn user_runtime_dir() -> Result<PathBuf> {
+    if let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from)
+        && dir.is_dir()
+    {
+        return Ok(dir);
+    }
+    let dir = PathBuf::from(format!("/run/user/{}", uid()));
+    if dir.is_dir() {
+        return Ok(dir);
+    }
+    bail!(
+        "systemd is not running a user instance for {user}: there is no \
+         $XDG_RUNTIME_DIR and no {dir}.\n\
+         That happens when you log in over ssh on a host without pam_systemd, \
+         and it also means the service would stop at logout. Both are fixed by:\n\
+         \n    sudo loginctl enable-linger {user}\n\n\
+         Then run `tiles service install` again.",
+        user = username(),
+        dir = dir.display(),
+    )
+}
+
+fn run(program: &str, args: &[&str]) -> Result<()> {
+    let mut command = Command::new(program);
+    command.args(args);
+    output(command, program, args)
+}
+
+fn output(mut command: Command, program: &str, args: &[&str]) -> Result<()> {
+    let output = command
         .output()
         .with_context(|| format!("running {program}"))?;
     if !output.status.success() {
@@ -324,51 +452,85 @@ fn username() -> String {
 mod tests {
     use super::*;
 
+    const MANAGERS: [Manager; 5] = [
+        Manager::Launchd,
+        Manager::Systemd,
+        Manager::OpenRc,
+        Manager::SysVInit,
+        Manager::Rc,
+    ];
+
     /// A template that lost a placeholder would install a unit pointing at
     /// nothing, and the failure would only show up on the machine it was
     /// installed on.
     #[test]
     fn every_template_names_the_binary_and_the_command() {
-        for manager in [
-            Manager::Launchd,
-            Manager::Systemd,
-            Manager::OpenRc,
-            Manager::SysVInit,
-            Manager::Rc,
-        ] {
-            let template = manager.template();
-            assert!(template.contains("@BIN@"), "{}", manager.label());
-            assert!(template.contains("@COMMAND@"), "{}", manager.label());
-            assert!(template.contains("@CONFIG@"), "{}", manager.label());
+        for manager in MANAGERS {
+            for scope in [Scope::User, Scope::System] {
+                let template = manager.template(scope);
+                assert!(template.contains("@BIN@"), "{}", manager.label());
+                assert!(template.contains("@COMMAND@"), "{}", manager.label());
+                assert!(template.contains("@CONFIG@"), "{}", manager.label());
+            }
+        }
+    }
+
+    /// A system unit runs as whoever the unit names, so it has to name them.
+    #[test]
+    fn system_templates_say_which_account_they_run_as() {
+        for manager in MANAGERS {
+            let template = manager.template(Scope::System);
+            assert!(template.contains("@USER@"), "{}", manager.label());
         }
     }
 
     #[test]
     fn rendering_leaves_no_placeholders_behind() {
-        let fields = Fields::new().unwrap();
-        for manager in [
-            Manager::Launchd,
-            Manager::Systemd,
-            Manager::OpenRc,
-            Manager::SysVInit,
-            Manager::Rc,
-        ] {
-            let rendered = fields.render(manager.template());
-            assert!(
-                !rendered.contains('@'),
-                "{} left a placeholder: {rendered}",
-                manager.label()
-            );
+        for scope in [Scope::User, Scope::System] {
+            let fields = Fields::new(scope).unwrap();
+            for manager in MANAGERS {
+                let rendered = fields.render(manager.template(scope));
+                assert!(
+                    !rendered.contains('@'),
+                    "{} left a placeholder: {rendered}",
+                    manager.label()
+                );
+            }
         }
     }
 
+    /// Root gets a system unit everywhere; as yourself, only the managers with
+    /// no per-user services make you reach for sudo.
     #[test]
-    fn system_wide_managers_are_the_ones_without_user_services() {
-        assert!(!Manager::Launchd.system_wide());
-        assert!(!Manager::Systemd.system_wide());
-        assert!(Manager::OpenRc.system_wide());
-        assert!(Manager::SysVInit.system_wide());
-        assert!(Manager::Rc.system_wide());
+    fn only_launchd_and_systemd_have_a_user_scope() {
+        let as_root = uid() == 0;
+        assert_eq!(Manager::Launchd.scope() == Scope::User, !as_root);
+        assert_eq!(Manager::Systemd.scope() == Scope::User, !as_root);
+        assert_eq!(Manager::OpenRc.scope(), Scope::System);
+        assert_eq!(Manager::SysVInit.scope(), Scope::System);
+        assert_eq!(Manager::Rc.scope(), Scope::System);
+    }
+
+    /// A system unit that landed in a home directory would never be loaded by
+    /// the machine, and a user one outside it would need root to write.
+    #[test]
+    fn units_land_in_the_directory_their_scope_is_read_from() {
+        for manager in [Manager::Launchd, Manager::Systemd] {
+            let system = manager.path(Scope::System).unwrap();
+            assert!(
+                system.starts_with("/Library") || system.starts_with("/etc"),
+                "{}: {}",
+                manager.label(),
+                system.display()
+            );
+            let user = manager.path(Scope::User).unwrap();
+            assert!(
+                user.starts_with(dirs::home_dir().unwrap()),
+                "{}: {}",
+                manager.label(),
+                user.display()
+            );
+        }
     }
 
     #[test]
