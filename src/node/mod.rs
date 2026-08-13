@@ -27,7 +27,7 @@ use tracing::{debug, info, warn};
 
 use crate::client::Stream;
 use crate::hosts::{Hosts, this_machine};
-use crate::proto::{self, HostedEvent, Request, Response, tag};
+use crate::proto::{self, FrameReader, HostedEvent, Request, Response, tag};
 use notify::Notifier;
 use peers::Peers;
 use registry::Registry;
@@ -175,12 +175,13 @@ impl Node {
 
     /// Serve one stream: a single request, then either a response or, for
     /// `Attach` and `Events`, something lasting until the client goes away.
-    pub async fn handle<R, W>(&self, mut read: R, mut write: W) -> Result<()>
+    pub async fn handle<R, W>(&self, read: R, mut write: W) -> Result<()>
     where
         R: AsyncRead + Unpin + Send,
         W: AsyncWrite + Unpin + Send,
     {
-        let Some(frame) = proto::read_frame(&mut read).await? else {
+        let mut read = FrameReader::new(read);
+        let Some(frame) = read.next().await? else {
             return Ok(());
         };
         if frame.tag != tag::REQUEST {
@@ -284,7 +285,11 @@ fn modified(path: &Path) -> Option<std::time::SystemTime> {
 ///
 /// Whatever ends this loop, the child is untouched: dropping the attachment
 /// only removes the client from the session's size negotiation.
-async fn pump_attachment<R, W>(attached: session::Attached, mut read: R, mut write: W) -> Result<()>
+async fn pump_attachment<R, W>(
+    attached: session::Attached,
+    mut read: FrameReader<R>,
+    mut write: W,
+) -> Result<()>
 where
     R: AsyncRead + Unpin + Send,
     W: AsyncWrite + Unpin + Send,
@@ -310,7 +315,7 @@ where
 
     loop {
         tokio::select! {
-            frame = proto::read_frame(&mut read) => {
+            frame = read.next() => {
                 let Some(frame) = frame? else { break };
                 last_heard = tokio::time::Instant::now();
                 match frame.tag {

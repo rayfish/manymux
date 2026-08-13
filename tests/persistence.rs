@@ -9,13 +9,13 @@ use std::time::Duration;
 
 use anyhow::Result;
 use manymux::node::{Config, Node};
-use manymux::proto::{self, Request, Response, Size, SpawnSpec, tag};
-use tokio::io::{DuplexStream, ReadHalf, WriteHalf, split};
+use manymux::proto::{self, FrameReader, Request, Response, Size, SpawnSpec, tag};
+use tokio::io::{AsyncRead, DuplexStream, WriteHalf, split};
 
 /// One client connection: a duplex pair with the server handler running on the
 /// far end, exactly as the socket listener would have spawned it.
 struct Client {
-    read: ReadHalf<DuplexStream>,
+    read: FrameReader<Box<dyn AsyncRead + Unpin + Send>>,
     write: WriteHalf<DuplexStream>,
 }
 
@@ -28,14 +28,15 @@ impl Client {
             let _ = node.handle(server_read, server_write).await;
         });
         let (read, write) = split(client_side);
-        Self { read, write }
+        Self {
+            read: FrameReader::new(Box::new(read)),
+            write,
+        }
     }
 
     async fn send(&mut self, request: &Request) -> Result<Response> {
         proto::write_msg(&mut self.write, tag::REQUEST, request).await?;
-        let frame = proto::read_frame(&mut self.read)
-            .await?
-            .expect("a response");
+        let frame = self.read.next().await?.expect("a response");
         assert_eq!(frame.tag, tag::RESPONSE);
         proto::decode(&frame.body)
     }
@@ -46,7 +47,7 @@ impl Client {
         let deadline = Duration::from_secs(10);
         let found = tokio::time::timeout(deadline, async {
             loop {
-                match proto::read_frame(&mut self.read).await.expect("a frame") {
+                match self.read.next().await.expect("a frame") {
                     Some(frame) if frame.tag == tag::DATA => {
                         seen.push_str(&String::from_utf8_lossy(&frame.body))
                     }
@@ -72,7 +73,7 @@ impl Client {
 
     /// The next frame, or `None` once the host has hung up on us.
     async fn next_frame(&mut self) -> Option<proto::Frame> {
-        proto::read_frame(&mut self.read).await.expect("a frame")
+        self.read.next().await.expect("a frame")
     }
 
     /// Read frames until a ping arrives, which is the host asking whether this

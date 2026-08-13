@@ -13,9 +13,12 @@
 //! keeping PTY output out of the serializer means the hot path is a copy.
 
 use anyhow::{Result, bail};
+use bytes::BytesMut;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio_stream::StreamExt;
+use tokio_util::codec::{Decoder, FramedRead};
 
 /// ALPN for the iroh transport. This is the only compatibility gate: bump it in
 /// the same change as any incompatible protocol change.
@@ -251,39 +254,85 @@ pub struct Frame {
     pub body: Vec<u8>,
 }
 
-/// Read one frame. `Ok(None)` is a clean end of stream.
-pub async fn read_frame<R>(r: &mut R) -> Result<Option<Frame>>
-where
-    R: AsyncRead + Unpin,
-{
-    let mut head = [0u8; 5];
-    match r.read_exact(&mut head).await {
-        Ok(_) => {}
-        Err(e) if is_eof(&e) => return Ok(None),
-        Err(e) => return Err(e.into()),
-    }
-    let len = u32::from_be_bytes(head[1..].try_into().unwrap()) as usize;
-    if len > MAX_FRAME {
-        bail!("peer sent a {len} byte frame, over the {MAX_FRAME} limit");
-    }
-    let mut body = vec![0u8; len];
-    r.read_exact(&mut body).await?;
-    Ok(Some(Frame { tag: head[0], body }))
-}
-
 pub fn decode<T: DeserializeOwned>(body: &[u8]) -> Result<T> {
     Ok(rmp_serde::from_slice(body)?)
 }
 
-fn is_eof(e: &std::io::Error) -> bool {
-    matches!(
-        e.kind(),
-        std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::ConnectionReset
-    )
+/// Bytes of header before a frame's body: the tag and the length.
+const HEAD: usize = 5;
+
+/// Picks frames out of a stream of bytes.
+///
+/// A codec rather than a pair of `read_exact` calls because both places that
+/// read frames do it inside a `select!`, which drops the losing branch's future
+/// wherever it happened to be. Bytes held by such a future are gone, and half a
+/// header consumed and dropped desynchronises the stream for good: the next
+/// read takes body content for a header. A codec keeps the partial frame in a
+/// buffer belonging to the reader, so a dropped read costs nothing.
+struct FrameCodec;
+
+impl Decoder for FrameCodec {
+    type Item = Frame;
+    type Error = anyhow::Error;
+
+    fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Frame>> {
+        if src.len() < HEAD {
+            return Ok(None);
+        }
+        let len = u32::from_be_bytes(src[1..HEAD].try_into().unwrap()) as usize;
+        if len > MAX_FRAME {
+            bail!("peer sent a {len} byte frame, over the {MAX_FRAME} limit");
+        }
+        if src.len() < HEAD + len {
+            // Ask for the whole of what is missing at once, rather than
+            // growing the buffer a read at a time.
+            src.reserve(HEAD + len - src.len());
+            return Ok(None);
+        }
+        let tag = src[0];
+        let body = src.split_to(HEAD + len).split_off(HEAD).to_vec();
+        Ok(Some(Frame { tag, body }))
+    }
+}
+
+/// The frames arriving on a stream.
+pub struct FrameReader<R> {
+    inner: FramedRead<R, FrameCodec>,
+}
+
+impl<R: AsyncRead + Unpin> FrameReader<R> {
+    pub fn new(read: R) -> Self {
+        Self {
+            inner: FramedRead::new(read, FrameCodec),
+        }
+    }
+
+    /// The next frame, or `None` at the end of the stream.
+    ///
+    /// Cancel safe: dropping this future leaves anything it had read in the
+    /// buffer, which is what makes it sound to await in a `select!`.
+    pub async fn next(&mut self) -> Result<Option<Frame>> {
+        match self.inner.next().await {
+            None => Ok(None),
+            Some(Ok(frame)) => Ok(Some(frame)),
+            // A peer that reset the connection has gone away, which callers
+            // want to hear about the same way as a clean close. A stream that
+            // ends mid-frame is a different thing and stays an error.
+            Some(Err(e)) if reset(&e) => Ok(None),
+            Some(Err(e)) => Err(e),
+        }
+    }
+}
+
+fn reset(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<std::io::Error>()
+        .is_some_and(|e| e.kind() == std::io::ErrorKind::ConnectionReset)
 }
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
 
     #[test]
@@ -301,24 +350,47 @@ mod tests {
 
     #[tokio::test]
     async fn frames_round_trip() {
-        let (mut a, mut b) = tokio::io::duplex(4096);
+        let (mut a, b) = tokio::io::duplex(4096);
+        let mut frames = FrameReader::new(b);
         write_msg(&mut a, tag::REQUEST, &Request::List)
             .await
             .unwrap();
         write_frame(&mut a, tag::DATA, b"raw bytes").await.unwrap();
 
-        let frame = read_frame(&mut b).await.unwrap().unwrap();
+        let frame = frames.next().await.unwrap().unwrap();
         assert_eq!(frame.tag, tag::REQUEST);
         assert!(matches!(
             decode::<Request>(&frame.body).unwrap(),
             Request::List
         ));
 
-        let frame = read_frame(&mut b).await.unwrap().unwrap();
+        let frame = frames.next().await.unwrap().unwrap();
         assert_eq!(frame.tag, tag::DATA);
         assert_eq!(frame.body, b"raw bytes");
 
         drop(a);
-        assert!(read_frame(&mut b).await.unwrap().is_none());
+        assert!(frames.next().await.unwrap().is_none());
+    }
+
+    /// What the codec is for. Both loops that read frames do it in a `select!`,
+    /// which drops the losing branch's future wherever it stood. Reading
+    /// straight from the stream, the bytes that future had already taken went
+    /// with it, and every frame after that was parsed one header short.
+    #[tokio::test]
+    async fn a_read_cancelled_part_way_through_a_frame_keeps_what_it_had() {
+        let (mut a, b) = tokio::io::duplex(4096);
+        let mut frames = FrameReader::new(b);
+
+        // Three bytes of a five byte header, then a read that gives up.
+        a.write_all(&[tag::DATA, 0, 0]).await.unwrap();
+        let cancelled = tokio::time::timeout(Duration::from_millis(20), frames.next()).await;
+        assert!(cancelled.is_err(), "half a header should not decode");
+
+        // The rest arrives and the frame is whole, three bytes and all.
+        a.write_all(&[0, 9]).await.unwrap();
+        a.write_all(b"raw bytes").await.unwrap();
+        let frame = frames.next().await.unwrap().unwrap();
+        assert_eq!(frame.tag, tag::DATA);
+        assert_eq!(frame.body, b"raw bytes");
     }
 }

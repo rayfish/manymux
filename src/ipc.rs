@@ -17,7 +17,7 @@ use tokio::sync::broadcast;
 use tokio::sync::broadcast::error::RecvError;
 use tracing::{debug, info, warn};
 
-use crate::proto::{self, tag};
+use crate::proto::{self, FrameReader, tag};
 
 /// Accept connections on `socket` forever, handling each in its own task.
 pub async fn serve<F, Fut>(socket: &Path, handle: F) -> Result<()>
@@ -134,7 +134,7 @@ fn set_mode(socket: &Path) -> Result<()> {
 /// sends nothing, so anything arriving on it is the end of the stream.
 pub async fn pump_events<T, R, W>(
     mut events: broadcast::Receiver<T>,
-    mut read: R,
+    mut read: FrameReader<R>,
     mut write: W,
 ) -> Result<()>
 where
@@ -151,7 +151,7 @@ where
                 Err(RecvError::Lagged(n)) => warn!("an event subscriber missed {n} events"),
                 Err(RecvError::Closed) => return Ok(()),
             },
-            frame = proto::read_frame(&mut read) => {
+            frame = read.next() => {
                 let _ = frame?;
                 return Ok(());
             }

@@ -17,9 +17,9 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::UnixStream;
 use tokio::process::Child;
 
-use crate::proto::{self, Request, Response, Size, tag};
+use crate::proto::{self, FrameReader, Request, Response, Size, tag};
 
-type Reader = Box<dyn AsyncRead + Unpin + Send>;
+type Reader = FrameReader<Box<dyn AsyncRead + Unpin + Send>>;
 type Writer = Box<dyn AsyncWrite + Unpin + Send>;
 
 /// The ssh process carrying a stream to another machine. Dropping it hangs up,
@@ -46,7 +46,7 @@ impl Stream {
         })?;
         let (read, write) = stream.into_split();
         Ok(Self {
-            read: Box::new(read),
+            read: FrameReader::new(Box::new(read)),
             write: Box::new(write),
             carrier: None,
         })
@@ -59,7 +59,7 @@ impl Stream {
     pub async fn over_ssh(host: &str) -> Result<Self> {
         let agent = crate::ssh::agent(host)?;
         Ok(Self {
-            read: Box::new(agent.stdout),
+            read: FrameReader::new(Box::new(agent.stdout)),
             write: Box::new(agent.stdin),
             carrier: Some(Carrier {
                 _child: agent.child,
@@ -69,9 +69,9 @@ impl Stream {
 
     /// Wrap an already-open pair of stream halves. The escape hatch for tests
     /// and for transports this module doesn't know about.
-    pub fn from_halves(read: Reader, write: Writer) -> Self {
+    pub fn from_halves(read: Box<dyn AsyncRead + Unpin + Send>, write: Writer) -> Self {
         Self {
-            read,
+            read: FrameReader::new(read),
             write,
             carrier: None,
         }
@@ -80,7 +80,7 @@ impl Stream {
     /// Send a request and read its response.
     pub async fn request(&mut self, request: &Request) -> Result<Response> {
         proto::write_msg(&mut self.write, tag::REQUEST, request).await?;
-        let Some(frame) = proto::read_frame(&mut self.read).await? else {
+        let Some(frame) = self.read.next().await? else {
             // An ssh that failed to connect, or a remote with no `mm` on it,
             // leaves nothing on the pipe. Its exit status says far more than
             // "the stream ended", so go and look.
@@ -112,7 +112,7 @@ impl Stream {
     /// the daemon's aggregated feed sends [`HostedEvent`](crate::proto::HostedEvent)s.
     pub async fn next_event<T: serde::de::DeserializeOwned>(&mut self) -> Result<Option<T>> {
         loop {
-            let Some(frame) = proto::read_frame(&mut self.read).await? else {
+            let Some(frame) = self.read.next().await? else {
                 return Ok(None);
             };
             // Skip anything else so a newer host can add frames without
@@ -201,7 +201,7 @@ pub struct SessionReader {
 impl SessionReader {
     pub async fn next(&mut self) -> Result<Update> {
         loop {
-            let Some(frame) = proto::read_frame(&mut self.read).await? else {
+            let Some(frame) = self.read.next().await? else {
                 return Ok(Update::Disconnected);
             };
             return Ok(match frame.tag {
