@@ -12,9 +12,59 @@ use anyhow::Result;
 
 use crate::client::{Attached, SessionHalves, Update};
 
-/// Detach prefix: Ctrl-\ (0x1c). Chosen over tmux's Ctrl-b and screen's Ctrl-a
-/// because you are likely running one of those *inside* the session.
-pub const PREFIX: u8 = 0x1c;
+/// Detach prefix: Ctrl-\ (0x1c).
+///
+/// Not tmux's Ctrl-b or screen's Ctrl-a, because you are quite likely running
+/// one of those *inside* a tiles session: tiles has no panes or tabs, so
+/// splitting a window is still their job, and taking their prefix would mean
+/// swallowing it before it ever reached them. Ctrl-\ is SIGQUIT, which almost
+/// nobody sends deliberately, and `Ctrl-\ Ctrl-\` sends a literal one through.
+pub const DEFAULT_PREFIX: u8 = 0x1c;
+
+/// The detach prefix in force, from `TILES_PREFIX` if it is set and usable.
+///
+/// Accepts `C-b`, `^B` or `\x02`. An unusable value is a warning rather than a
+/// failure: losing the ability to detach because of a typo in an environment
+/// variable would be worse than ignoring it.
+pub fn prefix() -> u8 {
+    let Some(text) = std::env::var_os("TILES_PREFIX") else {
+        return DEFAULT_PREFIX;
+    };
+    let text = text.to_string_lossy();
+    match parse_prefix(&text) {
+        Some(byte) => byte,
+        None => {
+            eprintln!("tiles: TILES_PREFIX={text:?} is not a control key; using Ctrl-\\");
+            DEFAULT_PREFIX
+        }
+    }
+}
+
+/// Parse a control key: `C-b`, `c-B`, `^b`, a bare `b`, or the raw byte.
+///
+/// A bare letter is read as the control key, since a printable character could
+/// not serve as a prefix anyway: it would arm on every one you typed.
+fn parse_prefix(text: &str) -> Option<u8> {
+    let key = text
+        .strip_prefix("C-")
+        .or_else(|| text.strip_prefix("c-"))
+        .or_else(|| text.strip_prefix('^'))
+        .unwrap_or(text);
+
+    let mut chars = key.chars();
+    let key = chars.next()?;
+    if chars.next().is_some() {
+        return None;
+    }
+    // A control character given literally, `$'\x02'` style.
+    if key.is_control() {
+        return Some(key as u8);
+    }
+    // `C-b` is 0x02: the letter with the top three bits cleared. The same
+    // arithmetic covers `C-\`, `C-]` and friends, which sit just past `Z`.
+    let byte = u8::try_from(key).ok()?.to_ascii_uppercase();
+    (0x40..0x60).contains(&byte).then_some(byte & 0x1f)
+}
 
 /// How the attach ended.
 #[derive(Debug, PartialEq, Eq)]
@@ -31,9 +81,15 @@ pub enum Outcome {
 /// `Ctrl-\ d` detaches. `Ctrl-\ Ctrl-\` sends a literal Ctrl-\ through, so the
 /// key is still usable (it is SIGQUIT) inside the session. Any other key after
 /// the prefix passes both bytes through unchanged.
-#[derive(Default)]
 pub struct KeyFilter {
+    prefix: u8,
     armed: bool,
+}
+
+impl Default for KeyFilter {
+    fn default() -> Self {
+        Self::new(prefix())
+    }
 }
 
 /// What a chunk of keystrokes amounts to once the detach sequence is taken out.
@@ -46,6 +102,13 @@ pub struct Keystrokes {
 }
 
 impl KeyFilter {
+    pub fn new(prefix: u8) -> Self {
+        Self {
+            prefix,
+            armed: false,
+        }
+    }
+
     pub fn filter(&mut self, input: &[u8]) -> Keystrokes {
         let mut forward = Vec::with_capacity(input.len());
         for &b in input {
@@ -58,13 +121,13 @@ impl KeyFilter {
                             detach: true,
                         };
                     }
-                    PREFIX => forward.push(PREFIX),
+                    b if b == self.prefix => forward.push(self.prefix),
                     other => {
-                        forward.push(PREFIX);
+                        forward.push(self.prefix);
                         forward.push(other);
                     }
                 }
-            } else if b == PREFIX {
+            } else if b == self.prefix {
                 self.armed = true;
             } else {
                 forward.push(b);
@@ -234,6 +297,53 @@ mod tests {
     }
 
     #[test]
+    fn a_control_key_can_be_named_several_ways() {
+        assert_eq!(parse_prefix("C-b"), Some(0x02));
+        assert_eq!(parse_prefix("c-B"), Some(0x02));
+        assert_eq!(parse_prefix("^b"), Some(0x02));
+        assert_eq!(parse_prefix("\u{2}"), Some(0x02));
+        // The default, and the other keys past `Z` that people pick.
+        assert_eq!(parse_prefix("C-\\"), Some(DEFAULT_PREFIX));
+        assert_eq!(parse_prefix("C-a"), Some(0x01));
+        assert_eq!(parse_prefix("C-]"), Some(0x1d));
+    }
+
+    #[test]
+    fn a_bare_letter_means_the_control_key() {
+        // The only reading that works: a printable prefix would arm on every
+        // one of those characters you typed.
+        assert_eq!(parse_prefix("b"), Some(0x02));
+    }
+
+    #[test]
+    fn a_prefix_that_is_not_a_key_at_all_is_refused() {
+        // Refused rather than silently mangled, and the caller then warns and
+        // keeps the default, since a typo here must not cost you the ability
+        // to detach.
+        assert_eq!(parse_prefix("C-bb"), None);
+        assert_eq!(parse_prefix(""), None);
+        assert_eq!(parse_prefix("C-"), None);
+        assert_eq!(parse_prefix("1"), None);
+    }
+
+    #[test]
+    fn the_prefix_can_be_tmuxs() {
+        // `TILES_PREFIX=C-b` for muscle memory, at the price of tmux inside a
+        // session no longer seeing its own prefix.
+        let mut f = KeyFilter::new(0x02);
+        assert_eq!(
+            f.filter(b"ls\x02d"),
+            Keystrokes {
+                forward: b"ls".to_vec(),
+                detach: true
+            }
+        );
+        // And Ctrl-\ is then just an ordinary keystroke again.
+        let mut f = KeyFilter::new(0x02);
+        assert_eq!(f.filter(b"\x1c"), forwarded(b"\x1c"));
+    }
+
+    #[test]
     fn ordinary_input_passes_through() {
         let mut f = KeyFilter::default();
         assert_eq!(f.filter(b"ls -la\r"), forwarded(b"ls -la\r"));
@@ -254,13 +364,13 @@ mod tests {
     #[test]
     fn doubled_prefix_sends_one_through() {
         let mut f = KeyFilter::default();
-        assert_eq!(f.filter(b"\x1c\x1c"), forwarded(&[PREFIX]));
+        assert_eq!(f.filter(b"\x1c\x1c"), forwarded(&[DEFAULT_PREFIX]));
     }
 
     #[test]
     fn prefix_then_other_key_forwards_both() {
         let mut f = KeyFilter::default();
-        assert_eq!(f.filter(b"\x1cx"), forwarded(&[PREFIX, b'x']));
+        assert_eq!(f.filter(b"\x1cx"), forwarded(&[DEFAULT_PREFIX, b'x']));
     }
 
     #[test]

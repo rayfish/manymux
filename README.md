@@ -49,6 +49,10 @@ tiles ls/attach ─► ssh gpu-box tiles agent ──► tiles daemon (unix sock
                    ProxyCommand, whatever
 ```
 
+- **A "node" is one `tiles daemon` process.** It owns that machine's sessions
+  and listens on a Unix socket; that is the whole of it. Every machine runs one,
+  including yours, and it starts itself the first time something needs it.
+
 - **tiles does no networking.** You already have a way to reach your machines,
   and it lives in `~/.ssh/config` where it belongs. A host is whatever ssh means
   by that name, so `gpu-box`, `dario@gpu-box`, a `ProxyJump` alias and a
@@ -60,13 +64,15 @@ tiles ls/attach ─► ssh gpu-box tiles agent ──► tiles daemon (unix sock
   sync with the real policy and no way for tiles to grant access ssh would
   refuse.
 
-- **The node owns the PTY.** A client leaving is invisible to the child: no
+- **That node owns the PTY.** A client leaving is invisible to the child: no
   SIGHUP, no EOF on stdin. That is the whole trick, and it is why a session
   outlives the ssh connection that started it.
 
-- **One node per user per machine.** `ssh deploy@box tiles agent` lands in
-  deploy's node, because the socket is under deploy's runtime directory. The
-  account question is ssh's, so tiles never drops privileges or runs as root.
+- **One node per user, not per machine.** `ssh deploy@box` lands in deploy's
+  node and `ssh alice@box` in alice's, because each socket sits in its owner's
+  runtime directory. So two people on one box get separate sessions, and tiles
+  never has to switch users, drop privileges, or run as root: ssh already put
+  the request in the right account.
 
 - **Nothing to install on the far side but the binary.** The node starts on
   demand the first time something asks for it, the way tmux starts its server.
@@ -180,9 +186,16 @@ are the same thing.
 wrap it in a script.
 
 Detach is `Ctrl-\` then `d`. `Ctrl-\ Ctrl-\` sends a literal `Ctrl-\` through,
-so the key still works inside the session. The prefix avoids tmux's `Ctrl-b`
-and screen's `Ctrl-a` because you are likely running one of those *inside* a
-session.
+so the key still works inside the session.
+
+The default avoids tmux's `Ctrl-b` and screen's `Ctrl-a` on purpose: tiles has
+no panes or tabs, so splitting a window is still their job, and taking their
+prefix would mean swallowing it before it ever reached them. If you would
+rather have the muscle memory, `TILES_PREFIX` takes `C-b`, `^b` or `b`:
+
+```bash
+export TILES_PREFIX=C-b     # then Ctrl-b d detaches
+```
 
 ## Titles, bells and notifications
 

@@ -24,7 +24,8 @@ pub fn socket() -> PathBuf {
     runtime_dir().join("tiles.sock")
 }
 
-/// Config directory: hosts, the allowlist, the node identity.
+/// Config directory: the list of machines to watch, and nothing secret. Keys
+/// and access policy are ssh's, not ours.
 ///
 /// `TILES_CONFIG_DIR` overrides it, which is how two nodes run on one machine
 /// (tests, and trying it out before committing to it).

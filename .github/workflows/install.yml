@@ -38,18 +38,28 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Any release, stable or the rolling nightly: the installer falls back to
-      # the nightly, so that is enough for it to have something to install.
-      # Not /releases/latest, which excludes pre-releases, nor the github.com
-      # URL, which redirects to the tag list and answers 200 regardless.
-      - name: Is there a release yet?
+      # Check for the asset this runner would actually download, not merely for
+      # a release. The nightly release is created before its binaries finish
+      # uploading, so "a release exists" is true during a window where there is
+      # still nothing to install, and this job then fails for no real reason.
+      - name: Is there something to install yet?
         id: released
         run: |
-          if curl -fsS "https://api.github.com/repos/${{ github.repository }}/releases" \
-              | grep -q '"tag_name"'; then
+          case "$(uname -s)" in
+            Linux) os=linux ;;
+            Darwin) os=macos ;;
+          esac
+          case "$(uname -m)" in
+            x86_64|amd64) arch=x86_64 ;;
+            aarch64|arm64) arch=aarch64 ;;
+          esac
+          asset="tiles-${os}-${arch}"
+          base="https://github.com/${{ github.repository }}/releases"
+          if curl -fsIL "${base}/latest/download/${asset}" >/dev/null 2>&1 \
+            || curl -fsIL "${base}/download/nightly/${asset}" >/dev/null 2>&1; then
             echo "yes=true" >> "$GITHUB_OUTPUT"
           else
-            echo "no published release yet; skipping the install run"
+            echo "no ${asset} published yet; skipping the install run"
             echo "yes=false" >> "$GITHUB_OUTPUT"
           fi
 
