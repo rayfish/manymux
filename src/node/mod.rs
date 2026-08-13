@@ -195,6 +195,21 @@ impl Node {
                 crate::ipc::pump_events(self.events.subscribe(), read, write).await
             }
 
+            // Answer before going, so the caller learns it worked rather than
+            // watching the socket vanish and having to guess why.
+            Request::Stop => {
+                proto::write_msg(&mut write, tag::RESPONSE, &Response::Ok).await?;
+                info!(sessions = self.registry.list().len(), "stopping on request");
+                // The reply is in the socket buffer, not yet read. A moment for
+                // the caller to take it costs nothing and saves a confusing
+                // "connection reset" on the way out.
+                tokio::spawn(async {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    std::process::exit(0);
+                });
+                Ok(())
+            }
+
             request => reply(&mut write, self.answer(request)).await,
         }
     }
@@ -210,7 +225,7 @@ impl Node {
             Request::Rename { name, title } => {
                 self.registry.rename(&name, &title).map(|()| Response::Ok)
             }
-            Request::Attach { .. } | Request::Events => {
+            Request::Attach { .. } | Request::Events | Request::Stop => {
                 unreachable!("handled before the single-response path")
             }
         }

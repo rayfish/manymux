@@ -97,10 +97,20 @@ curl -fsSL https://raw.githubusercontent.com/rayfish/tiles/master/install.sh | s
 ```
 
 Linux and macOS, x86_64 and aarch64. The installer picks the right binary,
-falls back to the static musl build where glibc is too old or absent, verifies
-the checksum, and only reaches for `sudo` if the target directory needs it.
-`INSTALL_DIR` changes where it goes (default `/usr/local/bin`), `TILES_VERSION`
-pins a release.
+falls back to the static musl build where glibc is too old or absent, and
+verifies the checksum.
+
+It installs to `/usr/local/bin` when that is writable without a password, and
+to `~/.local/bin` otherwise, so it never asks for root uninvited. For a machine
+you want to *manage* prefer the system-wide path — `~/.local/bin` is usually not
+on the PATH of a non-interactive ssh, which is how `tiles agent` gets run:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/rayfish/tiles/master/install.sh | sudo sh
+```
+
+`INSTALL_DIR` overrides the location and `TILES_VERSION` pins a release. Once
+installed, `tiles update` replaces the binary in place.
 
 Then run the same line on each machine you want to manage. That is the entire
 remote setup: no service to install, no pairing, no keys.
@@ -164,6 +174,7 @@ tiles kill <name|host/name>        SIGHUP a session's process group
 tiles rename <target> <title>      set a sticky title
 tiles add <ssh-host> | hosts | rm <host>
                                    which machines to list and watch
+tiles update [--check] [--force]   replace this binary with the published one
 tiles completions [shell] [--install]
 ```
 

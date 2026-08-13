@@ -13,6 +13,7 @@ pub mod config;
 pub mod hosts;
 pub mod proto;
 pub mod ssh;
+pub mod style;
 pub mod term;
 pub mod user;
 
@@ -24,3 +25,5 @@ pub mod log;
 pub mod node;
 #[cfg(feature = "desktop")]
 pub mod service;
+#[cfg(feature = "desktop")]
+pub mod update;

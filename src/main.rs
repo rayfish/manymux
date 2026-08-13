@@ -11,7 +11,7 @@ use tiles::client::attach::{self, Outcome};
 use tiles::hosts::{Hosts, LOCAL, Target, is_this_machine, this_machine};
 use tiles::node::{Config, Node};
 use tiles::proto::{HostedSession, Request, Response, SessionInfo, SpawnSpec};
-use tiles::{config, log, term};
+use tiles::{config, log, style, term};
 
 #[derive(Parser)]
 #[command(
@@ -79,6 +79,16 @@ enum Command {
     Hosts,
     /// Stop watching a machine.
     Rm { host: String },
+
+    /// Replace this binary with the published one.
+    Update {
+        /// Say what would change, without changing it.
+        #[arg(long)]
+        check: bool,
+        /// Restart the node even though sessions are running. They die with it.
+        #[arg(long)]
+        force: bool,
+    },
 
     /// Install or remove the background service.
     Service {
@@ -260,6 +270,8 @@ async fn run(cli: Cli) -> Result<u8> {
             Ok(OK)
         }
 
+        Command::Update { check, force } => update(&socket, check, force).await,
+
         Command::Service { action } => {
             match action {
                 ServiceAction::Install => {
@@ -280,6 +292,56 @@ async fn run(cli: Cli) -> Result<u8> {
 
         Command::Completions { shell, install } => completions(shell, install),
     }
+}
+
+/// Replace this binary with the published one, and pick it up.
+async fn update(socket: &Path, check: bool, force: bool) -> Result<u8> {
+    let available = tiles::update::check().await?;
+    if !available.is_newer() {
+        println!(
+            "{} tiles {} is the published {} build",
+            style::green("✓"),
+            env!("CARGO_PKG_VERSION"),
+            available.tag
+        );
+        return Ok(OK);
+    }
+    if check {
+        println!(
+            "an update is published on the {} channel; `tiles update` to take it",
+            style::bold(&available.tag)
+        );
+        return Ok(OK);
+    }
+
+    let path = tiles::update::apply(&available).await?;
+    println!(
+        "{} updated {}",
+        style::green("✓"),
+        style::bold(&path.display().to_string())
+    );
+
+    // The node is a long-running process still executing the old binary, so an
+    // update that leaves it alone has not really landed. Restarting it kills
+    // every session it owns, though, which is not something to do quietly.
+    let Some(running) = tiles::update::running(socket).await else {
+        return Ok(OK);
+    };
+    if running.sessions > 0 && !force {
+        println!(
+            "{} the node is still on the old binary, and restarting it would end \
+             {} running session{}.\n  `tiles update --force` to restart anyway, or leave it \
+             until they are done.",
+            style::amber("!"),
+            running.sessions,
+            if running.sessions == 1 { "" } else { "s" }
+        );
+        return Ok(OK);
+    }
+
+    tiles::update::restart_node(socket).await?;
+    println!("{} restarted the node", style::green("✓"));
+    Ok(OK)
 }
 
 /// Open a stream to a machine: this one's socket, or `tiles agent` over ssh.

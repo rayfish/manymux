@@ -134,23 +134,23 @@ impl Drop for World {
     }
 }
 
-/// Session names out of a `tiles ls` table, ignoring the header.
-fn sessions(table: &str) -> Vec<String> {
-    table
-        .lines()
-        .skip(1)
-        .filter_map(|line| line.split_whitespace().nth(1).map(str::to_string))
-        .collect()
-}
-
-/// `HOST/SESSION` pairs out of a `tiles ls` table.
+/// The `TARGET` column of a `tiles ls` table: exactly what you would type to
+/// reach each session, which is the point of that column existing.
 fn rows(table: &str) -> Vec<String> {
     table
         .lines()
         .skip(1)
-        .filter_map(|line| {
-            let mut fields = line.split_whitespace();
-            Some(format!("{}/{}", fields.next()?, fields.next()?))
+        .filter_map(|line| line.split_whitespace().next().map(str::to_string))
+        .collect()
+}
+
+/// Just the session names, with any `host/` prefix taken off.
+fn sessions(table: &str) -> Vec<String> {
+    rows(table)
+        .into_iter()
+        .map(|target| match target.split_once('/') {
+            Some((_, name)) => name.to_string(),
+            None => target,
         })
         .collect()
 }
@@ -192,7 +192,8 @@ fn one_listing_covers_this_machine_and_the_added_ones() {
     let listed = world.ok("laptop", &["ls"]);
     let found = rows(&listed);
     assert!(
-        found.iter().any(|row| row.ends_with("/here")),
+        // This machine's own sessions carry no prefix: `tiles attach here`.
+        found.contains(&"here".to_string()),
         "this machine's own session is missing: {listed}"
     );
     assert!(

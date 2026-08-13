@@ -116,6 +116,10 @@ pub enum Request {
     /// Turn this stream into a feed of everything happening in this machine's
     /// sessions. What lets a bell reach you when nothing is attached to see it.
     Events,
+
+    /// Stop the node. Every session it owns dies with it, so this is for
+    /// picking up a new binary, and the caller is expected to have asked.
+    Stop,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

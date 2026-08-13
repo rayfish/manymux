@@ -89,7 +89,7 @@ pub async fn greet(host: &str) -> Result<()> {
 /// `TILES_SSH` replaces the program, for anyone whose ssh lives somewhere
 /// unusual or who wraps it in a script. Tests use it to stand in for a second
 /// machine without needing a real sshd.
-fn command(host: &str) -> Command {
+pub fn command(host: &str) -> Command {
     let program = std::env::var("TILES_SSH").unwrap_or_else(|_| "ssh".to_string());
     let mut command = Command::new(program);
     command

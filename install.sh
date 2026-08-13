@@ -21,9 +21,24 @@ set -eu
 
 REPO="rayfish/tiles"
 BIN="tiles"
-INSTALL_DIR="${INSTALL_DIR:-/usr/local/bin}"
 VERSION="${TILES_VERSION:-latest}"
 SKIP_VERIFY="${TILES_SKIP_VERIFY:-0}"
+
+# Where to install, when not told.
+#
+# /usr/local/bin if it can be written without asking for a password, because
+# that is on the PATH of a *non-interactive* ssh and this binary has to be
+# runnable as `ssh host tiles agent`. Otherwise ~/.local/bin, which needs no
+# root: the local CLI then works, and `main` warns about the ssh case, since a
+# machine you want to manage needs it somewhere sshd will find it.
+default_install_dir() {
+  if [ -w /usr/local/bin ] 2>/dev/null; then
+    echo /usr/local/bin
+  else
+    echo "${HOME}/.local/bin"
+  fi
+}
+INSTALL_DIR="${INSTALL_DIR:-$(default_install_dir)}"
 
 if [ -t 1 ]; then
   RED='\033[0;31m'; GREEN='\033[0;32m'; BLUE='\033[0;34m'; NC='\033[0m'
@@ -209,7 +224,8 @@ main() {
 
   chmod +x "$TMP/$BIN"
 
-  # Install. Use sudo when the target dir is not writable by the current user.
+  # Install. Use sudo when the target dir is not writable by the current user,
+  # which with the default only happens if INSTALL_DIR was set by hand.
   if [ ! -w "$(existing_ancestor "$INSTALL_DIR")" ] && [ "$(id -u)" != "0" ]; then
     if command -v sudo >/dev/null 2>&1; then
       info "Installing to ${INSTALL_DIR} (requires sudo) ..."
@@ -229,6 +245,20 @@ main() {
     *":$INSTALL_DIR:"*) ;;
     *) info "Add ${INSTALL_DIR} to your PATH:
     export PATH=\"${INSTALL_DIR}:\$PATH\"" ;;
+  esac
+
+  # A machine you want to *manage* is reached as `ssh host tiles agent`, and a
+  # non-interactive ssh reads neither .bashrc nor .zshrc: a PATH set there will
+  # not apply. Under $HOME it usually will not be found, so say so rather than
+  # let it fail later as "tiles: command not found".
+  case "$INSTALL_DIR" in
+    "$HOME"/*)
+      echo
+      info "Note: ${INSTALL_DIR} is usually not on the PATH of a non-interactive ssh.
+That is fine for using tiles from here. On a machine you want to *manage*,
+install it system-wide instead:
+    curl -fsSL https://raw.githubusercontent.com/${REPO}/master/install.sh | sudo sh"
+      ;;
   esac
 
   echo
