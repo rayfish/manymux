@@ -173,24 +173,44 @@ mod terminal {
         "\x1b[?1049h", // switch to the alternate screen
     );
 
-    /// Terminal state a full-screen program may have left behind. Sent when we
-    /// give the terminal back so a detach never leaves an invisible cursor or a
-    /// stuck mouse-reporting mode.
-    const RESET: &str = concat!(
-        "\x1b[23;2t",                                   // pop the title pushed on attach
-        "\x1b[?1047l", // leave the alternate screen (the older form, which vim uses)
-        "\x1b[?1049l", // leave the alternate screen
-        "\x1b[?25h",   // show the cursor
-        "\x1b[0m",     // default attributes
-        "\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l", // mouse reporting off
-        "\x1b[?2004l", // bracketed paste off
-        "\x1b[?7h",    // autowrap on
+    /// Terminal state a full-screen program may have left behind, undone when
+    /// we give the terminal back, so a detach never leaves your shell with an
+    /// invisible cursor, a stuck mouse mode, or focus reporting still on.
+    ///
+    /// The private modes come from the same list a reattach replays: whatever
+    /// the node switches back on for the session is exactly what has to be
+    /// switched off again here, or it leaks into the shell you return to.
+    pub(super) fn reset() -> String {
+        use std::fmt::Write as _;
+
+        let mut reset = String::new();
+        // Both of these home the cursor, so they go first, while the alternate
+        // screen is still up and the cursor there is about to be discarded.
+        // Afterwards they would drop the shell's prompt in the top-left corner.
+        reset.push_str("\x1b[r"); // full-height scrolling region
+        reset.push_str("\x1b[?6l"); // absolute cursor addressing, not origin mode
+
+        reset.push_str("\x1b[23;2t"); // pop the title pushed on attach
+        reset.push_str("\x1b[?1047l"); // leave the alternate screen (the older form, which vim uses)
+        reset.push_str("\x1b[?1049l"); // leave the alternate screen
+
+        reset.push_str("\x1b[?25h"); // show the cursor
+        reset.push_str("\x1b[0 q"); // the cursor shape this terminal defaults to
+        reset.push_str("\x1b[0m"); // default attributes
+        reset.push_str("\x1b[?7h"); // autowrap on
+        reset.push_str("\x1b[4l"); // replace mode, not insert
+        reset.push_str("\x1b[?1l\x1b>"); // normal cursor keys and keypad
+        for mode in crate::node::events::REPLAYED_MODES {
+            let _ = write!(reset, "\x1b[?{mode}l");
+        }
+
         // Column zero, but no newline: leaving the alternate screen already put
         // the cursor back where the shell left it, on the line after the command
         // you typed. A newline here would print the detach message one blank
         // line further down for no reason.
-        "\r",
-    );
+        reset.push('\r');
+        reset
+    }
 
     pub fn terminal_size() -> Size {
         terminal::size()
@@ -222,7 +242,7 @@ mod terminal {
         // writes we no longer own.
         use std::io::Write;
         let mut out = std::io::stdout();
-        let _ = out.write_all(RESET.as_bytes());
+        let _ = out.write_all(reset().as_bytes());
         let _ = out.flush();
 
         result
@@ -309,6 +329,37 @@ mod tests {
         Keystrokes {
             forward: bytes.to_vec(),
             detach: false,
+        }
+    }
+
+    /// A mode the node turns back on for a session, and the client forgets to
+    /// turn off, is left on in the shell. Focus reporting was the one that got
+    /// noticed, because iTerm2 says so out loud; the mouse encodings would have
+    /// been the next.
+    #[cfg(feature = "desktop")]
+    #[test]
+    fn detaching_undoes_every_mode_a_reattach_replays() {
+        let reset = terminal::reset();
+        for mode in crate::node::events::REPLAYED_MODES {
+            assert!(
+                reset.contains(&format!("\x1b[?{mode}l")),
+                "detaching leaves private mode {mode} on"
+            );
+        }
+        // And the ones avt's dump restores on attach, which are therefore not
+        // on that list but are just as much ours to undo.
+        for sequence in [
+            "\x1b[?1l",    // normal cursor keys
+            "\x1b[?6l",    // absolute addressing
+            "\x1b[?7h",    // autowrap
+            "\x1b[?25h",   // visible cursor
+            "\x1b[?1047l", // alternate screen, both forms
+            "\x1b[?1049l",
+        ] {
+            assert!(
+                reset.contains(sequence),
+                "detaching leaves {sequence:?} unsent"
+            );
         }
     }
 

@@ -50,7 +50,11 @@ enum State {
 /// 7, 25, 1047, 1048, 1049): re-emitting those would fight the repaint.
 /// Everything here is about *input* and how the terminal talks back, which is
 /// exactly what the screen model has no opinion on.
-const REPLAYED_MODES: &[u16] = &[
+///
+/// Detaching undoes this list, in `client::attach`. The two have to stay
+/// together: a mode switched on for a session and not switched off again is a
+/// mode left on in the shell you get back.
+pub const REPLAYED_MODES: &[u16] = &[
     9,    // X10 mouse reporting
     66,   // application keypad
     1000, // mouse button press and release
