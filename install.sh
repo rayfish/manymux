@@ -110,6 +110,9 @@ Install one, or set TILES_SKIP_VERIFY=1 to install unverified."
 # The checksum sidecar is served from the same origin as the binary, so this
 # catches corruption and truncation, not a compromised release. It is still the
 # integrity floor: never skip it silently, since every release publishes one.
+#
+# Returns non-zero on a mismatch rather than dying, so the caller can retry: see
+# fetch_and_verify.
 verify_sha256() {
   local file="$1" sha_file="$2" expected actual
   expected="$(head -n 1 "$sha_file" | cut -d' ' -f1)"
@@ -117,10 +120,44 @@ verify_sha256() {
     "" | *[!0-9a-fA-F]*) die "malformed checksum sidecar for $(basename "$file")" ;;
   esac
   actual="$(sha256_of "$file")"
-  [ "$actual" = "$expected" ] || die "checksum mismatch
+  if [ "$actual" != "$expected" ]; then
+    err "checksum mismatch
   expected: $expected
   got:      $actual"
+    return 1
+  fi
   ok "checksum verified"
+}
+
+# Download the binary and its sidecar, and check one against the other.
+#
+# Retried once, because the nightly release is rebuilt in place: for a few
+# seconds during each build its assets are replaced one by one, and an install
+# landing in that window gets the old binary with the new sidecar. Failing
+# closed is right, but so is trying again before giving up on it.
+fetch_and_verify() {
+  local url="$1" attempt=1
+  while :; do
+    curl -fsSL "$url" -o "$TMP/$BIN" \
+      || die "download failed: no release asset at $url
+(does a published release exist yet for this platform?)"
+
+    if ! curl -fsSL "${url}.sha256" -o "$TMP/$BIN.sha256" 2>/dev/null; then
+      [ "$SKIP_VERIFY" = "1" ] || die "no checksum published at ${url}.sha256
+Every tiles release ships a .sha256 sidecar, so this should not happen.
+Refusing to install an unverified binary. Set TILES_SKIP_VERIFY=1 to override."
+      info "no .sha256 sidecar found; TILES_SKIP_VERIFY=1, installing unverified"
+      return 0
+    fi
+
+    verify_sha256 "$TMP/$BIN" "$TMP/$BIN.sha256" && return 0
+
+    [ "$attempt" = "1" ] || die "the download does not match its checksum twice over.
+Refusing to install. Set TILES_SKIP_VERIFY=1 to override, or try again later."
+    info "a release may be mid-upload; retrying once in 5s ..."
+    sleep 5
+    attempt=2
+  done
 }
 
 # The nearest existing directory at or above $1. A target that does not exist
@@ -168,19 +205,7 @@ main() {
   url="${base}/${asset}"
 
   info "Downloading ${asset} (${VERSION}) ..."
-  curl -fsSL "$url" -o "$TMP/$BIN" \
-    || die "download failed: no release asset at $url
-(does a published release exist yet for this platform?)"
-
-  if curl -fsSL "${url}.sha256" -o "$TMP/$BIN.sha256" 2>/dev/null; then
-    verify_sha256 "$TMP/$BIN" "$TMP/$BIN.sha256"
-  elif [ "$SKIP_VERIFY" = "1" ]; then
-    info "no .sha256 sidecar found; TILES_SKIP_VERIFY=1, installing unverified"
-  else
-    die "no checksum published at ${url}.sha256
-Every tiles release ships a .sha256 sidecar, so this should not happen.
-Refusing to install an unverified binary. Set TILES_SKIP_VERIFY=1 to override."
-  fi
+  fetch_and_verify "$url"
 
   chmod +x "$TMP/$BIN"
 
