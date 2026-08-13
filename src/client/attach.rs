@@ -156,10 +156,22 @@ mod terminal {
     use crate::client::{Attached, SessionHalves, Update};
     use crate::proto::Size;
 
-    /// Sent before attaching: push the terminal's current title so the session
-    /// can set its own, and detaching gives you your shell's title back rather
-    /// than leaving the tab named after a session you left.
-    const SETUP: &str = "\x1b[22;2t";
+    /// Sent before attaching.
+    ///
+    /// The alternate screen is the important part. A session's repaint places
+    /// everything by absolute coordinates, because that is what a screen dump
+    /// is, so painting it onto your shell's screen writes the session over your
+    /// scrollback and leaves the cursor at the session's row 1 rather than
+    /// where the session's prompt appears to be. Anything you then type lands
+    /// at the top of the terminal. On a surface of its own the coordinates mean
+    /// what they say, and detaching gives your shell's screen back untouched.
+    ///
+    /// The title is pushed for the same reason: detaching should give you back
+    /// the tab name you had, not leave it named after a session you left.
+    const SETUP: &str = concat!(
+        "\x1b[22;2t",  // push the window title
+        "\x1b[?1049h", // switch to the alternate screen
+    );
 
     /// Terminal state a full-screen program may have left behind. Sent when we
     /// give the terminal back so a detach never leaves an invisible cursor or a
