@@ -4,13 +4,21 @@
 //! [`Request`], and reads a [`Response`]. An `Attach` request turns the rest of
 //! the stream into a bidirectional pipe carrying the session's bytes.
 //!
-//! A "stream" is a Unix-socket connection locally and a QUIC bi-stream under
-//! iroh, so everything here is generic over `AsyncRead`/`AsyncWrite` and the
-//! transport swap costs nothing.
+//! A "stream" is a Unix-socket connection to the node on this machine, or the
+//! pipes of an `ssh <host> mm agent` for one on another, so everything here is
+//! generic over `AsyncRead`/`AsyncWrite` and a new transport costs nothing.
 //!
 //! Frames are `[tag: u8][len: u32 BE][body]`. Control bodies are msgpack; data
 //! bodies are raw terminal bytes, which is why this isn't one msgpack enum:
 //! keeping PTY output out of the serializer means the hot path is a copy.
+//!
+//! Nothing here negotiates a version, because the two machines on a stream are
+//! routinely running different builds: a fleet gets updated one host at a time.
+//! What keeps that working is that both ends skip a tag they do not know, which
+//! is what makes a new frame kind safe to add, and that an undecodable
+//! [`Request`] is answered with a complaint naming the version rather than a
+//! closed connection. Changing the framing itself has neither, and would need a
+//! way to tell the two apart before it could be done at all.
 
 use anyhow::{Result, bail};
 use bytes::BytesMut;
@@ -19,10 +27,6 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio_stream::StreamExt;
 use tokio_util::codec::{Decoder, FramedRead};
-
-/// ALPN for the iroh transport. This is the only compatibility gate: bump it in
-/// the same change as any incompatible protocol change.
-pub const ALPN: &[u8] = b"manymux/v1";
 
 /// Frames larger than this are a protocol error, not an allocation.
 pub const MAX_FRAME: usize = 1 << 20;
