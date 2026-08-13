@@ -141,7 +141,7 @@ impl KeyFilter {
 }
 
 #[cfg(feature = "desktop")]
-pub use terminal::{run, terminal_size};
+pub use terminal::{run, session_size, terminal_size};
 
 #[cfg(feature = "desktop")]
 mod terminal {
@@ -153,6 +153,7 @@ mod terminal {
     use tokio::signal::unix::{SignalKind, signal};
 
     use super::{KeyFilter, Outcome};
+    use crate::client::status::{self, Filter, Status};
     use crate::client::{Attached, SessionHalves, Update};
     use crate::proto::Size;
 
@@ -212,6 +213,7 @@ mod terminal {
         reset
     }
 
+    /// The terminal, whole.
     pub fn terminal_size() -> Size {
         terminal::size()
             .map(|(cols, rows)| Size::new(cols, rows))
@@ -219,23 +221,30 @@ mod terminal {
             .sane()
     }
 
+    /// The part of it the session gets, which is everything above the mark.
+    pub fn session_size() -> Size {
+        status::session_size(terminal_size())
+    }
+
     /// Run the attach loop until the client detaches or the session ends.
     ///
     /// Puts the terminal in raw mode for the duration and always restores it,
     /// so even an error path hands back a usable shell.
-    pub async fn run(session: Attached) -> Result<Outcome> {
+    pub async fn run(session: Attached, target: &str) -> Result<Outcome> {
         if !std::io::stdin().is_terminal() {
             bail!("attach needs a terminal on stdin");
         }
 
+        let status = Status::new(target);
         terminal::enable_raw_mode()?;
         {
             use std::io::Write;
             let mut out = std::io::stdout();
             let _ = out.write_all(SETUP.as_bytes());
+            let _ = out.write_all(status.setup(terminal_size()).as_bytes());
             let _ = out.flush();
         }
-        let result = pump(session).await;
+        let result = pump(session, &status).await;
         let _ = terminal::disable_raw_mode();
 
         // Restore through the real stdout: the async handle may have buffered
@@ -248,7 +257,7 @@ mod terminal {
         result
     }
 
-    async fn pump(session: Attached) -> Result<Outcome> {
+    async fn pump(session: Attached, status: &Status) -> Result<Outcome> {
         let SessionHalves {
             mut reader,
             mut writer,
@@ -257,6 +266,7 @@ mod terminal {
         let mut stdout = tokio::io::stdout();
         let mut winch = signal(SignalKind::window_change())?;
         let mut keys = KeyFilter::default();
+        let mut output = Filter::default();
         let mut buf = vec![0u8; 8192];
 
         loop {
@@ -277,13 +287,25 @@ mod terminal {
                 }
                 update = reader.next() => match update? {
                     Update::Output(bytes) => {
-                        stdout.write_all(&bytes).await?;
+                        stdout.write_all(&output.feed(&bytes)).await?;
+                        // Only between sequences: a repaint written into the
+                        // middle of one would corrupt it. Whatever cleared the
+                        // mark stays noted until there is a safe moment.
+                        if output.at_boundary() && output.take_dirty() {
+                            stdout.write_all(status.repaint(terminal_size()).as_bytes()).await?;
+                        }
                         stdout.flush().await?;
                     }
                     Update::Exited(code) => return Ok(Outcome::Exited(code)),
                     Update::Disconnected => return Ok(Outcome::Disconnected),
                 },
-                _ = winch.recv() => writer.resize(terminal_size()).await?,
+                _ = winch.recv() => {
+                    let size = terminal_size();
+                    writer.resize(status::session_size(size)).await?;
+                    // The new geometry moved the mark and the region with it.
+                    stdout.write_all(status.repaint(size).as_bytes()).await?;
+                    stdout.flush().await?;
+                }
             }
         }
     }

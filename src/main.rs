@@ -191,7 +191,7 @@ async fn run(cli: Cli) -> Result<u8> {
                 // Only meaningful on this machine; elsewhere the session starts
                 // in the node's own working directory.
                 cwd: is_this_machine(&host).then(current_dir).flatten(),
-                size: attach::terminal_size(),
+                size: attach::session_size(),
             };
             let mut stream = open_or_start(&socket, &host).await?;
             let Response::Spawned { name } = stream.call(&Request::Spawn(spec)).await? else {
@@ -499,10 +499,10 @@ async fn sessions_on(socket: &Path, host: &str) -> Result<Vec<SessionInfo>> {
 
 async fn do_attach(socket: &Path, host: &str, name: &str) -> Result<u8> {
     let stream = open(socket, host).await?;
-    let session = stream.attach(name, attach::terminal_size()).await?;
+    let session = stream.attach(name, attach::session_size()).await?;
     let where_ = qualified(host, name);
 
-    match attach::run(session).await? {
+    match attach::run(session, &where_).await? {
         Outcome::Detached => {
             println!("[detached from {where_}]");
             Ok(OK)

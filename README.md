@@ -74,6 +74,12 @@ change it:
 export MM_PREFIX=C-b        # or ^B, or \x02
 ```
 
+While you are attached, a dim `● host/name` sits in the bottom-right corner and
+the window title is prefixed with `mm`, so a session is never mistaken for a
+plain shell. The mark keeps a row to itself: the session is told the screen is
+one row shorter, so nothing it draws lands there. Detaching gives the row, the
+title and the terminal back.
+
 Targets are `host/name` for another machine and a bare `name` for this one. A
 bare name is looked for here first, then across every machine, so this finds the
 session wherever you left it:
