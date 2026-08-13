@@ -34,11 +34,14 @@ jobs:
         with:
           components: clippy, rustfmt
 
+      # Debug artifacts, so a key of its own rather than sharing with the
+      # release builds, which would thrash both. Only master saves; see below.
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: "ci-${{ matrix.name }}"
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/master' }}
 
       - name: Format
         run: cargo fmt --check
@@ -86,11 +89,19 @@ jobs:
         if: contains(matrix.target, 'musl')
         run: sudo apt-get update && sudo apt-get install -y musl-tools
 
+      # The same key the nightly and release builds use: this job runs the
+      # identical `cargo build --release --target X`, so a separate key would
+      # mean two copies of one cache and neither ever warming the other.
+      #
+      # Only master saves. A pull request still restores, but its writes would
+      # otherwise evict master's caches under the 10GB repository limit, which
+      # with six targets is easy to hit.
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: "cross-${{ matrix.target }}"
+          shared-key: "release-${{ matrix.target }}"
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/master' }}
 
       - name: Build
         run: cargo build --release --locked --target ${{ matrix.target }}

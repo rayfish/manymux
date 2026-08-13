@@ -104,6 +104,11 @@ enum ServiceAction {
     Uninstall,
 }
 
+/// Exit codes, as plain numbers rather than `ExitCode`, because the process
+/// exits by hand rather than by returning; see `main`.
+const OK: u8 = 0;
+const FAILED: u8 = 1;
+
 #[tokio::main]
 async fn main() -> ExitCode {
     let cli = Cli::parse();
@@ -114,16 +119,28 @@ async fn main() -> ExitCode {
         _ => None,
     });
 
-    match run(cli).await {
+    let code = match run(cli).await {
         Ok(code) => code,
         Err(e) => {
             eprintln!("tiles: {e:#}");
-            ExitCode::FAILURE
+            1
         }
-    }
+    };
+
+    // Exit rather than returning, because `tokio::io::stdin` reads on a
+    // blocking thread that cannot be cancelled: when a session ends by itself,
+    // that thread is still parked in read(2) with nobody about to type
+    // anything, and dropping the runtime waits for it forever. Detaching hid
+    // this, since pressing the detach key is itself the read that completes.
+    //
+    // Nothing here needs unwinding: the terminal was already restored, and the
+    // ssh child dies with our end of its pipes. Flush first, though, since a
+    // piped stdout is block-buffered and would otherwise be lost.
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+    std::process::exit(i32::from(code))
 }
 
-async fn run(cli: Cli) -> Result<ExitCode> {
+async fn run(cli: Cli) -> Result<u8> {
     let socket = cli.socket.unwrap_or_else(config::socket);
 
     match cli.command {
@@ -135,12 +152,12 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             })
             .await;
             node.serve(&socket).await?;
-            Ok(ExitCode::SUCCESS)
+            Ok(OK)
         }
 
         Command::Agent => {
             tiles::node::agent(&socket).await?;
-            Ok(ExitCode::SUCCESS)
+            Ok(OK)
         }
 
         Command::Ls { host } => list(&socket, host).await,
@@ -168,7 +185,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             }
             if detached {
                 println!("{}", qualified(&host, &name));
-                return Ok(ExitCode::SUCCESS);
+                return Ok(OK);
             }
             do_attach(&socket, &host, &name).await
         }
@@ -186,7 +203,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                     name: target.session,
                 })
                 .await?;
-            Ok(ExitCode::SUCCESS)
+            Ok(OK)
         }
 
         Command::Rename { target, title } => {
@@ -198,7 +215,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                     title,
                 })
                 .await?;
-            Ok(ExitCode::SUCCESS)
+            Ok(OK)
         }
 
         Command::Add { host } => {
@@ -214,11 +231,11 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             match sessions_on(&socket, &host).await {
                 Ok(sessions) => {
                     println!("watching {host} ({} sessions)", sessions.len());
-                    Ok(ExitCode::SUCCESS)
+                    Ok(OK)
                 }
                 Err(e) => {
                     eprintln!("tiles: added {host}, but could not reach it: {e:#}");
-                    Ok(ExitCode::FAILURE)
+                    Ok(FAILED)
                 }
             }
         }
@@ -231,7 +248,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             for host in hosts.names() {
                 println!("{host}");
             }
-            Ok(ExitCode::SUCCESS)
+            Ok(OK)
         }
 
         Command::Rm { host } => {
@@ -240,7 +257,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 bail!("{host} is not being watched");
             }
             hosts.save()?;
-            Ok(ExitCode::SUCCESS)
+            Ok(OK)
         }
 
         Command::Service { action } => {
@@ -258,7 +275,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                     println!("removed {}", path.display());
                 }
             }
-            Ok(ExitCode::SUCCESS)
+            Ok(OK)
         }
 
         Command::Completions { shell, install } => completions(shell, install),
@@ -318,7 +335,7 @@ impl Listing {
 }
 
 /// `tiles ls`, over every watched machine or just one.
-async fn list(socket: &Path, host: Option<String>) -> Result<ExitCode> {
+async fn list(socket: &Path, host: Option<String>) -> Result<u8> {
     let listing = match host {
         // One named machine: ask it directly, so an error names that machine.
         Some(name) => {
@@ -354,11 +371,7 @@ async fn list(socket: &Path, host: Option<String>) -> Result<ExitCode> {
     for host in &listing.unreachable {
         eprintln!("tiles: {}: {}", host.host, host.error);
     }
-    Ok(if nothing_answered {
-        ExitCode::FAILURE
-    } else {
-        ExitCode::SUCCESS
-    })
+    Ok(if nothing_answered { FAILED } else { OK })
 }
 
 /// One machine's answer, kept with which machine gave it.
@@ -412,7 +425,7 @@ async fn sessions_on(socket: &Path, host: &str) -> Result<Vec<SessionInfo>> {
     }
 }
 
-async fn do_attach(socket: &Path, host: &str, name: &str) -> Result<ExitCode> {
+async fn do_attach(socket: &Path, host: &str, name: &str) -> Result<u8> {
     let stream = open(socket, host).await?;
     let session = stream.attach(name, attach::terminal_size()).await?;
     let where_ = qualified(host, name);
@@ -420,15 +433,15 @@ async fn do_attach(socket: &Path, host: &str, name: &str) -> Result<ExitCode> {
     match attach::run(session).await? {
         Outcome::Detached => {
             println!("[detached from {where_}]");
-            Ok(ExitCode::SUCCESS)
+            Ok(OK)
         }
         Outcome::Exited(code) => {
             println!("[{where_} exited with status {code}]");
-            Ok(ExitCode::from(u8::try_from(code).unwrap_or(1)))
+            Ok(u8::try_from(code).unwrap_or(1))
         }
         Outcome::Disconnected => {
             println!("[disconnected from {where_}]");
-            Ok(ExitCode::FAILURE)
+            Ok(FAILED)
         }
     }
 }
@@ -561,7 +574,7 @@ fn current_dir() -> Option<String> {
 }
 
 /// Print a completion script, or write it where the shell will find it.
-fn completions(shell: Option<Shell>, install: bool) -> Result<ExitCode> {
+fn completions(shell: Option<Shell>, install: bool) -> Result<u8> {
     let Some(shell) = shell.or_else(Shell::from_env) else {
         bail!("could not tell which shell you use; name it: tiles completions zsh");
     };
@@ -569,7 +582,7 @@ fn completions(shell: Option<Shell>, install: bool) -> Result<ExitCode> {
 
     if !install {
         clap_complete::generate(shell, &mut command, "tiles", &mut std::io::stdout());
-        return Ok(ExitCode::SUCCESS);
+        return Ok(OK);
     }
 
     let Some(path) = completion_path(shell) else {
@@ -592,7 +605,7 @@ fn completions(shell: Option<Shell>, install: bool) -> Result<ExitCode> {
             path.parent().unwrap_or(&path).display()
         );
     }
-    Ok(ExitCode::SUCCESS)
+    Ok(OK)
 }
 
 /// Where each shell looks for user-installed completions.
