@@ -8,7 +8,7 @@
 # Short-Description: @DESC@
 ### END INIT INFO
 #
-# Written by `tiles service install`. SysV init has no per-user services, so
+# Written by `mm service install`. SysV init has no per-user services, so
 # this is a system service that drops to @USER@ before running.
 
 NAME=@NAME@
@@ -16,7 +16,7 @@ USER=@USER@
 BIN=@BIN@
 ARGS=@COMMAND@
 PIDFILE=/run/$NAME.pid
-export TILES_CONFIG_DIR=@CONFIG@
+export MM_CONFIG_DIR=@CONFIG@
 
 case "$1" in
 	start)

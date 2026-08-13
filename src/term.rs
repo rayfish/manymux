@@ -42,7 +42,7 @@ impl Cell {
 
 const HEADER: [&str; 5] = ["TARGET", "TITLE", "ATTACHED", "IDLE", "BELL"];
 
-/// Render `tiles ls` output.
+/// Render `mm ls` output.
 ///
 /// One `TARGET` column rather than separate host and session columns, because
 /// what you want from a listing is the thing to type next, and `host/name` is

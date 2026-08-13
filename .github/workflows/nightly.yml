@@ -51,7 +51,7 @@ jobs:
             Rolling build from master @ ${{ steps.meta.outputs.sha }}.
 
             ```
-            curl -fsSL https://raw.githubusercontent.com/rayfish/tiles/master/install.sh | sh
+            curl -fsSL https://raw.githubusercontent.com/rayfish/manymux/master/install.sh | sh
             ```
 
             Run the same line on each machine you want to manage.
@@ -67,27 +67,27 @@ jobs:
         include:
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-22.04
-            name: tiles-linux-x86_64
+            name: mm-linux-x86_64
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-22.04-arm
-            name: tiles-linux-aarch64
+            name: mm-linux-aarch64
           # Static builds: one binary that runs on any Linux regardless of the
-          # glibc version, which matters because tiles gets copied onto whatever
+          # glibc version, which matters because mm gets copied onto whatever
           # boxes you happen to have.
           - target: x86_64-unknown-linux-musl
             runner: ubuntu-22.04
-            name: tiles-linux-x86_64-musl
+            name: mm-linux-x86_64-musl
           - target: aarch64-unknown-linux-musl
             runner: ubuntu-22.04-arm
-            name: tiles-linux-aarch64-musl
+            name: mm-linux-aarch64-musl
           - target: aarch64-apple-darwin
             runner: macos-latest
-            name: tiles-macos-aarch64
+            name: mm-macos-aarch64
           - target: x86_64-apple-darwin
             # Cross-compiled on Apple Silicon (universal SDK); the Intel macOS
             # runners are being retired and leave the job queued indefinitely.
             runner: macos-latest
-            name: tiles-macos-x86_64
+            name: mm-macos-x86_64
 
     runs-on: ${{ matrix.runner }}
 
@@ -116,7 +116,7 @@ jobs:
 
       - name: Package for release
         run: |
-          BINARY=target/${{ matrix.target }}/release/tiles
+          BINARY=target/${{ matrix.target }}/release/mm
           cp "$BINARY" ${{ matrix.name }}
           if command -v sha256sum >/dev/null 2>&1; then
             sha256sum ${{ matrix.name }} > ${{ matrix.name }}.sha256

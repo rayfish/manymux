@@ -15,26 +15,26 @@ use crate::client::{Attached, SessionHalves, Update};
 /// Detach prefix: Ctrl-\ (0x1c).
 ///
 /// Not tmux's Ctrl-b or screen's Ctrl-a, because you are quite likely running
-/// one of those *inside* a tiles session: tiles has no panes or tabs, so
+/// one of those *inside* a manymux session: manymux has no panes or tabs, so
 /// splitting a window is still their job, and taking their prefix would mean
 /// swallowing it before it ever reached them. Ctrl-\ is SIGQUIT, which almost
 /// nobody sends deliberately, and `Ctrl-\ Ctrl-\` sends a literal one through.
 pub const DEFAULT_PREFIX: u8 = 0x1c;
 
-/// The detach prefix in force, from `TILES_PREFIX` if it is set and usable.
+/// The detach prefix in force, from `MM_PREFIX` if it is set and usable.
 ///
 /// Accepts `C-b`, `^B` or `\x02`. An unusable value is a warning rather than a
 /// failure: losing the ability to detach because of a typo in an environment
 /// variable would be worse than ignoring it.
 pub fn prefix() -> u8 {
-    let Some(text) = std::env::var_os("TILES_PREFIX") else {
+    let Some(text) = std::env::var_os("MM_PREFIX") else {
         return DEFAULT_PREFIX;
     };
     let text = text.to_string_lossy();
     match parse_prefix(&text) {
         Some(byte) => byte,
         None => {
-            eprintln!("tiles: TILES_PREFIX={text:?} is not a control key; using Ctrl-\\");
+            eprintln!("mm: MM_PREFIX={text:?} is not a control key; using Ctrl-\\");
             DEFAULT_PREFIX
         }
     }
@@ -395,7 +395,7 @@ mod tests {
 
     #[test]
     fn the_prefix_can_be_tmuxs() {
-        // `TILES_PREFIX=C-b` for muscle memory, at the price of tmux inside a
+        // `MM_PREFIX=C-b` for muscle memory, at the price of tmux inside a
         // session no longer seeing its own prefix.
         let mut f = KeyFilter::new(0x02);
         assert_eq!(

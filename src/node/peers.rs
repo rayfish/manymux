@@ -1,7 +1,7 @@
 //! Watching the other machines you care about.
 //!
 //! There are no connections to manage here. ssh does that: every request runs
-//! `ssh <host> tiles agent`, and a shared connection (`ControlMaster`) makes
+//! `ssh <host> mm agent`, and a shared connection (`ControlMaster`) makes
 //! the second one to a host cheap. What is left is keeping one long-lived
 //! subscription per machine, so a bell in a session nobody is watching still
 //! reaches the desktop you are sitting at.

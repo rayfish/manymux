@@ -1,5 +1,5 @@
 #!/sbin/openrc-run
-# @DESC@. Written by `tiles service install`.
+# @DESC@. Written by `mm service install`.
 #
 # OpenRC has no per-user services, so this is a system service that drops to
 # @USER@ before running: sessions still belong to that user's account.
@@ -10,7 +10,7 @@ command_args="@COMMAND@"
 command_user="@USER@"
 command_background=true
 pidfile="/run/@NAME@.pid"
-export TILES_CONFIG_DIR="@CONFIG@"
+export MM_CONFIG_DIR="@CONFIG@"
 
 depend() {
 	need net

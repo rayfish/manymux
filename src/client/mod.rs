@@ -2,7 +2,7 @@
 //!
 //! Everything here is transport-agnostic and terminal-agnostic: a [`Stream`] is
 //! a Unix-socket connection to the node on this machine, or the pipes of an
-//! `ssh <host> tiles agent` running on another one. An [`Attached`] session
+//! `ssh <host> mm agent` running on another one. An [`Attached`] session
 //! hands out bytes rather than driving a terminal. The CLI is one consumer; a
 //! mobile app rendering the session with its own terminal widget is another.
 
@@ -39,7 +39,7 @@ impl Stream {
     pub async fn local(socket: &Path) -> Result<Self> {
         let stream = UnixStream::connect(socket).await.with_context(|| {
             format!(
-                "connecting to {}: is `tiles daemon` running?",
+                "connecting to {}: is `mm daemon` running?",
                 socket.display()
             )
         })?;
@@ -51,7 +51,7 @@ impl Stream {
         })
     }
 
-    /// Reach another machine by running `tiles agent` there over ssh.
+    /// Reach another machine by running `mm agent` there over ssh.
     ///
     /// `host` is an ssh destination, so anything your ssh config can reach,
     /// this can reach, and sshd decides whether you are allowed in.
@@ -80,7 +80,7 @@ impl Stream {
     pub async fn request(&mut self, request: &Request) -> Result<Response> {
         proto::write_msg(&mut self.write, tag::REQUEST, request).await?;
         let Some(frame) = proto::read_frame(&mut self.read).await? else {
-            // An ssh that failed to connect, or a remote with no `tiles` on it,
+            // An ssh that failed to connect, or a remote with no `mm` on it,
             // leaves nothing on the pipe. Its exit status says far more than
             // "the stream ended", so go and look.
             if let Some(carrier) = &mut self.carrier

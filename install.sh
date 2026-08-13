@@ -1,15 +1,15 @@
 #!/bin/sh
 #
-# tiles installer. Installs the `tiles` binary from the latest GitHub release.
+# manymux installer. Installs the `mm` binary from the latest GitHub release.
 #
-#   curl -fsSL https://raw.githubusercontent.com/rayfish/tiles/master/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/rayfish/manymux/master/install.sh | sh
 #
 # Options (env vars):
 #   INSTALL_DIR         target dir (default: /usr/local/bin)
-#   TILES_VERSION       pin a release tag, e.g. v0.1.0 (default: latest)
-#   TILES_SKIP_VERIFY   set to 1 to install without checksum verification
+#   MM_VERSION       pin a release tag, e.g. v0.1.0 (default: latest)
+#   MM_SKIP_VERIFY   set to 1 to install without checksum verification
 #
-# The same line works on the machines you want to manage: tiles needs to be on
+# The same line works on the machines you want to manage: manymux needs to be on
 # PATH there, and nothing else.
 #
 # POSIX sh: this is piped to `sh`, which is dash on most Linux distros and does
@@ -19,17 +19,17 @@
 # shellcheck shell=dash
 set -eu
 
-REPO="rayfish/tiles"
-BIN="tiles"
-VERSION="${TILES_VERSION:-latest}"
-SKIP_VERIFY="${TILES_SKIP_VERIFY:-0}"
+REPO="rayfish/manymux"
+BIN="mm"
+VERSION="${MM_VERSION:-latest}"
+SKIP_VERIFY="${MM_SKIP_VERIFY:-0}"
 
 # Where to install, when not told.
 #
-# /usr/local/bin, because tiles has to be runnable as `ssh host tiles agent`,
+# /usr/local/bin, because mm has to be runnable as `ssh host mm agent`,
 # and that runs a *non-interactive* shell which reads neither .zshrc nor
 # .bashrc. A per-user directory like ~/.local/bin is invisible to it, so a
-# machine installed that way looks like it has no tiles at all. /usr/local/bin
+# machine installed that way looks like it has no mm at all. /usr/local/bin
 # is on the default PATH sshd hands out.
 #
 # Falls back to ~/.local/bin only when there is no way to write there, with a
@@ -116,7 +116,7 @@ sha256_of() {
     shasum -a 256 "$1" | cut -d' ' -f1
   else
     die "no sha256sum or shasum on this host, cannot verify the download.
-Install one, or set TILES_SKIP_VERIFY=1 to install unverified."
+Install one, or set MM_SKIP_VERIFY=1 to install unverified."
   fi
 }
 
@@ -157,16 +157,16 @@ fetch_and_verify() {
 
     if ! curl -fsSL "${url}.sha256" -o "$TMP/$BIN.sha256" 2>/dev/null; then
       [ "$SKIP_VERIFY" = "1" ] || die "no checksum published at ${url}.sha256
-Every tiles release ships a .sha256 sidecar, so this should not happen.
-Refusing to install an unverified binary. Set TILES_SKIP_VERIFY=1 to override."
-      info "no .sha256 sidecar found; TILES_SKIP_VERIFY=1, installing unverified"
+Every manymux release ships a .sha256 sidecar, so this should not happen.
+Refusing to install an unverified binary. Set MM_SKIP_VERIFY=1 to override."
+      info "no .sha256 sidecar found; MM_SKIP_VERIFY=1, installing unverified"
       return 0
     fi
 
     verify_sha256 "$TMP/$BIN" "$TMP/$BIN.sha256" && return 0
 
     [ "$attempt" = "1" ] || die "the download does not match its checksum twice over.
-Refusing to install. Set TILES_SKIP_VERIFY=1 to override, or try again later."
+Refusing to install. Set MM_SKIP_VERIFY=1 to override, or try again later."
     info "a release may be mid-upload; retrying once in 5s ..."
     sleep 5
     attempt=2
@@ -233,7 +233,7 @@ main() {
   elif [ "$INSTALL_DIR" = "$SYSTEM_DIR" ]; then
     INSTALL_DIR="$USER_DIR"
     err "cannot write ${SYSTEM_DIR} and sudo is unavailable; installing to ${INSTALL_DIR}.
-tiles will work here, but this machine cannot be managed from another one:
+manymux will work here, but this machine cannot be managed from another one:
 a non-interactive ssh does not see ${INSTALL_DIR}. Move the binary into
 ${SYSTEM_DIR} when you can."
   else
@@ -252,10 +252,10 @@ ${SYSTEM_DIR} when you can."
 
   echo
   ok "Next: start a session somewhere you can already ssh into"
-  echo "    tiles new <host>"
+  echo "    mm new <host>"
   echo
-  echo "  That host needs tiles on its PATH too; run this same line there."
-  echo "  Then \`tiles ls\` shows every session on every machine you use."
+  echo "  That host needs mm on its PATH too; run this same line there."
+  echo "  Then \`mm ls\` shows every session on every machine you use."
 }
 
 main "$@"

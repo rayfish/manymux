@@ -1,7 +1,7 @@
-//! The machines `tiles ls` should look at.
+//! The machines `mm ls` should look at.
 //!
 //! A host is an ssh destination and nothing more: a name from your ssh config,
-//! or `user@host`. tiles stores no addresses, keys or credentials, because ssh
+//! or `user@host`. manymux stores no addresses, keys or credentials, because ssh
 //! already has all of that and knows more about it than we do. This list only
 //! answers "which machines am I interested in", so a listing knows where to
 //! look.
@@ -20,7 +20,7 @@ pub const LOCAL: &str = "local";
 
 /// What this machine calls itself in a listing.
 ///
-/// The short hostname, so every row of `tiles ls` is a machine name rather than
+/// The short hostname, so every row of `mm ls` is a machine name rather than
 /// one magic word among real ones. Falls back to [`LOCAL`] on a machine that
 /// will not tell us.
 pub fn this_machine() -> &'static str {
@@ -161,7 +161,7 @@ mod tests {
     fn a_host_is_an_ssh_destination() {
         let mut hosts = Hosts::default();
         hosts.add("gpu-box").unwrap();
-        // ssh understands this, so tiles does too, with no parsing of its own.
+        // ssh understands this, so manymux does too, with no parsing of its own.
         hosts.add("dario@gpu-box").unwrap();
         assert!(hosts.has("dario@gpu-box"));
 

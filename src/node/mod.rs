@@ -1,9 +1,9 @@
-//! A tiles node: one per machine, per user, owning that machine's sessions.
+//! A manymux node: one per machine, per user, owning that machine's sessions.
 //!
 //! The node never touches the network. It listens on an owner-only Unix socket
 //! and nothing else; other machines reach it by running [`agent`] over ssh,
 //! which bridges its own stdin and stdout to that socket. So sshd decides who
-//! gets in, using whatever the admin already configured, and tiles has no
+//! gets in, using whatever the admin already configured, and manymux has no
 //! second allowlist to drift out of sync with the real one.
 //!
 //! It also means the account question answers itself: `ssh deploy@box` lands in
@@ -99,7 +99,7 @@ impl Node {
         }
     }
 
-    /// Re-read the watched-hosts file when it changes, so `tiles add` never
+    /// Re-read the watched-hosts file when it changes, so `mm add` never
     /// costs a restart. The node holding your sessions is the same one holding
     /// the subscriptions, and restarting it would kill them.
     async fn watch_hosts_file(self: Arc<Self>, path: PathBuf) {
@@ -184,7 +184,7 @@ impl Node {
             Err(e) => {
                 debug!("undecodable request: {e:#}");
                 let complaint = anyhow::anyhow!(
-                    "this machine runs tiles {}, which does not understand that request: \
+                    "this machine runs manymux {}, which does not understand that request: \
                      update it",
                     env!("CARGO_PKG_VERSION")
                 );
@@ -343,7 +343,7 @@ const START_TIMEOUT: Duration = Duration::from_secs(10);
 /// Bridge this process's stdin and stdout to the node on this machine, starting
 /// one if it is not running.
 ///
-/// This is what `ssh <host> tiles agent` runs, and it is the only way in from
+/// This is what `ssh <host> mm agent` runs, and it is the only way in from
 /// another machine. Starting the node on demand means a remote box needs no
 /// service installed and no setup beyond having the binary, the way `tmux`
 /// starts its server the first time you ask for a session.
@@ -372,7 +372,7 @@ pub async fn ensure_running(socket: &Path) -> Result<()> {
 
 /// Start a node in the background and wait for its socket to appear.
 async fn start_node(socket: &Path) -> Result<()> {
-    let binary = std::env::current_exe().context("finding the tiles binary")?;
+    let binary = std::env::current_exe().context("finding the mm binary")?;
     info!("no node running, starting one");
     std::process::Command::new(&binary)
         .arg("--socket")

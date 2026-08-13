@@ -57,7 +57,7 @@ impl Registry {
         sessions.insert(name, Arc::clone(&session));
         session.publish(EventKind::Started);
 
-        // Drop the session once the child exits so `tiles ls` reflects reality
+        // Drop the session once the child exits so `mm ls` reflects reality
         // and the PTY fd is released promptly.
         let registry = Arc::clone(self);
         let mut exit_rx = session.exit_rx();

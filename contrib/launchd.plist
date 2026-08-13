@@ -12,11 +12,11 @@
        is passed explicitly rather than left to be discovered. -->
   <key>EnvironmentVariables</key>
   <dict>
-    <key>TILES_CONFIG_DIR</key><string>@CONFIG@</string>
+    <key>MM_CONFIG_DIR</key><string>@CONFIG@</string>
   </dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
-  <!-- tiles writes its own rolling logs; this catches anything printed before
+  <!-- manymux writes its own rolling logs; this catches anything printed before
        logging starts, and panics. -->
   <key>StandardOutPath</key><string>@LOGS@/@NAME@.out</string>
   <key>StandardErrorPath</key><string>@LOGS@/@NAME@.out</string>

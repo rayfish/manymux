@@ -27,7 +27,7 @@ jobs:
         run: shellcheck -s dash install.sh
 
   # Actually install the latest release. The script's whole job is to put a
-  # working `tiles` on the host, so run it and then run what it installed.
+  # working `mm` on the host, so run it and then run what it installed.
   # Skipped until the first release exists, rather than failing every push.
   smoke:
     strategy:
@@ -53,7 +53,7 @@ jobs:
             x86_64|amd64) arch=x86_64 ;;
             aarch64|arm64) arch=aarch64 ;;
           esac
-          asset="tiles-${os}-${arch}"
+          asset="mm-${os}-${arch}"
           base="https://github.com/${{ github.repository }}/releases"
           if curl -fsIL "${base}/latest/download/${asset}" >/dev/null 2>&1 \
             || curl -fsIL "${base}/download/nightly/${asset}" >/dev/null 2>&1; then
@@ -71,5 +71,5 @@ jobs:
         if: steps.released.outputs.yes == 'true'
         run: |
           export PATH="$HOME/.local/bin:$PATH"
-          tiles --version
-          tiles ls local
+          mm --version
+          mm ls local

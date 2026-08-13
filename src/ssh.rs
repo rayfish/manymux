@@ -1,13 +1,13 @@
-//! Reaching another machine, by running `tiles agent` there over ssh.
+//! Reaching another machine, by running `mm agent` there over ssh.
 //!
-//! tiles does not do networking. You already have a way to reach your machines
+//! manymux does not do networking. You already have a way to reach your machines
 //! (plain ssh, a jump host, tailscale, rayfish), and it is configured in
 //! `~/.ssh/config` where it belongs. A "host" here is whatever ssh means by
-//! that name, so anything ssh can reach, tiles can manage.
+//! that name, so anything ssh can reach, manymux can manage.
 //!
 //! This also settles authorization: sshd decides who gets in, using whatever
-//! the admin configured. tiles keeps no allowlist of its own, so there is no
-//! second ACL to drift out of sync with the real one, and no way for tiles to
+//! the admin configured. manymux keeps no allowlist of its own, so there is no
+//! second ACL to drift out of sync with the real one, and no way for manymux to
 //! grant access ssh would refuse.
 
 use std::path::PathBuf;
@@ -18,20 +18,20 @@ use tokio::process::{Child, Command};
 
 /// How long a shared connection lingers after the last command using it.
 ///
-/// This is what makes `tiles ls` across five machines fast: the first command
+/// This is what makes `mm ls` across five machines fast: the first command
 /// pays for the handshake, the rest reuse it. Long enough to cover a working
 /// session, short enough that a laptop that moved network is not holding a dead
 /// master open.
 const PERSIST: &str = "5m";
 
-/// A running `ssh <host> tiles agent`, and its pipes.
+/// A running `ssh <host> mm agent`, and its pipes.
 pub struct Agent {
     pub child: Child,
     pub stdin: tokio::process::ChildStdin,
     pub stdout: tokio::process::ChildStdout,
 }
 
-/// Start `tiles agent` on `host` and hand back its pipes.
+/// Start `mm agent` on `host` and hand back its pipes.
 ///
 /// `host` is an ssh destination, so `gpu-box`, `dario@gpu-box` and any `Host`
 /// alias from your ssh config all work, along with whatever `ProxyCommand` or
@@ -39,11 +39,11 @@ pub struct Agent {
 pub fn agent(host: &str) -> Result<Agent> {
     let mut child = command(host)
         .arg("--")
-        // Plain `tiles`, found on the PATH a non-interactive ssh gets, which is
+        // Plain `mm`, found on the PATH a non-interactive ssh gets, which is
         // why the installer puts it in /usr/local/bin. Probing for it here
         // instead would mean either sourcing profiles, whose output would
         // corrupt the protocol on stdout, or guessing at directories.
-        .arg("tiles")
+        .arg("mm")
         .arg("agent")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -87,11 +87,11 @@ pub async fn greet(host: &str) -> Result<()> {
 
 /// An ssh invocation set up to share one connection per host.
 ///
-/// `TILES_SSH` replaces the program, for anyone whose ssh lives somewhere
+/// `MM_SSH` replaces the program, for anyone whose ssh lives somewhere
 /// unusual or who wraps it in a script. Tests use it to stand in for a second
 /// machine without needing a real sshd.
 pub fn command(host: &str) -> Command {
-    let program = std::env::var("TILES_SSH").unwrap_or_else(|_| "ssh".to_string());
+    let program = std::env::var("MM_SSH").unwrap_or_else(|_| "ssh".to_string());
     let mut command = Command::new(program);
     command
         // No PTY: this carries a framed protocol, and a PTY would mangle it.

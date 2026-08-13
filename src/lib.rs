@@ -1,9 +1,9 @@
 //! Persistent terminal sessions you can leave and come back to.
 //!
 //! The node owns the PTY, so disconnecting a client never touches the child
-//! process. Other machines are reached by running `tiles agent` there over ssh,
+//! process. Other machines are reached by running `mm agent` there over ssh,
 //! which means your existing ssh setup decides both how to get there and who is
-//! allowed in: tiles keeps no keys and no allowlist of its own.
+//! allowed in: manymux keeps no keys and no allowlist of its own.
 //!
 //! Building without the `desktop` feature drops the parts that need a real
 //! terminal or a PTY, leaving the client core that a mobile app links against.

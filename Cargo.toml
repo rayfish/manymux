@@ -1,5 +1,5 @@
 [package]
-name = "tiles"
+name = "manymux"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.91"
@@ -9,11 +9,11 @@ readme = "README.md"
 keywords = ["terminal", "session", "multiplexer", "ssh", "tmux"]
 categories = ["command-line-utilities"]
 
-# The `tiles` binary is desktop-only: it owns PTYs and drives a real terminal.
+# The `mm` binary is desktop-only: it owns PTYs and drives a real terminal.
 # A `--no-default-features` build is the library an Android/iOS client links
 # against, so it must not pull in pty-process or crossterm.
 [[bin]]
-name = "tiles"
+name = "mm"
 path = "src/main.rs"
 required-features = ["desktop"]
 

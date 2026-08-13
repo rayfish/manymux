@@ -73,7 +73,7 @@ async fn listen(socket: &Path) -> Result<UnixListener> {
 ///
 /// The way to reach a node that will not answer: it is whatever process is
 /// holding this socket, and the kernel already knows which one that is. Only
-/// Linux and macOS are covered, which is what tiles publishes builds for.
+/// Linux and macOS are covered, which is what manymux publishes builds for.
 pub fn peer_pid(stream: &tokio::net::UnixStream) -> Option<u32> {
     use std::os::fd::AsRawFd;
 
@@ -163,11 +163,11 @@ where
 mod tests {
     use super::*;
 
-    /// The fallback in `tiles update` leans on this: a node that will not answer
+    /// The fallback in `mm update` leans on this: a node that will not answer
     /// is still identifiable by the socket it holds.
     #[tokio::test]
     async fn a_connection_names_the_process_on_the_other_end() {
-        let dir = std::env::temp_dir().join(format!("tiles-peer-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("manymux-peer-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let socket = dir.join("t.sock");
         let listener = UnixListener::bind(&socket).unwrap();

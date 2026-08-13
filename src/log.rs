@@ -5,7 +5,7 @@
 //! session died, the terminal that started the server is long gone. Seven days
 //! are kept, so this never grows without bound.
 //!
-//! `TILES_LOG` overrides the filter for both, in the usual `env_filter` syntax.
+//! `MM_LOG` overrides the filter for both, in the usual `env_filter` syntax.
 
 use std::path::PathBuf;
 
@@ -19,10 +19,10 @@ pub fn log_dir() -> PathBuf {
     if cfg!(target_os = "macos")
         && let Some(home) = dirs::home_dir()
     {
-        return home.join("Library/Logs/tiles");
+        return home.join("Library/Logs/manymux");
     }
     dirs::state_dir()
-        .map(|dir| dir.join("tiles"))
+        .map(|dir| dir.join("manymux"))
         .unwrap_or_else(|| crate::config::config_dir().join("logs"))
 }
 
@@ -31,9 +31,9 @@ pub fn log_dir() -> PathBuf {
 /// out without their environment to ask.
 pub fn log_dir_for(home: &std::path::Path) -> PathBuf {
     if cfg!(target_os = "macos") {
-        home.join("Library/Logs/tiles")
+        home.join("Library/Logs/manymux")
     } else {
-        home.join(".local/state/tiles")
+        home.join(".local/state/manymux")
     }
 }
 
@@ -44,7 +44,7 @@ pub fn log_dir_for(home: &std::path::Path) -> PathBuf {
 /// alive for as long as the process runs.
 pub fn init(file: Option<&str>) -> Option<WorkerGuard> {
     let filter = |fallback: &str| {
-        EnvFilter::try_from_env("TILES_LOG").unwrap_or_else(|_| EnvFilter::new(fallback))
+        EnvFilter::try_from_env("MM_LOG").unwrap_or_else(|_| EnvFilter::new(fallback))
     };
 
     // The file keeps the detail; the console stays readable. The registry-wide
@@ -52,7 +52,7 @@ pub fn init(file: Option<&str>) -> Option<WorkerGuard> {
     // before the file layer sees them.
     let console = tracing_subscriber::fmt::layer()
         .with_writer(std::io::stderr)
-        .with_filter(filter("tiles=info"));
+        .with_filter(filter("manymux=info"));
 
     let (files, guard) = match file.and_then(open_file) {
         Some(appender) => {
@@ -66,7 +66,7 @@ pub fn init(file: Option<&str>) -> Option<WorkerGuard> {
     };
 
     tracing_subscriber::registry()
-        .with(filter("info,tiles=debug"))
+        .with(filter("info,manymux=debug"))
         .with(console)
         .with(files)
         .init();
@@ -89,7 +89,7 @@ fn open_file(name: &str) -> Option<tracing_appender::rolling::RollingFileAppende
     match built {
         Ok(appender) => Some(appender),
         Err(e) => {
-            eprintln!("tiles: not logging to {}: {e:#}", dir.display());
+            eprintln!("mm: not logging to {}: {e:#}", dir.display());
             None
         }
     }

@@ -375,6 +375,27 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
 
 [[package]]
+name = "manymux"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "avt",
+ "clap",
+ "clap_complete",
+ "crossterm",
+ "dirs",
+ "libc",
+ "pty-process",
+ "rmp-serde",
+ "serde",
+ "tokio",
+ "toml",
+ "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "matchers"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -761,27 +782,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ad99c4c6d32803332c548b1af0540b357b3f5fc0be8f6c6bfe8b2e6ae784070"
 dependencies = [
  "cfg-if",
-]
-
-[[package]]
-name = "tiles"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "avt",
- "clap",
- "clap_complete",
- "crossterm",
- "dirs",
- "libc",
- "pty-process",
- "rmp-serde",
- "serde",
- "tokio",
- "toml",
- "tracing",
- "tracing-appender",
- "tracing-subscriber",
 ]
 
 [[package]]

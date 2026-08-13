@@ -288,7 +288,7 @@ fn parse_osc(payload: &[u8]) -> Option<Event> {
 }
 
 /// Strip control characters so a title can't move the cursor when we print it
-/// in `tiles ls`, and cap the length.
+/// in `mm ls`, and cap the length.
 fn clean(s: &str) -> String {
     s.chars()
         .filter(|c| !c.is_control())

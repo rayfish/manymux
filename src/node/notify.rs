@@ -125,7 +125,7 @@ async fn deliver(notification: &Notification) {
 #[cfg(not(target_os = "macos"))]
 async fn deliver(notification: &Notification) {
     run(Command::new("notify-send")
-        .arg("--app-name=tiles")
+        .arg("--app-name=manymux")
         .arg(&notification.title)
         .arg(&notification.body))
     .await;

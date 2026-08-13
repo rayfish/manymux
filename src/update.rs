@@ -1,6 +1,6 @@
 //! Replacing the running binary with the published one.
 //!
-//! tiles has to be current on every machine you touch, and re-running the
+//! manymux has to be current on every machine you touch, and re-running the
 //! installer everywhere gets old. This is the same job `install.sh` does, from
 //! inside the binary.
 //!
@@ -15,7 +15,7 @@ use tokio::process::Command;
 use tracing::debug;
 
 /// Where the release binaries are published, the same repo `install.sh` reads.
-const REPO: &str = "rayfish/tiles";
+const REPO: &str = "rayfish/manymux";
 
 /// What is published, and whether it differs from what is running.
 pub struct Available {
@@ -37,7 +37,7 @@ impl Available {
     }
 }
 
-/// The release asset for this machine, e.g. `tiles-linux-x86_64`.
+/// The release asset for this machine, e.g. `manymux-linux-x86_64`.
 ///
 /// On Linux the libc flavour is a fact of the *running binary*, not the host: a
 /// musl build updates to the musl asset, which runs anywhere, and a glibc build
@@ -47,19 +47,19 @@ pub fn asset_name() -> Result<String> {
     let os = match std::env::consts::OS {
         "linux" => "linux",
         "macos" => "macos",
-        other => bail!("no tiles release for {other}; build from source"),
+        other => bail!("no manymux release for {other}; build from source"),
     };
     let arch = match std::env::consts::ARCH {
         "x86_64" => "x86_64",
         "aarch64" => "aarch64",
-        other => bail!("no tiles release for {other}; build from source"),
+        other => bail!("no manymux release for {other}; build from source"),
     };
     let libc = if cfg!(all(target_os = "linux", target_env = "musl")) {
         "-musl"
     } else {
         ""
     };
-    Ok(format!("tiles-{os}-{arch}{libc}"))
+    Ok(format!("mm-{os}-{arch}{libc}"))
 }
 
 /// What is published for this machine, and how it compares to what is running.
@@ -268,7 +268,7 @@ async fn sha256_of(path: &Path) -> Result<String> {
 fn file_name(path: &Path) -> String {
     path.file_name()
         .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "tiles".to_string())
+        .unwrap_or_else(|| "mm".to_string())
 }
 
 #[cfg(test)]
@@ -280,14 +280,14 @@ mod tests {
         // The names here have to be exactly the ones release.yml and
         // nightly.yml upload, or an update quietly finds nothing.
         let asset = asset_name().unwrap();
-        assert!(asset.starts_with("tiles-"), "{asset}");
+        assert!(asset.starts_with("mm-"), "{asset}");
         let published = [
-            "tiles-linux-x86_64",
-            "tiles-linux-aarch64",
-            "tiles-linux-x86_64-musl",
-            "tiles-linux-aarch64-musl",
-            "tiles-macos-x86_64",
-            "tiles-macos-aarch64",
+            "mm-linux-x86_64",
+            "mm-linux-aarch64",
+            "mm-linux-x86_64-musl",
+            "mm-linux-aarch64-musl",
+            "mm-macos-x86_64",
+            "mm-macos-aarch64",
         ];
         assert!(published.contains(&asset.as_str()), "unpublished: {asset}");
     }
@@ -295,12 +295,12 @@ mod tests {
     #[test]
     fn stable_and_nightly_have_different_urls() {
         assert_eq!(
-            download_url("latest", "tiles-macos-aarch64"),
-            "https://github.com/rayfish/tiles/releases/latest/download/tiles-macos-aarch64"
+            download_url("latest", "mm-macos-aarch64"),
+            "https://github.com/rayfish/manymux/releases/latest/download/mm-macos-aarch64"
         );
         assert_eq!(
-            download_url("nightly", "tiles-macos-aarch64"),
-            "https://github.com/rayfish/tiles/releases/download/nightly/tiles-macos-aarch64"
+            download_url("nightly", "mm-macos-aarch64"),
+            "https://github.com/rayfish/manymux/releases/download/nightly/mm-macos-aarch64"
         );
     }
 
@@ -310,7 +310,7 @@ mod tests {
         // versions would never update.
         let same = Available {
             tag: "nightly".into(),
-            asset: "tiles-macos-aarch64".into(),
+            asset: "mm-macos-aarch64".into(),
             checksum: "abc".into(),
             running: "abc".into(),
         };

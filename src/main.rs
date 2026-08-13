@@ -6,16 +6,16 @@ use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
 use tracing::debug;
 
-use tiles::client::Stream;
-use tiles::client::attach::{self, Outcome};
-use tiles::hosts::{Hosts, LOCAL, Target, is_this_machine, this_machine};
-use tiles::node::{Config, Node};
-use tiles::proto::{HostedSession, Request, Response, SessionInfo, SpawnSpec};
-use tiles::{config, log, style, term};
+use manymux::client::Stream;
+use manymux::client::attach::{self, Outcome};
+use manymux::hosts::{Hosts, LOCAL, Target, is_this_machine, this_machine};
+use manymux::node::{Config, Node};
+use manymux::proto::{HostedSession, Request, Response, SessionInfo, SpawnSpec};
+use manymux::{config, log, style, term};
 
 #[derive(Parser)]
 #[command(
-    name = "tiles",
+    name = "mm",
     version,
     about = "Persistent terminal sessions you can leave and come back to"
 )]
@@ -40,7 +40,7 @@ enum Command {
     },
     /// Bridge stdin and stdout to this machine's node, starting it if needed.
     ///
-    /// This is what `ssh <host> tiles agent` runs. You do not normally type it.
+    /// This is what `ssh <host> mm agent` runs. You do not normally type it.
     Agent,
 
     /// List sessions, on every added machine by default.
@@ -52,7 +52,7 @@ enum Command {
     /// Start a session and attach to it.
     ///
     /// A first argument naming a machine you have added runs it there; anything
-    /// else is the command, run here. `tiles new local <cmd>` forces this
+    /// else is the command, run here. `mm new local <cmd>` forces this
     /// machine, for a program that shares a name with one of your hosts.
     #[command(visible_alias = "n")]
     New {
@@ -77,7 +77,7 @@ enum Command {
     Rename { target: String, title: String },
 
     /// Watch a machine without starting a session on it. Starting one adds it
-    /// anyway; this is for machines you only want to see in `tiles ls`.
+    /// anyway; this is for machines you only want to see in `mm ls`.
     Add { host: String },
     /// List the machines being watched.
     #[command(visible_alias = "h")]
@@ -132,14 +132,14 @@ async fn main() -> ExitCode {
     // Only the node writes a log file. A command that prints and exits has the
     // terminal for that, and the agent must leave stdout strictly alone.
     let _log = log::init(match cli.command {
-        Command::Daemon { .. } => Some(tiles::service::NAME),
+        Command::Daemon { .. } => Some(manymux::service::NAME),
         _ => None,
     });
 
     let code = match run(cli).await {
         Ok(code) => code,
         Err(e) => {
-            eprintln!("tiles: {e:#}");
+            eprintln!("mm: {e:#}");
             1
         }
     };
@@ -173,7 +173,7 @@ async fn run(cli: Cli) -> Result<u8> {
         }
 
         Command::Agent => {
-            tiles::node::agent(&socket).await?;
+            manymux::node::agent(&socket).await?;
             Ok(OK)
         }
 
@@ -198,7 +198,7 @@ async fn run(cli: Cli) -> Result<u8> {
                 bail!("unexpected response to spawn");
             };
             if remember(&host)? {
-                eprintln!("tiles: now watching {host}; `tiles rm {host}` to stop");
+                eprintln!("mm: now watching {host}; `mm rm {host}` to stop");
             }
             if detached {
                 println!("{}", qualified(&host, &name));
@@ -241,7 +241,7 @@ async fn run(cli: Cli) -> Result<u8> {
             // Connect once with the terminal attached, so ssh can ask about an
             // unknown host key or a passphrase. Every later command carries the
             // protocol on stdin and has no way to prompt.
-            tiles::ssh::greet(&host).await?;
+            manymux::ssh::greet(&host).await?;
             hosts.save()?;
             // Prove it works now rather than at the next listing, when the
             // failure would be harder to connect to what you just typed.
@@ -251,7 +251,7 @@ async fn run(cli: Cli) -> Result<u8> {
                     Ok(OK)
                 }
                 Err(e) => {
-                    eprintln!("tiles: added {host}, but could not reach it: {e:#}");
+                    eprintln!("mm: added {host}, but could not reach it: {e:#}");
                     Ok(FAILED)
                 }
             }
@@ -260,7 +260,7 @@ async fn run(cli: Cli) -> Result<u8> {
         Command::Hosts => {
             let hosts = Hosts::load()?;
             if hosts.is_empty() {
-                println!("no machines added; `tiles add <ssh-host>`");
+                println!("no machines added; `mm add <ssh-host>`");
             }
             for host in hosts.names() {
                 println!("{host}");
@@ -282,18 +282,18 @@ async fn run(cli: Cli) -> Result<u8> {
         Command::Service { action } => {
             match action {
                 ServiceAction::Install => {
-                    let installed = tiles::service::install()?;
+                    let installed = manymux::service::install()?;
                     println!(
-                        "installed and started tiles under {} ({})",
+                        "installed and started manymux under {} ({})",
                         installed.manager.label(),
                         installed.path.display()
                     );
-                    if installed.scope == tiles::service::Scope::System {
+                    if installed.scope == manymux::service::Scope::System {
                         println!("it is a system service and runs as {}", installed.user);
                     }
                 }
                 ServiceAction::Uninstall => {
-                    let path = tiles::service::uninstall()?;
+                    let path = manymux::service::uninstall()?;
                     println!("removed {}", path.display());
                 }
             }
@@ -306,10 +306,10 @@ async fn run(cli: Cli) -> Result<u8> {
 
 /// Replace this binary with the published one, and pick it up.
 async fn update(socket: &Path, check: bool, force: bool) -> Result<u8> {
-    let available = tiles::update::check().await?;
+    let available = manymux::update::check().await?;
     if !available.is_newer() {
         println!(
-            "{} tiles {} is the published {} build",
+            "{} manymux {} is the published {} build",
             style::green("✓"),
             env!("CARGO_PKG_VERSION"),
             available.tag
@@ -318,13 +318,13 @@ async fn update(socket: &Path, check: bool, force: bool) -> Result<u8> {
     }
     if check {
         println!(
-            "an update is published on the {} channel; `tiles update` to take it",
+            "an update is published on the {} channel; `mm update` to take it",
             style::bold(&available.tag)
         );
         return Ok(OK);
     }
 
-    let path = tiles::update::apply(&available).await?;
+    let path = manymux::update::apply(&available).await?;
     println!(
         "{} updated {}",
         style::green("✓"),
@@ -334,13 +334,13 @@ async fn update(socket: &Path, check: bool, force: bool) -> Result<u8> {
     // The node is a long-running process still executing the old binary, so an
     // update that leaves it alone has not really landed. Restarting it kills
     // every session it owns, though, which is not something to do quietly.
-    let Some(running) = tiles::update::running(socket).await else {
+    let Some(running) = manymux::update::running(socket).await else {
         return Ok(OK);
     };
     if running.sessions > 0 && !force {
         println!(
             "{} the node is still on the old binary, and restarting it would end \
-             {} running session{}.\n  `tiles update --force` to restart anyway, or leave it \
+             {} running session{}.\n  `mm update --force` to restart anyway, or leave it \
              until they are done.",
             style::amber("!"),
             running.sessions,
@@ -349,12 +349,12 @@ async fn update(socket: &Path, check: bool, force: bool) -> Result<u8> {
         return Ok(OK);
     }
 
-    tiles::update::restart_node(socket).await?;
+    manymux::update::restart_node(socket).await?;
     println!("{} restarted the node", style::green("✓"));
     Ok(OK)
 }
 
-/// Open a stream to a machine: this one's socket, or `tiles agent` over ssh.
+/// Open a stream to a machine: this one's socket, or `mm agent` over ssh.
 async fn open(socket: &Path, host: &str) -> Result<Stream> {
     if is_this_machine(host) {
         return Stream::local(socket).await;
@@ -369,7 +369,7 @@ async fn open(socket: &Path, host: &str) -> Result<Stream> {
 /// same thing at the far end.
 async fn open_or_start(socket: &Path, host: &str) -> Result<Stream> {
     if is_this_machine(host) {
-        tiles::node::ensure_running(socket).await?;
+        manymux::node::ensure_running(socket).await?;
     }
     open(socket, host).await
 }
@@ -406,7 +406,7 @@ impl Listing {
     }
 }
 
-/// `tiles ls`, over every watched machine or just one.
+/// `mm ls`, over every watched machine or just one.
 async fn list(socket: &Path, host: Option<String>) -> Result<u8> {
     let listing = match host {
         // One named machine: ask it directly, so an error names that machine.
@@ -441,7 +441,7 @@ async fn list(socket: &Path, host: Option<String>) -> Result<u8> {
         print!("{}", term::session_table(&rows));
     }
     for host in &listing.unreachable {
-        eprintln!("tiles: {}: {}", host.host, host.error);
+        eprintln!("mm: {}: {}", host.host, host.error);
     }
     Ok(if nothing_answered { FAILED } else { OK })
 }
@@ -527,7 +527,7 @@ struct Located {
 /// Work out which machine a target is on.
 ///
 /// `host/session` says so outright. A bare name is looked for here first, and
-/// then across every watched machine, so `tiles attach api` finds the session
+/// then across every watched machine, so `mm attach api` finds the session
 /// wherever you left it without having to remember which machine that was.
 async fn locate(socket: &Path, target: &str) -> Result<Located> {
     let target = Target::parse(target)?;
@@ -561,7 +561,7 @@ async fn locate(socket: &Path, target: &str) -> Result<Located> {
             host: hosts.remove(0),
             session: target.session,
         }),
-        0 => bail!("no session named {}; see `tiles ls`", target.session),
+        0 => bail!("no session named {}; see `mm ls`", target.session),
         // Two machines can each have a `build`. Say which, rather than guessing.
         _ => bail!(
             "{} is on more than one machine ({}); say which, like `{}/{}`",
@@ -581,7 +581,7 @@ fn qualified(host: &str, name: &str) -> String {
     }
 }
 
-/// Where a `tiles new` should run, and what it should run there.
+/// Where a `mm new` should run, and what it should run there.
 struct Started {
     host: String,
     command: Vec<String>,
@@ -611,7 +611,7 @@ fn where_to_start(mut args: Vec<String>) -> Result<Started> {
 /// Whether this looks like something to run rather than somewhere to run it.
 ///
 /// A path or a shell snippet is taken at face value; a bare word has to be on
-/// `PATH`, which is what separates `tiles new claude` from `tiles new gpu-box`.
+/// `PATH`, which is what separates `mm new claude` from `mm new gpu-box`.
 fn runnable(program: &str) -> bool {
     if program.contains('/') {
         return Path::new(program).is_file();
@@ -623,7 +623,7 @@ fn runnable(program: &str) -> bool {
         .is_some_and(|paths| std::env::split_paths(&paths).any(|dir| dir.join(program).is_file()))
 }
 
-/// Remember a machine, so `tiles ls` covers it and the node watches it for
+/// Remember a machine, so `mm ls` covers it and the node watches it for
 /// bells. Starting a session somewhere is a clear enough signal of interest
 /// that asking you to register it first would be ceremony.
 fn remember(host: &str) -> Result<bool> {
@@ -648,26 +648,26 @@ fn current_dir() -> Option<String> {
 /// Print a completion script, or write it where the shell will find it.
 fn completions(shell: Option<Shell>, install: bool) -> Result<u8> {
     let Some(shell) = shell.or_else(Shell::from_env) else {
-        bail!("could not tell which shell you use; name it: tiles completions zsh");
+        bail!("could not tell which shell you use; name it: mm completions zsh");
     };
     let mut command = Cli::command();
 
     if !install {
-        clap_complete::generate(shell, &mut command, "tiles", &mut std::io::stdout());
+        clap_complete::generate(shell, &mut command, "mm", &mut std::io::stdout());
         return Ok(OK);
     }
 
     let Some(path) = completion_path(shell) else {
         bail!(
             "no install path known for {shell}; print it and place it yourself: \
-             tiles completions {shell}"
+             mm completions {shell}"
         );
     };
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
     let mut file = std::fs::File::create(&path)?;
-    clap_complete::generate(shell, &mut command, "tiles", &mut file);
+    clap_complete::generate(shell, &mut command, "mm", &mut file);
     println!("wrote {}", path.display());
 
     if shell == Shell::Zsh {
@@ -695,10 +695,10 @@ fn completion_path(shell: Shell) -> Option<PathBuf> {
     let data = base("XDG_DATA_HOME", ".local/share");
     let config = base("XDG_CONFIG_HOME", ".config");
     Some(match shell {
-        Shell::Bash => data.join("bash-completion/completions/tiles"),
-        Shell::Zsh => data.join("zsh/site-functions/_tiles"),
-        Shell::Fish => config.join("fish/completions/tiles.fish"),
-        Shell::Elvish => config.join("elvish/lib/tiles.elv"),
+        Shell::Bash => data.join("bash-completion/completions/mm"),
+        Shell::Zsh => data.join("zsh/site-functions/_mm"),
+        Shell::Fish => config.join("fish/completions/mm.fish"),
+        Shell::Elvish => config.join("elvish/lib/mm.elv"),
         // PowerShell loads completions from a profile script, not a directory.
         _ => return None,
     })

@@ -12,30 +12,30 @@ use anyhow::{Context, Result};
 /// rather than nesting under Application Support.
 pub fn runtime_dir() -> PathBuf {
     if let Some(dir) = dirs::runtime_dir() {
-        return dir.join("tiles");
+        return dir.join("manymux");
     }
     // SAFETY: getuid always succeeds and touches no memory.
     let uid = unsafe { libc::getuid() };
-    PathBuf::from(format!("/tmp/tiles-{uid}"))
+    PathBuf::from(format!("/tmp/manymux-{uid}"))
 }
 
 /// Socket the node listens on for the owner of this machine.
 pub fn socket() -> PathBuf {
-    runtime_dir().join("tiles.sock")
+    runtime_dir().join("manymux.sock")
 }
 
 /// Config directory: the list of machines to watch, and nothing secret. Keys
 /// and access policy are ssh's, not ours.
 ///
-/// `TILES_CONFIG_DIR` overrides it, which is how two nodes run on one machine
+/// `MM_CONFIG_DIR` overrides it, which is how two nodes run on one machine
 /// (tests, and trying it out before committing to it).
 pub fn config_dir() -> PathBuf {
-    if let Some(dir) = std::env::var_os("TILES_CONFIG_DIR") {
+    if let Some(dir) = std::env::var_os("MM_CONFIG_DIR") {
         return PathBuf::from(dir);
     }
     dirs::config_dir()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join("tiles")
+        .join("manymux")
 }
 
 /// The config directory belonging to `home`, for a system-wide unit that will
@@ -43,9 +43,9 @@ pub fn config_dir() -> PathBuf {
 /// worked out without their environment to ask.
 pub fn config_dir_for(home: &std::path::Path) -> PathBuf {
     if cfg!(target_os = "macos") {
-        home.join("Library/Application Support/tiles")
+        home.join("Library/Application Support/manymux")
     } else {
-        home.join(".config/tiles")
+        home.join(".config/manymux")
     }
 }
 

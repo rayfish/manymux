@@ -55,7 +55,7 @@ struct State {
     vt: Vt,
     scanner: Scanner,
     decoder: Utf8Decoder,
-    /// Title set by `tiles rename`, which wins over the one the program sets.
+    /// Title set by `mm rename`, which wins over the one the program sets.
     sticky_title: Option<String>,
     bells: u64,
     last_activity: Instant,
@@ -183,7 +183,7 @@ impl Session {
             cmd = cmd.current_dir(cwd);
         }
         cmd = cmd.env("TERM", "xterm-256color");
-        cmd = cmd.env("TILES_SESSION", &name);
+        cmd = cmd.env("MM_SESSION", &name);
 
         let mut child = cmd
             .spawn(pts)

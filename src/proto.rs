@@ -19,7 +19,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// ALPN for the iroh transport. This is the only compatibility gate: bump it in
 /// the same change as any incompatible protocol change.
-pub const ALPN: &[u8] = b"tiles/v1";
+pub const ALPN: &[u8] = b"manymux/v1";
 
 /// Frames larger than this are a protocol error, not an allocation.
 pub const MAX_FRAME: usize = 1 << 20;
@@ -193,7 +193,7 @@ pub struct UnreachableHost {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct SessionInfo {
     pub name: String,
-    /// What the session calls itself: a sticky title from `tiles rename`, else
+    /// What the session calls itself: a sticky title from `mm rename`, else
     /// the last OSC title the program set, else the command.
     pub title: String,
     pub command: String,

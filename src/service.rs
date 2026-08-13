@@ -18,15 +18,15 @@ use anyhow::{Context, Result, bail};
 
 /// Service, unit and log-file name, all one thing now that a machine runs one
 /// node rather than a server and a daemon.
-pub const NAME: &str = "tiles";
+pub const NAME: &str = "manymux";
 
 /// The subcommand the unit runs.
 const COMMAND: &str = "daemon";
 
-const DESCRIPTION: &str = "tiles node: persistent terminal sessions";
+const DESCRIPTION: &str = "manymux node: persistent terminal sessions";
 
 /// rc.d derives shell variable names from the file name, so it can hold no
-/// dashes. `tiles` has none, but keep the intent explicit.
+/// dashes. `manymux` has none, but keep the intent explicit.
 const RC_NAME: &str = NAME;
 
 /// The service manager this machine runs.
@@ -77,7 +77,7 @@ impl Manager {
         }
         bail!(
             "no service manager found (launchd, systemd, OpenRC, SysV init, rc.d).\n\
-             Run it in the foreground instead: tiles server"
+             Run it in the foreground instead: mm server"
         )
     }
 
@@ -95,7 +95,7 @@ impl Manager {
     ///
     /// Root gets the system one even where a per-user unit exists: there is no
     /// login session to bootstrap it into, and root's own node is rarely what
-    /// was meant by `sudo tiles service install`.
+    /// was meant by `sudo mm service install`.
     pub fn scope(self) -> Scope {
         match self {
             Self::Launchd | Self::Systemd if uid() != 0 => Scope::User,
@@ -292,7 +292,7 @@ impl Fields {
         };
         Ok(Self {
             bin: std::env::current_exe()
-                .context("finding the tiles binary")?
+                .context("finding the mm binary")?
                 .display()
                 .to_string(),
             user,
@@ -348,13 +348,13 @@ fn warn_about_linger(user: &str) {
         .unwrap_or(false);
     if !lingering {
         eprintln!(
-            "tiles: user services stop at logout unless lingering is on.\n\
-             tiles: run `sudo loginctl enable-linger {user}` to keep sessions alive."
+            "mm: user services stop at logout unless lingering is on.\n\
+             mm: run `sudo loginctl enable-linger {user}` to keep sessions alive."
         );
     }
 }
 
-const LAUNCHD_LABEL: &str = "xyz.rayfish.tiles";
+const LAUNCHD_LABEL: &str = "xyz.rayfish.manymux";
 
 /// Where launchd keeps this scope's jobs.
 fn launchd_domain(scope: Scope) -> String {
@@ -409,7 +409,7 @@ fn user_runtime_dir() -> Result<PathBuf> {
          That happens when you log in over ssh on a host without pam_systemd, \
          and it also means the service would stop at logout. Both are fixed by:\n\
          \n    sudo loginctl enable-linger {user}\n\n\
-         Then run `tiles service install` again.",
+         Then run `mm service install` again.",
         user = username(),
         dir = dir.display(),
     )

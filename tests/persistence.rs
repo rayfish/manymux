@@ -8,8 +8,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
-use tiles::node::{Config, Node};
-use tiles::proto::{self, Request, Response, Size, SpawnSpec, tag};
+use manymux::node::{Config, Node};
+use manymux::proto::{self, Request, Response, Size, SpawnSpec, tag};
 use tokio::io::{DuplexStream, ReadHalf, WriteHalf, split};
 
 /// One client connection: a duplex pair with the server handler running on the
