@@ -36,6 +36,13 @@ pub mod tag {
     /// A session event on a subscription stream: a bell, a title change, an
     /// exit. Server to client only, and unsolicited.
     pub const EVENT: u8 = 0x14;
+    /// Liveness probe on an attached stream, and its answer.
+    ///
+    /// The only way the host learns that a client vanished without detaching.
+    /// A client that answers one of these is expected to keep answering; one
+    /// that never answers is an older client and is left alone.
+    pub const PING: u8 = 0x15;
+    pub const PONG: u8 = 0x16;
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
@@ -230,7 +237,11 @@ where
     W: AsyncWrite + Unpin,
     T: Serialize,
 {
-    write_frame(w, tag, &rmp_serde::to_vec_named(msg)?).await
+    write_frame(w, tag, &encode(msg)?).await
+}
+
+pub fn encode<T: Serialize>(msg: &T) -> Result<Vec<u8>> {
+    Ok(rmp_serde::to_vec_named(msg)?)
 }
 
 /// One protocol frame: a tag saying what it is, and its payload.

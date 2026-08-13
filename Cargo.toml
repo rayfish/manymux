@@ -59,3 +59,8 @@ tracing-appender = { version = "0.2.5", optional = true }
 tracing-subscriber = { version = "0.3.23", features = [
     "env-filter",
 ], optional = true }
+
+[dev-dependencies]
+# `start_paused`, so a test can sit out the client-liveness deadline without
+# spending three quarters of a minute of real time on it.
+tokio = { version = "1.53.1", features = ["test-util"] }

@@ -182,6 +182,11 @@ impl Attached {
 pub enum Update {
     /// Terminal output. The first one after attaching repaints the screen.
     Output(Vec<u8>),
+    /// The host is checking this client is still there. Answer it with
+    /// [`SessionWriter::pong`], or the host will eventually conclude the client
+    /// went away and detach it. Answering once is what opts a client in: one
+    /// that never does is held to no deadline.
+    Ping,
     /// The session's process exited.
     Exited(i32),
     /// The host went away.
@@ -201,6 +206,7 @@ impl SessionReader {
             };
             return Ok(match frame.tag {
                 tag::DATA => Update::Output(frame.body),
+                tag::PING => Update::Ping,
                 tag::EXIT => Update::Exited(proto::decode(&frame.body)?),
                 // Unknown tags are skipped rather than fatal, so a newer host
                 // can add frames without breaking older clients.
@@ -226,5 +232,11 @@ impl SessionWriter {
 
     pub async fn detach(&mut self) -> Result<()> {
         proto::write_frame(&mut self.write, tag::DETACH, &[]).await
+    }
+
+    /// Answer an [`Update::Ping`], which is how the host tells a client that is
+    /// still there from one whose connection died without closing.
+    pub async fn pong(&mut self) -> Result<()> {
+        proto::write_frame(&mut self.write, tag::PONG, &[]).await
     }
 }

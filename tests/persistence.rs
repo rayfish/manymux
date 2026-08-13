@@ -69,6 +69,27 @@ impl Client {
     async fn type_line(&mut self, line: &str) -> Result<()> {
         proto::write_frame(&mut self.write, tag::DATA, format!("{line}\n").as_bytes()).await
     }
+
+    /// The next frame, or `None` once the host has hung up on us.
+    async fn next_frame(&mut self) -> Option<proto::Frame> {
+        proto::read_frame(&mut self.read).await.expect("a frame")
+    }
+
+    /// Read frames until a ping arrives, which is the host asking whether this
+    /// client is still there.
+    async fn read_until_ping(&mut self) {
+        loop {
+            match self.next_frame().await {
+                Some(frame) if frame.tag == tag::PING => return,
+                Some(_) => {}
+                None => panic!("the host hung up instead of pinging"),
+            }
+        }
+    }
+
+    async fn pong(&mut self) -> Result<()> {
+        proto::write_frame(&mut self.write, tag::PONG, &[]).await
+    }
 }
 
 fn alive(pid: u32) -> bool {
@@ -106,6 +127,85 @@ async fn spawn_session(node: &Arc<Node>, command: &[&str]) -> Spawned {
     };
     let pid = node.registry.get(&name).expect("the new session").pid;
     Spawned { name, pid }
+}
+
+/// The case this closes: a laptop whose lid shuts mid-attach. Its connection is
+/// dead but nothing closes it, so without a probe the phantom keeps its say in
+/// the session's size and keeps counting as attached for as long as the node
+/// lives. Time is paused, so the deadline passes in an instant here.
+#[tokio::test(start_paused = true)]
+async fn a_client_that_stops_answering_is_detached() {
+    let node = test_node().await;
+    let registry = &node.registry;
+    let Spawned { name, pid } = spawn_session(&node, &["/bin/sh", "-c", "sleep 300"]).await;
+
+    let mut client = Client::connect(&node);
+    let attach = Request::Attach {
+        name: name.clone(),
+        size: Size::new(80, 24),
+    };
+    assert!(matches!(
+        client.send(&attach).await.unwrap(),
+        Response::Attached { .. }
+    ));
+
+    // Answer once, which is what opts this client into being held to the
+    // deadline at all.
+    client.read_until_ping().await;
+    client.pong().await.unwrap();
+    assert_eq!(
+        registry.get(&name).unwrap().info().attached,
+        1,
+        "answering a ping did not keep the attachment"
+    );
+
+    // Then go silent, still reading so that nothing blocks on a full buffer:
+    // exactly what a machine that went away looks like from here.
+    let mut frames = 0;
+    while client.next_frame().await.is_some() {
+        frames += 1;
+        assert!(frames < 100, "the host never gave up on a silent client");
+    }
+
+    assert_eq!(
+        registry.get(&name).unwrap().info().attached,
+        0,
+        "the phantom client is still counted as attached"
+    );
+    assert!(alive(pid), "dropping a dead client took the child with it");
+    registry.kill(&name).unwrap();
+}
+
+/// A client built before pings existed skips the tag it does not know and
+/// answers nothing, which must not look like a client that died. Never
+/// answering is what keeps it out of the deadline entirely.
+#[tokio::test(start_paused = true)]
+async fn a_client_that_never_answers_is_left_alone() {
+    let node = test_node().await;
+    let registry = &node.registry;
+    let Spawned { name, .. } = spawn_session(&node, &["/bin/sh", "-c", "sleep 300"]).await;
+
+    let mut client = Client::connect(&node);
+    let attach = Request::Attach {
+        name: name.clone(),
+        size: Size::new(80, 24),
+    };
+    assert!(matches!(
+        client.send(&attach).await.unwrap(),
+        Response::Attached { .. }
+    ));
+
+    // Long past the deadline, had it ever applied to this client.
+    for _ in 0..10 {
+        client.read_until_ping().await;
+    }
+    assert_eq!(
+        registry.get(&name).unwrap().info().attached,
+        1,
+        "a client that never claimed to understand pings was dropped for not answering"
+    );
+
+    registry.kill(&name).unwrap();
 }
 
 #[tokio::test]

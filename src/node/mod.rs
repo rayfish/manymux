@@ -38,6 +38,17 @@ const HOSTS_POLL: Duration = Duration::from_secs(2);
 /// Events buffered per subscriber before it is considered too far behind.
 const EVENT_BACKLOG: usize = 256;
 
+/// How often an attached client is asked whether it is still there, and how
+/// long it may go without answering before it is treated as gone.
+///
+/// Nothing underneath notices a client that vanished without detaching. A
+/// closed laptop leaves sshd holding the session, sshd's own `ClientAlive`
+/// probing is off by default, and the kernel's TCP keepalive is two hours away.
+/// Until something says otherwise the phantom keeps its say in the session's
+/// size and keeps counting as attached in `mm ls`.
+const PING_EVERY: Duration = Duration::from_secs(15);
+const SILENT_FOR: Duration = Duration::from_secs(45);
+
 /// What a node needs to start.
 pub struct Config {
     /// Machines to watch for events, as ssh destinations.
@@ -285,31 +296,47 @@ where
         size: _,
     } = attached;
     // Paint the screen as it stands before streaming anything live.
-    proto::write_frame(&mut write, tag::DATA, repaint.as_bytes()).await?;
+    send(&mut write, tag::DATA, repaint.as_bytes()).await?;
 
     let mut exit_rx = attachment.exit_rx();
+    // A whole interval before the first probe: a client that just attached has
+    // nothing to prove yet.
+    let start = tokio::time::Instant::now();
+    let mut ping = tokio::time::interval_at(start + PING_EVERY, PING_EVERY);
+    let mut last_heard = start;
+    // Only a client that has answered a ping is held to the deadline, so an
+    // older one, which skips the tag it does not know, keeps working as before.
+    let mut answers_pings = false;
 
     loop {
         tokio::select! {
             frame = proto::read_frame(&mut read) => {
                 let Some(frame) = frame? else { break };
+                last_heard = tokio::time::Instant::now();
                 match frame.tag {
                     tag::DATA => attachment.send_input(frame.body),
                     tag::RESIZE => attachment.resize(proto::decode(&frame.body)?),
+                    tag::PONG => answers_pings = true,
                     tag::DETACH => break,
                     other => warn!("ignoring unexpected tag {other:#x} while attached"),
                 }
             }
             chunk = output.recv() => match chunk {
-                Ok(bytes) => proto::write_frame(&mut write, tag::DATA, &bytes).await?,
+                Ok(bytes) => send(&mut write, tag::DATA, &bytes).await?,
                 // The client fell behind. Repaint from the current screen
                 // instead of showing it a gap.
                 Err(RecvError::Lagged(n)) => {
                     debug!("client lagged {n} chunks, resyncing");
-                    proto::write_frame(&mut write, tag::DATA, attachment.resync().as_bytes()).await?;
+                    send(&mut write, tag::DATA, attachment.resync().as_bytes()).await?;
                 }
                 Err(RecvError::Closed) => break,
             },
+            _ = ping.tick() => {
+                if answers_pings && last_heard.elapsed() > SILENT_FOR {
+                    bail!("client stopped answering {:?} ago", last_heard.elapsed());
+                }
+                send(&mut write, tag::PING, &[]).await?;
+            }
             _ = exit_rx.changed() => {
                 let Some(code) = *exit_rx.borrow() else { continue };
                 // The child's last words are still in flight: the reader task
@@ -317,12 +344,30 @@ where
                 // picked this branch over a ready chunk. Flush both before
                 // telling the client it is over.
                 drain_output(&mut output, &mut write).await?;
-                proto::write_msg(&mut write, tag::EXIT, &code).await?;
+                send(&mut write, tag::EXIT, &proto::encode(&code)?).await?;
                 break;
             }
         }
     }
     Ok(())
+}
+
+/// Write a frame to an attached client, giving up on one that has stopped
+/// reading.
+///
+/// The deadline is what makes the ping above work at all. A client whose
+/// connection is dead but not closed leaves its ssh channel's window full, and
+/// a write into a full window blocks rather than failing. Without this the loop
+/// would park on that write forever, never reach the ping arm, and hold the
+/// attachment open for the life of the process.
+async fn send<W>(write: &mut W, tag: u8, body: &[u8]) -> Result<()>
+where
+    W: AsyncWrite + Unpin + Send,
+{
+    match tokio::time::timeout(SILENT_FOR, proto::write_frame(write, tag, body)).await {
+        Ok(written) => written,
+        Err(_) => bail!("client stopped reading for {SILENT_FOR:?}"),
+    }
 }
 
 /// Write every chunk already queued for this client, so nothing that landed
@@ -332,7 +377,7 @@ where
     W: AsyncWrite + Unpin + Send,
 {
     while let Ok(bytes) = output.try_recv() {
-        proto::write_frame(write, tag::DATA, &bytes).await?;
+        send(write, tag::DATA, &bytes).await?;
     }
     Ok(())
 }

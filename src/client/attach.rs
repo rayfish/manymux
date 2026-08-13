@@ -296,6 +296,9 @@ mod terminal {
                         }
                         stdout.flush().await?;
                     }
+                    // Answered from here rather than inside the reader, which
+                    // does not hold the writing half to answer with.
+                    Update::Ping => writer.pong().await?,
                     Update::Exited(code) => return Ok(Outcome::Exited(code)),
                     Update::Disconnected => return Ok(Outcome::Disconnected),
                 },
@@ -336,6 +339,11 @@ pub async fn collect_until(
                     continue;
                 }
             }
+            // Nothing here to answer with, the writing half having been
+            // dropped. Never answering is what leaves the host holding this
+            // client to no deadline, which is what a caller collecting output
+            // without a connection to keep alive wants.
+            Update::Ping => continue,
             Update::Exited(code) => Outcome::Exited(code),
             Update::Disconnected => Outcome::Disconnected,
         };
