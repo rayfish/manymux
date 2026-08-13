@@ -143,6 +143,16 @@ main() {
   asset="$ASSET"
   base="$(release_base)"
 
+  # Every push to master publishes a rolling `nightly` pre-release, and GitHub
+  # excludes pre-releases from /releases/latest. So until a stable release
+  # exists, "latest" resolves to nothing and the nightly is what to install.
+  if [ "$VERSION" = "latest" ] && ! asset_exists "${base}/${asset}"; then
+    if asset_exists "https://github.com/${REPO}/releases/download/nightly/${asset}"; then
+      info "no stable release yet; installing the rolling nightly build"
+      base="https://github.com/${REPO}/releases/download/nightly"
+    fi
+  fi
+
   # On Linux, switch to the static musl asset when the glibc binary will not run
   # here (musl distro, or glibc older than the build floor) but only if a musl
   # asset was actually published for this version.

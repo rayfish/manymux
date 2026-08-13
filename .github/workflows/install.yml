@@ -38,13 +38,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # The API endpoint, not github.com/.../releases/latest: that one redirects
-      # to the tag list and answers 200 even when nothing has been released,
-      # which made this guard useless and failed the job on the first push.
+      # Any release, stable or the rolling nightly: the installer falls back to
+      # the nightly, so that is enough for it to have something to install.
+      # Not /releases/latest, which excludes pre-releases, nor the github.com
+      # URL, which redirects to the tag list and answers 200 regardless.
       - name: Is there a release yet?
         id: released
         run: |
-          if curl -fsI "https://api.github.com/repos/${{ github.repository }}/releases/latest" >/dev/null 2>&1; then
+          if curl -fsS "https://api.github.com/repos/${{ github.repository }}/releases" \
+              | grep -q '"tag_name"'; then
             echo "yes=true" >> "$GITHUB_OUTPUT"
           else
             echo "no published release yet; skipping the install run"
