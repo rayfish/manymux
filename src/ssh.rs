@@ -115,5 +115,11 @@ pub fn command(host: &str) -> Command {
 /// (host, port, user, proxy), which keeps the path short enough for the ~104
 /// byte limit on socket names.
 fn control_path() -> PathBuf {
-    crate::config::runtime_dir().join("ssh-%C")
+    let dir = crate::config::runtime_dir();
+    // ssh binds the master socket but will not create the directory holding it,
+    // and on a machine that only ever talks to other machines no node has run to
+    // create it either, so the first command would die with ENOENT. Best effort:
+    // if the directory cannot be made, ssh reports it better than a guess here.
+    let _ = crate::config::ensure_private_dir(&dir);
+    dir.join("ssh-%C")
 }
