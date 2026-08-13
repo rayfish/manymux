@@ -26,10 +26,12 @@ Run it here and on each machine you want to manage. That is the entire remote
 setup: no service, no config. The node starts itself on demand, the way tmux
 starts its server.
 
-It installs to `/usr/local/bin` when that is writable, `~/.local/bin` otherwise.
-On a machine you *manage*, prefer system-wide: `~/.local/bin` is usually not on
-the PATH of a non-interactive ssh, which is how tiles gets run there. Pipe to
-`sudo sh` for that. Later, `tiles update` replaces the binary in place.
+It installs to `/usr/local/bin`, asking for `sudo` if that is what it takes.
+That is not fussiness: reaching a machine runs `ssh host tiles agent` through a
+*non-interactive* shell, which reads neither `.zshrc` nor `.bashrc`, so a binary
+in `~/.local/bin` is invisible to it and the machine looks like it has no tiles
+at all. `INSTALL_DIR` overrides it, `TILES_VERSION` pins a release, and
+afterwards `tiles update` replaces the binary in place.
 
 Optionally run the node as a service, so it survives logging out and keeps
 watching for bells: `tiles service install`. It writes the right unit for

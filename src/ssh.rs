@@ -39,9 +39,10 @@ pub struct Agent {
 pub fn agent(host: &str) -> Result<Agent> {
     let mut child = command(host)
         .arg("--")
-        // A login shell is not guaranteed here, so do not rely on PATH beyond
-        // what ssh gives us; `tiles` has to be somewhere ordinary on the
-        // remote, exactly like `tmux` or `git` would.
+        // Plain `tiles`, found on the PATH a non-interactive ssh gets, which is
+        // why the installer puts it in /usr/local/bin. Probing for it here
+        // instead would mean either sourcing profiles, whose output would
+        // corrupt the protocol on stdout, or guessing at directories.
         .arg("tiles")
         .arg("agent")
         .stdin(Stdio::piped())
