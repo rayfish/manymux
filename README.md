@@ -18,6 +18,12 @@ tiles attach api              # pick up where you left off, wherever that was
 key to exchange, and no host to register first: if you can `ssh` it, you can
 `tiles` it.
 
+Install it here, and on each machine you want to manage:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/rayfish/tiles/master/install.sh | sh
+```
+
 Status: early, but the whole loop works: sessions that outlive the connection,
 one cross-machine view, and bells that reach the machine you are sitting at.
 
@@ -81,16 +87,26 @@ tiles ls/attach ─► ssh gpu-box tiles agent ──► tiles daemon (unix sock
 ## Getting set up
 
 ```bash
-# on each machine you want to manage: nothing but the binary on PATH
-scp tiles gpu-box:/usr/local/bin/
+curl -fsSL https://raw.githubusercontent.com/rayfish/tiles/master/install.sh | sh
+```
 
-# on your laptop, nothing at all
+Linux and macOS, x86_64 and aarch64. The installer picks the right binary,
+falls back to the static musl build where glibc is too old or absent, verifies
+the checksum, and only reaches for `sudo` if the target directory needs it.
+`INSTALL_DIR` changes where it goes (default `/usr/local/bin`), `TILES_VERSION`
+pins a release.
+
+Then run the same line on each machine you want to manage. That is the entire
+remote setup: no service to install, no pairing, no keys.
+
+```bash
 tiles new gpu-box
 ```
 
-`tiles` must be on `PATH` for a *non-interactive* ssh, which does not read
-`.zshrc` or `.bashrc`. `/usr/local/bin` normally is; `~/.local/bin` often is
-not.
+`tiles` has to be on `PATH` for a *non-interactive* ssh, which reads neither
+`.zshrc` nor `.bashrc`. `/usr/local/bin` normally is; `~/.local/bin` often is
+not. Building it yourself instead is `cargo build --release` and copying
+`target/release/tiles` over.
 
 The first machine you use gets remembered, so `tiles ls` covers it from then on
 and its bells reach you. `tiles add <host>` does the same without starting a
