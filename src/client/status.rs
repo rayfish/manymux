@@ -143,8 +143,12 @@ enum State {
     ///
     /// `bel_ends` is for the payload of an OSC too long to hold, which ends the
     /// way an OSC does.
-    Str { bel_ends: bool },
-    StrEscape { bel_ends: bool },
+    Str {
+        bel_ends: bool,
+    },
+    StrEscape {
+        bel_ends: bool,
+    },
 }
 
 /// The longest title kept. A sequence longer than this is passed through
