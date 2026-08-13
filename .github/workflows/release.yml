@@ -1,0 +1,140 @@
+name: Release
+
+# Pushing a tag like `v0.1.0` cuts a release with Linux + macOS binaries.
+# Can also be run manually from the Actions tab.
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v0.1.0)"
+        required: false
+        type: string
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  create-release:
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    outputs:
+      tag: ${{ steps.extract_version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Extract version
+        id: extract_version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ github.event.inputs.tag }}" ]; then
+            TAG="${{ github.event.inputs.tag }}"
+          elif [ "${{ github.event_name }}" = "push" ]; then
+            TAG="${GITHUB_REF#refs/tags/}"
+          else
+            VERSION=$(grep '^version = ' Cargo.toml | head -1 | cut -d'"' -f2)
+            TAG="v${VERSION}"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Create Git tag
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          git tag -a "${{ steps.extract_version.outputs.tag }}" -m "Release ${{ steps.extract_version.outputs.tag }}" 2>/dev/null || true
+          git push origin "${{ steps.extract_version.outputs.tag }}" 2>/dev/null || true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ steps.extract_version.outputs.tag }}
+          name: ${{ steps.extract_version.outputs.tag }}
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ contains(steps.extract_version.outputs.tag, '-') }}
+
+  build:
+    needs: create-release
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-22.04
+            name: tiles-linux-x86_64
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-22.04-arm
+            name: tiles-linux-aarch64
+          # Static builds: one binary that runs on any Linux regardless of the
+          # glibc version, which matters because tiles gets copied onto whatever
+          # boxes you happen to have.
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-22.04
+            name: tiles-linux-x86_64-musl
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-22.04-arm
+            name: tiles-linux-aarch64-musl
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+            name: tiles-macos-aarch64
+          - target: x86_64-apple-darwin
+            # Cross-compiled on Apple Silicon (universal SDK); the Intel macOS
+            # runners are being retired and leave the job queued indefinitely.
+            runner: macos-latest
+            name: tiles-macos-x86_64
+
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install musl tools
+        if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      # Per-target key: the two macOS targets share a runner, so a single
+      # shared-key would make them overwrite each other's target dir cache.
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "release-${{ matrix.target }}"
+          cache-on-failure: true
+
+      - name: Build binary
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package for release
+        run: |
+          BINARY=target/${{ matrix.target }}/release/tiles
+          cp "$BINARY" ${{ matrix.name }}
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum ${{ matrix.name }} > ${{ matrix.name }}.sha256
+          else
+            shasum -a 256 ${{ matrix.name }} > ${{ matrix.name }}.sha256
+          fi
+
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ needs.create-release.outputs.tag }}
+          files: |
+            ${{ matrix.name }}
+            ${{ matrix.name }}.sha256

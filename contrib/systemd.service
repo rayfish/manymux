@@ -1,0 +1,12 @@
+[Unit]
+Description=@DESC@
+After=network-online.target
+
+[Service]
+ExecStart=@BIN@ @COMMAND@
+Environment=TILES_CONFIG_DIR=@CONFIG@
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=default.target

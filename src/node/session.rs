@@ -1,0 +1,561 @@
+//! A session: one PTY, one child process, and the screen state needed to make
+//! reattaching look like you never left.
+//!
+//! The client is not the child's terminal. The PTY master stays open here for
+//! the session's whole life, so a client going away is invisible to the child:
+//! no SIGHUP, no EOF on stdin, nothing. That is the entire point of the
+//! project, and it is why the PTY is owned by the server rather than proxied.
+
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
+
+use anyhow::{Context, Result};
+use avt::Vt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::{broadcast, mpsc, watch};
+use tracing::{debug, warn};
+
+use super::events::{Event, Scanner, Utf8Decoder};
+use crate::proto::{EventKind, SessionEvent, SessionInfo, Size, SpawnSpec};
+use crate::user;
+
+/// Lines of scrollback kept per session. Enough to scroll back through a long
+/// build; small enough that a hundred sessions don't matter.
+const SCROLLBACK: usize = 10_000;
+
+/// Output chunks buffered per attached client before it is considered lagging.
+/// A lagging client is resynced from the screen dump rather than disconnected.
+const OUTPUT_BACKLOG: usize = 256;
+
+/// Sent to the single task that owns the PTY write half. Input and resizes go
+/// through one channel because both touch the same fd and must not interleave.
+enum Input {
+    Bytes(Vec<u8>),
+    Resize(Size),
+}
+
+pub struct Session {
+    pub name: String,
+    pub command: String,
+    pub pid: u32,
+    input_tx: mpsc::UnboundedSender<Input>,
+    output_tx: broadcast::Sender<Arc<[u8]>>,
+    state: Mutex<State>,
+    /// Resolves to the child's exit code once it exits.
+    exit_rx: watch::Receiver<Option<i32>>,
+    /// The host-wide event bus. Bells and title changes go here so a laptop can
+    /// hear about them with nothing attached.
+    events: broadcast::Sender<SessionEvent>,
+    next_client: AtomicU64,
+}
+
+struct State {
+    vt: Vt,
+    scanner: Scanner,
+    decoder: Utf8Decoder,
+    /// Title set by `tiles rename`, which wins over the one the program sets.
+    sticky_title: Option<String>,
+    bells: u64,
+    last_activity: Instant,
+    /// Requested size per attached client. The effective size is the smallest
+    /// of these, so no attached client ever sees a truncated screen.
+    clients: HashMap<u64, Size>,
+    size: Size,
+}
+
+impl State {
+    fn title(&self, command: &str) -> String {
+        self.sticky_title
+            .as_deref()
+            .or_else(|| self.scanner.title())
+            .filter(|title| !title.is_empty())
+            .unwrap_or(command)
+            .to_string()
+    }
+
+    /// The screen exactly as it stands: `avt`'s dump, then everything it does
+    /// not model (title, mouse reporting, bracketed paste, cursor style).
+    /// Without the second half, reattaching to a full-screen program would
+    /// leave its mouse dead.
+    fn repaint(&self) -> String {
+        format!("{}{}", self.vt.dump(), self.scanner.replay())
+    }
+
+    /// Smallest size across attached clients, or the current size when nothing
+    /// is attached (the child keeps the geometry it had).
+    fn effective_size(&self) -> Size {
+        self.clients
+            .values()
+            .copied()
+            .reduce(|a, b| Size::new(a.cols.min(b.cols), a.rows.min(b.rows)))
+            .unwrap_or(self.size)
+    }
+}
+
+/// The starting point of an attach: the screen as it stands, and everything
+/// that happens from that instant on.
+///
+/// The three parts come apart because the output stream is read in the same
+/// `select!` that sends input, so they cannot stay behind one borrow.
+pub struct Attached {
+    /// Dropping this detaches.
+    pub attachment: Attachment,
+    /// Escape sequence that repaints the screen exactly as it is. Paint it
+    /// before streaming anything live.
+    pub repaint: String,
+    /// Live output, subscribed at the same instant the repaint was taken so
+    /// that no byte is both painted and streamed.
+    pub output: broadcast::Receiver<Arc<[u8]>>,
+    /// The size the session settled on, which is the smallest across all
+    /// attached clients and so may be smaller than the one asked for.
+    pub size: Size,
+}
+
+/// A client's handle on an attached session. Dropping it detaches.
+pub struct Attachment {
+    session: Arc<Session>,
+    id: u64,
+}
+
+impl Attachment {
+    pub fn send_input(&self, bytes: Vec<u8>) {
+        let _ = self.session.input_tx.send(Input::Bytes(bytes));
+    }
+
+    /// Update this client's requested size and renegotiate the effective size.
+    pub fn resize(&self, size: Size) {
+        let mut state = self.session.state.lock().unwrap();
+        state.clients.insert(self.id, size.sane());
+        let effective = state.effective_size();
+        self.session.apply_size(&mut state, effective);
+    }
+
+    /// Re-read the screen after a lag, so the client can repaint instead of
+    /// rendering a hole.
+    pub fn resync(&self) -> String {
+        self.session.state.lock().unwrap().repaint()
+    }
+
+    pub fn exit_rx(&self) -> watch::Receiver<Option<i32>> {
+        self.session.exit_rx.clone()
+    }
+}
+
+impl Drop for Attachment {
+    fn drop(&mut self) {
+        let mut state = self.session.state.lock().unwrap();
+        state.clients.remove(&self.id);
+        let effective = state.effective_size();
+        self.session.apply_size(&mut state, effective);
+    }
+}
+
+impl Session {
+    /// Spawn the child on a fresh PTY and start the three tasks that keep the
+    /// session alive: PTY reader, PTY writer, and child reaper.
+    pub fn spawn(
+        spec: &SpawnSpec,
+        name: String,
+        events: broadcast::Sender<SessionEvent>,
+    ) -> Result<Arc<Self>> {
+        let size = spec.size.sane();
+        let Launch { argv, label } = launch(spec);
+
+        let (pty, pts) = pty_process::open().context("opening pty")?;
+        pty.resize(size.into()).context("sizing pty")?;
+
+        let mut cmd = pty_process::Command::new(&argv[0]);
+        cmd = cmd.args(&argv[1..]);
+        // The node's own environment is whatever the service manager gave it,
+        // which is close to nothing. Set what a login would, and let the login
+        // shell source the user's profile for the rest.
+        if let Some(user) = user::current() {
+            cmd = cmd.env("SHELL", &user.shell);
+            cmd = cmd.env("HOME", &user.home);
+            cmd = cmd.env("USER", &user.name);
+            cmd = cmd.env("LOGNAME", &user.name);
+            cmd = cmd.current_dir(&user.home);
+        }
+        // A caller's working directory wins over the home directory above.
+        if let Some(cwd) = &spec.cwd {
+            cmd = cmd.current_dir(cwd);
+        }
+        cmd = cmd.env("TERM", "xterm-256color");
+        cmd = cmd.env("TILES_SESSION", &name);
+
+        let mut child = cmd
+            .spawn(pts)
+            .with_context(|| format!("spawning {}", argv[0]))?;
+        let pid = child.id().unwrap_or(0);
+
+        let (input_tx, mut input_rx) = mpsc::unbounded_channel();
+        let (output_tx, _) = broadcast::channel(OUTPUT_BACKLOG);
+        let (exit_tx, exit_rx) = watch::channel(None);
+
+        let session = Arc::new(Session {
+            name: name.clone(),
+            command: label,
+            pid,
+            input_tx,
+            output_tx: output_tx.clone(),
+            state: Mutex::new(State {
+                vt: Vt::builder()
+                    .size(size.cols as usize, size.rows as usize)
+                    .scrollback_limit(SCROLLBACK)
+                    .build(),
+                scanner: Scanner::new(),
+                decoder: Utf8Decoder::new(),
+                sticky_title: None,
+                bells: 0,
+                last_activity: Instant::now(),
+                clients: HashMap::new(),
+                size,
+            }),
+            exit_rx,
+            events,
+            next_client: AtomicU64::new(0),
+        });
+
+        let (mut pty_read, pty_write) = pty.into_split();
+
+        // PTY -> screen model -> attached clients.
+        let s = Arc::clone(&session);
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 16 * 1024];
+            loop {
+                match pty_read.read(&mut buf).await {
+                    // EOF on the master means every slave fd is closed: the
+                    // child and its whole process group are gone.
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => s.ingest(&buf[..n]),
+                }
+            }
+        });
+
+        // Attached clients -> PTY, with resizes interleaved on the same fd.
+        tokio::spawn(async move {
+            let mut pty_write = pty_write;
+            while let Some(msg) = input_rx.recv().await {
+                match msg {
+                    Input::Bytes(b) => {
+                        if pty_write.write_all(&b).await.is_err() {
+                            break;
+                        }
+                    }
+                    Input::Resize(size) => {
+                        if let Err(e) = pty_write.resize(size.into()) {
+                            debug!("resize failed: {e}");
+                        }
+                    }
+                }
+            }
+        });
+
+        // Reap the child and publish its exit.
+        let s = Arc::clone(&session);
+        tokio::spawn(async move {
+            let code = match child.wait().await {
+                Ok(status) => status.code().unwrap_or(-1),
+                Err(e) => {
+                    warn!(session = %s.name, "waiting on child failed: {e}");
+                    -1
+                }
+            };
+            s.publish(EventKind::Exited(code));
+            let _ = exit_tx.send(Some(code));
+        });
+
+        Ok(session)
+    }
+
+    /// Feed a chunk of PTY output into the screen model and fan it out.
+    ///
+    /// The screen update and the broadcast happen under one lock so that a
+    /// client attaching concurrently either sees a byte in its dump or in its
+    /// stream, never both and never neither.
+    fn ingest(&self, chunk: &[u8]) {
+        let mut events = Vec::new();
+        let mut state = self.state.lock().unwrap();
+
+        state.scanner.feed(chunk, |e| events.push(e));
+        let text = state.decoder.decode(chunk);
+        state.vt.feed_str(&text);
+        state.last_activity = Instant::now();
+
+        state.bells += events.iter().filter(|e| **e == Event::Bell).count() as u64;
+
+        let _ = self.output_tx.send(Arc::from(chunk));
+        drop(state);
+
+        for event in events {
+            self.publish(match event {
+                Event::Bell => EventKind::Bell,
+                Event::Title(t) => EventKind::TitleChanged(t),
+                Event::Notify { title, body } => EventKind::Notify { title, body },
+            });
+        }
+    }
+
+    /// Put an event on the host-wide bus, stamped with enough context that a
+    /// listener never has to ask a follow-up question to render a notification.
+    pub fn publish(&self, kind: EventKind) {
+        let (title, attached) = {
+            let state = self.state.lock().unwrap();
+            (state.title(&self.command), state.clients.len())
+        };
+        let _ = self.events.send(SessionEvent {
+            session: self.name.clone(),
+            title,
+            kind,
+            attached,
+        });
+    }
+
+    /// Attach a client.
+    pub fn attach(self: &Arc<Self>, size: Size) -> Attached {
+        let id = self.next_client.fetch_add(1, Ordering::Relaxed);
+        let mut state = self.state.lock().unwrap();
+
+        // Subscribe under the lock so the repaint and the stream meet exactly.
+        let output = self.output_tx.subscribe();
+        state.clients.insert(id, size.sane());
+        let effective = state.effective_size();
+        self.apply_size(&mut state, effective);
+        state.bells = 0;
+        let repaint = state.repaint();
+        drop(state);
+
+        Attached {
+            attachment: Attachment {
+                session: Arc::clone(self),
+                id,
+            },
+            repaint,
+            output,
+            size: effective,
+        }
+    }
+
+    /// Resize the child's terminal and the screen model together.
+    fn apply_size(&self, state: &mut State, size: Size) {
+        if size == state.size {
+            return;
+        }
+        state.size = size;
+        state.vt.resize(size.cols as usize, size.rows as usize);
+        let _ = self.input_tx.send(Input::Resize(size));
+    }
+
+    pub fn rename(&self, title: &str) {
+        let mut state = self.state.lock().unwrap();
+        state.sticky_title = if title.is_empty() {
+            None
+        } else {
+            Some(title.to_string())
+        };
+    }
+
+    /// Ask the child to go away. SIGHUP to the whole process group, the way a
+    /// terminal closing would, so shells and their children both get it.
+    pub fn kill(&self) {
+        if self.pid == 0 {
+            return;
+        }
+        // The child is a session leader (pty-process makes it one), so its pid
+        // is also its process-group id.
+        // SAFETY: killpg on a pid we spawned; a failure here is not fatal.
+        unsafe {
+            libc::killpg(self.pid as libc::pid_t, libc::SIGHUP);
+        }
+    }
+
+    pub fn has_exited(&self) -> bool {
+        self.exit_rx.borrow().is_some()
+    }
+
+    pub fn exit_rx(&self) -> watch::Receiver<Option<i32>> {
+        self.exit_rx.clone()
+    }
+
+    pub fn info(&self) -> SessionInfo {
+        let state = self.state.lock().unwrap();
+        SessionInfo {
+            name: self.name.clone(),
+            title: state.title(&self.command),
+            command: self.command.clone(),
+            pid: self.pid,
+            size: state.size,
+            attached: state.clients.len(),
+            idle: state.last_activity.elapsed().as_secs(),
+            bells: state.bells,
+        }
+    }
+}
+
+/// What to exec, and what to call it in a listing. The two differ because a
+/// command runs *through* the login shell, and a listing should show the
+/// command rather than the wrapper.
+struct Launch {
+    argv: Vec<String>,
+    label: String,
+}
+
+/// Everything runs under the user's login shell, the way `ssh host cmd` does.
+///
+/// With no command that is simply an interactive login. With one, the shell
+/// still starts as a login shell, so the session gets the `PATH` and the
+/// environment the user's own profile sets up. A node started as a service has
+/// neither, so exec'ing the command directly would fail to find half the
+/// programs worth running.
+fn launch(spec: &SpawnSpec) -> Launch {
+    let shell = user::shell();
+    if spec.command.is_empty() {
+        return Launch {
+            label: describe(std::slice::from_ref(&shell)),
+            argv: vec![shell, "-l".to_string()],
+        };
+    }
+    Launch {
+        label: describe(&spec.command),
+        argv: vec![shell, "-lc".to_string(), shell_command(&spec.command)],
+    }
+}
+
+/// Join argv into one shell command, so an argument with spaces or quotes in it
+/// survives the trip through `-c`.
+fn shell_command(argv: &[String]) -> String {
+    argv.iter()
+        .map(|arg| quote(arg))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Quote an argument for a POSIX shell. Everything inside single quotes is
+/// literal, so the only thing needing care is a single quote itself: close the
+/// quoting, emit an escaped one, open it again.
+fn quote(arg: &str) -> String {
+    let safe = |b: &u8| b.is_ascii_alphanumeric() || b"-_./:=@,+".contains(b);
+    if !arg.is_empty() && arg.as_bytes().iter().all(safe) {
+        return arg.to_string();
+    }
+    format!("'{}'", arg.replace('\'', "'\\''"))
+}
+
+/// A short human label for a command, used as the default session name and as
+/// the fallback title.
+fn describe(argv: &[String]) -> String {
+    let program = argv
+        .first()
+        .map(|p| {
+            std::path::Path::new(p)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| p.clone())
+        })
+        .unwrap_or_default();
+    let program = program.trim_start_matches('-').to_string();
+    if argv.len() > 1 {
+        format!("{program} {}", argv[1..].join(" "))
+    } else {
+        program
+    }
+}
+
+/// Default session name for a spec: the program's basename.
+pub fn default_name(spec: &SpawnSpec) -> String {
+    match spec.command.first() {
+        Some(program) => describe(std::slice::from_ref(program)),
+        None => describe(&[user::shell()]),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_bare_session_is_an_interactive_login_shell() {
+        let launched = launch(&SpawnSpec::default());
+        assert_eq!(launched.argv, vec![user::shell(), "-l".to_string()]);
+    }
+
+    /// The bug this closes: a node started as a service inherits no `SHELL` and
+    /// almost no `PATH`, so a session would land you in `/bin/sh` unable to
+    /// find half the programs worth running.
+    #[test]
+    fn a_command_runs_through_the_login_shell() {
+        let spec = SpawnSpec {
+            command: vec!["claude".into(), "--resume".into()],
+            ..Default::default()
+        };
+        let launched = launch(&spec);
+        assert_eq!(
+            launched.argv,
+            vec![
+                user::shell(),
+                "-lc".to_string(),
+                "claude --resume".to_string()
+            ]
+        );
+        // The listing shows what was asked for, not the wrapper.
+        assert_eq!(launched.label, "claude --resume");
+    }
+
+    #[test]
+    fn quoting_survives_spaces_and_quotes() {
+        assert_eq!(shell_command(&["echo".into(), "a b".into()]), "echo 'a b'");
+        assert_eq!(
+            shell_command(&["sh".into(), "-c".into(), "printf 'hi'".into()]),
+            r#"sh -c 'printf '\''hi'\'''"#
+        );
+        // A plain word is left alone, so the common case stays readable.
+        assert_eq!(shell_command(&["/usr/bin/vim".into()]), "/usr/bin/vim");
+    }
+
+    #[test]
+    fn describe_uses_basename_and_strips_login_dash() {
+        assert_eq!(describe(&["/bin/zsh".into(), "-l".into()]), "zsh -l");
+        assert_eq!(describe(&["-zsh".into()]), "zsh");
+    }
+
+    #[test]
+    fn effective_size_is_the_smallest_attached_client() {
+        let mut clients = HashMap::new();
+        clients.insert(1, Size::new(120, 40));
+        clients.insert(2, Size::new(80, 50));
+        let state = State {
+            vt: Vt::new(80, 24),
+            scanner: Scanner::new(),
+            decoder: Utf8Decoder::new(),
+            sticky_title: None,
+            bells: 0,
+            last_activity: Instant::now(),
+            clients,
+            size: Size::new(80, 24),
+        };
+        assert_eq!(state.effective_size(), Size::new(80, 40));
+    }
+
+    #[test]
+    fn sticky_title_wins_over_the_one_the_program_sets() {
+        let mut state = State {
+            vt: Vt::new(80, 24),
+            scanner: Scanner::new(),
+            decoder: Utf8Decoder::new(),
+            sticky_title: None,
+            bells: 0,
+            last_activity: Instant::now(),
+            clients: HashMap::new(),
+            size: Size::new(80, 24),
+        };
+        assert_eq!(state.title("zsh"), "zsh", "the command is the fallback");
+
+        state.scanner.feed(b"\x1b]0;from the program\x07", |_| {});
+        assert_eq!(state.title("zsh"), "from the program");
+
+        state.sticky_title = Some("mine".into());
+        assert_eq!(state.title("zsh"), "mine");
+    }
+}

@@ -1,0 +1,6 @@
+/target
+
+# Specs and plans stay on disk, untracked.
+/docs
+
+.DS_Store

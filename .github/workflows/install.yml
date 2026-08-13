@@ -1,0 +1,60 @@
+name: Install script
+
+# The install one-liner is piped straight into a shell, so it gets the same gate
+# as the rest of the code: a linter, and a real end-to-end run once there is a
+# release to install.
+
+on:
+  push:
+    branches:
+      - master
+    paths:
+      - install.sh
+      - .github/workflows/install.yml
+  pull_request:
+    paths:
+      - install.sh
+      - .github/workflows/install.yml
+
+jobs:
+  lint:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      # `local` is not POSIX but every shell that can be /bin/sh here implements
+      # it, so lint against dash rather than the stricter `sh` dialect.
+      - name: Shellcheck
+        run: shellcheck -s dash install.sh
+
+  # Actually install the latest release. The script's whole job is to put a
+  # working `tiles` on the host, so run it and then run what it installed.
+  # Skipped until the first release exists, rather than failing every push.
+  smoke:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Is there a release yet?
+        id: released
+        run: |
+          if curl -fsIL "https://github.com/${{ github.repository }}/releases/latest" >/dev/null 2>&1; then
+            echo "yes=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "no published release yet; skipping the install run"
+            echo "yes=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install
+        if: steps.released.outputs.yes == 'true'
+        run: INSTALL_DIR="$HOME/.local/bin" sh install.sh
+
+      - name: Run what was installed
+        if: steps.released.outputs.yes == 'true'
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          tiles --version
+          tiles ls local

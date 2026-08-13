@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>@LABEL@</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>@BIN@</string>
+    <string>@COMMAND@</string>
+  </array>
+  <!-- A launchd agent inherits almost no environment, so the config directory
+       is passed explicitly rather than left to be discovered. -->
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>TILES_CONFIG_DIR</key><string>@CONFIG@</string>
+  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <!-- tiles writes its own rolling logs; this catches anything printed before
+       logging starts, and panics. -->
+  <key>StandardOutPath</key><string>@LOGS@/@NAME@.out</string>
+  <key>StandardErrorPath</key><string>@LOGS@/@NAME@.out</string>
+</dict>
+</plist>
