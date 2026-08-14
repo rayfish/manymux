@@ -22,7 +22,7 @@ const GUTTER: u16 = 2;
 
 /// What the keys do, shown while control mode is on. Without it the mode is a
 /// terminal that has stopped taking what you type for no visible reason.
-const HINT: &str = "tab next  p prev  l last  d detach  esc focus";
+const HINT: &str = "tab next  p prev  h host  l last  d detach  esc focus";
 
 /// Columns kept for the mode's name, which is the width of the longer of the
 /// two. Fixed, so the mark does not jump sideways when the mode changes.

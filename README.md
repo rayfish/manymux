@@ -127,13 +127,17 @@ word goes amber, and the row spells out what the keys do. It stays on, so one
 
 | | |
 |---|---|
-| `tab`, `n` | next session |
+| `tab`, `n` | next session on this machine |
 | `p`, `shift-tab` | previous |
+| `h` | next machine |
+| `H` | previous machine |
 | `l` | the one you came from |
 | `d` | detach |
 | `esc`, `enter`, `Ctrl-]` | back to focus |
 
-The cycle covers every session on every machine you watch, in the order `mm ls`
+Two levels, because that is how your sessions are arranged. `tab` stays on the
+machine you are on and wraps around its sessions; `h` moves you to the next
+machine you watch and lands on its first session. Both go in the order `mm ls`
 prints them. `Ctrl-]` twice in quick succession, within three seconds, also
 sends one through to the session, for whatever wants it in there. Slower than
 that it is just a look at the mode and a way back out, and nothing reaches the

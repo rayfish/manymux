@@ -219,13 +219,17 @@ fn key_code(byte: u8) -> u32 {
     }
 }
 
-/// Which way a switch key moves through the sessions.
+/// Which way a switch key moves, through the sessions on a machine or through
+/// the machines themselves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Motion {
     Next,
     Previous,
     /// Back to the one you came from.
     Last,
+    /// The first session on the next machine.
+    NextHost,
+    PreviousHost,
 }
 
 /// What a key pressed in switch mode asks for.
@@ -281,7 +285,8 @@ impl Mode {
 /// keys that follow it.
 ///
 /// Control mode stays on: one mode key then `tab tab tab` walks through the
-/// sessions. `Esc`, `Enter` or the mode key goes back to focus, `d` detaches,
+/// sessions on the machine you are on, and `h` is how you change machine.
+/// `Esc`, `Enter` or the mode key goes back to focus, `d` detaches,
 /// and the mode key hit twice in a row quickly also sends one through for
 /// whatever wants it inside the session. Any other key drops back to focus and
 /// passes both bytes through unchanged, so a mistyped mode key costs you
@@ -460,6 +465,11 @@ impl KeyFilter {
                 b'\t' | b'n' | b'N' => Some(Action::Switch(Motion::Next)),
                 b'p' | b'P' => Some(Action::Switch(Motion::Previous)),
                 b'l' | b'L' => Some(Action::Switch(Motion::Last)),
+                // The one key that reads its own case, because shift already
+                // means backwards here: `H` is to `h` what shift-tab is to tab,
+                // rather than a second letter to remember.
+                b'h' => Some(Action::Switch(Motion::NextHost)),
+                b'H' => Some(Action::Switch(Motion::PreviousHost)),
                 // Shift-Tab, which starts with the same byte as the Esc that
                 // goes back to focus. An Esc with `[Z` behind it in the same
                 // read is the key; one at the end of a read is a real Esc.
@@ -1434,6 +1444,26 @@ mod tests {
         );
         assert_eq!(
             f.filter(b"n"),
+            asked(Action::Switch(Motion::Next), Mode::Control)
+        );
+    }
+
+    #[test]
+    fn the_host_keys_move_machine_and_leave_control_mode_on() {
+        // The one binding that reads its own case, so both spellings are keys
+        // rather than `H` dropping back to focus as an unbound one would.
+        let mut f = KeyFilter::default();
+        assert_eq!(
+            f.filter(&[KEY, b'h']),
+            asked(Action::Switch(Motion::NextHost), Mode::Control)
+        );
+        assert_eq!(
+            f.filter(b"H"),
+            asked(Action::Switch(Motion::PreviousHost), Mode::Control)
+        );
+        // And walking the machine you land on carries on from there.
+        assert_eq!(
+            f.filter(b"\t"),
             asked(Action::Switch(Motion::Next), Mode::Control)
         );
     }
