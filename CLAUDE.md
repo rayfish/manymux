@@ -1,0 +1,119 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## Commands
+
+Pass `-q` to cargo: the progress and status lines are noise, and the compiler
+errors and test failures you actually want are still printed.
+
+```bash
+cargo build -q --release
+cargo test -q                          # unit tests plus the end-to-end suites
+cargo test -q --test remote            # one integration suite
+cargo test -q --test remote a_tab_does_not_start_a_node   # one test
+cargo test -q proto::                  # unit tests in one module
+cargo fmt -q --check
+cargo clippy -q --all-targets --locked -- -D warnings
+cargo check -q --lib --no-default-features --locked       # the mobile client core
+```
+
+CI runs all of the above on Linux and macOS, plus a release build for each
+shipped target (`x86_64-unknown-linux-musl`, `aarch64-unknown-linux-gnu`,
+`x86_64-apple-darwin`). The `--no-default-features` check is not optional: the
+library without `desktop` is what a mobile app links against, and it has to keep
+compiling without `pty-process`, `crossterm` or `clap`.
+
+Running the binary during development wants a socket and config of its own, or
+it will talk to your real node:
+
+```bash
+MM_CONFIG_DIR=/tmp/mm-dev cargo run -- --socket /tmp/mm-dev.sock ls
+MM_LOG=manymux=debug cargo run -- --socket /tmp/mm-dev.sock daemon
+```
+
+## Architecture
+
+A **node** (`mm daemon`, `src/node/`) is one process per machine per user. It
+owns that machine's PTYs and listens on a 0600 Unix socket in the per-user
+runtime directory. It does no networking at all.
+
+A **client** (`src/client/`) is everything else: `mm ls`, `mm attach`, and a
+mobile app. It talks to a node over a `Stream`, which is either that Unix socket
+or the stdin/stdout pipes of `ssh <host> mm agent`. `mm agent` (`node::agent`)
+just bridges its own stdio to the local socket, starting a node on demand the
+way tmux starts its server.
+
+Three consequences run through the whole codebase and are worth keeping intact:
+
+- **ssh is the only transport.** No addresses, keys or allowlist are stored
+  anywhere. sshd decides who gets in, and `~/.ssh/config` decides how to get
+  there. `src/ssh.rs` is the whole of it; connections are shared with
+  `ControlMaster` so the second command to a host skips the handshake.
+- **The node owns the PTY**, so a client leaving is invisible to the child: no
+  SIGHUP, no EOF. `tests/persistence.rs` exists to defend this.
+- **One node per user.** `ssh deploy@box` lands in deploy's node because the
+  socket is under deploy's runtime directory. Nothing ever switches user or runs
+  as root.
+
+### Layers
+
+- `src/proto.rs` is the wire protocol, shared by both halves and generic over
+  `AsyncRead`/`AsyncWrite`. Frames are `[tag: u8][len: u32 BE][body]`; control
+  bodies are msgpack, `DATA` bodies are raw terminal bytes so the hot path stays
+  a copy. Frames are read through a `Decoder` (`FrameReader`) because both read
+  loops sit in a `select!`, and a raw `read_exact` dropped mid-header
+  desynchronises the stream for good.
+- `src/node/session.rs` is one PTY, one child, and an `avt::Vt` fed every output
+  byte so reattaching repaints the screen rather than replaying scrollback.
+  `src/node/events.rs` is a second VT state machine scanning the same stream for
+  what `avt` throws away: titles, bells, OSC 9/777 notifications, and the input
+  modes (mouse, bracketed paste, cursor style) to replay after the repaint.
+- `src/node/peers.rs` holds one long-lived `Request::Events` subscription per
+  watched machine, which is how a bell on a box nobody is attached to reaches
+  the desktop you are sitting at (`src/node/notify.rs`, via `osascript` or
+  `notify-send`).
+- `src/client/attach.rs` drives a real terminal (raw mode, focus/control modes,
+  the `Ctrl-]` prefix). `src/client/status.rs` and `src/client/switch.rs` are
+  deliberately terminal-free so they can be tested as string and list handling.
+- `src/main.rs` is the CLI, and the only place that decides local versus remote:
+  `open()` picks socket or ssh, `open_or_start()` is for commands that ask a
+  machine to hold something new.
+
+### Rules that are easy to break
+
+- **The protocol never negotiates a version.** A fleet is updated one machine at
+  a time, so both directions have to keep working. Adding a frame kind is safe
+  because both ends skip unknown tags; adding a field to an existing message
+  needs `#[serde(default)]` (see `Response::Attached { paste }` and the
+  round-trip test in `proto.rs`). Changing the framing itself is not doable.
+- **A tab completion never starts a node and never waits on ssh unless the word
+  already names a machine** (`src/complete.rs`). Both are tested.
+- **`mm agent` must leave stdout strictly alone**: the protocol is on it. Only
+  the daemon opens a log file; everything else logs to stderr.
+- **Modes switched on for a session must be switched off on detach.**
+  `events::REPLAYED_MODES` and the teardown in `client::attach` are a pair.
+- Session names are sanitised in `node::registry` because they appear in
+  `host/name` paths and in the terminal.
+
+### Tests
+
+`tests/remote.rs` builds a temporary world: two nodes with their own
+`MM_CONFIG_DIR` and `--socket`, and a shell script on `MM_SSH` that stands in
+for ssh by running the other node's agent directly. That covers CLI, ssh
+invocation, agent and remote node without an sshd. `tests/persistence.rs` drives
+`Node::handle` over an in-memory duplex, and uses tokio's `start_paused` to skip
+the client-liveness deadline.
+
+## Conventions
+
+- Comments say why, not what, and the interesting reasoning lives in module-level
+  `//!` docs. When changing behaviour these docs are usually the thing that needs
+  updating with it.
+- Test names are sentences: `a_bare_name_finds_a_session_on_another_machine`.
+- Commit subjects are conventional commits with a lowercase, plainly worded
+  description: `fix(ssh): create the directory the control socket goes in`.
+- `contrib/` holds the service unit templates that `src/service.rs` writes;
+  `install.sh` is linted and end-to-end tested by its own workflow, and the
+  platform reasoning in it (Linux `/usr/local/bin` versus macOS `~/.local/bin`)
+  is load-bearing for whether `ssh host mm agent` can find the binary at all.
