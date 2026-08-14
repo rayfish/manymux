@@ -66,18 +66,36 @@ pub fn asset_name() -> Result<String> {
     Ok(format!("mm-{os}-{arch}{libc}"))
 }
 
+/// Which release to take a binary from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Channel {
+    /// The newest release, or the nightly while there is no release at all.
+    Stable,
+    /// The rolling nightly: whatever master last built.
+    Nightly,
+}
+
+impl Channel {
+    /// The tags to try, in order.
+    fn tags(self) -> &'static [&'static str] {
+        match self {
+            // The fallback matches `install.sh`: GitHub excludes pre-releases
+            // from `/releases/latest`, so until there is a stable release the
+            // nightly is all there is.
+            Channel::Stable => &["latest", "nightly"],
+            Channel::Nightly => &["nightly"],
+        }
+    }
+}
+
 /// What is published for this machine, and how it compares to what is running.
-///
-/// Prefers a stable release and falls back to the rolling nightly, matching
-/// `install.sh`: GitHub excludes pre-releases from `/releases/latest`, so until
-/// there is a stable release the nightly is all there is.
-pub async fn check() -> Result<Available> {
+pub async fn check(channel: Channel) -> Result<Available> {
     let asset = asset_name()?;
     let running = sha256_of(&std::env::current_exe().context("finding the running binary")?)
         .await
         .context("checksumming the running binary")?;
 
-    for tag in ["latest", "nightly"] {
+    for tag in channel.tags().iter().copied() {
         let Some(checksum) = published_checksum(tag, &asset).await else {
             continue;
         };
@@ -88,7 +106,10 @@ pub async fn check() -> Result<Available> {
             running,
         });
     }
-    bail!("nothing published for {asset} yet")
+    match channel {
+        Channel::Stable => bail!("nothing published for {asset} yet"),
+        Channel::Nightly => bail!("no nightly published for {asset}"),
+    }
 }
 
 /// Download the published asset, verify it, and swap it in.
@@ -303,6 +324,14 @@ mod tests {
             download_url("nightly", "mm-macos-aarch64"),
             "https://github.com/rayfish/manymux/releases/download/nightly/mm-macos-aarch64"
         );
+    }
+
+    #[test]
+    fn asking_for_the_nightly_never_falls_back_to_a_release() {
+        // The whole point of the flag: a machine kept on master would otherwise
+        // be walked back onto the newest tag, which is older by construction.
+        assert_eq!(Channel::Nightly.tags(), ["nightly"]);
+        assert_eq!(Channel::Stable.tags(), ["latest", "nightly"]);
     }
 
     #[test]

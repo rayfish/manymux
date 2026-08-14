@@ -225,7 +225,11 @@ Keeping the binary current, on each machine:
 ```bash
 mm update --check
 mm update
+mm update --nightly   # master's last build, rather than the newest release
 ```
+
+`--nightly` is not remembered: a plain `mm update` afterwards puts the release
+back, which goes backwards whenever master is ahead of the tag.
 
 Replacing the binary is only half of it. The node is a long-running process
 still executing the one it started from, so until it restarts the machine keeps
@@ -266,7 +270,7 @@ mm attach <target>                   attach; Ctrl-] then tab switches, d detache
 mm kill <target>                     SIGHUP a session's process group
 mm rename <target> <title>           set a sticky title
 mm add <host> | hosts | rm <host>    which machines to list and watch
-mm update [--check] [--force]        replace this binary with the published one
+mm update [--check] [--nightly]      replace this binary with the published one
 mm start | stop | restart [--force]  this machine's node: up, down, and again
 mm service install|uninstall         run the node at boot
 mm completions [shell] [--install]   tab completion, with your session names in it

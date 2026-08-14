@@ -16,6 +16,7 @@ use manymux::client::{Attached, Stream};
 use manymux::hosts::{Hosts, LOCAL, Target, is_this_machine, this_machine};
 use manymux::node::{Config, Node};
 use manymux::proto::{HostedSession, Request, Response, SessionInfo, SpawnSpec};
+use manymux::update::Channel;
 use manymux::{config, log, style, term};
 
 mod complete;
@@ -123,6 +124,12 @@ enum Command {
         /// Restart the node even though sessions are running. They die with it.
         #[arg(long)]
         force: bool,
+        /// Take the rolling nightly build instead of the newest release.
+        ///
+        /// Not remembered: a plain `mm update` afterwards puts the release
+        /// back, which is a downgrade whenever master is ahead of the tag.
+        #[arg(long)]
+        nightly: bool,
     },
 
     /// Start this machine's node, if one is not already running.
@@ -349,7 +356,18 @@ async fn run(cli: Cli) -> Result<u8> {
             Ok(OK)
         }
 
-        Command::Update { check, force } => update(&socket, check, force).await,
+        Command::Update {
+            check,
+            force,
+            nightly,
+        } => {
+            let channel = if nightly {
+                Channel::Nightly
+            } else {
+                Channel::Stable
+            };
+            update(&socket, check, force, channel).await
+        }
 
         Command::Start => {
             if manymux::update::running(&socket).await.is_some() {
@@ -409,12 +427,19 @@ async fn run(cli: Cli) -> Result<u8> {
 }
 
 /// Replace this binary with the published one, and pick it up.
-async fn update(socket: &Path, check: bool, force: bool) -> Result<u8> {
-    let available = manymux::update::check().await?;
+async fn update(socket: &Path, check: bool, force: bool, channel: Channel) -> Result<u8> {
+    let available = manymux::update::check(channel).await?;
     if available.is_newer() {
         if check {
+            // The command to repeat, which is not always the channel that was
+            // found: with no stable release yet, a plain `mm update` is what
+            // lands the nightly.
+            let command = match channel {
+                Channel::Stable => "mm update",
+                Channel::Nightly => "mm update --nightly",
+            };
             println!(
-                "an update is published on the {} channel; `mm update` to take it",
+                "an update is published on the {} channel; `{command}` to take it",
                 style::bold(&available.tag)
             );
             return Ok(OK);
