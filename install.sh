@@ -330,6 +330,7 @@ login nor an interactive shell, or \`ssh <thishost> mm agent\` will not find mm:
     PATH_ADVICE="wrote"
     return 0
   fi
+  # shellcheck disable=SC2016  # $PATH is for the file to expand, not this script
   if ! printf '\n# manymux: also read by the non-interactive `zsh -c` behind `ssh host mm agent`\nexport PATH="%s:$PATH"\n' "$INSTALL_DIR" >> "$file"; then
     PATH_ADVICE="told"
     err "could not write ${file}; add this to it yourself:
