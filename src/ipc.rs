@@ -7,6 +7,7 @@
 
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
@@ -26,6 +27,7 @@ where
     Fut: Future<Output = Result<()>> + Send + 'static,
 {
     let listener = listen(socket).await?;
+    keep_alive(socket.to_path_buf());
     let handle = Arc::new(handle);
     loop {
         let (stream, _) = listener.accept().await?;
@@ -36,6 +38,46 @@ where
                 debug!("connection ended: {e:#}");
             }
         });
+    }
+}
+
+/// How often the socket's timestamps are pushed forward. Well inside the ten
+/// days a cleaner waits, and rare enough to be free.
+const TOUCH_EVERY: Duration = Duration::from_secs(6 * 60 * 60);
+
+/// Keep the socket looking like something in use.
+///
+/// It lives under `/tmp`, where `systemd-tmpfiles` deletes anything untouched
+/// for ten days on several distributions. A node holding a month-old session is
+/// exactly what that sweeps up: connecting to a socket does not change its
+/// timestamps, so a quiet one looks abandoned. Losing it is worse than it
+/// sounds, because the node binds once and never again, so the sessions would
+/// still be running with nothing left able to reach them.
+fn keep_alive(socket: std::path::PathBuf) {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(TOUCH_EVERY).await;
+            if let Err(e) = touch(&socket) {
+                debug!("could not touch {}: {e}", socket.display());
+            }
+        }
+    });
+}
+
+/// Set a path's times to now, without opening it: a socket cannot be opened.
+fn touch(path: &Path) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let path = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    // SAFETY: the pointer is to a NUL-terminated string alive for the call, and
+    // a null `times` is utimensat's own way of saying "now".
+    let set = unsafe { libc::utimensat(libc::AT_FDCWD, path.as_ptr(), std::ptr::null(), 0) };
+    if set == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
     }
 }
 
@@ -54,8 +96,15 @@ async fn listen(socket: &Path) -> Result<UnixListener> {
             socket.as_os_str().len()
         );
     }
+    // The default socket sits in a world-writable `/tmp`, so the directory has
+    // to be ours before anything is bound in it. A socket named with `--socket`
+    // is the caller's business, and lives wherever they said.
     if let Some(dir) = socket.parent() {
-        crate::config::ensure_private_dir(dir)?;
+        if dir == crate::config::runtime_dir() {
+            crate::config::ensure_runtime_dir()?;
+        } else {
+            crate::config::ensure_private_dir(dir)?;
+        }
     }
     if socket.exists() && tokio::net::UnixStream::connect(socket).await.is_ok() {
         bail!("something is already listening on {}", socket.display());
@@ -178,6 +227,27 @@ mod tests {
         // Both ends are this test process, so both readings have to name it.
         assert_eq!(peer_pid(&client), Some(std::process::id()));
         assert_eq!(peer_pid(&server), Some(std::process::id()));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The socket is the thing a `/tmp` cleaner would take, and it is also the
+    /// one kind of file that cannot simply be opened and written to.
+    #[tokio::test]
+    async fn a_bound_socket_can_be_kept_looking_used() {
+        let dir = std::env::temp_dir().join(format!("manymux-touch-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket = dir.join("t.sock");
+        let _listener = UnixListener::bind(&socket).unwrap();
+
+        let before = std::fs::metadata(&socket).unwrap().modified().unwrap();
+        touch(&socket).unwrap();
+        let after = std::fs::metadata(&socket).unwrap().modified().unwrap();
+        assert!(after >= before);
+        assert!(
+            after.elapsed().unwrap() < std::time::Duration::from_secs(5),
+            "the socket should look touched just now"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

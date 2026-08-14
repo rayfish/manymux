@@ -126,14 +126,14 @@ mod tests {
 
     #[test]
     fn a_path_is_pasted_the_way_the_program_asked_for() {
-        let path = Path::new("/run/user/1000/manymux/pastes/paste-1-0.png");
+        let path = Path::new("/tmp/manymux-1000/pastes/paste-1-0.png");
         assert_eq!(
             typed(path, true),
-            "\x1b[200~/run/user/1000/manymux/pastes/paste-1-0.png\x1b[201~ "
+            "\x1b[200~/tmp/manymux-1000/pastes/paste-1-0.png\x1b[201~ "
         );
         assert_eq!(
             typed(path, false),
-            "/run/user/1000/manymux/pastes/paste-1-0.png "
+            "/tmp/manymux-1000/pastes/paste-1-0.png "
         );
     }
 }

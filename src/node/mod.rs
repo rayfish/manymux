@@ -605,6 +605,7 @@ async fn signal_node(socket: &Path) -> Result<()> {
 async fn start_node(socket: &Path) -> Result<()> {
     let binary = std::env::current_exe().context("finding the mm binary")?;
     info!("no node running, starting one");
+    note_a_node_left_behind(socket).await;
     std::process::Command::new(&binary)
         .arg("--socket")
         .arg(socket)
@@ -625,6 +626,33 @@ async fn start_node(socket: &Path) -> Result<()> {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     bail!("started a node but it did not come up within {START_TIMEOUT:?}")
+}
+
+/// Say so when an older build's node is still up somewhere else.
+///
+/// The socket used to follow `$XDG_RUNTIME_DIR`, so the first command after an
+/// update can start an empty node beside one that is still running and still
+/// owns every session left on this machine. Nothing here touches that node:
+/// stopping it kills those sessions, and only the person looking at them can
+/// decide when that is fine.
+pub async fn note_a_node_left_behind(socket: &Path) {
+    // A socket named with `--socket` is a second node on purpose, not a machine
+    // that has just been updated.
+    if socket != crate::config::socket() {
+        return;
+    }
+    for old in crate::config::legacy_sockets() {
+        if tokio::net::UnixStream::connect(&old).await.is_ok() {
+            warn!(
+                "a node from an older build is still listening on {old}, and \
+                 the sessions it owns are still running. This build uses {new}. \
+                 To get to them: `mm --socket {old} ls`, then `mm --socket \
+                 {old} attach <name>`.",
+                old = old.display(),
+                new = socket.display(),
+            );
+        }
+    }
 }
 
 #[cfg(test)]

@@ -16,6 +16,8 @@ use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 
+use crate::config::uid;
+
 /// Service, unit and log-file name, all one thing now that a machine runs one
 /// node rather than a server and a daemon.
 pub const NAME: &str = "manymux";
@@ -443,11 +445,6 @@ fn output(mut command: Command, program: &str, args: &[&str]) -> Result<()> {
         );
     }
     Ok(())
-}
-
-fn uid() -> u32 {
-    // SAFETY: getuid always succeeds and touches no memory.
-    unsafe { libc::getuid() }
 }
 
 /// The account the service should run as: the user who invoked us, even when

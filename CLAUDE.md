@@ -91,6 +91,14 @@ Three consequences run through the whole codebase and are worth keeping intact:
   with an `Error` naming its version, and that refusal is usable as an answer.
   `Request::Version` is built on it, since a node too old to say what build it
   is running is by that fact older than the build asking.
+- **The socket path is worked out from the uid and nothing else**
+  (`/tmp/manymux-<uid>`, `src/config.rs`). It used to follow `$XDG_RUNTIME_DIR`,
+  which pam_systemd sets and an embedded ssh server, a system unit or cron do
+  not, so the same account got a second empty node depending on how it logged
+  in. Reading anything environmental back into that path brings the split back.
+  `/tmp` being world-writable is why `ensure_runtime_dir` checks the owner and
+  mode, and why `ipc` touches the socket every few hours: `systemd-tmpfiles`
+  deletes what looks unused for ten days.
 - **A tab completion never starts a node and never waits on ssh unless the word
   already names a machine** (`src/complete.rs`). Both are tested.
 - **`mm agent` must leave stdout strictly alone**: the protocol is on it. Only

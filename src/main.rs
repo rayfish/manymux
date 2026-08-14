@@ -649,6 +649,9 @@ async fn sessions_on(socket: &Path, host: &str) -> Result<Vec<SessionInfo>> {
     // No node here means no sessions here, which is an answer rather than a
     // failure. Starting one just to be told that would be rude.
     if is_this_machine(host) && !socket.exists() {
+        // Unless the sessions are all sitting in a node an older build left
+        // somewhere else, in which case an empty table is a lie.
+        manymux::node::note_a_node_left_behind(socket).await;
         return Ok(Vec::new());
     }
     match open(socket, host).await?.call(&Request::List).await? {

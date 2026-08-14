@@ -105,7 +105,7 @@ Nothing is installed for it on the far machine. On yours it uses what is already
 there: AppleScript on macOS, `wl-paste` on Wayland, `xclip` on X11. Copying an
 image *file* in a file manager works too. The key is only taken when there is an
 image to send, so `Ctrl-V` still reaches the session otherwise; `MM_PASTE=off`
-gives it back for good. Pasted files land in `$XDG_RUNTIME_DIR/manymux/pastes`
+gives it back for good. Pasted files land in `/tmp/manymux-<uid>/pastes`
 on the host and are cleaned up after a day.
 
 If it says the host is too old to take pasted files, that is the *node* holding
@@ -383,9 +383,12 @@ listens on a Unix socket; that is all.
   refuse.
 - **The node owns the PTY**, so a client leaving is invisible to the child: no
   SIGHUP, no EOF. That is the whole trick.
-- **One node per user**, because each socket sits in its owner's runtime
-  directory. `ssh deploy@box` lands in deploy's. manymux never switches users or
-  runs as root; ssh already put the request in the right account.
+- **One node per user**, because the socket is named from the uid alone
+  (`/tmp/manymux-<uid>`) and from nothing about the login. `ssh deploy@box`
+  lands in deploy's node, and your own sessions are the same ones whether you
+  came in over plain ssh, a mesh, a phone, or the keyboard in front of you.
+  manymux never switches users or runs as root; ssh already put the request in
+  the right account.
 - **Reattaching repaints** from a headless terminal emulator
   ([`avt`](https://github.com/asciinema/avt)) fed every output byte, so htop and
   vim come back intact. Mouse reporting, bracketed paste, cursor style and the
