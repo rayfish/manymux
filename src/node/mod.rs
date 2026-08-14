@@ -204,7 +204,7 @@ impl Node {
                 let complaint = anyhow::anyhow!(
                     "this machine runs manymux {}, which does not understand that request: \
                      update it",
-                    env!("CARGO_PKG_VERSION")
+                    crate::VERSION
                 );
                 return reply(&mut write, Err(complaint)).await;
             }
@@ -261,7 +261,7 @@ impl Node {
                 self.registry.rename(&name, &title).map(|()| Response::Ok)
             }
             Request::Version => Ok(Response::Version {
-                version: env!("CARGO_PKG_VERSION").to_string(),
+                version: crate::VERSION.to_string(),
                 build: self.build.clone(),
             }),
             Request::Attach { .. } | Request::Events | Request::Stop => {

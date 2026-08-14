@@ -241,6 +241,16 @@ mm restart --force
 The machine that has to be current is the one the *session* lives on, which for
 a remote session is the far end: `ssh gpu-box mm update`.
 
+Nightly builds all share one version number, so `mm --version` names the commit
+too:
+
+```
+mm 0.1.0 (a1b2c3d4)
+```
+
+That is the string to compare when you want to know whether two machines are
+actually running the same thing.
+
 ## Commands
 
 ```

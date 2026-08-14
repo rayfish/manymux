@@ -111,7 +111,12 @@ jobs:
           shared-key: "release-${{ matrix.target }}"
           cache-on-failure: true
 
+      # The commit goes into `mm --version`. Taken from the job that moved the
+      # tag rather than from git here, so every asset in one release names the
+      # same commit as the release does.
       - name: Build binary
+        env:
+          MM_COMMIT: ${{ needs.roll-tag.outputs.sha }}
         run: cargo build --release --locked --target ${{ matrix.target }}
 
       - name: Package for release

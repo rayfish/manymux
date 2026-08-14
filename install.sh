@@ -322,6 +322,9 @@ main() {
     if asset_exists "https://github.com/${REPO}/releases/download/nightly/${asset}"; then
       info "no stable release yet; installing the rolling nightly build"
       base="https://github.com/${REPO}/releases/download/nightly"
+      # What is being installed, not what was asked for: saying "latest" while
+      # fetching the nightly is how you end up unsure which one you have.
+      VERSION="nightly"
     fi
   fi
 

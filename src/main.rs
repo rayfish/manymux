@@ -21,7 +21,7 @@ mod complete;
 #[derive(Parser)]
 #[command(
     name = "mm",
-    version,
+    version = manymux::VERSION,
     about = "Persistent terminal sessions you can leave and come back to"
 )]
 struct Cli {
@@ -375,7 +375,7 @@ async fn update(socket: &Path, check: bool, force: bool) -> Result<u8> {
         println!(
             "{} manymux {} is the published {} build",
             style::green("✓"),
-            env!("CARGO_PKG_VERSION"),
+            manymux::VERSION,
             available.tag
         );
     }

@@ -327,7 +327,7 @@ async fn a_node_says_which_build_it_is_running() {
     let Response::Version { version, build } = client.send(&Request::Version).await.unwrap() else {
         panic!("a version request should be answered with a version");
     };
-    assert_eq!(version, env!("CARGO_PKG_VERSION"));
+    assert_eq!(version, manymux::VERSION);
     let build = build.expect("the node should have checksummed itself at startup");
     assert_eq!(build.len(), 64, "a sha-256 digest: {build}");
     assert!(build.chars().all(|c| c.is_ascii_hexdigit()), "{build}");

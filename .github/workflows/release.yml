@@ -116,8 +116,13 @@ jobs:
           shared-key: "release-${{ matrix.target }}"
           cache-on-failure: true
 
+      # The commit goes into `mm --version`. A tagged release has a version
+      # number that means something on its own, but the two are read together
+      # often enough that leaving it out would be its own small mystery.
       - name: Build binary
-        run: cargo build --release --locked --target ${{ matrix.target }}
+        run: |
+          export MM_COMMIT=$(git rev-parse --short=8 HEAD)
+          cargo build --release --locked --target ${{ matrix.target }}
 
       - name: Package for release
         run: |
