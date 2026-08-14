@@ -321,10 +321,14 @@ Reaching a machine runs `ssh host mm agent` through a *non-interactive* shell,
 which reads neither `.zshrc` nor `.bashrc`. Where `mm` has to live so that shell
 can find it differs by platform, and the installer handles both.
 
-On Linux it goes in `/usr/local/bin`, asking for `sudo` if that is what it
-takes. That is not fussiness: `/usr/local/bin` is on the PATH sshd hands out
-there, and `~/.local/bin` is invisible to it, so a machine installed that way
-looks like it has no manymux at all.
+On Linux it goes in `/usr/local/bin`, taking `sudo` if this account has it for
+free. That is not fussiness: `/usr/local/bin` is on the PATH sshd hands out
+there, and `~/.local/bin` is invisible to it. An account that would have to type
+a password gets `~/.local/bin` instead of a prompt, since a deploy user reached
+by key has no password to type and no sudoers entry either. A client that gets
+nothing from a plain `mm` tries `~/.local/bin/mm` next, so such a machine is
+still reachable, at one wasted ssh per connection. `curl ... | sudo sh` puts it
+in `/usr/local/bin` and saves that.
 
 On macOS it goes in `~/.local/bin`, no `sudo`, and the installer puts that
 directory on your PATH in `~/.zshenv`. macOS gives `/usr/local/bin` no such

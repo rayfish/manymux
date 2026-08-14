@@ -23,6 +23,8 @@ set -eu
 
 REPO="rayfish/manymux"
 BIN="mm"
+# This script's own URL, for telling someone how to run it again differently.
+INSTALLER="https://raw.githubusercontent.com/${REPO}/master/install.sh"
 VERSION="${MM_VERSION:-latest}"
 SKIP_VERIFY="${MM_SKIP_VERIFY:-0}"
 
@@ -31,9 +33,10 @@ SKIP_VERIFY="${MM_SKIP_VERIFY:-0}"
 # On Linux, /usr/local/bin, because mm has to be runnable as `ssh host mm
 # agent`, and that runs a *non-interactive* shell which reads neither .zshrc
 # nor .bashrc. A per-user directory like ~/.local/bin is invisible to it, so a
-# machine installed that way looks like it has no mm at all. /usr/local/bin is
+# machine installed that way is one mm has to go looking for. /usr/local/bin is
 # on the PATH sshd hands out there (login.defs ENV_PATH), which is what makes
-# a system install the reachable one, and worth a sudo prompt.
+# a system install the reachable one, and worth taking root for when root is
+# there for the taking. See can_sudo for when it is not.
 #
 # On macOS that trade does not exist to make: sshd hands out a PATH without
 # /usr/local/bin, which arrives in an interactive shell only via path_helper in
@@ -215,6 +218,22 @@ Refusing to install. Set MM_SKIP_VERIFY=1 to override, or try again later."
   done
 }
 
+# Whether this account can take root without being asked for anything.
+#
+# `command -v sudo` only says the binary is installed, and it is installed on
+# every machine where this account has no sudoers entry and no password to type:
+# a deploy user reached over ssh with a key is the normal case, and it is
+# exactly the case `mm` bootstraps into. Asking anyway spends three password
+# prompts on a machine that would have taken a per-user install happily, and
+# then fails the whole install over it.
+#
+# So the question is not whether sudo is here but whether it is free: root,
+# NOPASSWD, or a timestamp still live from a minute ago. Anything that would
+# prompt counts as no, and the caller installs somewhere this account owns.
+can_sudo() {
+  command -v sudo >/dev/null 2>&1 && sudo -n true >/dev/null 2>&1
+}
+
 # The nearest existing directory at or above $1. A target that does not exist
 # yet is not writable, so testing $INSTALL_DIR itself would demand sudo for a
 # path the user can perfectly well create (~/.local/bin, typically) and leave a
@@ -262,10 +281,10 @@ enable_linger() {
 
   if [ "$(id -u)" = "0" ]; then
     priv=""
-  elif command -v sudo >/dev/null 2>&1; then
+  elif can_sudo; then
     priv="sudo"
   else
-    err "sessions here will stop at logout, and sudo is unavailable to fix it.
+    err "sessions here will stop at logout, and there is no sudo to fix it with.
 Run this as root, then \`mm service install\`:
     loginctl enable-linger $user"
     return 0
@@ -392,22 +411,24 @@ main() {
   # failing outright, and say what it means.
   if [ -w "$(existing_ancestor "$INSTALL_DIR")" ] || [ "$(id -u)" = "0" ]; then
     info "Installing to ${INSTALL_DIR} ..."
-  elif command -v sudo >/dev/null 2>&1; then
-    info "Installing to ${INSTALL_DIR} (needs sudo) ..."
+  elif can_sudo; then
+    info "Installing to ${INSTALL_DIR} (sudo) ..."
     sudo=sudo
   elif [ "$INSTALL_DIR" = "$SYSTEM_DIR" ]; then
     INSTALL_DIR="$USER_DIR"
     if [ "$OS" = "macos" ]; then
       # Where a Mac was headed anyway; ensure_path makes it reachable.
-      info "cannot write ${SYSTEM_DIR} and sudo is unavailable; installing to ${INSTALL_DIR}."
+      info "cannot write ${SYSTEM_DIR} without a password; installing to ${INSTALL_DIR}."
     else
-      err "cannot write ${SYSTEM_DIR} and sudo is unavailable; installing to ${INSTALL_DIR}.
-manymux will work here, but this machine cannot be managed from another one:
-a non-interactive ssh does not see ${INSTALL_DIR}. Move the binary into
-${SYSTEM_DIR} when you can."
+      err "cannot write ${SYSTEM_DIR} without a password; installing to ${INSTALL_DIR}.
+Another machine still reaches this one: a client that gets nothing from a plain
+'mm' tries ${INSTALL_DIR}/${BIN} next, at the cost of one wasted ssh per
+connection. To save that, run the installer as root:
+    curl -fsSL ${INSTALLER} | sudo sh"
     fi
   else
-    die "$INSTALL_DIR is not writable and sudo is unavailable. Set INSTALL_DIR to a writable path."
+    die "$INSTALL_DIR is not writable and there is no sudo to be had.
+Set INSTALL_DIR to a writable path."
   fi
   $sudo mkdir -p "$INSTALL_DIR"
   $sudo install -m 0755 "$TMP/$BIN" "$INSTALL_DIR/$BIN"

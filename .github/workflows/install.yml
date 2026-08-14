@@ -73,3 +73,17 @@ jobs:
           export PATH="$HOME/.local/bin:$PATH"
           mm --version
           mm ls local
+
+      # An account with sudo installed and no right to use it, which is what a
+      # deploy user reached over ssh with a key looks like, and what `mm` finds
+      # when it offers to install itself on one. The default install dir is not
+      # writable there, so this has to land in the account's own home instead of
+      # spending three password prompts and then failing.
+      - name: An account that cannot sudo
+        if: steps.released.outputs.yes == 'true' && runner.os == 'Linux'
+        run: |
+          cp install.sh /tmp/install.sh
+          chmod a+r /tmp/install.sh
+          sudo useradd -m nosudo
+          sudo -H -u nosudo env MM_SKIP_LINGER=1 sh /tmp/install.sh
+          sudo test -x /home/nosudo/.local/bin/mm

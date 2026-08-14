@@ -150,3 +150,7 @@ the client-liveness deadline.
   `install.sh` is linted and end-to-end tested by its own workflow, and the
   platform reasoning in it (Linux `/usr/local/bin` versus macOS `~/.local/bin`)
   is load-bearing for whether `ssh host mm agent` can find the binary at all.
+  It takes root only when `can_sudo` says it is free: the account being
+  bootstrapped is usually a deploy user with a key, no password and no sudoers
+  entry, and prompting it wastes three attempts and then fails the install.
+  Falling back to `~/.local/bin` is safe because the client ladder looks there.
