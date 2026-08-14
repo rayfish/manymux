@@ -23,7 +23,7 @@ Start something on another machine and attach to it:
 mm new gpu-box claude
 ```
 
-Press ``Ctrl-` `` then `d` to detach. Claude keeps running on gpu-box. Close the
+Press `Ctrl-]` then `d` to detach. Claude keeps running on gpu-box. Close the
 laptop, go somewhere else, then look at what you have:
 
 ```console
@@ -65,7 +65,7 @@ starts listing it.
 
 ## Detaching and coming back
 
-``Ctrl-` `` then `d` detaches. Not tmux's `Ctrl-b` or screen's `Ctrl-a`, because
+`Ctrl-]` then `d` detaches. Not tmux's `Ctrl-b` or screen's `Ctrl-a`, because
 you are quite likely running one of those *inside* a session: manymux has no
 panes, so splitting a window is still their job, and taking their prefix would
 mean swallowing it. Set `MM_PREFIX` to change it:
@@ -102,9 +102,9 @@ session wants for itself.
 **Focus** is where you live. Every keystroke is the session's, and the row at
 the bottom reads `focus ● host/name`.
 
-**Control** is where the keys are the client's. ``Ctrl-` `` gets you there, the
+**Control** is where the keys are the client's. `Ctrl-]` gets you there, the
 word goes amber, and the row spells out what the keys do. It stays on, so one
-``Ctrl-` `` then `tab tab tab` walks through your sessions.
+`Ctrl-]` then `tab tab tab` walks through your sessions.
 
 | | |
 |---|---|
@@ -121,24 +121,24 @@ so a mistyped mode key costs you a stray keystroke rather than a swallowed line.
 
 ### About that key
 
-``Ctrl-` `` is a NUL byte, and so are `Ctrl-Space` and `Ctrl-@`: a terminal
-clears the top bits off the character, and backtick, space and `@` come out the
-same. All three work, which is the point: pick whichever your setup leaves alone.
+`Ctrl-]` is picked for being one every terminal sends without being asked, and
+one nothing much else wants. Two near misses, in case you were about to suggest
+them:
 
-- **macOS** binds `Ctrl-Space` to switching input sources once you have two of
-  them, and it never reaches the terminal. ``Ctrl-` `` gets past it. To have
-  `Ctrl-Space` back, untick it under Keyboard > Keyboard Shortcuts >
-  Input Sources.
-- **Linux input methods** (fcitx5, ibus) take `Ctrl-Space` the same way.
-- **Some terminals** send a plain backtick for ``Ctrl-` `` rather than clearing
-  the bits. In iTerm2, Settings > Profiles > Keys > `+`, press the key, choose
-  *Send Hex Code* and enter `0x00`. In VS Code the chord toggles the panel and
-  never gets through, so use `Ctrl-Space` there.
-- **Emacs** wants NUL for set-mark, and **tmux** inside a session wants its own
-  prefix. Press the key twice to send one through, or set `MM_PREFIX`.
+- **`Ctrl-Space`** is taken by input switching: macOS binds it to the next input
+  source once you have two, and fcitx5 and ibus do the same on Linux. It never
+  reaches the terminal at all.
+- **``Ctrl-` ``** looks like it should work, since clearing the top bits off a
+  backtick gives the same NUL as `Ctrl-Space`. Terminals only do that masking
+  for `@`, `A`-`Z`, `[`, `\`, `]`, `^`, `_` and space, and the backtick is
+  outside the set, so you get a plain backtick and nothing happens.
 
-To see what your terminal actually sends, run `cat -v` outside a session and
-press the key: `^@` is the NUL you want.
+What does want `Ctrl-]` is vim's jump-to-tag and telnet's escape. Press it twice
+to send one through, in there or anywhere else. `MM_PREFIX` takes any of the
+above spellings (`C-]`, `C-b`, `^B`, `C-Space`, or the raw byte).
+
+To see what your terminal sends for a key, run `cat -v` outside a session and
+press it: `Ctrl-]` shows up as `^]`.
 
 ## Machines
 
@@ -211,7 +211,7 @@ mm update
 ```
 mm ls [host]                         list sessions, everywhere or on one machine
 mm new [host] [-n name] [-d] [cmd]   start a session (default: your login shell)
-mm attach <target>                   attach; Ctrl-` then tab switches, d detaches
+mm attach <target>                   attach; Ctrl-] then tab switches, d detaches
 mm kill <target>                     SIGHUP a session's process group
 mm rename <target> <title>           set a sticky title
 mm add <host> | hosts | rm <host>    which machines to list and watch
@@ -236,7 +236,7 @@ pins a release.
 
 | | |
 |---|---|
-| `MM_PREFIX` | control-mode key, e.g. `C-b`. Default `` Ctrl-` `` |
+| `MM_PREFIX` | control-mode key, e.g. `C-b`. Default `Ctrl-]` |
 | `MM_SSH` | the ssh program, if yours lives somewhere unusual |
 | `MM_LOG` | log filter, e.g. `manymux=debug` |
 | `MM_CONFIG_DIR` | where the host list lives |

@@ -12,24 +12,27 @@ use anyhow::Result;
 
 use crate::client::{Attached, SessionHalves, Update};
 
-/// The key that goes from focus mode to control mode: Ctrl-` (0x00).
+/// The key that goes from focus mode to control mode: Ctrl-] (0x1d).
 ///
 /// Not tmux's Ctrl-b or screen's Ctrl-a, because you are quite likely running
 /// one of those *inside* a manymux session: manymux has no panes or tabs, so
 /// splitting a window is still their job, and taking their prefix would mean
 /// swallowing it before it ever reached them.
 ///
-/// What arrives is a NUL, and Ctrl-Space and Ctrl-@ send the same one: a
-/// terminal masks the top bits off the character, and backtick, space and `@`
-/// come out identical. So all three keys reach this, which is the point on
-/// macOS, where Ctrl-Space is taken by input-source switching and never gets
-/// to the terminal at all. Emacs wants the byte for set-mark, which is what
-/// pressing the key twice is for: it sends one through.
-pub const DEFAULT_PREFIX: u8 = 0x00;
+/// Not Ctrl-Space either, which macOS takes for switching input sources, and
+/// fcitx5 and ibus take on Linux. And not Ctrl-` despite the arithmetic saying
+/// it is the same NUL: a terminal only masks the top bits off `@`, `A`-`Z`,
+/// `[`, `\`, `]`, `^`, `_` and space, and the backtick is outside that set, so
+/// what arrives is a plain backtick that no client could tell from a typed one.
+///
+/// `]` is in the set, every terminal sends it unasked, and what wants it back
+/// is vim's jump-to-tag and telnet's escape. Pressing the key twice sends one
+/// through, which covers both.
+pub const DEFAULT_PREFIX: u8 = 0x1d;
 
 /// The key in force, from `MM_PREFIX` if it is set and usable.
 ///
-/// Accepts ``C-` ``, `C-b`, `^B`, `C-Space` or `\x02`. An unusable value is a
+/// Accepts `C-]`, `C-b`, `^B`, `C-Space` or `\x02`. An unusable value is a
 /// warning rather than a failure: losing the ability to detach because of a
 /// typo in an environment variable would be worse than ignoring it.
 pub fn prefix() -> u8 {
@@ -40,13 +43,13 @@ pub fn prefix() -> u8 {
     match parse_prefix(&text) {
         Some(byte) => byte,
         None => {
-            eprintln!("mm: MM_PREFIX={text:?} is not a control key; using Ctrl-`");
+            eprintln!("mm: MM_PREFIX={text:?} is not a control key; using Ctrl-]");
             DEFAULT_PREFIX
         }
     }
 }
 
-/// Parse a control key: ``C-` ``, `C-b`, `c-B`, `^b`, a bare `b`, `C-Space`, or
+/// Parse a control key: `C-]`, `C-b`, `c-B`, `^b`, a bare `b`, `C-Space`, or
 /// the raw byte.
 ///
 /// A bare letter is read as the control key, since a printable character could
@@ -59,8 +62,7 @@ fn parse_prefix(text: &str) -> Option<u8> {
         .or_else(|| text.strip_prefix('^'))
         .unwrap_or(text);
 
-    // Spelled out, because `MM_PREFIX=C- ` is not something anyone would type,
-    // and because it is the same byte as the default anyway.
+    // Spelled out, because `MM_PREFIX=C- ` is not something anyone would type.
     if key.eq_ignore_ascii_case("space") {
         return Some(0x00);
     }
@@ -75,8 +77,9 @@ fn parse_prefix(text: &str) -> Option<u8> {
         return Some(key as u8);
     }
     // `C-b` is 0x02: the letter with the top three bits cleared. The same
-    // arithmetic covers `C-\`, `C-]` and friends just past `Z`, and the
-    // backtick just past them, which is the default and comes out a NUL.
+    // arithmetic covers `C-\`, `C-]` and friends just past `Z`. The backtick
+    // past those is here for a terminal configured to send NUL for it, not
+    // because one does on its own.
     let byte = u8::try_from(key).ok()?.to_ascii_uppercase();
     (0x40..=0x60).contains(&byte).then_some(byte & 0x1f)
 }
@@ -539,8 +542,8 @@ mod tests {
         }
     }
 
-    /// The mode key, whatever it is. Written out because it cannot be typed
-    /// into a byte string: the default is Ctrl-`, which is a NUL.
+    /// The mode key, whatever it is. Named because a control byte in the middle
+    /// of a byte string is unreadable.
     const KEY: u8 = DEFAULT_PREFIX;
 
     /// A mode the node turns back on for a session, and the client forgets to
@@ -583,23 +586,30 @@ mod tests {
         // The keys past `Z` that people pick.
         assert_eq!(parse_prefix("C-a"), Some(0x01));
         assert_eq!(parse_prefix("C-\\"), Some(0x1c));
-        assert_eq!(parse_prefix("C-]"), Some(0x1d));
     }
 
     #[test]
     fn every_spelling_of_the_default_key_is_the_same_byte() {
-        // A terminal clears the top bits off the character, so the backtick,
-        // space and `@` all arrive as a NUL and are one key as far as this is
-        // concerned. `MM_PREFIX=C- ` is not something anyone would write, so
-        // the word stands in for that one.
-        assert_eq!(parse_prefix("C-`"), Some(DEFAULT_PREFIX));
-        assert_eq!(parse_prefix("^`"), Some(DEFAULT_PREFIX));
-        assert_eq!(parse_prefix("C-@"), Some(DEFAULT_PREFIX));
-        assert_eq!(parse_prefix("C-Space"), Some(DEFAULT_PREFIX));
-        assert_eq!(parse_prefix("c-space"), Some(DEFAULT_PREFIX));
-        assert_eq!(parse_prefix("^Space"), Some(DEFAULT_PREFIX));
+        assert_eq!(parse_prefix("C-]"), Some(DEFAULT_PREFIX));
+        assert_eq!(parse_prefix("c-]"), Some(DEFAULT_PREFIX));
+        assert_eq!(parse_prefix("^]"), Some(DEFAULT_PREFIX));
+        assert_eq!(parse_prefix("]"), Some(DEFAULT_PREFIX));
         // And the byte itself, however it got into the variable.
-        assert_eq!(parse_prefix("\0"), Some(DEFAULT_PREFIX));
+        assert_eq!(parse_prefix("\u{1d}"), Some(DEFAULT_PREFIX));
+    }
+
+    #[test]
+    fn the_keys_a_terminal_masks_to_nul_are_one_key() {
+        // A terminal clears the top bits off `@` and space alike, so both
+        // arrive as a NUL and `MM_PREFIX` cannot tell them apart. The backtick
+        // is not one a terminal masks, but it parses for anyone who has bound
+        // it to send the byte.
+        assert_eq!(parse_prefix("C-@"), Some(0x00));
+        assert_eq!(parse_prefix("C-Space"), Some(0x00));
+        assert_eq!(parse_prefix("c-space"), Some(0x00));
+        assert_eq!(parse_prefix("^Space"), Some(0x00));
+        assert_eq!(parse_prefix("C-`"), Some(0x00));
+        assert_eq!(parse_prefix("\0"), Some(0x00));
     }
 
     #[test]
