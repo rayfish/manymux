@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::broadcast;
 use tokio::sync::broadcast::error::RecvError;
 use tracing::{debug, info, warn};
@@ -484,16 +484,35 @@ const START_TIMEOUT: Duration = Duration::from_secs(10);
 /// another machine. Starting the node on demand means a remote box needs no
 /// service installed and no setup beyond having the binary, the way `tmux`
 /// starts its server the first time you ask for a session.
+///
+/// The two directions are raced rather than joined, because either one ending
+/// means the relay is over. `copy_bidirectional` would wait for both, and the
+/// half reading stdin never ends on its own: `tokio::io::stdin` reads on a
+/// blocking thread that cannot be cancelled, so an agent whose node has hung up
+/// would sit there holding a runtime and a dead socket until ssh closed the
+/// channel. That left one behind for every remote command.
 pub async fn agent(socket: &Path) -> Result<()> {
     ensure_running(socket).await?;
-    let mut node = tokio::net::UnixStream::connect(socket)
+    let node = tokio::net::UnixStream::connect(socket)
         .await
         .with_context(|| format!("connecting to {}", socket.display()))?;
+    let (mut from_node, mut to_node) = node.into_split();
 
-    let mut stdio = tokio::io::join(tokio::io::stdin(), tokio::io::stdout());
-    tokio::io::copy_bidirectional(&mut stdio, &mut node)
-        .await
-        .context("relaying between ssh and the node")?;
+    let mut stdin = tokio::io::stdin();
+    let mut stdout = tokio::io::stdout();
+    let out = async {
+        let copied = tokio::io::copy(&mut from_node, &mut stdout).await;
+        // The last frame is usually the one saying the session is over, and a
+        // client still waiting for it is the hang this whole path is about.
+        stdout.flush().await?;
+        copied
+    };
+    tokio::select! {
+        relayed = out => { relayed.context("relaying from the node to ssh")?; }
+        relayed = tokio::io::copy(&mut stdin, &mut to_node) => {
+            relayed.context("relaying from ssh to the node")?;
+        }
+    }
     Ok(())
 }
 

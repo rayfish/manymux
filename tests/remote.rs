@@ -209,6 +209,53 @@ fn a_remote_machine_is_reached_by_running_the_agent_over_ssh() {
     assert!(here.contains("no sessions"), "{here}");
 }
 
+/// One of these is left running on the far machine for every remote command if
+/// it waits for both directions to end. The half reading ssh's stdin never ends
+/// on its own, so the node hanging up has to be enough.
+#[test]
+fn an_agent_goes_away_when_the_node_hangs_up() {
+    use std::io::Write;
+
+    let world = World::new("agent-life");
+    world.ok("laptop", &["new", "-d", "-n", "here", "sleep", "60"]);
+    world.wait_for_node("laptop");
+
+    let mut agent = Command::new(MM)
+        .arg("--socket")
+        .arg(world.socket("laptop"))
+        .arg("agent")
+        .env("MM_CONFIG_DIR", world.dir.join("laptop"))
+        .env("MM_LOG", "manymux=warn")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("running the agent");
+
+    // A listing is a request the node answers and then hangs up on, which is
+    // every one-shot command. Its stdin stays open throughout, exactly as an
+    // ssh channel nobody has closed yet would.
+    let body = manymux::proto::encode(&manymux::proto::Request::List).unwrap();
+    let mut request = vec![manymux::proto::tag::REQUEST];
+    request.extend_from_slice(&(body.len() as u32).to_be_bytes());
+    request.extend_from_slice(&body);
+    let mut stdin = agent.stdin.take().expect("the agent's stdin");
+    stdin.write_all(&request).unwrap();
+    stdin.flush().unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let gone = loop {
+        match agent.try_wait().unwrap() {
+            Some(_) => break true,
+            None if Instant::now() > deadline => break false,
+            None => std::thread::sleep(Duration::from_millis(50)),
+        }
+    };
+    if !gone {
+        let _ = agent.kill();
+    }
+    assert!(gone, "the agent outlived the connection it was relaying");
+}
+
 #[test]
 fn one_listing_covers_this_machine_and_the_added_ones() {
     let world = World::new("listing");
