@@ -82,6 +82,39 @@ exec env MM_CONFIG_DIR="{dir}/$host" "{mm}" --socket "{dir}/$host.sock" agent
             .expect("running manymux")
     }
 
+    /// Ask for the completions of a command line, as a shell would.
+    ///
+    /// Everything after `--` is the line being typed, and the last word is the
+    /// one under the cursor. The fish adapter takes the index from the argument
+    /// count, so nothing else has to be arranged.
+    fn complete(&self, machine: &str, words: &[&str]) -> Vec<String> {
+        let out = Command::new(MM)
+            .arg("--")
+            .arg("mm")
+            .arg("--socket")
+            .arg(self.socket(machine))
+            .args(words)
+            .env("COMPLETE", "fish")
+            .env("MM_CONFIG_DIR", self.dir.join(machine))
+            .env("MM_SSH", self.ssh_stub())
+            .env("MM_LOG", "manymux=warn")
+            .output()
+            .expect("running manymux");
+        assert!(
+            out.status.success(),
+            "completing {words:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            // Each line is `value` or `value<TAB>description`, and options are
+            // offered alongside values; only the values are ours.
+            .filter_map(|line| line.split('\t').next())
+            .filter(|value| !value.starts_with('-'))
+            .map(str::to_string)
+            .collect()
+    }
+
     fn ok(&self, machine: &str, args: &[&str]) -> String {
         let out = self.run(machine, args);
         assert!(
@@ -332,6 +365,146 @@ fn the_real_ssh_is_the_default() {
 
     assert!(!out.status.success(), "an unreachable host should fail");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Tab completion knows what is running, which is the whole point of it asking
+/// the binary rather than reading a script written months ago.
+#[test]
+fn a_tab_offers_the_sessions_on_this_machine_and_a_door_to_the_others() {
+    let world = World::new("tab");
+
+    world.ok("laptop", &["new", "-d", "-n", "here", "sleep", "60"]);
+    world.ok(
+        "laptop",
+        &["new", "-d", "-n", "there", "gpu-box", "sleep", "60"],
+    );
+
+    let offered = world.complete("laptop", &["a", ""]);
+    assert!(offered.contains(&"here".to_string()), "{offered:?}");
+    assert!(offered.contains(&"gpu-box/".to_string()), "{offered:?}");
+    // A tab must not go out over ssh until it is told which machine.
+    assert!(
+        !offered.contains(&"gpu-box/there".to_string()),
+        "a bare tab reached another machine: {offered:?}"
+    );
+}
+
+#[test]
+fn naming_a_machine_completes_the_sessions_on_it() {
+    let world = World::new("tab-remote");
+
+    world.ok(
+        "laptop",
+        &["new", "-d", "-n", "there", "gpu-box", "sleep", "60"],
+    );
+
+    assert_eq!(
+        world.complete("laptop", &["a", "gpu-box/"]),
+        ["gpu-box/there"]
+    );
+    assert_eq!(
+        world.complete("laptop", &["a", "gpu-box/th"]),
+        ["gpu-box/there"]
+    );
+    assert!(world.complete("laptop", &["a", "gpu-box/x"]).is_empty());
+    // A machine that was never added is not one to go asking.
+    assert!(world.complete("laptop", &["a", "nowhere/"]).is_empty());
+}
+
+/// The short forms are what anyone actually types.
+#[test]
+fn the_aliases_complete_targets_too() {
+    let world = World::new("tab-alias");
+
+    world.ok("laptop", &["new", "-d", "-n", "here", "sleep", "60"]);
+
+    for command in ["attach", "a", "kill", "k", "rename", "r"] {
+        let offered = world.complete("laptop", &[command, ""]);
+        assert!(
+            offered.contains(&"here".to_string()),
+            "{command} offered {offered:?}"
+        );
+    }
+}
+
+#[test]
+fn machines_complete_where_a_machine_is_wanted() {
+    let world = World::new("tab-hosts");
+
+    world.ok("laptop", &["add", "gpu-box"]);
+
+    let listed = world.complete("laptop", &["ls", ""]);
+    assert!(listed.contains(&"local".to_string()), "{listed:?}");
+    assert!(listed.contains(&"gpu-box".to_string()), "{listed:?}");
+    // `rm` takes a machine off the list, and this one is not on it.
+    assert_eq!(world.complete("laptop", &["rm", ""]), ["gpu-box"]);
+}
+
+/// A machine that is not answering costs a pause, not the shell.
+#[test]
+fn a_tab_gives_up_on_a_machine_that_does_not_answer() {
+    let world = World::new("tab-slow");
+
+    world.ok("laptop", &["add", "gpu-box"]);
+    std::fs::write(world.ssh_stub(), "#!/bin/sh\nsleep 60\n").unwrap();
+
+    let started = Instant::now();
+    let offered = world.complete("laptop", &["a", "gpu-box/"]);
+    assert!(offered.is_empty(), "{offered:?}");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "waited {:?} on a machine that never answered",
+        started.elapsed()
+    );
+}
+
+/// Pressing tab is not asking for a daemon.
+#[test]
+fn a_tab_does_not_start_a_node() {
+    let world = World::new("tab-quiet");
+
+    let offered = world.complete("laptop", &["a", ""]);
+    assert!(offered.is_empty(), "{offered:?}");
+    assert!(
+        !world.socket("laptop").exists(),
+        "a tab started this machine's node"
+    );
+}
+
+/// The installed script is the stub that asks the binary, in the place each
+/// shell looks for it.
+#[test]
+fn installing_writes_a_script_that_asks_the_binary() {
+    let world = World::new("tab-install");
+    let home = world.dir.join("home");
+
+    for (shell, relative) in [
+        ("zsh", "zsh/site-functions/_mm"),
+        ("bash", "bash-completion/completions/mm"),
+    ] {
+        let out = Command::new(MM)
+            .args(["completions", shell, "--install"])
+            .env("HOME", &home)
+            .env("XDG_DATA_HOME", home.join("data"))
+            .env("MM_CONFIG_DIR", world.dir.join("laptop"))
+            .output()
+            .expect("running manymux");
+        assert!(
+            out.status.success(),
+            "installing for {shell}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        let script = std::fs::read_to_string(home.join("data").join(relative))
+            .unwrap_or_else(|e| panic!("{shell} script not installed: {e}"));
+        assert!(script.contains("COMPLETE"), "{shell}: {script}");
+        if shell == "zsh" {
+            assert!(script.starts_with("#compdef mm"), "{script}");
+            // Autoloaded from fpath, so the first tab has to be answered by
+            // hand rather than lost to `compdef` taking effect too late.
+            assert!(script.contains("_comps[mm]"), "{script}");
+        }
+    }
 }
 
 /// Nothing in these tests should have left a node running.

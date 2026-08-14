@@ -58,7 +58,19 @@ impl Stream {
     /// `host` is an ssh destination, so anything your ssh config can reach,
     /// this can reach, and sshd decides whether you are allowed in.
     pub async fn over_ssh(host: &str) -> Result<Self> {
-        let agent = crate::ssh::agent(host)?;
+        Self::carried_by(crate::ssh::agent(host)?)
+    }
+
+    /// Like [`Stream::over_ssh`], but ssh stays silent and does not prompt.
+    ///
+    /// For asking a question on someone's behalf, such as tab completion, where
+    /// a password prompt or a host-key warning would land in the middle of the
+    /// line they are typing.
+    pub async fn over_ssh_quietly(host: &str) -> Result<Self> {
+        Self::carried_by(crate::ssh::agent_quietly(host)?)
+    }
+
+    fn carried_by(agent: crate::ssh::Agent) -> Result<Self> {
         Ok(Self {
             read: FrameReader::new(Box::new(agent.stdout)),
             write: Box::new(agent.stdin),

@@ -3,7 +3,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use anyhow::{Result, bail};
-use clap::{CommandFactory, Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueHint};
 use clap_complete::Shell;
 use tokio::task::JoinHandle;
 use tracing::debug;
@@ -16,6 +16,8 @@ use manymux::node::{Config, Node};
 use manymux::proto::{HostedSession, Request, Response, SessionInfo, SpawnSpec};
 use manymux::{config, log, style, term};
 
+mod complete;
+
 #[derive(Parser)]
 #[command(
     name = "mm",
@@ -24,7 +26,7 @@ use manymux::{config, log, style, term};
 )]
 struct Cli {
     /// Where this machine's node listens. Defaults to the per-user runtime path.
-    #[arg(long, global = true)]
+    #[arg(long, global = true, value_hint = ValueHint::FilePath)]
     socket: Option<PathBuf>,
 
     #[command(subcommand)]
@@ -50,6 +52,7 @@ enum Command {
     #[command(visible_alias = "l", alias = "list")]
     Ls {
         /// Limit to one machine.
+        #[arg(add = complete::hosts_or_local())]
         host: Option<String>,
     },
     /// Start a session and attach to it.
@@ -66,18 +69,28 @@ enum Command {
         #[arg(short, long)]
         detached: bool,
         /// `[host] [command...]`. Defaults to your login shell, here.
-        #[arg(trailing_var_arg = true)]
+        #[arg(trailing_var_arg = true, add = complete::new_args())]
         args: Vec<String>,
     },
     /// Attach to a session, as `name` or `host/name`.
     #[command(visible_alias = "a")]
-    Attach { target: String },
+    Attach {
+        #[arg(add = complete::targets())]
+        target: String,
+    },
     /// Send SIGHUP to a session's process group.
     #[command(visible_alias = "k")]
-    Kill { target: String },
+    Kill {
+        #[arg(add = complete::targets())]
+        target: String,
+    },
     /// Set a session's title, overriding whatever the program sets.
     #[command(visible_alias = "r")]
-    Rename { target: String, title: String },
+    Rename {
+        #[arg(add = complete::targets())]
+        target: String,
+        title: String,
+    },
 
     /// Watch a machine without starting a session on it. Starting one adds it
     /// anyway; this is for machines you only want to see in `mm ls`.
@@ -87,7 +100,10 @@ enum Command {
     Hosts,
     /// Stop watching a machine.
     #[command(alias = "remove")]
-    Rm { host: String },
+    Rm {
+        #[arg(add = complete::watched_hosts())]
+        host: String,
+    },
 
     /// Replace this binary with the published one.
     #[command(visible_alias = "up")]
@@ -129,8 +145,16 @@ enum ServiceAction {
 const OK: u8 = 0;
 const FAILED: u8 = 1;
 
+fn main() -> ExitCode {
+    // Before anything else: before stdout is touched, before the arguments are
+    // parsed (a completion request is not a command line this parser accepts),
+    // and outside the runtime, since the completers start one of their own.
+    complete::intercept();
+    cli()
+}
+
 #[tokio::main]
-async fn main() -> ExitCode {
+async fn cli() -> ExitCode {
     let cli = Cli::parse();
     // Only the node writes a log file. A command that prints and exits has the
     // terminal for that, and the agent must leave stdout strictly alone.
@@ -333,6 +357,7 @@ async fn update(socket: &Path, check: bool, force: bool) -> Result<u8> {
         style::green("✓"),
         style::bold(&path.display().to_string())
     );
+    refresh_completions();
 
     // The node is a long-running process still executing the old binary, so an
     // update that leaves it alone has not really landed. Restarting it kills
@@ -741,15 +766,36 @@ fn current_dir() -> Option<String> {
         .map(|p| p.to_string_lossy().into_owned())
 }
 
+/// Rewrite an installed completion script after an update.
+///
+/// The script and the binary talk to each other, and clap_complete makes no
+/// promise that a script written by one version still works with the next. Only
+/// touches a file that is already there, and says nothing either way: nobody
+/// asked about completions, they asked for an update.
+fn refresh_completions() {
+    let Some(shell) = Shell::from_env() else {
+        return;
+    };
+    let Some(path) = completion_path(shell).filter(|path| path.exists()) else {
+        return;
+    };
+    match std::fs::File::create(&path).map_err(anyhow::Error::from) {
+        Ok(mut file) => {
+            if let Err(e) = complete::registration(shell, &mut file) {
+                debug!("could not refresh {}: {e:#}", path.display());
+            }
+        }
+        Err(e) => debug!("could not refresh {}: {e:#}", path.display()),
+    }
+}
+
 /// Print a completion script, or write it where the shell will find it.
 fn completions(shell: Option<Shell>, install: bool) -> Result<u8> {
     let Some(shell) = shell.or_else(Shell::from_env) else {
         bail!("could not tell which shell you use; name it: mm completions zsh");
     };
-    let mut command = Cli::command();
-
     if !install {
-        clap_complete::generate(shell, &mut command, "mm", &mut std::io::stdout());
+        complete::registration(shell, &mut std::io::stdout())?;
         return Ok(OK);
     }
 
@@ -763,7 +809,7 @@ fn completions(shell: Option<Shell>, install: bool) -> Result<u8> {
         std::fs::create_dir_all(dir)?;
     }
     let mut file = std::fs::File::create(&path)?;
-    clap_complete::generate(shell, &mut command, "mm", &mut file);
+    complete::registration(shell, &mut file)?;
     println!("wrote {}", path.display());
 
     if shell == Shell::Zsh {
@@ -773,6 +819,7 @@ fn completions(shell: Option<Shell>, install: bool) -> Result<u8> {
             path.parent().unwrap_or(&path).display()
         );
     }
+    println!("the script asks `mm` for session names as you type, so it needs mm on your PATH");
     Ok(OK)
 }
 

@@ -217,11 +217,29 @@ mm rename <target> <title>           set a sticky title
 mm add <host> | hosts | rm <host>    which machines to list and watch
 mm update [--check] [--force]        replace this binary with the published one
 mm service install|uninstall         run the node at boot
-mm completions [shell] [--install]   tab completion for your shell
+mm completions [shell] [--install]   tab completion, with your session names in it
 mm daemon | agent                    the node, and what ssh runs on the far side
 ```
 
 The ones you type often have a short form: `l`, `n`, `a`, `k`, `r`, `h`, `up`.
+
+## Tab completion
+
+`mm completions --install` writes the script where your shell looks for it, and
+`mm update` rewrites it afterwards. It is a stub that asks `mm` on every tab, so
+`mm a <TAB>` offers the sessions running right now:
+
+```
+$ mm a <TAB>
+api  build  gpu-box/  laptop/
+
+$ mm a gpu-box/<TAB>
+gpu-box/train  gpu-box/logs
+```
+
+A bare tab stays on this machine and offers `host/` as a way in, because a
+keystroke should not wait on ssh. Only naming a machine goes out to it, and it
+gives up rather than hanging if that machine is asleep.
 
 ## Install details
 
@@ -240,6 +258,7 @@ pins a release.
 | `MM_SSH` | the ssh program, if yours lives somewhere unusual |
 | `MM_LOG` | log filter, e.g. `manymux=debug` |
 | `MM_CONFIG_DIR` | where the host list lives |
+| `MM_COMPLETE_REMOTE` | let a bare tab reach every machine, not just this one |
 | `NO_COLOR` | plain output; `CLICOLOR_FORCE` colours a pipe |
 
 The CLI logs to stderr. The node also writes a daily-rotating file, keeping

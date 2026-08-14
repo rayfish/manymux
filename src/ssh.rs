@@ -37,7 +37,35 @@ pub struct Agent {
 /// alias from your ssh config all work, along with whatever `ProxyCommand` or
 /// `ProxyJump` that alias carries.
 pub fn agent(host: &str) -> Result<Agent> {
-    let mut child = command(host)
+    let mut command = command(host);
+    // Let ssh's own errors (host key, permission denied) reach the user's
+    // terminal rather than vanishing.
+    command.stderr(Stdio::inherit());
+    spawn(command, host)
+}
+
+/// Like [`agent`], but for a question nobody asked out loud.
+///
+/// Tab completion runs this on a keystroke, so ssh must not stop to ask about a
+/// host key or a passphrase, and must not print over the line being typed. A
+/// machine that cannot be reached without a conversation simply has no sessions
+/// to offer, which is the right answer for a tab.
+pub fn agent_quietly(host: &str) -> Result<Agent> {
+    let mut command = base();
+    command
+        // Fail rather than prompt, and give up on a machine that is not
+        // answering instead of sitting on the default 2 minute connect timeout.
+        .arg("-o")
+        .arg("BatchMode=yes")
+        .arg("-o")
+        .arg("ConnectTimeout=1")
+        .arg(host)
+        .stderr(Stdio::null());
+    spawn(command, host)
+}
+
+fn spawn(mut command: Command, host: &str) -> Result<Agent> {
+    let mut child = command
         .arg("--")
         // Plain `mm`, found on the PATH a non-interactive ssh gets, which is
         // why the installer puts it in /usr/local/bin. Probing for it here
@@ -47,9 +75,6 @@ pub fn agent(host: &str) -> Result<Agent> {
         .arg("agent")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        // Let ssh's own errors (host key, permission denied) reach the user's
-        // terminal rather than vanishing.
-        .stderr(Stdio::inherit())
         .kill_on_drop(true)
         .spawn()
         .with_context(|| format!("running ssh {host}"))?;
@@ -91,6 +116,15 @@ pub async fn greet(host: &str) -> Result<()> {
 /// unusual or who wraps it in a script. Tests use it to stand in for a second
 /// machine without needing a real sshd.
 pub fn command(host: &str) -> Command {
+    let mut command = base();
+    command.arg(host);
+    command
+}
+
+/// The options every invocation shares, with no destination yet. ssh reads
+/// everything after the destination as the remote command, so a caller wanting
+/// options of its own has to add them before naming the host.
+fn base() -> Command {
     let program = std::env::var("MM_SSH").unwrap_or_else(|_| "ssh".to_string());
     let mut command = Command::new(program);
     command
@@ -103,8 +137,7 @@ pub fn command(host: &str) -> Command {
         .arg("-o")
         .arg(format!("ControlPath={}", control_path().display()))
         .arg("-o")
-        .arg(format!("ControlPersist={PERSIST}"))
-        .arg(host);
+        .arg(format!("ControlPersist={PERSIST}"));
     command
 }
 
