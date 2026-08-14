@@ -673,7 +673,7 @@ async fn do_attach(socket: &Path, host: &str, name: &str) -> Result<u8> {
     // to go on.
     let mut listing = Some(spawn_listing(socket));
 
-    let held = attach::hold()?;
+    let mut held = attach::hold()?;
     let mut mode = Mode::Focus;
     let mut hopped = false;
     let (outcome, where_) = loop {
@@ -695,7 +695,7 @@ async fn do_attach(socket: &Path, host: &str, name: &str) -> Result<u8> {
             Err(e) => return Err(e),
         };
 
-        match attach::run(&held, session, &where_, mode).await? {
+        match attach::run(&mut held, session, &where_, mode).await? {
             Outcome::Switch(motion) => {
                 take_listing(&mut listing, &mut cycle).await;
                 hopped = false;

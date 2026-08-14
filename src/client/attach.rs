@@ -426,7 +426,9 @@ mod terminal {
     /// does not flap the alternate screen between every hop. Dropping it is
     /// what restores the terminal, on the error paths too.
     pub struct Held {
-        _private: (),
+        /// The keyboard, owned here rather than by an attach, because it
+        /// outlives one. See [`keyboard`].
+        keys: mpsc::Receiver<Vec<u8>>,
     }
 
     pub fn hold() -> Result<Held> {
@@ -445,7 +447,7 @@ mod terminal {
         }));
         terminal::enable_raw_mode()?;
         write_now(SETUP);
-        Ok(Held { _private: () })
+        Ok(Held { keys: keyboard() })
     }
 
     impl Drop for Held {
@@ -469,11 +471,16 @@ mod terminal {
     ///
     /// `mode` is where the keyboard starts, which is how a hop carries control
     /// mode through the reattach.
-    pub async fn run(_held: &Held, session: Attached, target: &str, mode: Mode) -> Result<Outcome> {
+    pub async fn run(
+        held: &mut Held,
+        session: Attached,
+        target: &str,
+        mode: Mode,
+    ) -> Result<Outcome> {
         let mut status = Status::new(target);
         status.set_mode(mode);
         write_now(&status.setup(terminal_size()));
-        pump(session, status, mode).await
+        pump(&mut held.keys, session, status, mode).await
     }
 
     /// How long a notice from the client itself stays on the row before the key
@@ -488,6 +495,15 @@ mod terminal {
     /// session has just ended, so that wait is forever, and the process hangs
     /// on with the terminal already given back until a keystroke happens to
     /// land. A thread nobody joins reads the same bytes and holds up nothing.
+    ///
+    /// One of these lasts as long as the terminal is [`Held`], not as long as
+    /// an attach, because the read it is sitting in cannot be taken back. A
+    /// reader started per attach would leave the old one blocked on stdin
+    /// across a hop, and it learns its channel is closed only by finishing a
+    /// read first: it swallows the keystroke that told it, which is the one
+    /// that was meant to arrive in the session just switched to. That cost
+    /// exactly one key per hop, so walking the list took two presses of the
+    /// switch key instead of one.
     fn keyboard() -> mpsc::Receiver<Vec<u8>> {
         // Enough to stay ahead of a paste arriving as one burst, and small
         // enough that a client not reading stops the thread rather than
@@ -510,13 +526,17 @@ mod terminal {
         keys
     }
 
-    async fn pump(session: Attached, mut status: Status, mode: Mode) -> Result<Outcome> {
+    async fn pump(
+        keyboard: &mut mpsc::Receiver<Vec<u8>>,
+        session: Attached,
+        mut status: Status,
+        mode: Mode,
+    ) -> Result<Outcome> {
         let takes_pastes = session.paste;
         let SessionHalves {
             mut reader,
             mut writer,
         } = session.split();
-        let mut keyboard = keyboard();
         let mut stdout = tokio::io::stdout();
         let mut winch = signal(SignalKind::window_change())?;
         let mut keys = KeyFilter::default();
