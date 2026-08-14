@@ -5,10 +5,11 @@
 #   curl -fsSL https://raw.githubusercontent.com/rayfish/manymux/master/install.sh | sh
 #
 # Options (env vars):
-#   INSTALL_DIR         target dir (default: /usr/local/bin)
+#   INSTALL_DIR      target dir (default: /usr/local/bin, ~/.local/bin on macOS)
 #   MM_VERSION       pin a release tag, e.g. v0.1.0 (default: latest)
 #   MM_SKIP_VERIFY   set to 1 to install without checksum verification
 #   MM_SKIP_LINGER   set to 1 to leave systemd lingering alone
+#   MM_SKIP_PATH     set to 1 to leave ~/.zshenv alone on macOS
 #
 # The same line works on the machines you want to manage: manymux needs to be on
 # PATH there, and nothing else.
@@ -25,19 +26,24 @@ BIN="mm"
 VERSION="${MM_VERSION:-latest}"
 SKIP_VERIFY="${MM_SKIP_VERIFY:-0}"
 
-# Where to install, when not told.
+# Where to install, when not told. Set per-OS in main, once the OS is known.
 #
-# /usr/local/bin, because mm has to be runnable as `ssh host mm agent`,
-# and that runs a *non-interactive* shell which reads neither .zshrc nor
-# .bashrc. A per-user directory like ~/.local/bin is invisible to it, so a
-# machine installed that way looks like it has no mm at all. /usr/local/bin
-# is on the default PATH sshd hands out.
+# On Linux, /usr/local/bin, because mm has to be runnable as `ssh host mm
+# agent`, and that runs a *non-interactive* shell which reads neither .zshrc
+# nor .bashrc. A per-user directory like ~/.local/bin is invisible to it, so a
+# machine installed that way looks like it has no mm at all. /usr/local/bin is
+# on the PATH sshd hands out there (login.defs ENV_PATH), which is what makes
+# a system install the reachable one, and worth a sudo prompt.
 #
-# Falls back to ~/.local/bin only when there is no way to write there, with a
-# warning: better a working local CLI than nothing.
+# On macOS that trade does not exist to make: sshd hands out a PATH without
+# /usr/local/bin, which arrives in an interactive shell only via path_helper in
+# /etc/zprofile, and the `zsh -c` behind `ssh host mm agent` reads no profile.
+# So a system install there costs a password and still leaves the machine
+# unreachable. A user install plus one line in ~/.zshenv, which every zsh reads
+# including `zsh -c`, is what actually makes a Mac reachable. See ensure_path.
 SYSTEM_DIR="/usr/local/bin"
 USER_DIR="${HOME}/.local/bin"
-INSTALL_DIR="${INSTALL_DIR:-$SYSTEM_DIR}"
+INSTALL_DIR="${INSTALL_DIR:-}"
 
 if [ -t 1 ]; then
   RED='\033[0;31m'; GREEN='\033[0;32m'; BLUE='\033[0;34m'; NC='\033[0m'
@@ -239,11 +245,75 @@ Run this as root, then \`mm service install\`:
   fi
 }
 
+# Put INSTALL_DIR on the PATH, on a macOS install that landed in the user's
+# home. This is what that install has instead of /usr/local/bin, so it is the
+# step that makes the machine reachable, not a convenience.
+#
+# ~/.zshenv, not .zprofile or .zshrc: zsh reads .zshenv on every invocation,
+# including the non-login non-interactive `zsh -c` that `ssh host mm agent`
+# becomes. The other two are read by login or interactive shells, which that is
+# neither. zsh has been the macOS default shell since Catalina; on anything
+# else, say what is needed rather than guess at a file.
+#
+# Only ever an addition, and never a second one: a line naming INSTALL_DIR
+# already there is left alone. MM_SKIP_PATH=1 skips it.
+#
+# Sets PATH_ADVICE, so the closing hint knows whether PATH has been dealt with
+# ("wrote"), already spelled out ("told"), or not raised at all ("").
+PATH_ADVICE=""
+ensure_path() {
+  local file="${ZDOTDIR:-$HOME}/.zshenv"
+  [ "$OS" = "macos" ] || return 0
+  [ "${MM_SKIP_PATH:-0}" = "1" ] && return 0
+
+  # An asked-for system install on a Mac: their call, but not one to make
+  # quietly, since the symptom is a machine that lists as if mm were missing.
+  if [ "$INSTALL_DIR" = "$SYSTEM_DIR" ]; then
+    PATH_ADVICE="told"
+    err "note: macOS leaves ${SYSTEM_DIR} off the PATH a non-interactive ssh gets, so
+\`ssh <thishost> mm agent\` will not find mm there and this machine cannot be
+managed from another one. Install to ${USER_DIR} instead, or arrange the PATH
+yourself in ~/.zshenv."
+    return 0
+  fi
+
+  # Not .zshenv for a shell that never reads it. What that shell does read on a
+  # non-login non-interactive run varies (bash: only $BASH_ENV, unless it was
+  # built to source .bashrc under sshd), so name the requirement, not a file.
+  case "${SHELL##*/}" in
+    zsh) ;;
+    *)
+      PATH_ADVICE="told"
+      err "your login shell is ${SHELL:-unknown}, so putting ${INSTALL_DIR} on its PATH is
+yours to do. It has to be somewhere that shell reads even when it is neither a
+login nor an interactive shell, or \`ssh <thishost> mm agent\` will not find mm:
+    export PATH=\"${INSTALL_DIR}:\$PATH\""
+      return 0 ;;
+  esac
+
+  if [ -f "$file" ] && grep -qF "$INSTALL_DIR" "$file"; then
+    PATH_ADVICE="wrote"
+    return 0
+  fi
+  if ! printf '\n# manymux: also read by the non-interactive `zsh -c` behind `ssh host mm agent`\nexport PATH="%s:$PATH"\n' "$INSTALL_DIR" >> "$file"; then
+    PATH_ADVICE="told"
+    err "could not write ${file}; add this to it yourself:
+    export PATH=\"${INSTALL_DIR}:\$PATH\""
+    return 0
+  fi
+  ok "put ${INSTALL_DIR} on your PATH in ${file}"
+  PATH_ADVICE="wrote"
+}
+
 main() {
   local asset base url sudo=""
   detect_asset
   asset="$ASSET"
   base="$(release_base)"
+
+  if [ -z "$INSTALL_DIR" ]; then
+    if [ "$OS" = "macos" ]; then INSTALL_DIR="$USER_DIR"; else INSTALL_DIR="$SYSTEM_DIR"; fi
+  fi
 
   # Every push to master publishes a rolling `nightly` pre-release, and GitHub
   # excludes pre-releases from /releases/latest. So until a stable release
@@ -280,14 +350,19 @@ main() {
   if [ -w "$(existing_ancestor "$INSTALL_DIR")" ] || [ "$(id -u)" = "0" ]; then
     info "Installing to ${INSTALL_DIR} ..."
   elif command -v sudo >/dev/null 2>&1; then
-    info "Installing to ${INSTALL_DIR} (needs sudo, so a remote ssh can find it) ..."
+    info "Installing to ${INSTALL_DIR} (needs sudo) ..."
     sudo=sudo
   elif [ "$INSTALL_DIR" = "$SYSTEM_DIR" ]; then
     INSTALL_DIR="$USER_DIR"
-    err "cannot write ${SYSTEM_DIR} and sudo is unavailable; installing to ${INSTALL_DIR}.
+    if [ "$OS" = "macos" ]; then
+      # Where a Mac was headed anyway; ensure_path makes it reachable.
+      info "cannot write ${SYSTEM_DIR} and sudo is unavailable; installing to ${INSTALL_DIR}."
+    else
+      err "cannot write ${SYSTEM_DIR} and sudo is unavailable; installing to ${INSTALL_DIR}.
 manymux will work here, but this machine cannot be managed from another one:
 a non-interactive ssh does not see ${INSTALL_DIR}. Move the binary into
 ${SYSTEM_DIR} when you can."
+    fi
   else
     die "$INSTALL_DIR is not writable and sudo is unavailable. Set INSTALL_DIR to a writable path."
   fi
@@ -297,11 +372,18 @@ ${SYSTEM_DIR} when you can."
   ok "Installed $("$INSTALL_DIR/$BIN" --version 2>/dev/null || echo "$BIN") to $INSTALL_DIR/$BIN"
 
   enable_linger
+  ensure_path
 
   case ":$PATH:" in
     *":$INSTALL_DIR:"*) ;;
-    *) info "Add ${INSTALL_DIR} to your PATH:
+    *)
+      case "$PATH_ADVICE" in
+        wrote) info "Open a new shell, or for this one:
     export PATH=\"${INSTALL_DIR}:\$PATH\"" ;;
+        told) ;;
+        *) info "Add ${INSTALL_DIR} to your PATH:
+    export PATH=\"${INSTALL_DIR}:\$PATH\"" ;;
+      esac ;;
   esac
 
   echo
