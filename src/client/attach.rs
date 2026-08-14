@@ -8,6 +8,8 @@
 //! arrives, watch for the detach key. All the state lives on the server, which
 //! is what makes detaching free.
 
+use std::time::{Duration, Instant};
+
 use anyhow::Result;
 
 use crate::client::{Attached, SessionHalves, Update};
@@ -26,8 +28,8 @@ use crate::client::{Attached, SessionHalves, Update};
 /// what arrives is a plain backtick that no client could tell from a typed one.
 ///
 /// `]` is in the set, every terminal sends it unasked, and what wants it back
-/// is vim's jump-to-tag and telnet's escape. Pressing the key twice sends one
-/// through, which covers both.
+/// is vim's jump-to-tag and telnet's escape. Pressing the key twice quickly
+/// sends one through, which covers both.
 pub const DEFAULT_PREFIX: u8 = 0x1d;
 
 /// The key in force, from `MM_PREFIX` if it is set and usable.
@@ -142,23 +144,30 @@ impl Mode {
 /// keys that follow it.
 ///
 /// Control mode stays on: one mode key then `tab tab tab` walks through the
-/// sessions. `Esc` or `Enter` goes back to focus, `d` detaches, and the key
-/// pressed twice sends one through for whatever wants it inside the session.
-/// Any other key drops back to focus and passes both bytes through unchanged,
-/// so a mistyped mode key costs you visible junk rather than a silently
-/// swallowed line.
+/// sessions. `Esc`, `Enter` or the mode key goes back to focus, `d` detaches,
+/// and the mode key hit twice in a row quickly also sends one through for
+/// whatever wants it inside the session. Any other key drops back to focus and
+/// passes both bytes through unchanged, so a mistyped mode key costs you
+/// visible junk rather than a silently swallowed line.
 pub struct KeyFilter {
     prefix: u8,
     mode: Mode,
-    /// Whether the key that turned control mode on is the last one pressed.
+    /// When the key that turned control mode on was pressed, while it is still
+    /// the last key pressed.
     ///
-    /// It matters for exactly one key: its own. Pressed straight after itself
-    /// it sends one through, and pressed in a control mode that a switch left
-    /// on it starts over instead. So the key always starts a mode key, two in a
-    /// row always send one, and `<key> d` detaches whether or not you were
-    /// already walking the sessions.
-    fresh: bool,
+    /// It matters for exactly one key: its own. The key always goes back to
+    /// focus, and this decides whether a literal one goes to the session on the
+    /// way out. Two in a row inside [`LITERAL`] are the sequence that means the
+    /// byte, so one is sent. Anything slower is a hand that went in and came
+    /// out again, so nothing is: a mode you sat in for a while, or one a switch
+    /// left on, was never a request for that byte.
+    pressed: Option<Instant>,
 }
+
+/// How long after the mode key a second one still means "send me the byte"
+/// rather than "back to focus". Long enough not to need a fast hand, short
+/// enough that nothing you left the mode sitting in counts.
+const LITERAL: Duration = Duration::from_secs(3);
 
 impl Default for KeyFilter {
     fn default() -> Self {
@@ -183,7 +192,7 @@ impl KeyFilter {
         Self {
             prefix,
             mode: Mode::Focus,
-            fresh: false,
+            pressed: None,
         }
     }
 
@@ -191,10 +200,16 @@ impl KeyFilter {
     /// is what makes `tab tab tab` walk the list across the hops.
     pub fn set_mode(&mut self, mode: Mode) {
         self.mode = mode;
-        self.fresh = false;
+        self.pressed = None;
     }
 
     pub fn filter(&mut self, input: &[u8]) -> Keystrokes {
+        self.filter_at(input, Instant::now())
+    }
+
+    /// [`Self::filter`] with the clock handed in, so the window a literal mode
+    /// key lives in can be tested without waiting out three real seconds.
+    fn filter_at(&mut self, input: &[u8], now: Instant) -> Keystrokes {
         let mut forward = Vec::with_capacity(input.len());
         let mut i = 0;
         while i < input.len() {
@@ -203,23 +218,21 @@ impl KeyFilter {
             if self.mode == Mode::Focus {
                 if b == self.prefix {
                     self.mode = Mode::Control;
-                    self.fresh = true;
+                    self.pressed = Some(now);
                 } else {
                     forward.push(b);
                 }
                 continue;
             }
-            let was_fresh = std::mem::take(&mut self.fresh);
+            let pressed = self.pressed.take();
             let action = match b {
                 // First, so that a mode key which is itself one of the keys
                 // below can still be sent through by pressing it twice.
                 b if b == self.prefix => {
-                    if was_fresh {
+                    if pressed.is_some_and(|at| now.duration_since(at) < LITERAL) {
                         forward.push(self.prefix);
-                        self.mode = Mode::Focus;
-                    } else {
-                        self.fresh = true;
                     }
+                    self.mode = Mode::Focus;
                     None
                 }
                 b'd' | b'D' => Some(Action::Detach),
@@ -693,29 +706,30 @@ mod tests {
         );
     }
 
-    /// The habit that would otherwise put a stray byte into whatever is
-    /// running: the mode key and `d` typed together without noticing that a
-    /// switch had left control mode on.
+    /// The way out of a control mode a switch left on, for a hand that reaches
+    /// for the mode key rather than for `Esc`. Nothing reaches the session on
+    /// the way: the key was not asking for a literal one.
     #[test]
-    fn the_detach_habit_still_detaches_while_walking_the_sessions() {
+    fn the_mode_key_leaves_a_control_mode_that_a_switch_left_on() {
         let mut f = KeyFilter::default();
         assert_eq!(
             f.filter(&[KEY, b'\t']),
             asked(Action::Switch(Motion::Next), Mode::Control)
         );
-        assert_eq!(f.filter(&[KEY, b'd']), asked(Action::Detach, Mode::Focus));
+        assert_eq!(f.filter(&[KEY]), forwarded(b""));
+        assert_eq!(f.filter(b"ls"), forwarded(b"ls"));
     }
 
     #[test]
-    fn a_literal_mode_key_still_takes_two_of_them_from_inside_control_mode() {
+    fn a_literal_mode_key_still_takes_two_of_them_while_walking_the_sessions() {
         let mut f = KeyFilter::default();
         assert_eq!(
             f.filter(&[KEY, b'\t']),
             asked(Action::Switch(Motion::Next), Mode::Control)
         );
-        // The first starts over rather than being sent, the second is the one
-        // that goes through, and the keyboard is back in focus afterwards.
-        assert_eq!(f.filter(&[KEY, KEY]), forwarded(&[KEY]));
+        // The first goes back to focus, the second starts a fresh mode key, and
+        // the third is the one that goes through.
+        assert_eq!(f.filter(&[KEY, KEY, KEY]), forwarded(&[KEY]));
         assert_eq!(f.filter(b"x"), forwarded(b"x"));
     }
 
@@ -756,6 +770,46 @@ mod tests {
     fn the_mode_key_twice_sends_one_through() {
         let mut f = KeyFilter::default();
         assert_eq!(f.filter(&[KEY, KEY]), forwarded(&[KEY]));
+    }
+
+    /// Two presses with a pause in between are a look at the mode and a way
+    /// back out of it, not the sequence that means the byte. Sending one there
+    /// would put a `^]` into whatever is running for no reason the hand can
+    /// remember.
+    #[test]
+    fn the_mode_key_twice_slowly_only_goes_in_and_out_of_control() {
+        let mut f = KeyFilter::default();
+        let at = Instant::now();
+        assert_eq!(
+            f.filter_at(&[KEY], at),
+            Keystrokes {
+                forward: vec![],
+                action: None,
+                mode: Mode::Control,
+            }
+        );
+        assert_eq!(f.filter_at(&[KEY], at + LITERAL), forwarded(b""));
+        assert_eq!(f.filter_at(b"ls", at + LITERAL), forwarded(b"ls"));
+    }
+
+    /// A hand that is not fast, typing the sequence that means the byte across
+    /// two reads. The window is for telling the two apart, not a reflex test.
+    #[test]
+    fn the_second_mode_key_still_counts_a_beat_later() {
+        let mut f = KeyFilter::default();
+        let at = Instant::now();
+        assert_eq!(
+            f.filter_at(&[KEY], at),
+            Keystrokes {
+                forward: vec![],
+                action: None,
+                mode: Mode::Control,
+            }
+        );
+        assert_eq!(
+            f.filter_at(&[KEY], at + Duration::from_millis(700)),
+            forwarded(&[KEY])
+        );
     }
 
     #[test]

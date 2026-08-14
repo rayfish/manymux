@@ -112,12 +112,14 @@ word goes amber, and the row spells out what the keys do. It stays on, so one
 | `p`, `shift-tab` | previous |
 | `l` | the one you came from |
 | `d` | detach |
-| `esc`, `enter` | back to focus |
+| `esc`, `enter`, `Ctrl-]` | back to focus |
 
 The cycle covers every session on every machine you watch, in the order `mm ls`
-prints them. The key pressed twice sends one through to the session, for
-whatever wants it in there. Any other key drops back to focus and goes through,
-so a mistyped mode key costs you a stray keystroke rather than a swallowed line.
+prints them. `Ctrl-]` twice in quick succession, within three seconds, also
+sends one through to the session, for whatever wants it in there. Slower than
+that it is just a look at the mode and a way back out, and nothing reaches the
+session. Any other key drops back to focus and goes through, so a mistyped mode
+key costs you a stray keystroke rather than a swallowed line.
 
 ### About that key
 
@@ -134,8 +136,8 @@ them:
   outside the set, so you get a plain backtick and nothing happens.
 
 What does want `Ctrl-]` is vim's jump-to-tag and telnet's escape. Press it twice
-to send one through, in there or anywhere else. `MM_PREFIX` takes any of the
-above spellings (`C-]`, `C-b`, `^B`, `C-Space`, or the raw byte).
+quickly to send one through, in there or anywhere else. `MM_PREFIX` takes any
+of the above spellings (`C-]`, `C-b`, `^B`, `C-Space`, or the raw byte).
 
 To see what your terminal sends for a key, run `cat -v` outside a session and
 press it: `Ctrl-]` shows up as `^]`.
