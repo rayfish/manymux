@@ -92,6 +92,18 @@ pub async fn apply(available: &Available) -> Result<PathBuf> {
     let binary = std::env::current_exe().context("finding the running binary")?;
     let dir = binary.parent().unwrap_or(Path::new("."));
 
+    // Before spending a download on it. The installer puts mm in
+    // /usr/local/bin, which is root-owned on a stock macOS and on most Linux,
+    // so this is the common case rather than an edge one, and it deserves an
+    // answer rather than curl's own "failure writing output to destination".
+    if !writable(dir) {
+        bail!(
+            "{} lives in {}, which needs root to replace: re-run with `sudo mm update`",
+            file_name(&binary),
+            dir.display()
+        );
+    }
+
     // Staged beside the binary rather than in /tmp, so the rename below is
     // within one filesystem and therefore atomic. Renaming over a running
     // executable is fine on Unix: the old inode stays alive for this process.
@@ -101,10 +113,7 @@ pub async fn apply(available: &Available) -> Result<PathBuf> {
     let downloaded = curl(&url, &staged).await;
     if let Err(e) = downloaded {
         let _ = std::fs::remove_file(&staged);
-        return Err(e.context(format!(
-            "downloading {url}\n(is {} writable? try again with sudo)",
-            dir.display()
-        )));
+        return Err(e.context(format!("downloading {url}")));
     }
 
     let actual = sha256_of(&staged).await?;
@@ -119,13 +128,23 @@ pub async fn apply(available: &Available) -> Result<PathBuf> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755))
         .context("making the new binary executable")?;
-    std::fs::rename(&staged, &binary).with_context(|| {
-        format!(
-            "replacing {}\n(not writable? try again with sudo)",
-            binary.display()
-        )
-    })?;
+    std::fs::rename(&staged, &binary).with_context(|| format!("replacing {}", binary.display()))?;
     Ok(binary)
+}
+
+/// Whether this process can create and rename files in a directory.
+///
+/// `access` rather than reading the mode bits, because the mode is not the
+/// whole answer: macOS ACLs can grant or deny past it, and root ignores it
+/// entirely. Asking the kernel gets all three right.
+fn writable(dir: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+
+    let Ok(path) = std::ffi::CString::new(dir.as_os_str().as_bytes()) else {
+        return false;
+    };
+    // SAFETY: access reads the path and returns; the CString outlives the call.
+    unsafe { libc::access(path.as_ptr(), libc::W_OK | libc::X_OK) == 0 }
 }
 
 /// What the node on this machine is doing, so an update knows whether
@@ -234,16 +253,24 @@ async fn published_checksum(tag: &str, asset: &str) -> Option<String> {
 }
 
 async fn curl(url: &str, to: &Path) -> Result<()> {
-    let status = Command::new("curl")
+    // Captured rather than inherited: curl writes its own diagnosis to the
+    // terminal before we get to say anything, so its half-sentence lands above
+    // ours and the two read as one confused message.
+    let out = Command::new("curl")
         .arg("-fsSL")
         .arg(url)
         .arg("-o")
         .arg(to)
-        .status()
+        .output()
         .await
         .context("running curl")?;
-    if !status.success() {
-        bail!("curl failed ({status})");
+    if !out.status.success() {
+        let why = String::from_utf8_lossy(&out.stderr);
+        let why = why.trim();
+        if why.is_empty() {
+            bail!("curl failed ({})", out.status);
+        }
+        bail!("{why}");
     }
     Ok(())
 }
@@ -302,6 +329,17 @@ mod tests {
             download_url("nightly", "mm-macos-aarch64"),
             "https://github.com/rayfish/manymux/releases/download/nightly/mm-macos-aarch64"
         );
+    }
+
+    #[test]
+    fn a_root_owned_install_dir_is_not_writable() {
+        // The case every macOS install hits: /usr/local/bin is root-owned
+        // there, so `mm update` has to say so instead of downloading first and
+        // failing on the write.
+        assert!(writable(Path::new(std::env!("CARGO_MANIFEST_DIR"))));
+        if unsafe { libc::getuid() } != 0 {
+            assert!(!writable(Path::new("/")));
+        }
     }
 
     #[test]
