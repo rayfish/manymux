@@ -241,6 +241,15 @@ A bare tab stays on this machine and offers `host/` as a way in, because a
 keystroke should not wait on ssh. Only naming a machine goes out to it, and it
 gives up rather than hanging if that machine is asleep.
 
+`--install` writes to `~/.local/share/zsh/site-functions`, which zsh does not
+search unless you put it on the `fpath` before `compinit` runs. If that is a
+line you would rather not add, source the script instead, at the end of
+`~/.zshrc`:
+
+```bash
+echo 'source <(mm completions zsh)' >> ~/.zshrc
+```
+
 ## Install details
 
 The installer puts `mm` in `/usr/local/bin`, asking for `sudo` if that is what

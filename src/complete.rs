@@ -79,13 +79,20 @@ pub fn registration(shell: Shell, out: &mut dyn Write) -> Result<()> {
 /// file is autoloaded *by* the first tab, and `compdef` there only takes effect
 /// from the next one. So call what it just registered, read back out of
 /// `_comps` rather than by naming a function that belongs to clap_complete.
+/// The file has to work both ways, since sourcing it from `.zshrc` is the other
+/// way people set this up. `CURRENT` is only set while a completion is running,
+/// which is what tells the two apart: sourced, this does nothing and `compdef`
+/// alone is enough.
 const ZSH_AUTOLOAD_SHIM: &str = r#"
 # Autoloaded from fpath, `compdef` above applies from the next completion
 # onwards, so run what it registered rather than letting this tab come back
-# empty.
-local _mm_completer=${_comps[mm]}
-if [[ -n $_mm_completer && $_mm_completer != $0 ]]; then
-  $_mm_completer "$@"
+# empty. Sourced from .zshrc instead, there is no completion to answer and
+# `CURRENT` is unset, so this stays out of the way.
+if (( ${+CURRENT} )); then
+  local _mm_completer=${_comps[mm]}
+  if [[ -n $_mm_completer && $_mm_completer != $0 ]]; then
+    $_mm_completer "$@"
+  fi
 fi
 "#;
 
@@ -383,6 +390,9 @@ mod tests {
         assert!(script.contains("COMPLETE"));
         // The shim, without which the first tab after a shell starts is eaten.
         assert!(script.contains("_comps[mm]"));
+        // Guarded, so sourcing the file from .zshrc does not run it as though a
+        // completion were in progress.
+        assert!(script.contains("${+CURRENT}"));
     }
 
     #[test]
