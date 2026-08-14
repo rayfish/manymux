@@ -268,12 +268,24 @@ echo 'source <(mm completions zsh)' >> ~/.zshrc
 
 ## Install details
 
-The installer puts `mm` in `/usr/local/bin`, asking for `sudo` if that is what
-it takes. That is not fussiness: reaching a machine runs `ssh host mm agent`
-through a *non-interactive* shell, which reads neither `.zshrc` nor `.bashrc`,
-so a binary in `~/.local/bin` is invisible to it and the machine looks like it
-has no manymux at all. `INSTALL_DIR` overrides the location and `MM_VERSION`
-pins a release.
+Reaching a machine runs `ssh host mm agent` through a *non-interactive* shell,
+which reads neither `.zshrc` nor `.bashrc`. Where `mm` has to live so that shell
+can find it differs by platform, and the installer handles both.
+
+On Linux it goes in `/usr/local/bin`, asking for `sudo` if that is what it
+takes. That is not fussiness: `/usr/local/bin` is on the PATH sshd hands out
+there, and `~/.local/bin` is invisible to it, so a machine installed that way
+looks like it has no manymux at all.
+
+On macOS it goes in `~/.local/bin`, no `sudo`, and the installer puts that
+directory on your PATH in `~/.zshenv`. macOS gives `/usr/local/bin` no such
+advantage: it reaches an interactive shell only through `path_helper` in
+`/etc/zprofile`, which a non-interactive `zsh -c` never reads, so a system
+install would cost a password and still leave the machine unreachable.
+`~/.zshenv` is the file that works, being the one zsh reads on *every*
+invocation. `MM_SKIP_PATH=1` leaves it alone if you would rather do it yourself.
+
+`INSTALL_DIR` overrides the location and `MM_VERSION` pins a release.
 
 ## Environment
 
