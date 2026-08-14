@@ -87,6 +87,10 @@ Three consequences run through the whole codebase and are worth keeping intact:
   because both ends skip unknown tags; adding a field to an existing message
   needs `#[serde(default)]` (see `Response::Attached { paste }` and the
   round-trip test in `proto.rs`). Changing the framing itself is not doable.
+  Adding a `Request` variant is safe too: a node that cannot decode one answers
+  with an `Error` naming its version, and that refusal is usable as an answer.
+  `Request::Version` is built on it, since a node too old to say what build it
+  is running is by that fact older than the build asking.
 - **A tab completion never starts a node and never waits on ssh unless the word
   already names a machine** (`src/complete.rs`). Both are tested.
 - **`mm agent` must leave stdout strictly alone**: the protocol is on it. Only

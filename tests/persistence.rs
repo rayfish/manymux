@@ -315,6 +315,24 @@ async fn resizing_a_client_resizes_the_child_terminal() {
     registry.kill(&name).unwrap();
 }
 
+/// The state `mm update` cannot see from the outside: replacing the binary
+/// leaves this process running the old one, so the node has to be able to say
+/// which build it started from. Hashing its own path later would answer with
+/// whatever the update just wrote there, so the checksum is taken at startup.
+#[tokio::test]
+async fn a_node_says_which_build_it_is_running() {
+    let node = test_node().await;
+    let mut client = Client::connect(&node);
+
+    let Response::Version { version, build } = client.send(&Request::Version).await.unwrap() else {
+        panic!("a version request should be answered with a version");
+    };
+    assert_eq!(version, env!("CARGO_PKG_VERSION"));
+    let build = build.expect("the node should have checksummed itself at startup");
+    assert_eq!(build.len(), 64, "a sha-256 digest: {build}");
+    assert!(build.chars().all(|c| c.is_ascii_hexdigit()), "{build}");
+}
+
 #[tokio::test]
 async fn a_session_disappears_from_the_list_once_its_child_exits() {
     let node = test_node().await;

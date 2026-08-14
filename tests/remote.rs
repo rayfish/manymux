@@ -315,6 +315,60 @@ fn a_session_survives_the_connection_that_started_it() {
     }
 }
 
+/// The gap this closes: replacing the binary leaves the node running the old
+/// one, so a machine can be up to date and still behave like the old build.
+/// Nothing else restarts it, since `mm new` reuses whatever node is listening.
+#[test]
+fn a_restart_replaces_the_node_and_takes_its_sessions_with_it() {
+    let world = World::new("restart");
+
+    world.ok("laptop", &["new", "-d", "-n", "doomed", "sleep", "60"]);
+
+    // Sessions are the node's children, so they cannot outlive it. Refusing
+    // until asked twice is the point: it is the caller who knows whether the
+    // work in them is finished.
+    let refused = world.ok("laptop", &["restart"]);
+    assert!(
+        refused.contains("1 running session"),
+        "a restart should say what it would cost: {refused}"
+    );
+    let listed = world.ok("laptop", &["ls", "local"]);
+    assert!(
+        listed.contains("doomed"),
+        "the session was killed: {listed}"
+    );
+
+    let restarted = world.ok("laptop", &["restart", "--force"]);
+    assert!(
+        restarted.contains("restarted the node"),
+        "the restart said nothing: {restarted}"
+    );
+
+    // A node is listening again, and it is a new one: the sessions the old node
+    // owned are gone with it.
+    world.wait_for_node("laptop");
+    let listed = world.ok("laptop", &["ls", "local"]);
+    assert!(
+        !listed.contains("doomed"),
+        "the session outlived the node that owned it: {listed}"
+    );
+}
+
+/// A machine with no node is the ordinary state of one nobody has used yet, and
+/// asking it to restart is not an error there: it has to end up with a node
+/// running either way.
+#[test]
+fn a_restart_with_no_node_running_starts_one() {
+    let world = World::new("restart-cold");
+
+    let started = world.ok("laptop", &["restart"]);
+    assert!(
+        started.contains("started one"),
+        "a cold restart should say it started a node: {started}"
+    );
+    world.wait_for_node("laptop");
+}
+
 /// The stub stands in for ssh, so this checks the thing the stub cannot: that
 /// what manymux hands to ssh is a plain destination plus `mm agent`.
 #[test]

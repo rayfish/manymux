@@ -67,6 +67,10 @@ pub struct Node {
     /// Ours and every watched machine's events. The notifier reads this, and so
     /// does anything asking for `Events` over the socket.
     events: broadcast::Sender<HostedEvent>,
+    /// SHA-256 of the binary this node started from, taken before an update can
+    /// replace the file. Asking again later would hash whatever now sits at
+    /// that path, which is the new binary and not what this process is running.
+    build: Option<String>,
 }
 
 impl Node {
@@ -77,6 +81,7 @@ impl Node {
             peers: Peers::default(),
             notifier: Arc::new(Notifier::new(config.notifications)),
             events,
+            build: own_build().await,
         });
 
         // Our own sessions' events, tagged with this machine's name.
@@ -255,6 +260,10 @@ impl Node {
             Request::Rename { name, title } => {
                 self.registry.rename(&name, &title).map(|()| Response::Ok)
             }
+            Request::Version => Ok(Response::Version {
+                version: env!("CARGO_PKG_VERSION").to_string(),
+                build: self.build.clone(),
+            }),
             Request::Attach { .. } | Request::Events | Request::Stop => {
                 unreachable!("handled before the single-response path")
             }
@@ -273,6 +282,20 @@ where
 {
     let response = response.unwrap_or_else(|e| Response::Error(format!("{e:#}")));
     proto::write_msg(write, tag::RESPONSE, &response).await
+}
+
+/// SHA-256 of the binary this process is running, or `None` if it cannot be
+/// read. A node that cannot say what it is running is no reason not to start
+/// one: it costs an update the chance to notice a stale node, and nothing else.
+async fn own_build() -> Option<String> {
+    let binary = std::env::current_exe().ok()?;
+    match crate::update::sha256_of(&binary).await {
+        Ok(digest) => Some(digest),
+        Err(e) => {
+            debug!("cannot checksum {}: {e:#}", binary.display());
+            None
+        }
+    }
 }
 
 /// A file's modification time, or `None` if it is missing or unreadable. Both

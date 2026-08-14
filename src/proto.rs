@@ -158,6 +158,14 @@ pub enum Request {
     /// Stop the node. Every session it owns dies with it, so this is for
     /// picking up a new binary, and the caller is expected to have asked.
     Stop,
+
+    /// What build the node is running, so an update can tell whether
+    /// restarting it would change anything.
+    ///
+    /// A node too old to decode this answers with an error, and that is itself
+    /// the answer: nothing older than the build that introduced the request
+    /// knows it, so an error means the node is behind.
+    Version,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -180,6 +188,15 @@ pub enum Response {
         /// host's answer gets `false` rather than a decode error.
         #[serde(default)]
         paste: bool,
+    },
+    /// What the node is running. `build` is the SHA-256 of the binary it
+    /// started from, taken at startup: the version alone cannot answer the
+    /// question, since the nightly channel keeps one version across builds,
+    /// and the path is no better once an update has replaced the file
+    /// underneath the process. `None` if the node could not hash itself.
+    Version {
+        version: String,
+        build: Option<String>,
     },
     Error(String),
 }
@@ -427,6 +444,64 @@ mod tests {
         })
         .unwrap();
         assert!(matches!(decode::<Old>(&new).unwrap(), Old::Attached { .. }));
+    }
+
+    /// What makes an unanswered version request an answer in itself: a node
+    /// from before the request existed cannot decode it, so `mm update` reads
+    /// the complaint as "older than me" rather than having to guess.
+    #[test]
+    fn a_node_from_before_version_cannot_decode_the_request() {
+        /// `Request` as it was before the version request existed.
+        #[derive(Serialize, Deserialize)]
+        enum Old {
+            List,
+            #[allow(dead_code)]
+            Spawn(SpawnSpec),
+            #[allow(dead_code)]
+            Kill {
+                name: String,
+            },
+            #[allow(dead_code)]
+            Rename {
+                name: String,
+                title: String,
+            },
+            #[allow(dead_code)]
+            Attach {
+                name: String,
+                size: Size,
+            },
+            #[allow(dead_code)]
+            Events,
+            #[allow(dead_code)]
+            Stop,
+        }
+
+        let asked = encode(&Request::Version).unwrap();
+        assert!(
+            decode::<Old>(&asked).is_err(),
+            "an older node has no variant to decode this into"
+        );
+
+        // The requests it does know still arrive as themselves, so adding the
+        // variant costs nothing on the machines that are behind.
+        assert!(matches!(
+            decode::<Old>(&encode(&Request::List).unwrap()).unwrap(),
+            Old::List
+        ));
+    }
+
+    #[test]
+    fn a_version_answer_round_trips() {
+        let sent = Response::Version {
+            version: "0.1.0".into(),
+            build: Some("abc".into()),
+        };
+        let Response::Version { version, build } = decode(&encode(&sent).unwrap()).unwrap() else {
+            panic!("a version answer should decode as one");
+        };
+        assert_eq!(version, "0.1.0");
+        assert_eq!(build.as_deref(), Some("abc"));
     }
 
     #[tokio::test]

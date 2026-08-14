@@ -108,6 +108,10 @@ image to send, so `Ctrl-V` still reaches the session otherwise; `MM_PASTE=off`
 gives it back for good. Pasted files land in `$XDG_RUNTIME_DIR/manymux/pastes`
 on the host and are cleaned up after a day.
 
+If it says the host is too old to take pasted files, that is the *node* holding
+the session, not the binary you typed into: see [Keeping it
+running](#keeping-it-running).
+
 ## Two modes
 
 Modal, like vim, and for the same reason: the keys worth having are the ones a
@@ -222,6 +226,21 @@ mm update --check
 mm update
 ```
 
+Replacing the binary is only half of it. The node is a long-running process
+still executing the one it started from, so until it restarts the machine keeps
+behaving like the old build: a client that pastes images into a session hosted
+by an older node gets told the host cannot take one, however current its own
+binary is. `mm update` asks the node what it is running and offers the restart
+when the two differ, including when there was nothing to download. Every session
+dies with the node, so it takes `--force` while any are open:
+
+```bash
+mm restart --force
+```
+
+The machine that has to be current is the one the *session* lives on, which for
+a remote session is the far end: `ssh gpu-box mm update`.
+
 ## Commands
 
 ```
@@ -232,6 +251,7 @@ mm kill <target>                     SIGHUP a session's process group
 mm rename <target> <title>           set a sticky title
 mm add <host> | hosts | rm <host>    which machines to list and watch
 mm update [--check] [--force]        replace this binary with the published one
+mm restart [--force]                 restart the node so it picks up that binary
 mm service install|uninstall         run the node at boot
 mm completions [shell] [--install]   tab completion, with your session names in it
 mm daemon | agent                    the node, and what ssh runs on the far side

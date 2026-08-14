@@ -164,6 +164,38 @@ pub async fn running(socket: &Path) -> Option<Running> {
     }
 }
 
+/// Whether the node is running a build other than `build`, the SHA-256 of the
+/// binary now on disk.
+///
+/// This is the state that makes an update look finished when it is not:
+/// replacing the file leaves the node running the old inode, so the machine
+/// keeps behaving like the old build until it restarts. Nothing about the
+/// binary on disk reveals it, which is why it is asked over the socket.
+///
+/// A node that cannot answer is behind by definition: `Version` did not exist
+/// before the build that asks it, so an error or a dropped connection means the
+/// node predates this binary. A node that answers without a checksum is the one
+/// case left undecided, and it is reported as current: nagging about a node we
+/// cannot compare would be a restart with nothing behind it.
+pub async fn is_stale(socket: &Path, build: &str) -> bool {
+    let Ok(mut stream) = crate::client::Stream::local(socket).await else {
+        return false;
+    };
+    match stream.call(&crate::proto::Request::Version).await {
+        Ok(crate::proto::Response::Version { build: theirs, .. }) => {
+            theirs.is_some_and(|theirs| theirs != build)
+        }
+        Ok(other) => {
+            debug!("unexpected answer to a version request: {other:?}");
+            true
+        }
+        Err(e) => {
+            debug!("the node did not answer a version request: {e:#}");
+            true
+        }
+    }
+}
+
 /// Stop the node so it comes back on the new binary, then start one again.
 ///
 /// Every session it owns dies with it: they are its children, holding PTYs it
@@ -276,7 +308,7 @@ async fn curl(url: &str, to: &Path) -> Result<()> {
 }
 
 /// SHA-256 of a file, via whichever tool this machine has.
-async fn sha256_of(path: &Path) -> Result<String> {
+pub(crate) async fn sha256_of(path: &Path) -> Result<String> {
     for (program, args) in [("sha256sum", &[][..]), ("shasum", &["-a", "256"][..])] {
         let Ok(out) = Command::new(program).args(args).arg(path).output().await else {
             continue;
@@ -340,6 +372,47 @@ mod tests {
         if unsafe { libc::getuid() } != 0 {
             assert!(!writable(Path::new("/")));
         }
+    }
+
+    /// The check that decides whether an update is finished or only half done.
+    /// Both answers matter: a node running this binary must not be restarted
+    /// for nothing, and one running anything else has to be caught, since
+    /// nothing visible on disk says so.
+    #[tokio::test]
+    async fn a_node_is_stale_when_it_started_from_another_binary() {
+        let dir = std::env::temp_dir().join(format!("mm-stale-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket = dir.join("s.sock");
+
+        let node = crate::node::Node::start(crate::node::Config {
+            peers: Vec::new(),
+            hosts_file: None,
+            notifications: false,
+        })
+        .await;
+        let serving = tokio::spawn({
+            let socket = socket.clone();
+            async move { node.serve(&socket).await }
+        });
+        for _ in 0..100 {
+            if tokio::net::UnixStream::connect(&socket).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        // The node hashed this test binary at startup, which is the binary
+        // "on disk" as far as it is concerned.
+        let ours = sha256_of(&std::env::current_exe().unwrap()).await.unwrap();
+        assert!(!is_stale(&socket, &ours).await, "it is running this binary");
+        assert!(
+            is_stale(&socket, "a build it did not start from").await,
+            "a node running something else has to be caught"
+        );
+
+        serving.abort();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -116,6 +116,19 @@ enum Command {
         force: bool,
     },
 
+    /// Restart this machine's node so it picks up the binary on disk.
+    ///
+    /// An update replaces the file; the node is a long-running process still
+    /// executing the old one, and keeps answering like the old build until it
+    /// is restarted. `mm update` does this for you when it downloads
+    /// something, so this is for the times it did not: a binary installed some
+    /// other way, or a restart deferred while sessions were running.
+    Restart {
+        /// Restart even though sessions are running. They die with the node.
+        #[arg(long)]
+        force: bool,
+    },
+
     /// Install or remove the background service.
     Service {
         #[command(subcommand)]
@@ -306,6 +319,15 @@ async fn run(cli: Cli) -> Result<u8> {
 
         Command::Update { check, force } => update(&socket, check, force).await,
 
+        Command::Restart { force } => {
+            let Some(running) = manymux::update::running(&socket).await else {
+                manymux::node::ensure_running(&socket).await?;
+                println!("{} no node was running; started one", style::green("✓"));
+                return Ok(OK);
+            };
+            restart(&socket, running.sessions, force, "mm restart").await
+        }
+
         Command::Service { action } => {
             match action {
                 ServiceAction::Install => {
@@ -334,45 +356,63 @@ async fn run(cli: Cli) -> Result<u8> {
 /// Replace this binary with the published one, and pick it up.
 async fn update(socket: &Path, check: bool, force: bool) -> Result<u8> {
     let available = manymux::update::check().await?;
-    if !available.is_newer() {
+    if available.is_newer() {
+        if check {
+            println!(
+                "an update is published on the {} channel; `mm update` to take it",
+                style::bold(&available.tag)
+            );
+            return Ok(OK);
+        }
+        let path = manymux::update::apply(&available).await?;
+        println!(
+            "{} updated {}",
+            style::green("✓"),
+            style::bold(&path.display().to_string())
+        );
+        refresh_completions();
+    } else {
         println!(
             "{} manymux {} is the published {} build",
             style::green("✓"),
             env!("CARGO_PKG_VERSION"),
             available.tag
         );
+    }
+
+    // Whether anything was downloaded or not. The node is a long-running
+    // process still executing whatever it started from, so a machine whose
+    // binary is current can still behave like the old build in every way that
+    // matters, and saying "already current" and stopping there is how an
+    // update looks finished while the machine is not.
+    let Some(running) = manymux::update::running(socket).await else {
+        return Ok(OK);
+    };
+    if !manymux::update::is_stale(socket, &available.checksum).await {
         return Ok(OK);
     }
     if check {
         println!(
-            "an update is published on the {} channel; `mm update` to take it",
-            style::bold(&available.tag)
+            "{} the node is running an older build; `mm restart` to pick this one up",
+            style::amber("!")
         );
         return Ok(OK);
     }
+    restart(socket, running.sessions, force, "mm update").await
+}
 
-    let path = manymux::update::apply(&available).await?;
-    println!(
-        "{} updated {}",
-        style::green("✓"),
-        style::bold(&path.display().to_string())
-    );
-    refresh_completions();
-
-    // The node is a long-running process still executing the old binary, so an
-    // update that leaves it alone has not really landed. Restarting it kills
-    // every session it owns, though, which is not something to do quietly.
-    let Some(running) = manymux::update::running(socket).await else {
-        return Ok(OK);
-    };
-    if running.sessions > 0 && !force {
+/// Restart the node, unless that would cost sessions the caller has not agreed
+/// to lose. `command` is what to suggest `--force` on, since both `mm update`
+/// and `mm restart` end up here.
+async fn restart(socket: &Path, sessions: usize, force: bool, command: &str) -> Result<u8> {
+    if sessions > 0 && !force {
         println!(
             "{} the node is still on the old binary, and restarting it would end \
-             {} running session{}.\n  `mm update --force` to restart anyway, or leave it \
+             {} running session{}.\n  `{command} --force` to restart anyway, or leave it \
              until they are done.",
             style::amber("!"),
-            running.sessions,
-            if running.sessions == 1 { "" } else { "s" }
+            sessions,
+            if sessions == 1 { "" } else { "s" }
         );
         return Ok(OK);
     }
