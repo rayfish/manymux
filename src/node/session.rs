@@ -132,6 +132,12 @@ impl Attachment {
         self.session.apply_size(&mut state, effective);
     }
 
+    /// Whether the program is expecting pastes to be bracketed, which decides
+    /// how a pasted file's path is handed to it.
+    pub fn bracketed_paste(&self) -> bool {
+        self.session.state.lock().unwrap().scanner.bracketed_paste()
+    }
+
     /// Re-read the screen after a lag, so the client can repaint instead of
     /// rendering a hole.
     pub fn resync(&self) -> String {

@@ -50,6 +50,30 @@ pub mod tag {
     /// that never answers is an older client and is left alone.
     pub const PING: u8 = 0x15;
     pub const PONG: u8 = 0x16;
+    /// A chunk of a file pasted from the clipboard of the machine the client is
+    /// sitting at. Client to server only, and meaningless on its own: the
+    /// chunks are appended until [`PASTE_END`] says the file is whole.
+    pub const PASTE: u8 = 0x17;
+    /// The end of a paste, carrying the [`super::PasteInfo`] describing what
+    /// the chunks before it add up to.
+    pub const PASTE_END: u8 = 0x18;
+}
+
+/// The largest file a paste may carry. A screenshot is a couple of megabytes;
+/// past this someone is sending a video, and the host would be holding all of
+/// it in memory while they did.
+pub const MAX_PASTE: usize = 16 << 20;
+
+/// How much of a pasted file goes in one frame. Well under [`MAX_FRAME`], and
+/// large enough that a few megabytes is tens of frames rather than thousands.
+pub const PASTE_CHUNK: usize = 256 << 10;
+
+/// What the host needs to know about the bytes a paste just sent it.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct PasteInfo {
+    /// File extension, sniffed from the bytes by the client: `png`, `jpg`,
+    /// `gif`, `webp`. The host sanitises it before it becomes a filename.
+    pub kind: String,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
@@ -147,6 +171,15 @@ pub enum Response {
     /// `RESIZE`, `DETACH` or `EXIT`.
     Attached {
         size: Size,
+        /// Whether this host understands `PASTE` frames. A host too old to
+        /// know the tag would skip them in silence, and a client that could
+        /// not tell would leave you pressing a key that does nothing; with
+        /// this it can say why instead.
+        ///
+        /// Defaulted rather than required, so a newer client reading an older
+        /// host's answer gets `false` rather than a decode error.
+        #[serde(default)]
+        paste: bool,
     },
     Error(String),
 }
@@ -350,6 +383,50 @@ mod tests {
     fn real_sizes_are_left_alone_but_capped() {
         assert_eq!(Size::new(120, 40).sane(), Size::new(120, 40));
         assert_eq!(Size::new(9000, 9000).sane(), Size::new(1000, 1000));
+    }
+
+    /// The one place a field was added to an existing message, and the reason
+    /// it could be: both directions of a fleet halfway through an update have
+    /// to keep working, and neither end negotiates anything.
+    #[test]
+    fn an_older_hosts_attach_answer_still_decodes() {
+        /// `Response::Attached` as it was before pasting existed.
+        #[derive(Serialize, Deserialize)]
+        enum Old {
+            #[allow(dead_code)]
+            Sessions(Vec<SessionInfo>),
+            #[allow(dead_code)]
+            Spawned {
+                name: String,
+            },
+            #[allow(dead_code)]
+            Ok,
+            Attached {
+                size: Size,
+            },
+            #[allow(dead_code)]
+            Error(String),
+        }
+
+        let old = encode(&Old::Attached {
+            size: Size::new(80, 24),
+        })
+        .unwrap();
+        let decoded: Response = decode(&old).unwrap();
+        let Response::Attached { size, paste } = decoded else {
+            panic!("an old answer should still be an attach");
+        };
+        assert_eq!(size, Size::new(80, 24));
+        assert!(!paste, "a host that never heard of pasting cannot take one");
+
+        // And the other way: an old client reading a new host's answer, which
+        // is a fleet updated from the far end first.
+        let new = encode(&Response::Attached {
+            size: Size::new(80, 24),
+            paste: true,
+        })
+        .unwrap();
+        assert!(matches!(decode::<Old>(&new).unwrap(), Old::Attached { .. }));
     }
 
     #[tokio::test]

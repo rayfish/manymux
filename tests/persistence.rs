@@ -339,7 +339,7 @@ async fn two_clients_share_one_session_at_the_smaller_size() {
     let Spawned { name, .. } = spawn_session(&node, &["/bin/sh", "-i"]).await;
 
     let mut wide = Client::connect(&node);
-    let Response::Attached { size } = wide
+    let Response::Attached { size, .. } = wide
         .send(&Request::Attach {
             name: name.clone(),
             size: Size::new(120, 40),
@@ -352,7 +352,7 @@ async fn two_clients_share_one_session_at_the_smaller_size() {
     assert_eq!(size, Size::new(120, 40));
 
     let mut narrow = Client::connect(&node);
-    let Response::Attached { size } = narrow
+    let Response::Attached { size, .. } = narrow
         .send(&Request::Attach {
             name: name.clone(),
             size: Size::new(80, 50),
@@ -430,5 +430,66 @@ async fn reattaching_restores_mouse_reporting_and_the_title() {
         );
     }
 
+    registry.kill(&name).unwrap();
+}
+
+/// The whole point of forwarding a paste: the image is on the machine you are
+/// sitting at and the program is on another one, so the bytes travel and what
+/// the program is handed is a path to them on its own filesystem.
+#[tokio::test]
+async fn a_pasted_image_is_written_on_the_host_and_its_path_typed_into_the_session() {
+    let node = test_node().await;
+    let registry = &node.registry;
+    // `cat` so the session is reading, and the terminal echoes what arrives.
+    let Spawned { name, .. } = spawn_session(&node, &["/bin/sh", "-c", "echo ready; cat"]).await;
+
+    let mut client = Client::connect(&node);
+    let attach = Request::Attach {
+        name: name.clone(),
+        size: Size::new(200, 24),
+    };
+    let Response::Attached { paste, .. } = client.send(&attach).await.unwrap() else {
+        panic!("attach failed");
+    };
+    assert!(paste, "a host that takes pastes has to say so");
+    client.read_until("ready").await;
+
+    // A PNG, as far as anything here is concerned: the client sniffed it and
+    // the host only ever treats it as bytes.
+    let png = b"\x89PNG\r\n\x1a\nnot really an image, but nothing here looks";
+    proto::write_frame(&mut client.write, tag::PASTE, &png[..8])
+        .await
+        .unwrap();
+    proto::write_frame(&mut client.write, tag::PASTE, &png[8..])
+        .await
+        .unwrap();
+    proto::write_msg(
+        &mut client.write,
+        tag::PASTE_END,
+        &proto::PasteInfo {
+            kind: "png".to_string(),
+        },
+    )
+    .await
+    .unwrap();
+
+    let seen = client.read_until(".png").await;
+
+    let written: Vec<_> = std::fs::read_dir(manymux::node::paste::dir())
+        .expect("the paste directory")
+        .flatten()
+        .filter(|entry| std::fs::read(entry.path()).is_ok_and(|data| data == png))
+        .collect();
+    assert_eq!(written.len(), 1, "the file should be on the host, once");
+
+    let name_on_disk = written[0].file_name().to_string_lossy().into_owned();
+    assert!(
+        seen.contains(&name_on_disk),
+        "the session was never told where the file went; saw {seen:?}"
+    );
+    // Two chunks, one file: nothing was written until the paste was whole.
+    assert_eq!(std::fs::read(written[0].path()).unwrap(), png);
+
+    std::fs::remove_file(written[0].path()).unwrap();
     registry.kill(&name).unwrap();
 }

@@ -86,6 +86,14 @@ fn parse_prefix(text: &str) -> Option<u8> {
     (0x40..=0x60).contains(&byte).then_some(byte & 0x1f)
 }
 
+/// The key that pastes what is on this machine's clipboard: Ctrl-V (0x16).
+///
+/// The key everything else already uses for it, and the one `claude` itself
+/// listens for. Taken from the session only when the clipboard actually holds
+/// an image: with text on it, or nothing, the byte goes through and vim's
+/// visual block still works. `MM_PASTE=off` gives the key back entirely.
+pub const PASTE_KEY: u8 = 0x16;
+
 /// Which way a switch key moves through the sessions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Motion {
@@ -100,6 +108,10 @@ pub enum Motion {
 pub enum Action {
     Detach,
     Switch(Motion),
+    /// Send this machine's clipboard to the session, if there is an image on
+    /// it. Deciding that is the caller's: this half of the client knows nothing
+    /// about clipboards.
+    Paste,
 }
 
 /// How the attach ended.
@@ -151,6 +163,8 @@ impl Mode {
 /// visible junk rather than a silently swallowed line.
 pub struct KeyFilter {
     prefix: u8,
+    /// Whether [`PASTE_KEY`] is the client's or the session's.
+    paste: bool,
     mode: Mode,
     /// When the key that turned control mode on was pressed, while it is still
     /// the last key pressed.
@@ -171,8 +185,24 @@ const LITERAL: Duration = Duration::from_secs(3);
 
 impl Default for KeyFilter {
     fn default() -> Self {
-        Self::new(prefix())
+        Self {
+            paste: paste_enabled(),
+            ..Self::new(prefix())
+        }
     }
+}
+
+/// Whether the paste key is watched for by default. A client with no clipboard
+/// of its own to read (a phone, which has its own way of sending one) is left
+/// to decide for itself.
+#[cfg(feature = "desktop")]
+fn paste_enabled() -> bool {
+    crate::clipboard::enabled()
+}
+
+#[cfg(not(feature = "desktop"))]
+fn paste_enabled() -> bool {
+    true
 }
 
 /// What a chunk of keystrokes amounts to once the client's own keys are taken
@@ -191,9 +221,16 @@ impl KeyFilter {
     pub fn new(prefix: u8) -> Self {
         Self {
             prefix,
+            paste: true,
             mode: Mode::Focus,
             pressed: None,
         }
+    }
+
+    /// Whether the paste key is the client's. Off hands it back to the session,
+    /// which is what `MM_PASTE=off` asks for.
+    pub fn set_paste(&mut self, on: bool) {
+        self.paste = on;
     }
 
     /// Start in a mode. Attaching after a switch starts in control mode, which
@@ -219,6 +256,16 @@ impl KeyFilter {
                 if b == self.prefix {
                     self.mode = Mode::Control;
                     self.pressed = Some(now);
+                } else if self.paste && b == PASTE_KEY {
+                    // Handed up rather than swallowed: the caller sends the
+                    // key on when the clipboard turns out to hold nothing to
+                    // paste, so the session keeps the key on every press that
+                    // was not one.
+                    return Keystrokes {
+                        forward,
+                        action: Some(Action::Paste),
+                        mode: self.mode,
+                    };
                 } else {
                     forward.push(b);
                 }
@@ -265,7 +312,7 @@ impl KeyFilter {
                 // A switch leaves control mode on, so the next key carries on
                 // walking without a mode key of its own.
                 self.mode = match action {
-                    Action::Detach => Mode::Focus,
+                    Action::Detach | Action::Paste => Mode::Focus,
                     Action::Switch(_) => Mode::Control,
                 };
                 return Keystrokes {
@@ -289,15 +336,17 @@ pub use terminal::{Held, hold, run, session_size, terminal_size};
 #[cfg(feature = "desktop")]
 mod terminal {
     use std::io::IsTerminal;
+    use std::time::Duration;
 
     use anyhow::{Result, bail};
     use crossterm::terminal;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt, Stdout};
     use tokio::signal::unix::{SignalKind, signal};
 
-    use super::{Action, KeyFilter, Mode, Outcome};
+    use super::{Action, KeyFilter, Mode, Outcome, PASTE_KEY};
     use crate::client::status::{self, Filter, Status};
-    use crate::client::{Attached, SessionHalves, Update};
+    use crate::client::{Attached, SessionHalves, SessionReader, SessionWriter, Update};
+    use crate::clipboard;
     use crate::proto::Size;
 
     /// Sent before attaching.
@@ -416,7 +465,12 @@ mod terminal {
         pump(session, status, mode).await
     }
 
+    /// How long a notice from the client itself stays on the row before the key
+    /// hints have it back. Long enough to read without looking for it.
+    const NOTICE_FOR: Duration = Duration::from_secs(5);
+
     async fn pump(session: Attached, mut status: Status, mode: Mode) -> Result<Outcome> {
+        let takes_pastes = session.paste;
         let SessionHalves {
             mut reader,
             mut writer,
@@ -431,6 +485,8 @@ mod terminal {
         // The row no longer says what the keys are doing. Held until there is a
         // safe moment to draw, the same as a mark the session cleared.
         let mut restate = false;
+        // When the notice on the row stops being worth showing.
+        let mut notice_until: Option<tokio::time::Instant> = None;
 
         loop {
             tokio::select! {
@@ -463,6 +519,29 @@ mod terminal {
                             writer.detach().await?;
                             return Ok(Outcome::Switch(motion));
                         }
+                        Some(Action::Paste) => {
+                            let pasted = paste(
+                                &mut reader,
+                                &mut writer,
+                                &mut stdout,
+                                &mut output,
+                                &mut status,
+                                takes_pastes,
+                            ).await?;
+                            notice_until = Some(tokio::time::Instant::now() + NOTICE_FOR);
+                            // The same discipline as everywhere else: never
+                            // into the middle of a sequence the session is
+                            // part way through.
+                            restate = true;
+                            if output.at_boundary() {
+                                stdout.write_all(status.repaint(terminal_size()).as_bytes()).await?;
+                                stdout.flush().await?;
+                                restate = false;
+                            }
+                            if let Pasted::Ended(outcome) = pasted {
+                                return Ok(outcome);
+                            }
+                        }
                         None => {}
                     }
                 }
@@ -491,6 +570,108 @@ mod terminal {
                     stdout.write_all(status.repaint(size).as_bytes()).await?;
                     stdout.flush().await?;
                 }
+                // A notice the client put on the row has been up long enough.
+                _ = expire(notice_until) => {
+                    notice_until = None;
+                    status.clear_notice();
+                    restate = true;
+                    if output.at_boundary() {
+                        stdout.write_all(status.repaint(terminal_size()).as_bytes()).await?;
+                        stdout.flush().await?;
+                        restate = false;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Wait for a notice's time to be up, or forever when there is no notice on
+    /// the row. Never resolving is what keeps the arm out of the way.
+    async fn expire(at: Option<tokio::time::Instant>) {
+        match at {
+            Some(at) => tokio::time::sleep_until(at).await,
+            None => std::future::pending().await,
+        }
+    }
+
+    /// Whether the session was still there when the paste finished.
+    enum Pasted {
+        Done,
+        Ended(Outcome),
+    }
+
+    /// Read this machine's clipboard and send what is on it to the session's
+    /// host, which writes it down and pastes the path.
+    ///
+    /// The key goes through untouched when there is nothing to paste, so a
+    /// Ctrl-V that was meant for the program still reaches it. Everything else
+    /// is said on the status row: this runs while a full-screen program owns the
+    /// screen, and there is nowhere else to put a sentence.
+    async fn paste(
+        reader: &mut SessionReader,
+        writer: &mut SessionWriter,
+        stdout: &mut Stdout,
+        output: &mut Filter,
+        status: &mut Status,
+        takes_pastes: bool,
+    ) -> Result<Pasted> {
+        let image = match clipboard::image().await {
+            Ok(Some(image)) => image,
+            // Text on the clipboard, or none at all. The ordinary case, and the
+            // one that must stay silent: the key belongs to the session.
+            Ok(None) => {
+                writer.send_input(&[PASTE_KEY]).await?;
+                return Ok(Pasted::Done);
+            }
+            // A missing helper program, or one that failed. Worth a sentence,
+            // and the key still goes through.
+            Err(e) => {
+                status.set_notice(&format!("{e:#}"));
+                writer.send_input(&[PASTE_KEY]).await?;
+                return Ok(Pasted::Done);
+            }
+        };
+        if !takes_pastes {
+            status.set_notice("this host is too old to take pasted files; `mm update` there");
+            writer.send_input(&[PASTE_KEY]).await?;
+            return Ok(Pasted::Done);
+        }
+
+        let size = clipboard::mb(image.data.len());
+        status.set_notice(&format!("pasting {size}"));
+        if output.at_boundary() {
+            stdout
+                .write_all(status.repaint(terminal_size()).as_bytes())
+                .await?;
+            stdout.flush().await?;
+        }
+
+        // The screen has to stay alive while the bytes go: a session still
+        // producing output would otherwise fill the connection nobody is
+        // reading, and both ends would sit there waiting for the other. The
+        // send is a single future polled to completion rather than one
+        // recreated per pass, so nothing is ever cancelled mid-frame.
+        let send = writer.send_paste(image.kind, &image.data);
+        tokio::pin!(send);
+        loop {
+            tokio::select! {
+                sent = &mut send => {
+                    sent?;
+                    status.set_notice(&format!("pasted {size}"));
+                    return Ok(Pasted::Done);
+                }
+                update = reader.next() => match update? {
+                    Update::Output(bytes) => {
+                        stdout.write_all(&output.feed(&bytes)).await?;
+                        stdout.flush().await?;
+                    }
+                    // Left unanswered: the writing half is busy with the paste,
+                    // and every chunk of it is a frame the host counts as this
+                    // client being alive.
+                    Update::Ping => {}
+                    Update::Exited(code) => return Ok(Pasted::Ended(Outcome::Exited(code))),
+                    Update::Disconnected => return Ok(Pasted::Ended(Outcome::Disconnected)),
+                },
             }
         }
     }
@@ -659,6 +840,41 @@ mod tests {
         // And the default key is then just an ordinary keystroke again.
         let mut f = KeyFilter::new(0x02);
         assert_eq!(f.filter(&[KEY]), forwarded(&[KEY]));
+    }
+
+    #[test]
+    fn the_paste_key_is_handed_up_rather_than_swallowed() {
+        // Handed up, because whether it is the client's key at all depends on
+        // what is on the clipboard, and the filter has no way to know. What is
+        // typed before it still goes to the session.
+        let mut f = KeyFilter::default();
+        assert_eq!(
+            f.filter(&[b'l', b's', PASTE_KEY]),
+            Keystrokes {
+                forward: b"ls".to_vec(),
+                action: Some(Action::Paste),
+                mode: Mode::Focus,
+            }
+        );
+        // And the keyboard is still in focus afterwards: pasting is not a mode.
+        assert_eq!(f.filter(b"x"), forwarded(b"x"));
+    }
+
+    #[test]
+    fn mm_paste_off_gives_the_key_back_to_the_session() {
+        // For vim's visual block, which is what Ctrl-V is for anyone not
+        // pasting screenshots.
+        let mut f = KeyFilter::default();
+        f.set_paste(false);
+        assert_eq!(f.filter(&[PASTE_KEY]), forwarded(&[PASTE_KEY]));
+    }
+
+    #[test]
+    fn the_paste_key_is_only_the_paste_key_in_focus() {
+        // In control mode it is an unbound key like any other: back to focus,
+        // both bytes through.
+        let mut f = KeyFilter::default();
+        assert_eq!(f.filter(&[KEY, PASTE_KEY]), forwarded(&[KEY, PASTE_KEY]));
     }
 
     #[test]

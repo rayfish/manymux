@@ -18,6 +18,8 @@ pub mod term;
 pub mod user;
 
 #[cfg(feature = "desktop")]
+pub mod clipboard;
+#[cfg(feature = "desktop")]
 pub mod ipc;
 #[cfg(feature = "desktop")]
 pub mod log;

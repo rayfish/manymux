@@ -94,6 +94,20 @@ session wherever you left it:
 mm attach api
 ```
 
+## Pasting an image
+
+`Ctrl-V` pastes the image on your clipboard into a session on another machine.
+The client reads the clipboard here, sends the bytes to the host, and what the
+program receives is the path they were written to, which is what `claude` wants:
+it reads the file itself.
+
+Nothing is installed for it on the far machine. On yours it uses what is already
+there: AppleScript on macOS, `wl-paste` on Wayland, `xclip` on X11. Copying an
+image *file* in a file manager works too. The key is only taken when there is an
+image to send, so `Ctrl-V` still reaches the session otherwise; `MM_PASTE=off`
+gives it back for good. Pasted files land in `$XDG_RUNTIME_DIR/manymux/pastes`
+on the host and are cleaned up after a day.
+
 ## Two modes
 
 Modal, like vim, and for the same reason: the keys worth having are the ones a
@@ -266,6 +280,7 @@ pins a release.
 | | |
 |---|---|
 | `MM_PREFIX` | control-mode key, e.g. `C-b`. Default `Ctrl-]` |
+| `MM_PASTE` | `off` gives `Ctrl-V` back to the session |
 | `MM_SSH` | the ssh program, if yours lives somewhere unusual |
 | `MM_LOG` | log filter, e.g. `manymux=debug` |
 | `MM_CONFIG_DIR` | where the host list lives |

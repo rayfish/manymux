@@ -54,6 +54,11 @@ enum State {
 /// Detaching undoes this list, in `client::attach`. The two have to stay
 /// together: a mode switched on for a session and not switched off again is a
 /// mode left on in the shell you get back.
+/// Bracketed paste: the program has asked to be told when text arrives as a
+/// paste rather than as typing. Named because a pasted file's path is wrapped
+/// in it when the program is expecting that.
+pub const BRACKETED_PASTE: u16 = 2004;
+
 pub const REPLAYED_MODES: &[u16] = &[
     9,    // X10 mouse reporting
     66,   // application keypad
@@ -65,7 +70,7 @@ pub const REPLAYED_MODES: &[u16] = &[
     1006, // SGR mouse encoding
     1015, // urxvt mouse encoding
     1016, // SGR pixel mouse encoding
-    2004, // bracketed paste
+    BRACKETED_PASTE,
 ];
 
 /// Longest CSI parameter run we buffer. Real sequences are a handful of bytes.
@@ -136,6 +141,13 @@ impl Scanner {
     /// The title the program last set, if any.
     pub fn title(&self) -> Option<&str> {
         self.title.as_deref()
+    }
+
+    /// Whether the program is expecting pastes to be bracketed. A path pasted
+    /// into a shell that asked for this must arrive as a paste, or the shell
+    /// runs it the moment a newline turns up in the middle of it.
+    pub fn bracketed_paste(&self) -> bool {
+        self.modes.contains(&BRACKETED_PASTE)
     }
 
     /// Feed a chunk of output. Partial sequences are carried across calls, so

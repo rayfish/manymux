@@ -53,6 +53,11 @@ pub struct Status {
     target: String,
     /// The mode the row says the keyboard is in.
     mode: Mode,
+    /// Something the client has to say for itself, which takes the hints' place
+    /// while it is up. A paste is the only thing that has anything to say so
+    /// far, and it says it here because a full-screen program owns every other
+    /// row on the screen.
+    notice: Option<String>,
 }
 
 impl Status {
@@ -60,7 +65,18 @@ impl Status {
         Self {
             target: target.to_string(),
             mode: Mode::default(),
+            notice: None,
         }
+    }
+
+    /// Put a message on the row. The caller repaints, and takes it off again
+    /// once it has been up long enough.
+    pub fn set_notice(&mut self, notice: &str) {
+        self.notice = Some(notice.to_string());
+    }
+
+    pub fn clear_notice(&mut self) {
+        self.notice = None;
     }
 
     /// Say which mode the row is to show. The caller repaints afterwards.
@@ -123,14 +139,22 @@ impl Status {
         )
     }
 
-    /// The key hints, at the left end of the same row, while there is room for
-    /// them beside the mark. The mark wins when there is not.
+    /// What sits at the left end of the same row: whatever the client has to
+    /// say, else the key hints while control mode is on, while there is room
+    /// for it beside the mark. The mark wins when there is not.
     fn hint(&self, size: Size, mark: u16) -> String {
+        let (text, styled) = match (&self.notice, self.mode) {
+            // A notice outranks the hints: it is the answer to a key that was
+            // just pressed, and the hints will be back in a few seconds.
+            (Some(notice), _) => (notice.as_str(), style::amber as fn(&str) -> String),
+            (None, Mode::Control) => (HINT, style::faint as fn(&str) -> String),
+            (None, Mode::Focus) => return String::new(),
+        };
         // A blank column between the two, so they never run together.
-        if self.mode != Mode::Control || columns(HINT) + 1 + mark + GUTTER > size.cols {
+        if columns(text) + 1 + mark + GUTTER > size.cols {
             return String::new();
         }
-        style::faint(HINT)
+        styled(text)
     }
 
     /// `mm ` in front of a title, or in front of the target when the session has

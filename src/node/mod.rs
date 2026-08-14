@@ -11,6 +11,7 @@
 
 pub mod events;
 pub mod notify;
+pub mod paste;
 pub mod peers;
 pub mod registry;
 pub mod session;
@@ -213,6 +214,7 @@ impl Node {
                 let attached = session.attach(size);
                 let response = Response::Attached {
                     size: attached.size,
+                    paste: true,
                 };
                 proto::write_msg(&mut write, tag::RESPONSE, &response).await?;
                 pump_attachment(attached, read, write).await
@@ -312,6 +314,7 @@ where
     // Only a client that has answered a ping is held to the deadline, so an
     // older one, which skips the tag it does not know, keeps working as before.
     let mut answers_pings = false;
+    let mut incoming = Paste::default();
 
     loop {
         tokio::select! {
@@ -322,6 +325,22 @@ where
                     tag::DATA => attachment.send_input(frame.body),
                     tag::RESIZE => attachment.resize(proto::decode(&frame.body)?),
                     tag::PONG => answers_pings = true,
+                    tag::PASTE => incoming.take(frame.body),
+                    tag::PASTE_END => {
+                        let info: proto::PasteInfo = proto::decode(&frame.body)?;
+                        // A paste that fails is reported to the log and not to
+                        // the client: there is no way to say anything on this
+                        // stream that would not land in the middle of whatever
+                        // the program is drawing.
+                        match incoming.finish(&info.kind) {
+                            Ok(path) => {
+                                debug!(path = %path.display(), "pasted a file into the session");
+                                let typed = paste::typed(&path, attachment.bracketed_paste());
+                                attachment.send_input(typed.into_bytes());
+                            }
+                            Err(e) => warn!("dropping a paste: {e:#}"),
+                        }
+                    }
                     tag::DETACH => break,
                     other => warn!("ignoring unexpected tag {other:#x} while attached"),
                 }
@@ -355,6 +374,51 @@ where
         }
     }
     Ok(())
+}
+
+/// A pasted file arriving a frame at a time.
+///
+/// Held per attachment rather than per session: a paste belongs to the client
+/// sending it, and two clients pasting at once must not interleave into one
+/// corrupt file.
+#[derive(Default)]
+struct Paste {
+    data: Vec<u8>,
+    /// Set when the file went over the limit. The chunks after it are still
+    /// read and thrown away, so the stream stays in step, and the end of it is
+    /// refused rather than written down half a file.
+    too_big: bool,
+}
+
+impl Paste {
+    fn take(&mut self, chunk: Vec<u8>) {
+        if self.too_big {
+            return;
+        }
+        if self.data.len() + chunk.len() > proto::MAX_PASTE {
+            self.too_big = true;
+            self.data = Vec::new();
+            return;
+        }
+        if self.data.is_empty() {
+            self.data = chunk;
+        } else {
+            self.data.extend_from_slice(&chunk);
+        }
+    }
+
+    /// Write what has arrived, and be empty again either way: a refused paste
+    /// must not turn up on the end of the next one.
+    fn finish(&mut self, kind: &str) -> Result<PathBuf> {
+        let data = std::mem::take(&mut self.data);
+        if std::mem::take(&mut self.too_big) {
+            bail!("the file was over the {} byte limit", proto::MAX_PASTE);
+        }
+        if data.is_empty() {
+            bail!("the paste carried no data");
+        }
+        paste::write(kind, &data)
+    }
 }
 
 /// Write a frame to an attached client, giving up on one that has stopped
@@ -444,4 +508,36 @@ async fn start_node(socket: &Path) -> Result<()> {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     bail!("started a node but it did not come up within {START_TIMEOUT:?}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_paste_is_only_written_once_it_is_whole() {
+        let mut paste = Paste::default();
+        paste.take(b"\x89PNG".to_vec());
+        paste.take(b"\r\n\x1a\n".to_vec());
+        assert_eq!(paste.data, b"\x89PNG\r\n\x1a\n");
+
+        let path = paste.finish("png").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"\x89PNG\r\n\x1a\n");
+        assert!(path.extension().is_some_and(|kind| kind == "png"));
+        std::fs::remove_file(path).unwrap();
+
+        // And it is empty again, so the next paste is its own file.
+        assert!(paste.finish("png").is_err(), "an empty paste is not a file");
+    }
+
+    #[test]
+    fn a_paste_over_the_limit_is_refused_rather_than_truncated() {
+        let mut paste = Paste::default();
+        paste.take(vec![0u8; proto::MAX_PASTE]);
+        paste.take(vec![0u8; 1]);
+        assert!(paste.finish("png").is_err());
+        // Nothing of it is left to turn up on the end of the next one.
+        assert!(paste.data.is_empty());
+        assert!(!paste.too_big);
+    }
 }

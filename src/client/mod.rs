@@ -18,7 +18,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::UnixStream;
 use tokio::process::Child;
 
-use crate::proto::{self, FrameReader, Request, Response, Size, tag};
+use crate::proto::{self, FrameReader, PasteInfo, Request, Response, Size, tag};
 
 type Reader = FrameReader<Box<dyn AsyncRead + Unpin + Send>>;
 type Writer = Box<dyn AsyncWrite + Unpin + Send>;
@@ -143,11 +143,12 @@ impl Stream {
             size,
         };
         match self.request(&request).await? {
-            Response::Attached { size } => Ok(Attached {
+            Response::Attached { size, paste } => Ok(Attached {
                 read: self.read,
                 write: self.write,
                 carrier: self.carrier,
                 size,
+                paste,
             }),
             Response::Error(message) => bail!(message),
             other => bail!("unexpected response to attach: {other:?}"),
@@ -163,6 +164,10 @@ pub struct Attached {
     /// The size the session settled on, which is the smallest of all attached
     /// clients and so may be smaller than the one requested.
     pub size: Size,
+    /// Whether this host takes pasted files. False on a host running a build
+    /// from before pasting existed, which is worth saying out loud rather than
+    /// leaving a key that does nothing.
+    pub paste: bool,
 }
 
 /// The two halves of an attached session, so output can be read while input is
@@ -237,6 +242,22 @@ pub struct SessionWriter {
 impl SessionWriter {
     pub async fn send_input(&mut self, bytes: &[u8]) -> Result<()> {
         proto::write_frame(&mut self.write, tag::DATA, bytes).await
+    }
+
+    /// Send a file from this machine's clipboard to the session's host, which
+    /// writes it down and pastes the path into the session.
+    ///
+    /// Sent in chunks because a screenshot is bigger than a frame, and finished
+    /// with the tag that says the chunks add up to a whole file: a transfer cut
+    /// off part way through is one the host never acts on.
+    pub async fn send_paste(&mut self, kind: &str, data: &[u8]) -> Result<()> {
+        for chunk in data.chunks(proto::PASTE_CHUNK) {
+            proto::write_frame(&mut self.write, tag::PASTE, chunk).await?;
+        }
+        let info = PasteInfo {
+            kind: kind.to_string(),
+        };
+        proto::write_msg(&mut self.write, tag::PASTE_END, &info).await
     }
 
     pub async fn resize(&mut self, size: Size) -> Result<()> {
