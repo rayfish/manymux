@@ -94,6 +94,131 @@ fn parse_prefix(text: &str) -> Option<u8> {
 /// visual block still works. `MM_PASTE=off` gives the key back entirely.
 pub const PASTE_KEY: u8 = 0x16;
 
+/// A key as a terminal in one of the extended-keys modes spells it.
+///
+/// The ordinary encoding cannot say which key produced a control byte: Ctrl-],
+/// Ctrl-3 and a literal 0x1d all arrive as 0x1d. A program that wants to tell
+/// Shift-Enter from Enter asks the terminal for a protocol that can, and from
+/// then on every chord arrives as an escape sequence instead of the byte the
+/// client was watching for. `pi` asks for it on startup, `helix` and `neovim`
+/// on request, so the mode key has to be recognised in all three spellings or
+/// a session running one of them cannot be left.
+#[derive(Debug, PartialEq, Eq)]
+struct Encoded {
+    /// How many bytes of the input the sequence took.
+    len: usize,
+    /// The key, as the codepoint it types unmodified: `]` for Ctrl-].
+    code: u32,
+    /// Which modifiers were down, in the protocol's bits, with the `+1` it
+    /// adds to them taken back off.
+    mods: u8,
+    /// 1 press, 2 repeat, 3 release. Only a press is a keystroke.
+    event: u8,
+}
+
+const SHIFT: u8 = 1;
+const CTRL: u8 = 4;
+/// Caps and num lock, which are reported alongside the modifiers actually held
+/// and must not stop a chord from matching.
+const LOCKS: u8 = 64 | 128;
+
+const PRESS: u8 = 1;
+
+/// The key codes control mode reads. No letters: one typed without modifiers
+/// still arrives as itself, whatever protocol is on.
+const ESCAPE: u32 = 27;
+const ENTER: u32 = 13;
+const TAB: u32 = 9;
+/// The modifier keys, which report presses and releases of their own once a
+/// program asks for event types. 57441 to 57454 is both shifts, controls,
+/// alts, supers, hypers and metas, and the two ISO level shifts.
+const MODIFIER_KEYS: std::ops::RangeInclusive<u32> = 57441..=57454;
+
+impl Encoded {
+    /// Read one key off the front of `input`, if what is there is one.
+    ///
+    /// Both spellings: kitty's `CSI code[:alt] ; mods[:event] u`, and the older
+    /// `CSI 27 ; mods ; code ~` that xterm's `modifyOtherKeys` sends, which is
+    /// what a program falls back to when the terminal does not know the first.
+    /// A sequence split across two reads is not one: its bytes go to the
+    /// session and the keystroke is missed, the same way a Shift-Tab split down
+    /// the middle is.
+    fn parse(input: &[u8]) -> Option<Self> {
+        let rest = input.strip_prefix(b"\x1b[")?;
+        let end = rest.iter().position(|b| (0x40..=0x7e).contains(b))?;
+        let mut fields = std::str::from_utf8(&rest[..end]).ok()?.split(';');
+        let (code, mods, event) = match rest[end] {
+            b'u' => {
+                let code = number(fields.next()?)?;
+                let (mods, event) = modifiers(fields.next());
+                (code, mods, event)
+            }
+            // The older spelling puts the key last and always names 27 first,
+            // which is what tells it from `CSI 2 ~` and the other keys that end
+            // the same way.
+            b'~' => {
+                if number(fields.next()?)? != ESCAPE {
+                    return None;
+                }
+                let (mods, event) = modifiers(fields.next());
+                (number(fields.next()?)?, mods, event)
+            }
+            _ => return None,
+        };
+        Some(Self {
+            len: 2 + end + 1,
+            code,
+            mods,
+            event,
+        })
+    }
+
+    /// Whether this is the terminal's spelling of a control byte the client
+    /// watches for, held with ctrl and nothing else.
+    fn is(&self, byte: u8) -> bool {
+        self.code == key_code(byte) && self.mods & !LOCKS == CTRL
+    }
+
+    /// Whether it is a modifier pressed on its own, which is not a keystroke.
+    fn is_modifier(&self) -> bool {
+        MODIFIER_KEYS.contains(&self.code)
+    }
+}
+
+/// The first number in a parameter, ignoring the sub-parameters behind it:
+/// those are the alternate keys, which say what the same press would type on
+/// another layout and are not what we match on.
+fn number(field: &str) -> Option<u32> {
+    field.split(':').next()?.parse().ok()
+}
+
+/// The modifier field: a bitmask plus one, with the event type behind a colon.
+/// An absent field means no modifiers and a press, which is what the protocol
+/// says a missing one means.
+fn modifiers(field: Option<&str>) -> (u8, u8) {
+    let Some(field) = field else {
+        return (0, PRESS);
+    };
+    let mut parts = field.split(':');
+    let mods = parts
+        .next()
+        .and_then(|p| p.parse::<u8>().ok())
+        .map_or(0, |m| m.saturating_sub(1));
+    let event = parts.next().and_then(|p| p.parse().ok()).unwrap_or(PRESS);
+    (mods, event)
+}
+
+/// The codepoint a terminal reports for the key behind a control byte. Ctrl-]
+/// is 0x1d and the key is `]`; Ctrl-B is 0x02 and the key is `b`, unshifted,
+/// which is the form these protocols report. Space is the one the arithmetic
+/// does not reach, since a terminal masks it to NUL along with `@`.
+fn key_code(byte: u8) -> u32 {
+    match byte {
+        0 => u32::from(b' '),
+        b => u32::from((b | 0x40).to_ascii_lowercase()),
+    }
+}
+
 /// Which way a switch key moves through the sessions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Motion {
@@ -176,6 +301,12 @@ pub struct KeyFilter {
     /// out again, so nothing is: a mode you sat in for a while, or one a switch
     /// left on, was never a request for that byte.
     pressed: Option<Instant>,
+    /// How the terminal spelled the key most recently taken from it: the bare
+    /// control byte, or the escape sequence an extended-keys terminal sends in
+    /// its place. What goes to the session when the key turns out to be the
+    /// session's after all has to be what the terminal sent, or a program that
+    /// asked for the long spelling gets a byte it no longer reads that way.
+    spelling: Vec<u8>,
 }
 
 /// How long after the mode key a second one still means "send me the byte"
@@ -224,6 +355,29 @@ impl KeyFilter {
             paste: true,
             mode: Mode::Focus,
             pressed: None,
+            spelling: vec![prefix],
+        }
+    }
+
+    /// How the terminal spelled the last key the client took for itself, for a
+    /// caller that decides to hand it back: the paste key, when there turns out
+    /// to be no image on the clipboard.
+    pub fn spelling(&self) -> &[u8] {
+        &self.spelling
+    }
+
+    /// Remember a spelling, for the paths that give the key to the session.
+    fn spell(&mut self, bytes: &[u8]) {
+        self.spelling.clear();
+        self.spelling.extend_from_slice(bytes);
+    }
+
+    /// Where an action leaves the keyboard. A switch stays in control mode, so
+    /// the next key carries on walking without a mode key of its own.
+    fn after(action: Action) -> Mode {
+        match action {
+            Action::Detach | Action::Paste => Mode::Focus,
+            Action::Switch(_) => Mode::Control,
         }
     }
 
@@ -250,13 +404,32 @@ impl KeyFilter {
         let mut forward = Vec::with_capacity(input.len());
         let mut i = 0;
         while i < input.len() {
+            // A terminal that a program has put into an extended-keys mode
+            // spells the client's own keys as escape sequences, so they have to
+            // be read off before the bytes are looked at or the mode key goes
+            // past unnoticed.
+            if let Some(key) = Encoded::parse(&input[i..]) {
+                let spelling = &input[i..i + key.len];
+                i += key.len;
+                if let Some(action) = self.encoded(&key, spelling, now, &mut forward) {
+                    self.mode = Self::after(action);
+                    return Keystrokes {
+                        forward,
+                        action: Some(action),
+                        mode: self.mode,
+                    };
+                }
+                continue;
+            }
             let b = input[i];
             i += 1;
             if self.mode == Mode::Focus {
                 if b == self.prefix {
+                    self.spell(&[b]);
                     self.mode = Mode::Control;
                     self.pressed = Some(now);
                 } else if self.paste && b == PASTE_KEY {
+                    self.spell(&[b]);
                     // Handed up rather than swallowed: the caller sends the
                     // key on when the clipboard turns out to hold nothing to
                     // paste, so the session keeps the key on every press that
@@ -276,8 +449,9 @@ impl KeyFilter {
                 // First, so that a mode key which is itself one of the keys
                 // below can still be sent through by pressing it twice.
                 b if b == self.prefix => {
+                    self.spell(&[b]);
                     if pressed.is_some_and(|at| now.duration_since(at) < LITERAL) {
-                        forward.push(self.prefix);
+                        forward.push(b);
                     }
                     self.mode = Mode::Focus;
                     None
@@ -301,7 +475,7 @@ impl KeyFilter {
                 }
                 other => {
                     self.mode = Mode::Focus;
-                    forward.push(self.prefix);
+                    forward.extend_from_slice(&self.spelling);
                     forward.push(other);
                     None
                 }
@@ -309,12 +483,7 @@ impl KeyFilter {
             // Whatever is left of the chunk is dropped: nobody types through a
             // detach or a switch.
             if let Some(action) = action {
-                // A switch leaves control mode on, so the next key carries on
-                // walking without a mode key of its own.
-                self.mode = match action {
-                    Action::Detach | Action::Paste => Mode::Focus,
-                    Action::Switch(_) => Mode::Control,
-                };
+                self.mode = Self::after(action);
                 return Keystrokes {
                     forward,
                     action: Some(action),
@@ -327,6 +496,74 @@ impl KeyFilter {
             action: None,
             mode: self.mode,
         }
+    }
+
+    /// One key in the terminal's own spelling. Returns what it asked for, if it
+    /// asked for anything; everything else it does, it does to `forward` and to
+    /// the mode.
+    fn encoded(
+        &mut self,
+        key: &Encoded,
+        spelling: &[u8],
+        now: Instant,
+        forward: &mut Vec<u8>,
+    ) -> Option<Action> {
+        if self.mode == Mode::Focus {
+            if key.event != PRESS {
+                // The session's own keys keep their releases, since it asked to
+                // be told about them. The client's do not: the press they
+                // belong to never got there either.
+                if !key.is(self.prefix) && !(self.paste && key.is(PASTE_KEY)) {
+                    forward.extend_from_slice(spelling);
+                }
+                return None;
+            }
+            if key.is(self.prefix) {
+                self.spell(spelling);
+                self.mode = Mode::Control;
+                self.pressed = Some(now);
+                return None;
+            }
+            if self.paste && key.is(PASTE_KEY) {
+                self.spell(spelling);
+                return Some(Action::Paste);
+            }
+            forward.extend_from_slice(spelling);
+            return None;
+        }
+
+        // Dropping everything that is not a press is what makes control mode
+        // usable at all once a program has asked for event types: the ctrl you
+        // were holding reports its own release the moment you let go of the
+        // mode key, and reading that as a key would drop you back to focus
+        // before you had typed anything.
+        if key.event != PRESS || key.is_modifier() {
+            return None;
+        }
+        let pressed = self.pressed.take();
+        if key.is(self.prefix) {
+            self.spell(spelling);
+            if pressed.is_some_and(|at| now.duration_since(at) < LITERAL) {
+                forward.extend_from_slice(spelling);
+            }
+            self.mode = Mode::Focus;
+            return None;
+        }
+        match key.code {
+            TAB if key.mods & SHIFT != 0 => return Some(Action::Switch(Motion::Previous)),
+            TAB => return Some(Action::Switch(Motion::Next)),
+            ESCAPE | ENTER => {
+                self.mode = Mode::Focus;
+                return None;
+            }
+            _ => {}
+        }
+        // An unbound key, handled the way the plain spelling of one is: back to
+        // focus, with what opened the mode and what closed it both passed on.
+        self.mode = Mode::Focus;
+        forward.extend_from_slice(&self.spelling);
+        forward.extend_from_slice(spelling);
+        None
     }
 }
 
@@ -344,7 +581,7 @@ mod terminal {
     use tokio::signal::unix::{SignalKind, signal};
     use tokio::sync::mpsc;
 
-    use super::{Action, KeyFilter, Mode, Outcome, PASTE_KEY};
+    use super::{Action, KeyFilter, Mode, Outcome};
     use crate::client::status::{self, Filter, Status};
     use crate::client::{Attached, SessionHalves, SessionReader, SessionWriter, Update};
     use crate::clipboard;
@@ -397,6 +634,18 @@ mod terminal {
         for mode in crate::node::events::REPLAYED_MODES {
             let _ = write!(reset, "\x1b[?{mode}l");
         }
+
+        // The extended-keys protocols, off the same way. A program that asked
+        // for one and was left running is asking the terminal it is no longer
+        // on, and a shell handed one back still in that mode reads `\x1b[13;2u`
+        // where it expects a carriage return.
+        //
+        // The count is kitty's whole stack, because the pushing was the
+        // program's and there is no telling how deep it went; popping past the
+        // bottom does nothing. The set that follows is for a program that
+        // changed the flags without pushing, which the pops cannot undo.
+        reset.push_str("\x1b[<16u\x1b[=0;1u");
+        reset.push_str("\x1b[>4;0m"); // and xterm's older modifyOtherKeys
 
         // Column zero, but no newline: leaving the alternate screen already put
         // the cursor back where the shell left it, on the line after the command
@@ -582,6 +831,10 @@ mod terminal {
                             return Ok(Outcome::Switch(motion));
                         }
                         Some(Action::Paste) => {
+                            // The key as the terminal spelled it, since it goes
+                            // to the session unchanged when there turns out to
+                            // be nothing on the clipboard to paste.
+                            let key = keys.spelling().to_vec();
                             let pasted = paste(
                                 &mut reader,
                                 &mut writer,
@@ -589,6 +842,7 @@ mod terminal {
                                 &mut output,
                                 &mut status,
                                 takes_pastes,
+                                &key,
                             ).await?;
                             notice_until = Some(tokio::time::Instant::now() + NOTICE_FOR);
                             // The paste had the writing half to itself, so a
@@ -709,26 +963,27 @@ mod terminal {
         output: &mut Filter,
         status: &mut Status,
         takes_pastes: bool,
+        key: &[u8],
     ) -> Result<Pasted> {
         let image = match clipboard::image().await {
             Ok(Some(image)) => image,
             // Text on the clipboard, or none at all. The ordinary case, and the
             // one that must stay silent: the key belongs to the session.
             Ok(None) => {
-                writer.send_input(&[PASTE_KEY]).await?;
+                writer.send_input(key).await?;
                 return Ok(Pasted::Done);
             }
             // A missing helper program, or one that failed. Worth a sentence,
             // and the key still goes through.
             Err(e) => {
                 status.set_notice(&format!("{e:#}"));
-                writer.send_input(&[PASTE_KEY]).await?;
+                writer.send_input(key).await?;
                 return Ok(Pasted::Done);
             }
         };
         if !takes_pastes {
             status.set_notice("this host is too old to take pasted files; `mm update` there");
-            writer.send_input(&[PASTE_KEY]).await?;
+            writer.send_input(key).await?;
             return Ok(Pasted::Done);
         }
 
@@ -822,6 +1077,16 @@ mod tests {
         }
     }
 
+    /// A key that took the keyboard into control mode without asking for
+    /// anything or reaching the session.
+    fn held() -> Keystrokes {
+        Keystrokes {
+            forward: vec![],
+            action: None,
+            mode: Mode::Control,
+        }
+    }
+
     /// A key that asked for something, with nothing forwarded alongside it.
     fn asked(action: Action, mode: Mode) -> Keystrokes {
         Keystrokes {
@@ -863,6 +1128,162 @@ mod tests {
                 reset.contains(sequence),
                 "detaching leaves {sequence:?} unsent"
             );
+        }
+    }
+
+    /// The keyboard protocols are the client's to undo for the same reason the
+    /// private modes are: the program that asked for one is still running on a
+    /// terminal that is no longer this one, and a shell handed back a keyboard
+    /// still in that mode reads escape sequences where it expects keys.
+    #[cfg(feature = "desktop")]
+    #[test]
+    fn detaching_undoes_the_keyboard_protocols_too() {
+        let reset = terminal::reset();
+        for sequence in [
+            "\x1b[<16u",  // pop kitty's stack, however deep the program went
+            "\x1b[=0;1u", // and clear flags it set without pushing
+            "\x1b[>4;0m", // xterm's modifyOtherKeys
+        ] {
+            assert!(
+                reset.contains(sequence),
+                "detaching leaves {sequence:?} unsent"
+            );
+        }
+    }
+
+    /// The bug this was written for: `pi` asks the terminal for the kitty
+    /// keyboard protocol on startup, and from then on the mode key arrives as
+    /// `CSI 93 ; 5 u` (`]` held with ctrl) rather than as 0x1d, so a session
+    /// running it could not be left.
+    #[test]
+    fn the_mode_key_is_still_the_mode_key_spelt_as_an_escape_sequence() {
+        let mut f = KeyFilter::default();
+        assert_eq!(
+            f.filter(b"ls\x1b[93;5ud"),
+            Keystrokes {
+                forward: b"ls".to_vec(),
+                action: Some(Action::Detach),
+                mode: Mode::Focus,
+            }
+        );
+    }
+
+    /// The other spelling, which is what a program falls back to on a terminal
+    /// that does not know the first.
+    #[test]
+    fn modify_other_keys_spells_the_mode_key_too() {
+        let mut f = KeyFilter::default();
+        assert_eq!(
+            f.filter(b"\x1b[27;5;93~d"),
+            asked(Action::Detach, Mode::Focus)
+        );
+    }
+
+    /// The alternate keys a terminal reports alongside the key, which say what
+    /// the same press would type on another layout, and the lock keys, which
+    /// are reported whether or not they are part of the chord.
+    #[test]
+    fn the_mode_key_matches_past_what_the_terminal_adds_to_it() {
+        let mut f = KeyFilter::default();
+        assert_eq!(f.filter(b"\x1b[93:125;5u"), held());
+        assert_eq!(f.filter(b"d"), asked(Action::Detach, Mode::Focus));
+        // Caps lock is bit 64, on top of ctrl's 4: 1 + 4 + 64.
+        let mut f = KeyFilter::default();
+        assert_eq!(f.filter(b"\x1b[93;69u"), held());
+        assert_eq!(f.filter(b"d"), asked(Action::Detach, Mode::Focus));
+    }
+
+    /// A chord that is not the mode key goes to the session as the terminal
+    /// spelt it, byte for byte.
+    #[test]
+    fn another_chord_in_the_same_spelling_passes_through() {
+        let mut f = KeyFilter::default();
+        // Ctrl-A, and the same key with shift as well, which is not the key
+        // either even though `]` is in it.
+        assert_eq!(f.filter(b"\x1b[97;5u"), forwarded(b"\x1b[97;5u"));
+        assert_eq!(f.filter(b"\x1b[93;6u"), forwarded(b"\x1b[93;6u"));
+    }
+
+    /// Once a program asks for event types, letting go of the key reports
+    /// itself, and so does the ctrl that was held with it. Read as keystrokes
+    /// they would take the mode away again before anything could be typed
+    /// into it.
+    #[test]
+    fn releases_are_not_keystrokes_and_do_not_leave_control_mode() {
+        let mut f = KeyFilter::default();
+        assert_eq!(f.filter(b"\x1b[93;5u"), held());
+        // The mode key released, then the ctrl key itself released.
+        assert_eq!(f.filter(b"\x1b[93;5:3u"), held());
+        assert_eq!(f.filter(b"\x1b[57442;5:3u"), held());
+        assert_eq!(f.filter(b"d"), asked(Action::Detach, Mode::Focus));
+    }
+
+    /// A release in focus mode is the session's, and goes to it, unless the
+    /// press it belongs to was the client's and never got there.
+    #[test]
+    fn the_session_keeps_the_releases_of_its_own_keys() {
+        let mut f = KeyFilter::default();
+        assert_eq!(f.filter(b"\x1b[97;5:3u"), forwarded(b"\x1b[97;5:3u"));
+        assert_eq!(f.filter(b"\x1b[93;5:3u"), forwarded(b""));
+    }
+
+    #[test]
+    fn the_escape_sequence_spelling_of_the_mode_key_twice_sends_one_through() {
+        // What goes to the session is what the terminal sent, since a program
+        // that asked for the long spelling is no longer reading the byte.
+        let mut f = KeyFilter::default();
+        assert_eq!(f.filter(b"\x1b[93;5u\x1b[93;5u"), forwarded(b"\x1b[93;5u"));
+    }
+
+    #[test]
+    fn control_mode_reads_escape_and_shift_tab_in_the_long_spelling() {
+        let mut f = KeyFilter::default();
+        assert_eq!(f.filter(b"\x1b[93;5u\x1b[9;2u"), {
+            asked(Action::Switch(Motion::Previous), Mode::Control)
+        });
+        assert_eq!(f.filter(b"\x1b[27u"), forwarded(b""));
+        assert_eq!(f.filter(b"ls"), forwarded(b"ls"));
+    }
+
+    #[test]
+    fn an_unbound_key_in_the_long_spelling_forwards_both() {
+        let mut f = KeyFilter::default();
+        assert_eq!(
+            f.filter(b"\x1b[93;5u\x1b[122;5u"),
+            forwarded(b"\x1b[93;5u\x1b[122;5u")
+        );
+    }
+
+    #[test]
+    fn the_paste_key_is_read_in_the_long_spelling_as_well() {
+        let mut f = KeyFilter::default();
+        assert_eq!(
+            f.filter(b"ls\x1b[118;5u"),
+            Keystrokes {
+                forward: b"ls".to_vec(),
+                action: Some(Action::Paste),
+                mode: Mode::Focus,
+            }
+        );
+        // And what goes back to the session, when the clipboard turns out to
+        // have nothing on it to paste, is what the terminal sent.
+        assert_eq!(f.spelling(), b"\x1b[118;5u");
+    }
+
+    #[test]
+    fn a_sequence_that_is_not_a_key_is_left_alone() {
+        let mut f = KeyFilter::default();
+        // Arrow keys, a bracketed paste, and a mouse report: all of them end in
+        // bytes a key sequence never does, or start with a number that is not
+        // the one the long spelling of a key starts with.
+        for sequence in [
+            &b"\x1b[A"[..],
+            b"\x1b[1;5C",
+            b"\x1b[200~hello\x1b[201~",
+            b"\x1b[<0;12;24M",
+            b"\x1b[2~",
+        ] {
+            assert_eq!(f.filter(sequence), forwarded(sequence));
         }
     }
 

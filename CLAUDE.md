@@ -116,7 +116,16 @@ Three consequences run through the whole codebase and are worth keeping intact:
 - **`mm agent` must leave stdout strictly alone**: the protocol is on it. Only
   the daemon opens a log file; everything else logs to stderr.
 - **Modes switched on for a session must be switched off on detach.**
-  `events::REPLAYED_MODES` and the teardown in `client::attach` are a pair.
+  `events::REPLAYED_MODES` and the teardown in `client::attach` are a pair, and
+  so are `events::Keyboard` and the pops in the same teardown.
+- **The mode key has three spellings, not one.** A program that asks for the
+  kitty keyboard protocol (`CSI > 7 u`, which `pi` sends on startup) or for
+  xterm's `modifyOtherKeys` changes how the *terminal* encodes every chord, so
+  Ctrl-] stops arriving as 0x1d and starts arriving as `CSI 93 ; 5 u`. Watching
+  for the byte alone means a session running one of those programs cannot be
+  left. `attach::Encoded` reads all three, and drops the repeats, releases and
+  bare modifier keys that the same protocols add, since in control mode letting
+  go of ctrl would otherwise read as a keystroke.
 - Session names are sanitised in `node::registry` because they appear in
   `host/name` paths and in the terminal.
 

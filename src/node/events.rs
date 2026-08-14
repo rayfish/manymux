@@ -9,7 +9,8 @@
 //! titled whatever it was before.
 //!
 //! So this scans the same stream in parallel and keeps what `avt` drops: the
-//! title, the bells, and the modes to switch back on when someone reattaches.
+//! title, the bells, the modes to switch back on when someone reattaches, and
+//! the keyboard protocol a program asked the terminal for.
 //!
 //! It is a real VT state machine rather than a substring search because the
 //! same bytes mean different things in different states: `ESC ] 0 ; title BEL`
@@ -97,6 +98,70 @@ pub struct Scanner {
     /// Last title the program set. Kept here as well as on the session because
     /// a reattach has to restore it on the client's terminal.
     title: Option<String>,
+    /// What the program asked the keyboard to do.
+    keyboard: Keyboard,
+}
+
+/// The extended-keys protocols: kitty's stack of enhancement flags, and
+/// xterm's older `modifyOtherKeys`. Both change how the *terminal* spells a
+/// keystroke, so a program that turned one on and then found itself painted
+/// onto a fresh terminal would be reading Enter where it asked for
+/// Shift-Enter, and Ctrl-] as the byte it stopped expecting.
+///
+/// `client::attach` undoes all of this on detach, the same pairing the private
+/// modes have.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct Keyboard {
+    /// Flags set without pushing, with `CSI = flags ; mode u`.
+    base: u16,
+    /// Flags pushed with `CSI > flags u`, outermost first. The current flags
+    /// are the last of these, or `base` when nothing is pushed.
+    stack: Vec<u16>,
+    /// The level asked for with xterm's `CSI > 4 ; Pv m`.
+    modify_other_keys: Option<u16>,
+}
+
+/// How deep kitty's stack goes. A program that pushes past it loses the oldest
+/// entry rather than growing the node's memory on a stream that never pops.
+const KEYBOARD_STACK: usize = 16;
+
+impl Keyboard {
+    fn push(&mut self, flags: u16) {
+        if self.stack.len() == KEYBOARD_STACK {
+            self.stack.remove(0);
+        }
+        self.stack.push(flags);
+    }
+
+    fn pop(&mut self, count: usize) {
+        self.stack.truncate(self.stack.len().saturating_sub(count));
+    }
+
+    /// `CSI = flags ; mode u`: 1 sets the flags to exactly this, 2 turns the
+    /// named ones on, 3 turns them off. It changes the current entry rather
+    /// than pushing one.
+    fn set(&mut self, flags: u16, mode: u16) {
+        let current = self.stack.last_mut().unwrap_or(&mut self.base);
+        *current = match mode {
+            2 => *current | flags,
+            3 => *current & !flags,
+            _ => flags,
+        };
+    }
+
+    fn replay(&self, out: &mut String) {
+        use std::fmt::Write as _;
+
+        if self.base != 0 {
+            let _ = write!(out, "\x1b[={};1u", self.base);
+        }
+        for flags in &self.stack {
+            let _ = write!(out, "\x1b[>{flags}u");
+        }
+        if let Some(level) = self.modify_other_keys.filter(|level| *level != 0) {
+            let _ = write!(out, "\x1b[>4;{level}m");
+        }
+    }
 }
 
 impl Default for Scanner {
@@ -115,6 +180,7 @@ impl Scanner {
             modes: Vec::new(),
             cursor_style: None,
             title: None,
+            keyboard: Keyboard::default(),
         }
     }
 
@@ -132,6 +198,7 @@ impl Scanner {
         for mode in &self.modes {
             out.push_str(&format!("\x1b[?{mode}h"));
         }
+        self.keyboard.replay(&mut out);
         if let Some(style) = self.cursor_style {
             out.push_str(&format!("\x1b[{style} q"));
         }
@@ -236,6 +303,46 @@ impl Scanner {
             self.cursor_style = std::str::from_utf8(digits)
                 .ok()
                 .and_then(|p| p.parse().ok());
+            return;
+        }
+
+        // The kitty keyboard protocol: `CSI > flags u` pushes a set of flags,
+        // `CSI < n u` pops n of them, `CSI = flags ; mode u` changes the ones
+        // in force. `CSI ? u` is the query for them and changes nothing.
+        if final_byte == b'u' {
+            let Some((&lead, rest)) = params.split_first() else {
+                return;
+            };
+            let Ok(text) = std::str::from_utf8(rest) else {
+                return;
+            };
+            let mut fields = text.split(';');
+            let first = fields.next().unwrap_or_default().parse::<u16>();
+            match lead {
+                b'>' => self.keyboard.push(first.unwrap_or(0)),
+                b'<' => self.keyboard.pop(first.unwrap_or(1).into()),
+                b'=' => {
+                    if let Ok(flags) = first {
+                        let mode = fields.next().and_then(|m| m.parse().ok()).unwrap_or(1);
+                        self.keyboard.set(flags, mode);
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        // xterm's `modifyOtherKeys`, which is `CSI > 4 ; Pv m`. Without the
+        // value it is a reset, which is the same as off.
+        if final_byte == b'm' && params.first() == Some(&b'>') {
+            let Ok(text) = std::str::from_utf8(&params[1..]) else {
+                return;
+            };
+            let mut fields = text.split(';');
+            if fields.next().and_then(|r| r.parse::<u16>().ok()) != Some(4) {
+                return;
+            }
+            self.keyboard.modify_other_keys = fields.next().and_then(|v| v.parse().ok());
             return;
         }
 
@@ -476,6 +583,55 @@ mod tests {
         let s = scanner_after(b"\x1b]0;fixing the parser\x07\x1b[?1006h");
         assert_eq!(s.title(), Some("fixing the parser"));
         assert_eq!(s.replay(), "\x1b]2;fixing the parser\x07\x1b[?1006h");
+    }
+
+    /// What `pi` writes on startup, and what a reattach owes it: a terminal
+    /// that is not in the mode the program asked for spells Ctrl-] as the byte
+    /// the program stopped reading, and Shift-Enter as Enter.
+    #[test]
+    fn the_keyboard_protocol_a_program_asked_for_is_replayed() {
+        let s = scanner_after(b"\x1b[?2004h\x1b[>7u\x1b[?u\x1b[c");
+        assert_eq!(s.replay(), "\x1b[?2004h\x1b[>7u");
+    }
+
+    #[test]
+    fn a_keyboard_protocol_the_program_popped_is_not_replayed() {
+        let s = scanner_after(b"\x1b[>7u\x1b[<u");
+        assert_eq!(s.replay(), "");
+        // Popping more than was pushed empties it rather than underflowing.
+        let s = scanner_after(b"\x1b[>1u\x1b[>7u\x1b[<16u");
+        assert_eq!(s.replay(), "");
+    }
+
+    #[test]
+    fn nested_programs_keep_their_own_entry_on_the_stack() {
+        // An editor started inside a shell that had asked for its own flags:
+        // the pop the editor does on exit has to land on the shell's entry.
+        let s = scanner_after(b"\x1b[>1u\x1b[>7u");
+        assert_eq!(s.replay(), "\x1b[>1u\x1b[>7u");
+    }
+
+    #[test]
+    fn flags_set_without_pushing_are_replayed_as_a_set() {
+        let s = scanner_after(b"\x1b[=5;1u");
+        assert_eq!(s.replay(), "\x1b[=5;1u");
+        // Mode 2 adds bits to what is in force, mode 3 takes them away.
+        let s = scanner_after(b"\x1b[=1;1u\x1b[=4;2u\x1b[=1;3u");
+        assert_eq!(s.replay(), "\x1b[=4;1u");
+    }
+
+    #[test]
+    fn modify_other_keys_is_replayed_and_undone() {
+        let s = scanner_after(b"\x1b[>4;2m");
+        assert_eq!(s.replay(), "\x1b[>4;2m");
+        let s = scanner_after(b"\x1b[>4;2m\x1b[>4;0m");
+        assert_eq!(s.replay(), "");
+        // The reset form, which takes no value.
+        let s = scanner_after(b"\x1b[>4;2m\x1b[>4m");
+        assert_eq!(s.replay(), "");
+        // Some other resource being set is none of our business.
+        let s = scanner_after(b"\x1b[>0;2m");
+        assert_eq!(s.replay(), "");
     }
 
     #[test]
