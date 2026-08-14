@@ -64,6 +64,39 @@ pub fn named(name: &str) -> Option<User> {
 }
 
 fn lookup() -> Option<User> {
+    let passwd = from_passwd();
+    if !cfg!(target_os = "android") {
+        return passwd;
+    }
+
+    // Android has no passwd database to read: bionic makes an entry up for
+    // every app uid, always with a shell of `/system/bin/sh` and a home of
+    // `/data` the app is not allowed to enter, so a session started from it
+    // fails to chdir before it ever reaches a prompt. The reasoning at the top
+    // of this file does not apply there either, since Android has no service
+    // manager to start a node with nothing in its environment: whatever runs
+    // `mm` is a Termux shell that already exports the right answers.
+    // The home is dropped rather than kept as a fallback: `/data` is worse than
+    // no answer, since a session that chdirs into it never starts.
+    let (name, shell) = match passwd {
+        Some(user) => (Some(user.name), Some(user.shell)),
+        None => (None, None),
+    };
+    Some(User {
+        name: var("USER")
+            .or_else(|| var("LOGNAME"))
+            .or(name)
+            .unwrap_or_else(|| "termux".to_string()),
+        home: var("HOME")?,
+        shell: var("SHELL").or(shell)?,
+    })
+}
+
+fn var(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|value| !value.is_empty())
+}
+
+fn from_passwd() -> Option<User> {
     // SAFETY: getpwuid returns a pointer into static storage, valid until the
     // next getpw* call. This runs once, behind a OnceLock, and every field is
     // copied out before returning.

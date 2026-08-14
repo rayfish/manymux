@@ -62,6 +62,16 @@ impl Manager {
         if cfg!(target_os = "macos") {
             return Ok(Self::Launchd);
         }
+        // Android runs none of these, and no amount of looking will find one.
+        // The node lives as long as Termux does, which is a different thing to
+        // arrange and worth naming rather than leaving to the list below.
+        if cfg!(target_os = "android") {
+            bail!(
+                "Android has no service manager to install into. A node started here \
+                 lives as long as Termux does, and `termux-wake-lock` is what stops \
+                 Android freezing it in the background."
+            );
+        }
         // The check systemd itself documents for "booted with systemd".
         if Path::new("/run/systemd/system").is_dir() {
             return Ok(Self::Systemd);

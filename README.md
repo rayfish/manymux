@@ -320,6 +320,16 @@ install would cost a password and still leave the machine unreachable.
 `~/.zshenv` is the file that works, being the one zsh reads on *every*
 invocation. `MM_SKIP_PATH=1` leaves it alone if you would rather do it yourself.
 
+On Android the same line works inside [Termux](https://termux.dev), which gets
+its own binary: `mm` there is linked against bionic, so neither Linux build
+runs. It lands in `$PREFIX/bin`, which is already on PATH and needs no root.
+`pkg install curl` first if the installer says so.
+
+A phone is a client like any other machine, so `mm ls` and `mm attach gpu-box/x`
+work from it. Sessions started *on* the phone are the one difference: they last
+as long as Termux does, and `termux-wake-lock` is what stops Android freezing it
+in the background. There is no service to install, since Android has none.
+
 `INSTALL_DIR` overrides the location and `MM_VERSION` pins a release.
 
 ## Environment

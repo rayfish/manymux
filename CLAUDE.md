@@ -20,7 +20,7 @@ cargo check -q --lib --no-default-features --locked       # the mobile client co
 
 CI runs all of the above on Linux and macOS, plus a release build for each
 shipped target (`x86_64-unknown-linux-musl`, `aarch64-unknown-linux-gnu`,
-`x86_64-apple-darwin`). The `--no-default-features` check is not optional: the
+`x86_64-apple-darwin`, `aarch64-linux-android`). The `--no-default-features` check is not optional: the
 library without `desktop` is what a mobile app links against, and it has to keep
 compiling without `pty-process`, `crossterm` or `clap`.
 

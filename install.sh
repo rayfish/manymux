@@ -41,8 +41,12 @@ SKIP_VERIFY="${MM_SKIP_VERIFY:-0}"
 # So a system install there costs a password and still leaves the machine
 # unreachable. A user install plus one line in ~/.zshenv, which every zsh reads
 # including `zsh -c`, is what actually makes a Mac reachable. See ensure_path.
+#
+# On Android there is one place and no choice: Termux has its own prefix, which
+# is the only writable directory on PATH, and root does not come into it.
 SYSTEM_DIR="/usr/local/bin"
 USER_DIR="${HOME}/.local/bin"
+TERMUX_DIR="${PREFIX:-/data/data/com.termux/files/usr}/bin"
 INSTALL_DIR="${INSTALL_DIR:-}"
 
 if [ -t 1 ]; then
@@ -55,7 +59,23 @@ ok()    { printf "${GREEN}%s${NC}\n" "$*"; }
 err()   { printf "${RED}%s${NC}\n" "$*" >&2; }
 die()   { err "$*"; exit 1; }
 
-need() { command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"; }
+# Termux ships a very small base: curl is not in it, and neither is anything
+# else assumed below, so say the one command that fixes it rather than leaving
+# a bare "not found".
+need() {
+  local pkg
+  command -v "$1" >/dev/null 2>&1 && return 0
+  if [ -n "${TERMUX_VERSION:-}" ]; then
+    case "$1" in
+      curl) pkg="curl" ;;
+      *) pkg="coreutils" ;;
+    esac
+    die "required command not found: $1
+Install it with:
+    pkg install $pkg"
+  fi
+  die "required command not found: $1"
+}
 need curl
 need mktemp
 need install
@@ -81,11 +101,26 @@ detect_asset() {
     darwin) OS="macos" ;;
     *) die "unsupported OS: $OS" ;;
   esac
+  # Android says Linux and means something else: the binary is linked against
+  # bionic, so both Linux assets are wrong here. Termux sets TERMUX_VERSION in
+  # the environment every shell it starts inherits, and `uname -o` covers a
+  # shell that lost it.
+  if [ "$OS" = "linux" ] \
+    && { [ -n "${TERMUX_VERSION:-}" ] || [ "$(uname -o 2>/dev/null)" = "Android" ]; }; then
+    OS="android"
+  fi
   case "$arch" in
     x86_64|amd64)  arch="x86_64" ;;
     aarch64|arm64) arch="aarch64" ;;
     *) die "unsupported architecture: $arch" ;;
   esac
+  # Only 64-bit ARM is published for Android, which is every phone Termux still
+  # supports. An emulator on an x86_64 image would otherwise get a 404 and no
+  # idea why.
+  if [ "$OS" = "android" ] && [ "$arch" != "aarch64" ]; then
+    die "manymux publishes an Android build for aarch64 only, and this is $arch.
+Build from source instead: https://github.com/${REPO}"
+  fi
   ASSET="${BIN}-${OS}-${arch}"
 }
 
@@ -312,7 +347,11 @@ main() {
   base="$(release_base)"
 
   if [ -z "$INSTALL_DIR" ]; then
-    if [ "$OS" = "macos" ]; then INSTALL_DIR="$USER_DIR"; else INSTALL_DIR="$SYSTEM_DIR"; fi
+    case "$OS" in
+      macos)   INSTALL_DIR="$USER_DIR" ;;
+      android) INSTALL_DIR="$TERMUX_DIR" ;;
+      *)       INSTALL_DIR="$SYSTEM_DIR" ;;
+    esac
   fi
 
   # Every push to master publishes a rolling `nightly` pre-release, and GitHub
@@ -395,6 +434,15 @@ ${SYSTEM_DIR} when you can."
   echo
   echo "  That host needs mm on its PATH too; run this same line there."
   echo "  Then \`mm ls\` shows every session on every machine you use."
+
+  # The one thing that behaves differently here, and the one command that fixes
+  # it. A node on a phone is a node inside an app Android is free to freeze.
+  if [ "$OS" = "android" ]; then
+    echo
+    info "On Android, sessions started here only last as long as Termux does.
+  \`termux-wake-lock\` keeps it running in the background. Sessions on the
+  machines you ssh into are unaffected: they live on those machines."
+  fi
 }
 
 main "$@"

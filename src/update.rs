@@ -47,6 +47,10 @@ pub fn asset_name() -> Result<String> {
     let os = match std::env::consts::OS {
         "linux" => "linux",
         "macos" => "macos",
+        // Termux. Android is its own asset rather than a Linux one: the binary
+        // is linked against bionic, so the glibc and musl builds are both wrong
+        // here even though `uname` says Linux.
+        "android" => "android",
         other => bail!("no manymux release for {other}; build from source"),
     };
     let arch = match std::env::consts::ARCH {
@@ -284,6 +288,7 @@ mod tests {
             "mm-linux-aarch64-musl",
             "mm-macos-x86_64",
             "mm-macos-aarch64",
+            "mm-android-aarch64",
         ];
         assert!(published.contains(&asset.as_str()), "unpublished: {asset}");
     }

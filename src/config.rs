@@ -14,6 +14,15 @@ pub fn runtime_dir() -> PathBuf {
     if let Some(dir) = dirs::runtime_dir() {
         return dir.join("manymux");
     }
+    // Android has no `/tmp` at all: everything outside an app's own directories
+    // is read-only, so the fallback below has nowhere to land. Termux makes one
+    // under its prefix and exports it as `TMPDIR`, which is already private to
+    // the one uid the whole sandbox runs as.
+    if cfg!(target_os = "android")
+        && let Some(tmp) = std::env::var_os("TMPDIR")
+    {
+        return PathBuf::from(tmp).join("manymux");
+    }
     // SAFETY: getuid always succeeds and touches no memory.
     let uid = unsafe { libc::getuid() };
     PathBuf::from(format!("/tmp/manymux-{uid}"))

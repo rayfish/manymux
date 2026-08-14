@@ -73,6 +73,8 @@ jobs:
             runner: ubuntu-22.04-arm
           - target: x86_64-apple-darwin
             runner: macos-latest
+          - target: aarch64-linux-android
+            runner: ubuntu-22.04
 
     name: build (${{ matrix.target }})
     runs-on: ${{ matrix.runner }}
@@ -88,6 +90,14 @@ jobs:
       - name: Install musl tools
         if: contains(matrix.target, 'musl')
         run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      # Nothing in the tree compiles C, so the linker is all the NDK is needed
+      # for. API 24 is the oldest Android that Termux itself still supports.
+      - name: Point cargo at the Android NDK
+        if: contains(matrix.target, 'android')
+        run: |
+          TOOLS="$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$TOOLS/aarch64-linux-android24-clang" >> "$GITHUB_ENV"
 
       # The same key the nightly and release builds use: this job runs the
       # identical `cargo build --release --target X`, so a separate key would
