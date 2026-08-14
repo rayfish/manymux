@@ -23,7 +23,7 @@ Start something on another machine and attach to it:
 mm new gpu-box claude
 ```
 
-Press `Ctrl-Space` then `d` to detach. Claude keeps running on gpu-box. Close the
+Press ``Ctrl-` `` then `d` to detach. Claude keeps running on gpu-box. Close the
 laptop, go somewhere else, then look at what you have:
 
 ```console
@@ -65,10 +65,10 @@ starts listing it.
 
 ## Detaching and coming back
 
-`Ctrl-Space` then `d` detaches. The key is `Ctrl-Space` rather than tmux's
-`Ctrl-b` or screen's `Ctrl-a` because you are quite likely running one of those
-*inside* a session, and taking their prefix would mean swallowing it. Set
-`MM_PREFIX` to change it:
+``Ctrl-` `` then `d` detaches. Not tmux's `Ctrl-b` or screen's `Ctrl-a`, because
+you are quite likely running one of those *inside* a session: manymux has no
+panes, so splitting a window is still their job, and taking their prefix would
+mean swallowing it. Set `MM_PREFIX` to change it:
 
 ```bash
 export MM_PREFIX=C-b        # or ^B, or \x02
@@ -86,6 +86,14 @@ otherwise (iTerm2: Settings > General > Selection; Terminal.app has no OSC 52 at
 all). A session is drawn on the alternate screen, so mouse selection covers what
 is on screen and not what has scrolled past it.
 
+Targets are `host/name` for another machine and a bare `name` for this one. A
+bare name is looked for here first, then across every machine, so this finds the
+session wherever you left it:
+
+```bash
+mm attach api
+```
+
 ## Two modes
 
 Modal, like vim, and for the same reason: the keys worth having are the ones a
@@ -94,9 +102,9 @@ session wants for itself.
 **Focus** is where you live. Every keystroke is the session's, and the row at
 the bottom reads `focus ● host/name`.
 
-**Control** is where the keys are the client's. `Ctrl-Space` gets you there, the
+**Control** is where the keys are the client's. ``Ctrl-` `` gets you there, the
 word goes amber, and the row spells out what the keys do. It stays on, so one
-`Ctrl-Space` then `tab tab tab` walks through your sessions.
+``Ctrl-` `` then `tab tab tab` walks through your sessions.
 
 | | |
 |---|---|
@@ -107,17 +115,30 @@ word goes amber, and the row spells out what the keys do. It stays on, so one
 | `esc`, `enter` | back to focus |
 
 The cycle covers every session on every machine you watch, in the order `mm ls`
-prints them. `Ctrl-Space Ctrl-Space` sends one through to the session, for
+prints them. The key pressed twice sends one through to the session, for
 whatever wants it in there. Any other key drops back to focus and goes through,
 so a mistyped mode key costs you a stray keystroke rather than a swallowed line.
 
-Targets are `host/name` for another machine and a bare `name` for this one. A
-bare name is looked for here first, then across every machine, so this finds the
-session wherever you left it:
+### About that key
 
-```bash
-mm attach api
-```
+``Ctrl-` `` is a NUL byte, and so are `Ctrl-Space` and `Ctrl-@`: a terminal
+clears the top bits off the character, and backtick, space and `@` come out the
+same. All three work, which is the point: pick whichever your setup leaves alone.
+
+- **macOS** binds `Ctrl-Space` to switching input sources once you have two of
+  them, and it never reaches the terminal. ``Ctrl-` `` gets past it. To have
+  `Ctrl-Space` back, untick it under Keyboard > Keyboard Shortcuts >
+  Input Sources.
+- **Linux input methods** (fcitx5, ibus) take `Ctrl-Space` the same way.
+- **Some terminals** send a plain backtick for ``Ctrl-` `` rather than clearing
+  the bits. In iTerm2, Settings > Profiles > Keys > `+`, press the key, choose
+  *Send Hex Code* and enter `0x00`. In VS Code the chord toggles the panel and
+  never gets through, so use `Ctrl-Space` there.
+- **Emacs** wants NUL for set-mark, and **tmux** inside a session wants its own
+  prefix. Press the key twice to send one through, or set `MM_PREFIX`.
+
+To see what your terminal actually sends, run `cat -v` outside a session and
+press the key: `^@` is the NUL you want.
 
 ## Machines
 
@@ -190,7 +211,7 @@ mm update
 ```
 mm ls [host]                         list sessions, everywhere or on one machine
 mm new [host] [-n name] [-d] [cmd]   start a session (default: your login shell)
-mm attach <target>                   attach; Ctrl-Space then tab switches, d detaches
+mm attach <target>                   attach; Ctrl-` then tab switches, d detaches
 mm kill <target>                     SIGHUP a session's process group
 mm rename <target> <title>           set a sticky title
 mm add <host> | hosts | rm <host>    which machines to list and watch
@@ -215,7 +236,7 @@ pins a release.
 
 | | |
 |---|---|
-| `MM_PREFIX` | control-mode key, e.g. `C-b`. Default `Ctrl-Space` |
+| `MM_PREFIX` | control-mode key, e.g. `C-b`. Default `` Ctrl-` `` |
 | `MM_SSH` | the ssh program, if yours lives somewhere unusual |
 | `MM_LOG` | log filter, e.g. `manymux=debug` |
 | `MM_CONFIG_DIR` | where the host list lives |

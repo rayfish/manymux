@@ -12,21 +12,26 @@ use anyhow::Result;
 
 use crate::client::{Attached, SessionHalves, Update};
 
-/// The key that goes from focus mode to control mode: Ctrl-Space (0x00).
+/// The key that goes from focus mode to control mode: Ctrl-` (0x00).
 ///
 /// Not tmux's Ctrl-b or screen's Ctrl-a, because you are quite likely running
 /// one of those *inside* a manymux session: manymux has no panes or tabs, so
 /// splitting a window is still their job, and taking their prefix would mean
-/// swallowing it before it ever reached them. Ctrl-Space is the one most people
-/// rebind a mux to anyway, and shells and vim leave it alone. Emacs does not,
-/// which is what `Ctrl-Space Ctrl-Space` is for: it sends one through.
+/// swallowing it before it ever reached them.
+///
+/// What arrives is a NUL, and Ctrl-Space and Ctrl-@ send the same one: a
+/// terminal masks the top bits off the character, and backtick, space and `@`
+/// come out identical. So all three keys reach this, which is the point on
+/// macOS, where Ctrl-Space is taken by input-source switching and never gets
+/// to the terminal at all. Emacs wants the byte for set-mark, which is what
+/// pressing the key twice is for: it sends one through.
 pub const DEFAULT_PREFIX: u8 = 0x00;
 
 /// The key in force, from `MM_PREFIX` if it is set and usable.
 ///
-/// Accepts `C-b`, `^B`, `C-Space` or `\x02`. An unusable value is a warning
-/// rather than a failure: losing the ability to detach because of a typo in an
-/// environment variable would be worse than ignoring it.
+/// Accepts ``C-` ``, `C-b`, `^B`, `C-Space` or `\x02`. An unusable value is a
+/// warning rather than a failure: losing the ability to detach because of a
+/// typo in an environment variable would be worse than ignoring it.
 pub fn prefix() -> u8 {
     let Some(text) = std::env::var_os("MM_PREFIX") else {
         return DEFAULT_PREFIX;
@@ -35,14 +40,14 @@ pub fn prefix() -> u8 {
     match parse_prefix(&text) {
         Some(byte) => byte,
         None => {
-            eprintln!("mm: MM_PREFIX={text:?} is not a control key; using Ctrl-Space");
+            eprintln!("mm: MM_PREFIX={text:?} is not a control key; using Ctrl-`");
             DEFAULT_PREFIX
         }
     }
 }
 
-/// Parse a control key: `C-b`, `c-B`, `^b`, a bare `b`, `C-Space`, or the raw
-/// byte.
+/// Parse a control key: ``C-` ``, `C-b`, `c-B`, `^b`, a bare `b`, `C-Space`, or
+/// the raw byte.
 ///
 /// A bare letter is read as the control key, since a printable character could
 /// not serve as the key anyway: it would take you out of the session on every
@@ -54,8 +59,8 @@ fn parse_prefix(text: &str) -> Option<u8> {
         .or_else(|| text.strip_prefix('^'))
         .unwrap_or(text);
 
-    // Spelled out, because the key it names cannot be written down: the default
-    // is Ctrl-Space and `MM_PREFIX=C- ` is not something anyone would type.
+    // Spelled out, because `MM_PREFIX=C- ` is not something anyone would type,
+    // and because it is the same byte as the default anyway.
     if key.eq_ignore_ascii_case("space") {
         return Some(0x00);
     }
@@ -70,9 +75,10 @@ fn parse_prefix(text: &str) -> Option<u8> {
         return Some(key as u8);
     }
     // `C-b` is 0x02: the letter with the top three bits cleared. The same
-    // arithmetic covers `C-\`, `C-]` and friends, which sit just past `Z`.
+    // arithmetic covers `C-\`, `C-]` and friends just past `Z`, and the
+    // backtick just past them, which is the default and comes out a NUL.
     let byte = u8::try_from(key).ok()?.to_ascii_uppercase();
-    (0x40..0x60).contains(&byte).then_some(byte & 0x1f)
+    (0x40..=0x60).contains(&byte).then_some(byte & 0x1f)
 }
 
 /// Which way a switch key moves through the sessions.
@@ -132,12 +138,12 @@ impl Mode {
 /// Watches the keystroke stream for the key that changes mode, and reads the
 /// keys that follow it.
 ///
-/// Control mode stays on: one `Ctrl-Space` then `tab tab tab` walks through the
-/// sessions. `Esc` or `Enter` goes back to focus, `d` detaches, and
-/// `Ctrl-Space Ctrl-Space` sends a literal one through for whatever wants it
-/// inside the session. Any other key drops back to focus and passes both bytes
-/// through unchanged, so a mistyped mode key costs you visible junk rather than
-/// a silently swallowed line.
+/// Control mode stays on: one mode key then `tab tab tab` walks through the
+/// sessions. `Esc` or `Enter` goes back to focus, `d` detaches, and the key
+/// pressed twice sends one through for whatever wants it inside the session.
+/// Any other key drops back to focus and passes both bytes through unchanged,
+/// so a mistyped mode key costs you visible junk rather than a silently
+/// swallowed line.
 pub struct KeyFilter {
     prefix: u8,
     mode: Mode,
@@ -534,7 +540,7 @@ mod tests {
     }
 
     /// The mode key, whatever it is. Written out because it cannot be typed
-    /// into a byte string: the default is Ctrl-Space, which is a NUL.
+    /// into a byte string: the default is Ctrl-`, which is a NUL.
     const KEY: u8 = DEFAULT_PREFIX;
 
     /// A mode the node turns back on for a session, and the client forgets to
@@ -581,9 +587,14 @@ mod tests {
     }
 
     #[test]
-    fn the_default_key_can_be_named_even_though_it_cannot_be_typed() {
-        // `MM_PREFIX=C- ` is not something anyone would write, so the word
-        // stands in for the key.
+    fn every_spelling_of_the_default_key_is_the_same_byte() {
+        // A terminal clears the top bits off the character, so the backtick,
+        // space and `@` all arrive as a NUL and are one key as far as this is
+        // concerned. `MM_PREFIX=C- ` is not something anyone would write, so
+        // the word stands in for that one.
+        assert_eq!(parse_prefix("C-`"), Some(DEFAULT_PREFIX));
+        assert_eq!(parse_prefix("^`"), Some(DEFAULT_PREFIX));
+        assert_eq!(parse_prefix("C-@"), Some(DEFAULT_PREFIX));
         assert_eq!(parse_prefix("C-Space"), Some(DEFAULT_PREFIX));
         assert_eq!(parse_prefix("c-space"), Some(DEFAULT_PREFIX));
         assert_eq!(parse_prefix("^Space"), Some(DEFAULT_PREFIX));
@@ -622,7 +633,7 @@ mod tests {
                 mode: Mode::Focus,
             }
         );
-        // And Ctrl-Space is then just an ordinary keystroke again.
+        // And the default key is then just an ordinary keystroke again.
         let mut f = KeyFilter::new(0x02);
         assert_eq!(f.filter(&[KEY]), forwarded(&[KEY]));
     }
