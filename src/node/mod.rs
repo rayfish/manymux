@@ -348,6 +348,13 @@ where
                     tag::DATA => attachment.send_input(frame.body),
                     tag::RESIZE => attachment.resize(proto::decode(&frame.body)?),
                     tag::PONG => answers_pings = true,
+                    // The client swallowed a screen switch, so what the
+                    // terminal shows is no longer what the session thinks it
+                    // is showing. This model is the only place the right
+                    // picture still exists.
+                    tag::RESYNC => {
+                        send(&mut write, tag::RESYNC, attachment.resync().as_bytes()).await?
+                    }
                     tag::PASTE => incoming.take(frame.body),
                     tag::PASTE_END => {
                         let info: proto::PasteInfo = proto::decode(&frame.body)?;

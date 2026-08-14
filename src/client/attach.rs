@@ -525,6 +525,9 @@ mod terminal {
         // The row no longer says what the keys are doing. Held until there is a
         // safe moment to draw, the same as a mark the session cleared.
         let mut restate = false;
+        // Whether the frame that repaints the screen on attach has been and
+        // gone. Everything after it is the session speaking for itself.
+        let mut painted = false;
         // When the notice on the row stops being worth showing.
         let mut notice_until: Option<tokio::time::Instant> = None;
 
@@ -568,6 +571,12 @@ mod terminal {
                                 takes_pastes,
                             ).await?;
                             notice_until = Some(tokio::time::Instant::now() + NOTICE_FOR);
+                            // The paste had the writing half to itself, so a
+                            // switch swallowed while it ran is only now
+                            // answerable.
+                            if output.take_switched() {
+                                writer.resync().await?;
+                            }
                             // The same discipline as everywhere else: never
                             // into the middle of a sequence the session is
                             // part way through.
@@ -587,10 +596,37 @@ mod terminal {
                 update = reader.next() => match update? {
                     Update::Output(bytes) => {
                         stdout.write_all(&output.feed(&bytes)).await?;
+                        // A screen switch went no further than this client, so
+                        // the terminal is still showing the screen the session
+                        // has just left. Ask for the other one, which exists
+                        // only in the node's model of the session. The frame
+                        // that repaints on attach is a dump like the answer
+                        // would be, and asking for another of those is a round
+                        // trip that paints the same screen twice.
+                        if output.take_switched() && painted {
+                            writer.resync().await?;
+                        }
+                        painted = true;
                         // Only between sequences: a repaint written into the
                         // middle of one would corrupt it. Whatever cleared the
                         // mark stays noted until there is a safe moment.
                         if output.at_boundary() && (output.take_dirty() || restate) {
+                            stdout.write_all(status.repaint(terminal_size()).as_bytes()).await?;
+                            restate = false;
+                        }
+                        stdout.flush().await?;
+                    }
+                    // The screen we asked for. Its own switches are how a dump
+                    // paints both buffers, so they are swallowed and dropped
+                    // rather than answered with another request.
+                    Update::Screen(bytes) => {
+                        stdout.write_all(&output.feed(&bytes)).await?;
+                        output.take_switched();
+                        output.take_dirty();
+                        // The dump put the session's own screen back, mark and
+                        // region included, so both are ours to draw again.
+                        restate = true;
+                        if output.at_boundary() {
                             stdout.write_all(status.repaint(terminal_size()).as_bytes()).await?;
                             restate = false;
                         }
@@ -700,7 +736,7 @@ mod terminal {
                     return Ok(Pasted::Done);
                 }
                 update = reader.next() => match update? {
-                    Update::Output(bytes) => {
+                    Update::Output(bytes) | Update::Screen(bytes) => {
                         stdout.write_all(&output.feed(&bytes)).await?;
                         stdout.flush().await?;
                     }
@@ -733,7 +769,7 @@ pub async fn collect_until(
     let mut output = Vec::new();
     loop {
         let outcome = match reader.next().await? {
-            Update::Output(bytes) => {
+            Update::Output(bytes) | Update::Screen(bytes) => {
                 output.extend_from_slice(&bytes);
                 if stop(&output) {
                     Outcome::Detached

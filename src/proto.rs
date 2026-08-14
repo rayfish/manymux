@@ -57,6 +57,19 @@ pub mod tag {
     /// The end of a paste, carrying the [`super::PasteInfo`] describing what
     /// the chunks before it add up to.
     pub const PASTE_END: u8 = 0x18;
+    /// The screen again: empty from the client asking, and the screen itself
+    /// coming back.
+    ///
+    /// The client asks when it has swallowed something from the session that
+    /// the terminal would otherwise have redrawn for it, which means a switch
+    /// between the primary and alternate screens. The answer is tagged rather
+    /// than sent as [`DATA`] because a dump paints both screen buffers and so
+    /// carries switches of its own: seeing those as the session's would have
+    /// the client asking for another screen forever.
+    ///
+    /// A node too old to know the tag skips it, and the screen stays as it was
+    /// until the session next paints, which is what happened before it existed.
+    pub const RESYNC: u8 = 0x19;
 }
 
 /// The largest file a paste may carry. A screenshot is a couple of megabytes;

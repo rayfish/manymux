@@ -192,10 +192,11 @@ fn prefixed(text: &str) -> String {
 
 /// Rewrites the session's output on its way to the terminal.
 ///
-/// Two jobs, both needing the same parse. Titles get the prefix, so the tab says
-/// `mm` however often the remote shell renames it. And sequences that would take
-/// the mark or its scrolling region with them are noted, so the client can put
-/// both back.
+/// Three jobs, all needing the same parse. Titles get the prefix, so the tab
+/// says `mm` however often the remote shell renames it. Sequences that would
+/// take the mark or its scrolling region with them are noted, so the client can
+/// put both back. And the session's own switches between the primary and
+/// alternate screens are swallowed, because that screen is the client's.
 ///
 /// Everything else passes through byte for byte. This is not a terminal
 /// emulator and must never become one: it tracks just enough state to know a
@@ -207,6 +208,7 @@ pub struct Filter {
     /// it is clear whether they need rewriting.
     held: Vec<u8>,
     dirty: bool,
+    switched: bool,
 }
 
 #[derive(Default, Clone, Copy, PartialEq, Eq)]
@@ -271,8 +273,12 @@ impl Filter {
                 State::Csi => {
                     self.held.push(b);
                     if (0x40..=0x7e).contains(&b) {
-                        self.note_csi(b);
-                        self.release(&mut out);
+                        if self.note_csi(b) {
+                            self.release(&mut out);
+                        } else {
+                            self.held.clear();
+                            self.state = State::Ground;
+                        }
                     }
                 }
                 State::Osc => match b {
@@ -327,19 +333,31 @@ impl Filter {
         std::mem::take(&mut self.dirty)
     }
 
+    /// Whether a screen switch was swallowed since this was last asked. Clears
+    /// the flag.
+    ///
+    /// The caller owes the terminal a screen after one: the switch the terminal
+    /// would have restored from never reached it, so the only place the right
+    /// picture still exists is the node's model of the session.
+    pub fn take_switched(&mut self) -> bool {
+        std::mem::take(&mut self.switched)
+    }
+
     /// Whether the parser is between sequences, and so whether bytes of our own
     /// can be written without landing in the middle of one.
     pub fn at_boundary(&self) -> bool {
         self.state == State::Ground
     }
 
-    /// Sequences that clear the screen or hand the margins back.
+    /// Sequences that clear the screen or hand the margins back, and the ones
+    /// that are not the session's to send at all. Answers whether the sequence
+    /// may go on to the terminal.
     ///
     /// A region the session sets for itself is left alone: it thinks the screen
     /// is a row shorter than it is, so anything it asks for fits inside ours.
     /// The exception is a bare `CSI r`, which means the whole screen and would
     /// let the next scroll eat the mark.
-    fn note_csi(&mut self, final_byte: u8) {
+    fn note_csi(&mut self, final_byte: u8) -> bool {
         // `held` is `\x1b[` then the parameters then the final byte.
         let params = &self.held[2..self.held.len() - 1];
         match final_byte {
@@ -347,25 +365,47 @@ impl Filter {
             b'r' if params.is_empty() => self.dirty = true,
             // Soft reset, which includes the margins.
             b'p' if params == b"!" => self.dirty = true,
-            // A full-screen program switching screens: the alternate screen has
-            // margins of its own, and coming back restores none of ours.
-            b'h' | b'l' => {
-                let Ok(text) = std::str::from_utf8(params) else {
-                    return;
-                };
-                let Some(modes) = text.strip_prefix('?') else {
-                    return;
-                };
-                if modes
-                    .split(';')
-                    .filter_map(|mode| mode.parse::<u16>().ok())
-                    .any(|mode| matches!(mode, 47 | 1047 | 1049))
-                {
-                    self.dirty = true;
-                }
-            }
+            b'h' | b'l' => return self.note_modes(final_byte),
             _ => {}
         }
+        true
+    }
+
+    /// A full-screen program switching screens, which is the one thing the
+    /// session may not do.
+    ///
+    /// The client is already on the alternate screen and draws the mark there.
+    /// Letting `?1049l` through pops the terminal back to the shell's screen
+    /// while the client is still attached, so the session and the mark end up
+    /// painted over the scrollback of the terminal you started from. The node
+    /// makes the same choice on the way in: `events::REPLAYED_MODES` leaves
+    /// these out, so attaching to a session sitting in a full-screen program
+    /// draws its screen without switching yours.
+    ///
+    /// Other modes in the same sequence are none of our business and go on
+    /// without the ones taken out.
+    fn note_modes(&mut self, final_byte: u8) -> bool {
+        let params = &self.held[2..self.held.len() - 1];
+        let Ok(text) = std::str::from_utf8(params) else {
+            return true;
+        };
+        let Some(modes) = text.strip_prefix('?') else {
+            return true;
+        };
+        let ours = |mode: &&str| matches!(mode.parse::<u16>(), Ok(47 | 1047 | 1049));
+        let kept: Vec<&str> = modes.split(';').filter(|m| !ours(m)).collect();
+        if kept.len() == modes.split(';').count() {
+            return true;
+        }
+        // The screen underneath is about to be a different one, and the mark
+        // and its region do not survive the trip either way.
+        self.dirty = true;
+        self.switched = true;
+        if kept.is_empty() {
+            return false;
+        }
+        self.held = format!("\x1b[?{}{}", kept.join(";"), final_byte as char).into_bytes();
+        true
     }
 
     /// A finished OSC: rewrite it if it is a title, pass it on if it is not.
@@ -502,6 +542,40 @@ mod tests {
         // Modes that have nothing to do with the screen do not.
         through(&mut filter, "\x1b[?2004h");
         assert!(!filter.take_dirty());
+    }
+
+    /// The screen the mark is drawn on belongs to the client. A session that
+    /// switched it would leave the client attached to a terminal showing the
+    /// shell it was started from, with the session painted over the scrollback.
+    #[test]
+    fn a_session_never_gets_to_switch_the_screen_out_from_under_the_client() {
+        for switch in ["\x1b[?1049h", "\x1b[?1049l", "\x1b[?1047l", "\x1b[?47h"] {
+            let mut filter = Filter::default();
+            assert_eq!(through(&mut filter, &format!("a{switch}b")), "ab");
+            assert!(filter.take_switched(), "{switch}");
+            assert!(filter.take_dirty(), "{switch}");
+            assert!(filter.at_boundary());
+        }
+    }
+
+    #[test]
+    fn a_swallowed_switch_keeps_the_modes_beside_it() {
+        let mut filter = Filter::default();
+        assert_eq!(
+            through(&mut filter, "\x1b[?1049;1000;2004h"),
+            "\x1b[?1000;2004h"
+        );
+        assert!(filter.take_switched());
+    }
+
+    #[test]
+    fn every_other_mode_goes_through_untouched() {
+        let mut filter = Filter::default();
+        assert_eq!(
+            through(&mut filter, "\x1b[?25l\x1b[?1000h"),
+            "\x1b[?25l\x1b[?1000h"
+        );
+        assert!(!filter.take_switched());
     }
 
     #[test]

@@ -254,6 +254,88 @@ async fn detaching_leaves_the_child_running_and_reattach_repaints() {
     registry.kill(&name).unwrap();
 }
 
+/// The other half of the same promise: a client that stays is told when the
+/// session ends, and told what it ended with. Nothing covered this path, which
+/// is the one an attached client is sitting in when you type `exit`.
+#[tokio::test]
+async fn a_client_watching_a_session_end_is_told_what_it_ended_with() {
+    let node = test_node().await;
+    let Spawned { name, .. } =
+        spawn_session(&node, &["/bin/sh", "-c", "echo about-to-go; exit 130"]).await;
+
+    let mut client = Client::connect(&node);
+    assert!(matches!(
+        client
+            .send(&Request::Attach {
+                name: name.clone(),
+                size: Size::new(80, 24),
+            })
+            .await
+            .unwrap(),
+        Response::Attached { .. }
+    ));
+
+    let exit = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match client.next_frame().await {
+                Some(frame) if frame.tag == tag::EXIT => {
+                    return proto::decode::<i32>(&frame.body).unwrap();
+                }
+                Some(_) => {}
+                None => panic!("the stream closed without saying the session had ended"),
+            }
+        }
+    })
+    .await;
+    assert_eq!(exit.expect("an exit frame"), 130);
+}
+
+/// A client swallows the session's switch between the primary and alternate
+/// screens, because that screen is the client's own. The picture on the other
+/// side of the switch then exists nowhere but here.
+#[tokio::test]
+async fn asking_for_the_screen_again_gets_the_screen_again() {
+    let node = test_node().await;
+    let registry = &node.registry;
+    let Spawned { name, .. } =
+        spawn_session(&node, &["/bin/sh", "-c", "echo still-here; sleep 30"]).await;
+
+    let mut client = Client::connect(&node);
+    assert!(matches!(
+        client
+            .send(&Request::Attach {
+                name: name.clone(),
+                size: Size::new(80, 24),
+            })
+            .await
+            .unwrap(),
+        Response::Attached { .. }
+    ));
+    client.read_until("still-here").await;
+
+    proto::write_frame(&mut client.write, tag::RESYNC, &[])
+        .await
+        .unwrap();
+    // Tagged rather than sent as output, because a dump paints both screen
+    // buffers and a client cannot tell those switches from the session's.
+    let dump = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match client.next_frame().await {
+                Some(frame) if frame.tag == tag::RESYNC => {
+                    return String::from_utf8_lossy(&frame.body).into_owned();
+                }
+                Some(_) => {}
+                None => panic!("the host hung up instead of sending the screen"),
+            }
+        }
+    })
+    .await
+    .expect("a screen");
+    assert!(dump.contains("still-here"), "the resync was not a screen");
+
+    registry.kill(&name).unwrap();
+}
+
 #[tokio::test]
 async fn output_produced_while_detached_is_on_the_screen_when_you_return() {
     let node = test_node().await;

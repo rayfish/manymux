@@ -200,6 +200,13 @@ impl Attached {
 pub enum Update {
     /// Terminal output. The first one after attaching repaints the screen.
     Output(Vec<u8>),
+    /// The screen as the host has it, in answer to [`SessionWriter::resync`].
+    ///
+    /// Written to the terminal like any other output, but never treated as the
+    /// session doing something: a dump paints both screen buffers, so taking
+    /// its screen switches for the session's would ask for another dump
+    /// forever.
+    Screen(Vec<u8>),
     /// The host is checking this client is still there. Answer it with
     /// [`SessionWriter::pong`], or the host will eventually conclude the client
     /// went away and detach it. Answering once is what opts a client in: one
@@ -224,6 +231,7 @@ impl SessionReader {
             };
             return Ok(match frame.tag {
                 tag::DATA => Update::Output(frame.body),
+                tag::RESYNC => Update::Screen(frame.body),
                 tag::PING => Update::Ping,
                 tag::EXIT => Update::Exited(proto::decode(&frame.body)?),
                 // Unknown tags are skipped rather than fatal, so a newer host
@@ -266,6 +274,16 @@ impl SessionWriter {
 
     pub async fn detach(&mut self) -> Result<()> {
         proto::write_frame(&mut self.write, tag::DETACH, &[]).await
+    }
+
+    /// Ask for the screen again, answered with an [`Update::Screen`].
+    ///
+    /// For when the client has swallowed something the terminal would have
+    /// redrawn from: a session switching between the primary and alternate
+    /// screens never reaches the terminal, so the picture on the other side of
+    /// the switch has to come from the node's model instead.
+    pub async fn resync(&mut self) -> Result<()> {
+        proto::write_frame(&mut self.write, tag::RESYNC, &[]).await
     }
 
     /// Answer an [`Update::Ping`], which is how the host tells a client that is
