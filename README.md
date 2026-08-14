@@ -278,8 +278,10 @@ The ones you type often have a short form: `l`, `n`, `a`, `k`, `r`, `h`, `up`.
 ## Tab completion
 
 `mm completions --install` writes the script where your shell looks for it, and
-`mm update` rewrites it afterwards. It is a stub that asks `mm` on every tab, so
-`mm a <TAB>` offers the sessions running right now:
+`mm update` installs it if there is none and rewrites it if there is, whether
+that update downloads anything or not, so a machine set up with `install.sh`
+picks it up the next time it looks. It is a stub that asks `mm` on every tab,
+so `mm a <TAB>` offers the sessions running right now:
 
 ```
 $ mm a <TAB>
@@ -301,6 +303,13 @@ line you would rather not add, source the script instead, at the end of
 ```bash
 echo 'source <(mm completions zsh)' >> ~/.zshrc
 ```
+
+Termux is the exception. Its shells are built against `$PREFIX` and search
+there rather than under `$HOME`, so the script goes to
+`$PREFIX/share/zsh/site-functions`, which is on zsh's `fpath` already and wants
+no line in `.zshrc`. bash there reads its own completion directory only once
+`pkg install bash-completion` has happened, which is not part of the Termux
+base and is not something `mm` can do for you.
 
 ## Install details
 

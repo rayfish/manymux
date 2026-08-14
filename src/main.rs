@@ -425,7 +425,6 @@ async fn update(socket: &Path, check: bool, force: bool) -> Result<u8> {
             style::green("✓"),
             style::bold(&path.display().to_string())
         );
-        refresh_completions();
     } else {
         println!(
             "{} manymux {} is the published {} build",
@@ -433,6 +432,15 @@ async fn update(socket: &Path, check: bool, force: bool) -> Result<u8> {
             manymux::VERSION,
             available.tag
         );
+    }
+
+    // Whether anything was downloaded or not, for the same reason the node is
+    // checked below: a machine whose binary is current can still be one that
+    // has never had a completion script, and it would then have to wait for a
+    // release it does not need before tab did anything. `--check` changes
+    // nothing, here as everywhere.
+    if !check {
+        refresh_completions();
     }
 
     // Whether anything was downloaded or not. The node is a long-running
@@ -958,26 +966,28 @@ fn current_dir() -> Option<String> {
         .map(|p| p.to_string_lossy().into_owned())
 }
 
-/// Rewrite an installed completion script after an update.
+/// Install the completion script after an update, or rewrite the one there.
 ///
 /// The script and the binary talk to each other, and clap_complete makes no
-/// promise that a script written by one version still works with the next. Only
-/// touches a file that is already there, and says nothing either way: nobody
-/// asked about completions, they asked for an update.
+/// promise that a script written by one version still works with the next, so a
+/// script already installed is rewritten silently: nobody asked about
+/// completions, they asked for an update. A machine that never had one gets it
+/// now and is told where it went, which is the only way someone who installed
+/// with `install.sh` ever ends up with working completion.
+///
+/// Neither is worth failing an update over, so a write that does not work is
+/// left to the log.
 fn refresh_completions() {
     let Some(shell) = Shell::from_env() else {
         return;
     };
-    let Some(path) = completion_path(shell).filter(|path| path.exists()) else {
+    let Some(at) = completion_path(shell) else {
         return;
     };
-    match std::fs::File::create(&path).map_err(anyhow::Error::from) {
-        Ok(mut file) => {
-            if let Err(e) = complete::registration(shell, &mut file) {
-                debug!("could not refresh {}: {e:#}", path.display());
-            }
-        }
-        Err(e) => debug!("could not refresh {}: {e:#}", path.display()),
+    match write_completions(shell, &at) {
+        Ok(true) => println!("{}", installed_message(shell, &at)),
+        Ok(false) => {}
+        Err(e) => debug!("could not install {}: {e:#}", at.path.display()),
     }
 }
 
@@ -991,35 +1001,36 @@ fn completions(shell: Option<Shell>, install: bool) -> Result<u8> {
         return Ok(OK);
     }
 
-    let Some(path) = completion_path(shell) else {
+    let Some(at) = completion_path(shell) else {
         bail!(
             "no install path known for {shell}; print it and place it yourself: \
              mm completions {shell}"
         );
     };
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    let mut file = std::fs::File::create(&path)?;
-    complete::registration(shell, &mut file)?;
-    println!("wrote {}", path.display());
-
-    if shell == Shell::Zsh {
-        println!(
-            "zsh only reads completions on its fpath. If tab completion does not work, add this \
-             to ~/.zshrc:\n\n  fpath=({} $fpath)\n  autoload -Uz compinit && compinit\n",
-            path.parent().unwrap_or(&path).display()
-        );
-    }
+    write_completions(shell, &at)?;
+    // Asked for outright, so it is said whether the script was already there or
+    // not; only `mm update` has a reason to keep quiet about a rewrite.
+    println!("{}", installed_message(shell, &at));
     println!("the script asks `mm` for session names as you type, so it needs mm on your PATH");
     Ok(OK)
+}
+
+/// Where a completion script goes, and whether the shell looks there by itself.
+struct Location {
+    path: PathBuf,
+    /// zsh reads completions off its `fpath` and from nowhere else, and
+    /// `~/.local/share/zsh/site-functions` is not on it, so installing there
+    /// costs a line in `.zshrc`. Under Termux's prefix it is on the default
+    /// `fpath` already, and saying otherwise would send someone to fix
+    /// something that works.
+    searched: bool,
 }
 
 /// Where each shell looks for user-installed completions.
 ///
 /// Deliberately not `dirs::data_dir()`: shells follow the XDG layout on macOS
 /// too, where that would point at `~/Library/Application Support`.
-fn completion_path(shell: Shell) -> Option<PathBuf> {
+fn completion_path(shell: Shell) -> Option<Location> {
     let home = dirs::home_dir()?;
     let base = |var: &str, fallback: &str| {
         std::env::var_os(var)
@@ -1027,14 +1038,170 @@ fn completion_path(shell: Shell) -> Option<PathBuf> {
             .filter(|path| path.is_absolute())
             .unwrap_or_else(|| home.join(fallback))
     };
-    let data = base("XDG_DATA_HOME", ".local/share");
-    let config = base("XDG_CONFIG_HOME", ".config");
-    Some(match shell {
-        Shell::Bash => data.join("bash-completion/completions/mm"),
-        Shell::Zsh => data.join("zsh/site-functions/_mm"),
-        Shell::Fish => config.join("fish/completions/mm.fish"),
-        Shell::Elvish => config.join("elvish/lib/mm.elv"),
+    // Termux is a prefix installation on a system that has no `/usr`, and its
+    // shells are built to search that prefix. Nowhere else has a `$PREFIX`
+    // worth reading, so nowhere else reads it.
+    let prefix = if cfg!(target_os = "android") {
+        std::env::var_os("PREFIX")
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute())
+    } else {
+        None
+    };
+    completion_path_in(
+        shell,
+        &base("XDG_DATA_HOME", ".local/share"),
+        &base("XDG_CONFIG_HOME", ".config"),
+        prefix.as_deref(),
+    )
+}
+
+fn completion_path_in(
+    shell: Shell,
+    data: &Path,
+    config: &Path,
+    prefix: Option<&Path>,
+) -> Option<Location> {
+    // Only bash and zsh have their search path baked in at build time, which is
+    // what a prefix moves. fish and elvish read `~/.config` wherever they run.
+    let under_prefix = prefix.and_then(|prefix| match shell {
+        Shell::Bash => Some(prefix.join("share/bash-completion/completions/mm")),
+        Shell::Zsh => Some(prefix.join("share/zsh/site-functions/_mm")),
+        _ => None,
+    });
+    if let Some(path) = under_prefix {
+        return Some(Location {
+            path,
+            searched: true,
+        });
+    }
+    let (path, searched) = match shell {
+        Shell::Bash => (data.join("bash-completion/completions/mm"), true),
+        // The one place a shell has to be told: see `Location::searched`.
+        Shell::Zsh => (data.join("zsh/site-functions/_mm"), false),
+        Shell::Fish => (config.join("fish/completions/mm.fish"), true),
+        Shell::Elvish => (config.join("elvish/lib/mm.elv"), true),
         // PowerShell loads completions from a profile script, not a directory.
         _ => return None,
-    })
+    };
+    Some(Location { path, searched })
+}
+
+/// Write the script for `shell`, saying whether there was none there before.
+fn write_completions(shell: Shell, at: &Location) -> Result<bool> {
+    let fresh = !at.path.exists();
+    if let Some(dir) = at.path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let mut file = std::fs::File::create(&at.path)?;
+    complete::registration(shell, &mut file)?;
+    Ok(fresh)
+}
+
+/// What to say after writing a script that was not there before.
+fn installed_message(shell: Shell, at: &Location) -> String {
+    let mut message = format!("wrote {}", at.path.display());
+    if shell == Shell::Zsh && !at.searched {
+        let dir = at.path.parent().unwrap_or(&at.path).display();
+        message.push_str(&format!(
+            "\n\nzsh only reads completions on its fpath. If tab completion does not work, add \
+             this to ~/.zshrc:\n\n  fpath=({dir} $fpath)\n  autoload -Uz compinit && compinit\n"
+        ));
+    }
+    message
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn xdg(shell: Shell) -> Location {
+        completion_path_in(
+            shell,
+            Path::new("/home/me/.local/share"),
+            Path::new("/home/me/.config"),
+            None,
+        )
+        .expect("a path for this shell")
+    }
+
+    fn termux(shell: Shell) -> Location {
+        completion_path_in(
+            shell,
+            Path::new("/data/data/com.termux/files/home/.local/share"),
+            Path::new("/data/data/com.termux/files/home/.config"),
+            Some(Path::new("/data/data/com.termux/files/usr")),
+        )
+        .expect("a path for this shell")
+    }
+
+    #[test]
+    fn the_xdg_directories_are_where_a_script_goes() {
+        assert_eq!(
+            xdg(Shell::Bash).path,
+            Path::new("/home/me/.local/share/bash-completion/completions/mm")
+        );
+        assert_eq!(
+            xdg(Shell::Zsh).path,
+            Path::new("/home/me/.local/share/zsh/site-functions/_mm")
+        );
+        assert_eq!(
+            xdg(Shell::Fish).path,
+            Path::new("/home/me/.config/fish/completions/mm.fish")
+        );
+    }
+
+    /// Termux is a prefix installation on a system with no `/usr`, so its bash
+    /// and zsh search under `$PREFIX` and never under `$HOME`. A script in the
+    /// XDG directory there is a file nothing reads.
+    #[test]
+    fn bash_and_zsh_move_under_the_termux_prefix() {
+        assert_eq!(
+            termux(Shell::Bash).path,
+            Path::new("/data/data/com.termux/files/usr/share/bash-completion/completions/mm")
+        );
+        assert_eq!(
+            termux(Shell::Zsh).path,
+            Path::new("/data/data/com.termux/files/usr/share/zsh/site-functions/_mm")
+        );
+    }
+
+    /// fish reads its own config directory wherever it runs, Termux included,
+    /// so only the two whose search path is baked into the prefix move.
+    #[test]
+    fn fish_reads_its_own_config_directory_under_termux() {
+        assert_eq!(
+            termux(Shell::Fish).path,
+            Path::new("/data/data/com.termux/files/home/.config/fish/completions/mm.fish")
+        );
+    }
+
+    /// The line is advice about a directory zsh does not search. Printing it
+    /// for one that is already on the `fpath` sends someone to fix nothing.
+    #[test]
+    fn only_a_directory_zsh_does_not_search_gets_the_fpath_line() {
+        let hint = "fpath=(";
+        assert!(installed_message(Shell::Zsh, &xdg(Shell::Zsh)).contains(hint));
+        assert!(!installed_message(Shell::Zsh, &termux(Shell::Zsh)).contains(hint));
+        assert!(!installed_message(Shell::Bash, &xdg(Shell::Bash)).contains(hint));
+    }
+
+    /// `mm update` installs a script that is missing and rewrites one that is
+    /// not, and only the first of those is news.
+    #[test]
+    fn a_script_is_installed_once_and_rewritten_afterwards() {
+        let dir = std::env::temp_dir().join(format!("manymux-completions-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let at = completion_path_in(Shell::Bash, &dir.join("data"), &dir.join("config"), None)
+            .expect("a path for bash");
+
+        assert!(write_completions(Shell::Bash, &at).unwrap());
+        let script = std::fs::read_to_string(&at.path).expect("the script was written");
+        assert!(script.contains("COMPLETE"), "{script}");
+
+        assert!(!write_completions(Shell::Bash, &at).unwrap());
+        assert_eq!(std::fs::read_to_string(&at.path).unwrap(), script);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
