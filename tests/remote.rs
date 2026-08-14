@@ -115,6 +115,37 @@ exec env MM_CONFIG_DIR="{dir}/$host" "{mm}" --socket "{dir}/$host.sock" agent
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
+    /// A stand-in for zsh, answering `print -rl -- $fpath` with the directories
+    /// given and nothing else, and a PATH that finds it first.
+    ///
+    /// The real zsh answers for the machine the tests run on: an account that
+    /// owns one of the directories its zsh was built to search, which is any
+    /// Homebrew mac and most CI runners, would have the script installed there,
+    /// outside the world these tests clean up.
+    fn write_stub_zsh(&self, fpath: &[&Path]) -> std::ffi::OsString {
+        let dir = self.dir.join("bin");
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = format!(
+            "#!/bin/sh\n{}\n",
+            fpath
+                .iter()
+                .map(|entry| format!("printf '%s\\n' '{}'", entry.display()))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        let path = dir.join("zsh");
+        std::fs::write(&path, script).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut looked_in = dir.into_os_string();
+        if let Some(rest) = std::env::var_os("PATH") {
+            looked_in.push(":");
+            looked_in.push(rest);
+        }
+        looked_in
+    }
+
     /// What the installer was asked to run on `machine`, if it ran at all.
     fn installer_ran_on(&self, machine: &str) -> Option<String> {
         std::fs::read_to_string(self.dir.join(format!("{machine}.installed"))).ok()
@@ -755,18 +786,22 @@ fn a_tab_does_not_start_a_node() {
 }
 
 /// The installed script is the stub that asks the binary, in the place each
-/// shell looks for it.
+/// shell looks for it: what zsh says it searches, and the XDG directory for the
+/// shells that read one wherever they run.
 #[test]
 fn installing_writes_a_script_that_asks_the_binary() {
     let world = World::new("tab-install");
     let home = world.dir.join("home");
+    let searched = world.dir.join("site-functions");
+    let path = world.write_stub_zsh(&[&searched]);
 
-    for (shell, relative) in [
-        ("zsh", "zsh/site-functions/_mm"),
-        ("bash", "bash-completion/completions/mm"),
+    for (shell, at) in [
+        ("zsh", searched.join("_mm")),
+        ("bash", home.join("data/bash-completion/completions/mm")),
     ] {
         let out = Command::new(MM)
             .args(["completions", shell, "--install"])
+            .env("PATH", &path)
             .env("HOME", &home)
             .env("XDG_DATA_HOME", home.join("data"))
             .env("MM_CONFIG_DIR", world.dir.join("laptop"))
@@ -778,7 +813,7 @@ fn installing_writes_a_script_that_asks_the_binary() {
             String::from_utf8_lossy(&out.stderr)
         );
 
-        let script = std::fs::read_to_string(home.join("data").join(relative))
+        let script = std::fs::read_to_string(&at)
             .unwrap_or_else(|e| panic!("{shell} script not installed: {e}"));
         assert!(script.contains("COMPLETE"), "{shell}: {script}");
         if shell == "zsh" {
@@ -786,8 +821,44 @@ fn installing_writes_a_script_that_asks_the_binary() {
             // Autoloaded from fpath, so the first tab has to be answered by
             // hand rather than lost to `compdef` taking effect too late.
             assert!(script.contains("_comps[mm]"), "{script}");
+            // Nothing to add to a file for a directory zsh already reads.
+            let said = String::from_utf8_lossy(&out.stdout);
+            assert!(!said.contains("fpath=("), "{said}");
         }
     }
+}
+
+/// Where zsh searches nowhere this account can write, which is the usual shared
+/// Linux box, the script goes in the XDG directory with the line to add.
+#[test]
+fn a_zsh_that_searches_nowhere_of_ours_gets_the_xdg_directory_and_a_line() {
+    let world = World::new("tab-install-xdg");
+    let home = world.dir.join("home");
+    let path = world.write_stub_zsh(&[]);
+
+    let out = Command::new(MM)
+        .args(["completions", "zsh", "--install"])
+        .env("PATH", &path)
+        .env("HOME", &home)
+        .env("XDG_DATA_HOME", home.join("data"))
+        .env("MM_CONFIG_DIR", world.dir.join("laptop"))
+        .output()
+        .expect("running manymux");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let at = home.join("data/zsh/site-functions/_mm");
+    let script = std::fs::read_to_string(&at).unwrap_or_else(|e| panic!("not installed: {e}"));
+    assert!(script.starts_with("#compdef mm"), "{script}");
+
+    let said = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        said.contains(&format!("fpath=({}", at.parent().unwrap().display())),
+        "{said}"
+    );
 }
 
 /// Nothing in these tests should have left a node running.
