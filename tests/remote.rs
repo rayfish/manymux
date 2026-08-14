@@ -342,6 +342,44 @@ fn a_machine_that_cannot_be_reached_is_reported_not_hidden() {
     );
 }
 
+/// Worse than a machine that refuses: one that swallows the connection. ssh
+/// spends minutes on a TCP connect to an address nothing answers at, once per
+/// address the name has, and every other machine's sessions used to sit behind
+/// that wait.
+#[test]
+fn a_machine_that_never_answers_does_not_hold_up_the_others() {
+    let world = World::new("silent");
+
+    world.ok("laptop", &["new", "-d", "-n", "here", "sleep", "60"]);
+    world.ok("laptop", &["add", "gpu-box"]);
+
+    // Not a refusal, not an answer: the connection is simply taken and kept,
+    // the way a machine that is asleep or off the network takes it. `exec`, so
+    // that giving up on the stub is giving up on the whole of it, as it is for
+    // a real ssh: a leftover grandchild would sit on the inherited stderr and
+    // hold this test open long after the listing had moved on.
+    std::fs::write(world.ssh_stub(), "#!/bin/sh\nexec sleep 600\n").unwrap();
+
+    let started = Instant::now();
+    let out = world.run("laptop", &["ls"]);
+    let waited = started.elapsed();
+    let listed = String::from_utf8_lossy(&out.stdout);
+    let complaint = String::from_utf8_lossy(&out.stderr);
+
+    assert!(
+        waited < Duration::from_secs(60),
+        "waited {waited:?} on a machine that never answered"
+    );
+    assert!(
+        listed.contains("here"),
+        "the machine that is up should still be listed: {listed}"
+    );
+    assert!(
+        complaint.contains("gpu-box"),
+        "the machine that never answered should be named: {complaint}"
+    );
+}
+
 #[test]
 fn a_session_survives_the_connection_that_started_it() {
     let world = World::new("survive");

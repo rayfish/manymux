@@ -2,10 +2,11 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
-use anyhow::{Result, bail};
+use anyhow::{Result, anyhow, bail};
 use clap::{Parser, Subcommand, ValueHint};
 use clap_complete::Shell;
 use tokio::task::JoinHandle;
+use tokio::time::timeout;
 use tracing::debug;
 
 use manymux::client::attach::{self, Mode, Outcome};
@@ -612,6 +613,20 @@ struct Asked {
     found: Result<Vec<SessionInfo>>,
 }
 
+/// How long one machine may take over a full listing before it is reported as
+/// not answering.
+///
+/// Without this a single machine that is asleep or off the network holds up
+/// every other machine's answer for as long as the kernel spends on a TCP
+/// connect, which is minutes and once per address the name resolves to. Naming
+/// a machine yourself still waits as long as it takes: you asked about that one
+/// and an error about it is the answer. It is a fan-out that needs the bound.
+///
+/// Generous enough for a cold ssh handshake through a `ProxyCommand` and a node
+/// starting at the far end, and short enough that a listing stays something you
+/// wait for rather than something you go away from.
+const HOST_DEADLINE: Duration = Duration::from_secs(5);
+
 /// Sessions on this machine and on every watched one, asked all at once.
 async fn everywhere(socket: &Path) -> Result<Listing> {
     let mut listing = Listing::default();
@@ -627,7 +642,12 @@ async fn everywhere(socket: &Path) -> Result<Listing> {
     for host in Hosts::load()?.names() {
         let socket = socket.to_path_buf();
         asked.spawn(async move {
-            let found = sessions_on(&socket, &host).await;
+            // Giving up drops the query, and with it the ssh carrying it, so a
+            // machine that never answers leaves nothing behind.
+            let found = match timeout(HOST_DEADLINE, sessions_on(&socket, &host)).await {
+                Ok(found) => found,
+                Err(_) => Err(anyhow!("no answer in {}s", HOST_DEADLINE.as_secs())),
+            };
             Asked { host, found }
         });
     }
