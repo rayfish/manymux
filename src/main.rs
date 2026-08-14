@@ -16,6 +16,7 @@ use manymux::client::{Attached, Stream};
 use manymux::hosts::{Hosts, LOCAL, Target, is_this_machine, this_machine};
 use manymux::node::{Config, Node};
 use manymux::proto::{HostedSession, Request, Response, SessionInfo, SpawnSpec};
+use manymux::settings::Settings;
 use manymux::update::Channel;
 use manymux::{config, log, style, term};
 
@@ -113,6 +114,20 @@ enum Command {
     Rm {
         #[arg(add = complete::watched_hosts())]
         host: String,
+    },
+
+    /// Show or change a setting. With nothing to set, it prints.
+    ///
+    /// `mm config notify off` silences both ways a bell reaches you: the
+    /// desktop notification a watching node raises, and the one an attached
+    /// terminal is asked to show.
+    Config {
+        /// `notify`. Left out, every setting is listed.
+        #[arg(add = complete::settings())]
+        key: Option<String>,
+        /// `on` or `off`. Left out, the setting is printed rather than changed.
+        #[arg(add = complete::setting_values())]
+        value: Option<String>,
     },
 
     /// Replace this binary with the published one.
@@ -353,6 +368,26 @@ async fn run(cli: Cli) -> Result<u8> {
                 bail!("{host} is not being watched");
             }
             hosts.save()?;
+            Ok(OK)
+        }
+
+        Command::Config { key, value } => {
+            let mut settings = Settings::load()?;
+            match (key, value) {
+                (None, _) => {
+                    for (key, value) in settings.all() {
+                        println!("{key} {value}");
+                    }
+                }
+                (Some(key), None) => println!("{}", settings.get(&key)?),
+                (Some(key), Some(value)) => {
+                    settings.set(&key, &value)?;
+                    settings.save()?;
+                    // A node already running reads the file when it next has
+                    // something to say, so there is nothing to restart.
+                    println!("{key} {}", settings.get(&key)?);
+                }
+            }
             Ok(OK)
         }
 

@@ -72,8 +72,12 @@ Three consequences run through the whole codebase and are worth keeping intact:
   modes (mouse, bracketed paste, cursor style) to replay after the repaint.
 - `src/node/peers.rs` holds one long-lived `Request::Events` subscription per
   watched machine, which is how a bell on a box nobody is attached to reaches
-  the desktop you are sitting at (`src/node/notify.rs`, via `osascript` or
+  the desktop you are sitting at (`src/notify.rs`, via `osascript` or
   `notify-send`).
+- `src/notify.rs` decides what is worth interrupting someone over, for both ways
+  out: the desktop tools above, and `escape()`, the OSC 9 an attached client
+  hands to the terminal it is sitting in. `src/settings.rs` is `settings.toml`
+  beside the host list, which so far holds only `notify`.
 - `src/client/attach.rs` drives a real terminal (raw mode, focus/control modes,
   the `Ctrl-]` prefix). `src/client/status.rs` and `src/client/switch.rs` are
   deliberately terminal-free so they can be tested as string and list handling.
@@ -119,6 +123,16 @@ Three consequences run through the whole codebase and are worth keeping intact:
   every command that reaches such a machine.
 - **`mm agent` must leave stdout strictly alone**: the protocol is on it. Only
   the daemon opens a log file; everything else logs to stderr.
+- **A bell goes to exactly one of two places, and the event says which.**
+  An attach stream carries this machine's other sessions' events unasked
+  (`pump_attachment`), so whoever is sitting in one session hears the one next
+  door on the terminal in front of them; over ssh that is the only route that
+  reaches a person at all. `SessionEvent::host_attached` counts the clients
+  attached anywhere on the machine, and a desktop notifier that sees one keeps
+  quiet (`notify::for_desktop`), or one bell interrupts twice. The escape is
+  written only at a `Filter::at_boundary()` moment, like the mark, and the text
+  is scrubbed first: it comes from the program in the session, and a BEL in a
+  title would end the sequence and leave the rest to be read as commands.
 - **Modes switched on for a session must be switched off on detach.**
   `events::REPLAYED_MODES` and the teardown in `client::attach` are a pair, and
   so are `events::Keyboard` and the pops in the same teardown.

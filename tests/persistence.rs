@@ -9,7 +9,9 @@ use std::time::Duration;
 
 use anyhow::Result;
 use manymux::node::{Config, Node};
-use manymux::proto::{self, FrameReader, Request, Response, Size, SpawnSpec, tag};
+use manymux::proto::{
+    self, EventKind, FrameReader, HostedEvent, Request, Response, Size, SpawnSpec, tag,
+};
 use tokio::io::{AsyncRead, DuplexStream, WriteHalf, split};
 
 /// One client connection: a duplex pair with the server handler running on the
@@ -90,6 +92,28 @@ impl Client {
 
     async fn pong(&mut self) -> Result<()> {
         proto::write_frame(&mut self.write, tag::PONG, &[]).await
+    }
+
+    /// The next bell an attached client is told about, whichever session it
+    /// came from.
+    async fn read_until_bell(&mut self) -> HostedEvent {
+        let deadline = Duration::from_secs(10);
+        let found = tokio::time::timeout(deadline, async {
+            loop {
+                match self.next_frame().await {
+                    Some(frame) if frame.tag == tag::EVENT => {
+                        let hosted: HostedEvent = proto::decode(&frame.body).expect("an event");
+                        if hosted.event.kind == EventKind::Bell {
+                            return hosted;
+                        }
+                    }
+                    Some(_) => {}
+                    None => panic!("the stream closed before any bell"),
+                }
+            }
+        })
+        .await;
+        found.expect("a bell within the deadline")
     }
 }
 
@@ -592,4 +616,48 @@ async fn a_pasted_image_is_written_on_the_host_and_its_path_typed_into_the_sessi
 
     std::fs::remove_file(written[0].path()).unwrap();
     registry.kill(&name).unwrap();
+}
+
+/// The route a bell takes to somebody sitting in another session on the same
+/// machine. It is the only one that works when the machine is one you ssh into:
+/// a desktop notification raised over there is raised on a desktop nobody is
+/// looking at, while this comes back down the connection you are typing into.
+///
+/// The session on the screen is left out on purpose: its bell is already
+/// audible where it happened.
+#[tokio::test]
+async fn a_bell_next_door_reaches_an_attached_client_and_this_ones_does_not() {
+    let node = test_node().await;
+    let registry = &node.registry;
+    let Spawned { name, .. } = spawn_session(&node, &["/bin/sh", "-i"]).await;
+
+    let mut client = Client::connect(&node);
+    let attach = Request::Attach {
+        name: name.clone(),
+        size: Size::new(80, 24),
+    };
+    assert!(matches!(
+        client.send(&attach).await.unwrap(),
+        Response::Attached { .. }
+    ));
+
+    // This session rings first, and must not be reported: it is on the screen.
+    client.type_line("printf 'here\\a'").await.unwrap();
+    client.read_until("here").await;
+
+    let next_door = spawn_session(&node, &["/bin/sh", "-c", "printf 'x\\a'; sleep 300"]).await;
+
+    let hosted = client.read_until_bell().await;
+    assert_eq!(
+        hosted.event.session, next_door.name,
+        "the client was told about its own bell"
+    );
+    assert!(
+        hosted.event.host_attached >= 1,
+        "a machine with somebody attached to it says so, which is what keeps a \
+         desktop notifier from saying the same thing twice"
+    );
+
+    registry.kill(&name).unwrap();
+    registry.kill(&next_door.name).unwrap();
 }

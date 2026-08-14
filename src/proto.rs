@@ -225,6 +225,15 @@ pub struct SessionEvent {
     /// How many clients were attached when this happened. Zero is the case
     /// worth interrupting someone over: nobody saw it.
     pub attached: usize,
+    /// How many clients are attached to any session on the machine this came
+    /// from, this one included. What decides *where* a notification goes: with
+    /// somebody attached there, their terminal is told (`notify::escape`) and
+    /// the desktop notifier stays quiet, so one bell interrupts once.
+    ///
+    /// Defaulted rather than required, so an older node's events still notify
+    /// the way they always did instead of failing to decode.
+    #[serde(default)]
+    pub host_attached: usize,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -457,6 +466,47 @@ mod tests {
         })
         .unwrap();
         assert!(matches!(decode::<Old>(&new).unwrap(), Old::Attached { .. }));
+    }
+
+    /// The same rule for the event feed: a node that predates the host-wide
+    /// count still notifies the way it always did, rather than an event that
+    /// will not decode.
+    #[test]
+    fn an_older_hosts_event_still_decodes() {
+        /// `SessionEvent` as it was before an attached terminal could notify.
+        #[derive(Serialize, Deserialize)]
+        struct Old {
+            session: String,
+            title: String,
+            kind: EventKind,
+            attached: usize,
+        }
+
+        let old = encode(&Old {
+            session: "api".into(),
+            title: "fixing the parser".into(),
+            kind: EventKind::Bell,
+            attached: 0,
+        })
+        .unwrap();
+        let event: SessionEvent = decode(&old).unwrap();
+        assert_eq!(event.session, "api");
+        assert_eq!(
+            event.host_attached, 0,
+            "a host that cannot count them has nobody attached as far as we know"
+        );
+
+        // And an old node reading a new one's event, which is a machine
+        // watching a peer that was updated first.
+        let new = encode(&SessionEvent {
+            session: "api".into(),
+            title: "fixing the parser".into(),
+            kind: EventKind::Bell,
+            attached: 0,
+            host_attached: 2,
+        })
+        .unwrap();
+        assert_eq!(decode::<Old>(&new).unwrap().session, "api");
     }
 
     /// What makes an unanswered version request an answer in itself: a node

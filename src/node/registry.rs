@@ -1,6 +1,7 @@
 //! The set of live sessions on this host.
 
 use std::collections::HashMap;
+use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Result, bail};
@@ -18,6 +19,10 @@ pub struct Registry {
     sessions: Mutex<HashMap<String, Arc<Session>>>,
     /// Everything happening in every session on this host, in one stream.
     events: broadcast::Sender<SessionEvent>,
+    /// Clients attached anywhere on this host, counted once for the machine
+    /// rather than per session: a bell reaches whoever is sitting here, whichever
+    /// session they happen to be looking at.
+    clients: Arc<AtomicUsize>,
 }
 
 impl Registry {
@@ -26,6 +31,7 @@ impl Registry {
         Arc::new(Self {
             sessions: Mutex::new(HashMap::new()),
             events,
+            clients: Arc::new(AtomicUsize::new(0)),
         })
     }
 
@@ -52,7 +58,12 @@ impl Registry {
             None => unique_name(&sanitize(&default_name(spec)), |n| sessions.contains_key(n)),
         };
 
-        let session = Session::spawn(spec, name.clone(), self.events.clone())?;
+        let session = Session::spawn(
+            spec,
+            name.clone(),
+            self.events.clone(),
+            Arc::clone(&self.clients),
+        )?;
         info!(session = %name, pid = session.pid, "spawned");
         sessions.insert(name, Arc::clone(&session));
         session.publish(EventKind::Started);

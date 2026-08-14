@@ -7,7 +7,7 @@
 //! project, and it is why the PTY is owned by the server rather than proxied.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -48,6 +48,10 @@ pub struct Session {
     /// The host-wide event bus. Bells and title changes go here so a laptop can
     /// hear about them with nothing attached.
     events: broadcast::Sender<SessionEvent>,
+    /// Clients attached to any session on this host, shared by all of them.
+    /// Stamped onto every event, because it decides whether a bell is shown to
+    /// somebody sitting in a terminal here or raised on a desktop elsewhere.
+    host_clients: Arc<AtomicUsize>,
     next_client: AtomicU64,
 }
 
@@ -151,6 +155,7 @@ impl Attachment {
 
 impl Drop for Attachment {
     fn drop(&mut self) {
+        self.session.host_clients.fetch_sub(1, Ordering::Relaxed);
         let mut state = self.session.state.lock().unwrap();
         state.clients.remove(&self.id);
         let effective = state.effective_size();
@@ -165,6 +170,7 @@ impl Session {
         spec: &SpawnSpec,
         name: String,
         events: broadcast::Sender<SessionEvent>,
+        host_clients: Arc<AtomicUsize>,
     ) -> Result<Arc<Self>> {
         let size = spec.size.sane();
         let Launch { argv, label } = launch(spec);
@@ -221,6 +227,7 @@ impl Session {
             }),
             exit_rx,
             events,
+            host_clients,
             next_client: AtomicU64::new(0),
         });
 
@@ -316,12 +323,14 @@ impl Session {
             title,
             kind,
             attached,
+            host_attached: self.host_clients.load(Ordering::Relaxed),
         });
     }
 
     /// Attach a client.
     pub fn attach(self: &Arc<Self>, size: Size) -> Attached {
         let id = self.next_client.fetch_add(1, Ordering::Relaxed);
+        self.host_clients.fetch_add(1, Ordering::Relaxed);
         let mut state = self.state.lock().unwrap();
 
         // Subscribe under the lock so the repaint and the stream meet exactly.

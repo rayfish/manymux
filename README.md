@@ -202,11 +202,31 @@ mm rename gpu-box/build "nightly bench"
 ```
 
 When a session rings the bell or asks for a notification outright (OSC 9,
-OSC 777) and nobody is attached to see it, your machine raises a desktop
-notification: `osascript` on macOS, `notify-send` on Linux. A session someone is
-watching stays quiet, and one session can interrupt you at most every 30
-seconds. A clean exit is not worth interrupting over; a non-zero one is.
+OSC 777) and nobody is attached to see it, you are told. Where depends on where
+you are sitting:
 
+- Attached to a session on that machine, a bell in one of its other sessions
+  goes to the terminal in front of you, as an OSC 9 that iTerm2, kitty, ghostty,
+  WezTerm, foot, VS Code and Windows Terminal raise as a desktop notification.
+  The status row names the session for a few seconds as well, for a terminal
+  that raises nothing. This is the route that works over ssh, where a
+  notification on the far machine would be raised on a desktop nobody is at.
+- Attached nowhere on it, whichever machine watches it says so on its own
+  desktop: `osascript` on macOS, `notify-send` on Linux.
+
+Somebody attached on a machine is enough for the desktop notifier to keep out of
+the way, so one bell interrupts once. A session someone is watching stays quiet
+altogether, and one session can interrupt you at most every 30 seconds. A clean
+exit is not worth interrupting over; a non-zero one is.
+
+To turn the lot off:
+
+```bash
+mm config notify off
+```
+
+It takes hold at once, in the session you are already attached to and in any
+node already running. `MM_NOTIFY=off` does the same for one command, and
 `mm daemon --no-notify` runs the node but stays silent.
 
 ## Keeping it running
@@ -274,6 +294,7 @@ mm attach <target>                   attach; Ctrl-] then tab switches, d detache
 mm kill <target>                     SIGHUP a session's process group
 mm rename <target> <title>           set a sticky title
 mm add <host> | hosts | rm <host>    which machines to list and watch
+mm config [key] [value]              show or change a setting: notify on|off
 mm update [--check] [--nightly]      replace this binary with the published one
 mm start | stop | restart [--force]  this machine's node: up, down, and again
 mm service install|uninstall         run the node at boot
@@ -373,7 +394,8 @@ in the background. There is no service to install, since Android has none.
 | `MM_PASTE` | `off` gives `Ctrl-V` back to the session |
 | `MM_SSH` | the ssh program, if yours lives somewhere unusual |
 | `MM_LOG` | log filter, e.g. `manymux=debug` |
-| `MM_CONFIG_DIR` | where the host list lives |
+| `MM_NOTIFY` | `off` silences bells for one command; see `mm config` |
+| `MM_CONFIG_DIR` | where the host list and settings live |
 | `MM_COMPLETE_REMOTE` | let a bare tab reach every machine, not just this one |
 | `NO_COLOR` | plain output; `CLICOLOR_FORCE` colours a pipe |
 

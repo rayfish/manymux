@@ -1004,3 +1004,113 @@ fn setup_puts_mm_on_a_machine() {
         .expect("nothing was installed");
     assert!(installer.contains("install.sh"), "{installer}");
 }
+
+/// A setting is worth nothing if it does not survive the command that set it,
+/// and `mm config` is the only way to know a node will be quiet.
+#[test]
+fn a_setting_is_written_where_the_next_command_reads_it() {
+    let world = World::new("config");
+
+    assert_eq!(world.ok("laptop", &["config"]).trim(), "notify on");
+
+    world.ok("laptop", &["config", "notify", "off"]);
+    assert_eq!(world.ok("laptop", &["config", "notify"]).trim(), "off");
+    assert_eq!(world.ok("laptop", &["config"]).trim(), "notify off");
+
+    // A refusal rather than a file with a typo in it that changes nothing.
+    let out = world.run("laptop", &["config", "notify", "maybe"]);
+    assert!(!out.status.success());
+    assert_eq!(world.ok("laptop", &["config", "notify"]).trim(), "off");
+
+    // And a tab knows what there is to set, without asking a node anything.
+    assert_eq!(world.complete("laptop", &["config", ""]), vec!["notify"]);
+    assert_eq!(
+        world.complete("laptop", &["config", "notify", ""]),
+        vec!["on", "off"]
+    );
+}
+
+/// The whole path on a real terminal: a bell in one session, and an OSC 9 on
+/// the terminal of whoever is attached to another one next door. Everything
+/// under it is tested in pieces; this is the only thing that shows the pieces
+/// are joined up.
+#[test]
+fn a_bell_next_door_lands_on_the_terminal_of_whoever_is_attached() {
+    use std::io::Read;
+    use std::sync::mpsc;
+
+    let world = World::new("bell-terminal");
+    world.ok("laptop", &["new", "-d", "-n", "quiet", "sh"]);
+    world.wait_for_node("laptop");
+
+    let (mut pty, pts) = pty_process::blocking::open().unwrap();
+    let mut client = pty_process::blocking::Command::new(MM)
+        .arg("--socket")
+        .arg(world.socket("laptop"))
+        .args(["attach", "quiet"])
+        .env("MM_CONFIG_DIR", world.dir.join("laptop"))
+        .env("MM_SSH", world.ssh_stub())
+        .env("MM_LOG", "manymux=warn")
+        .env("TERM", "xterm-256color")
+        .spawn(pts)
+        .expect("attaching on a terminal");
+
+    // Read the terminal on a thread of its own: the point of the test is what
+    // arrives without anyone typing, and a read on a pty blocks until it does.
+    let (seen_tx, seen_rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 1024];
+        while let Ok(read @ 1..) = pty.read(&mut buf) {
+            if seen_tx.send(buf[..read].to_vec()).is_err() {
+                return;
+            }
+        }
+    });
+
+    let mut seen = String::new();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut rung = false;
+    let notification = loop {
+        if let Ok(chunk) = seen_rx.recv_timeout(Duration::from_millis(200)) {
+            seen.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        // Ring only once the client is on the screen, or the bell would be over
+        // before there was anybody attached to tell about it.
+        if !rung && !seen.is_empty() {
+            rung = true;
+            world.ok(
+                "laptop",
+                &[
+                    "new",
+                    "-d",
+                    "-n",
+                    "ringer",
+                    "sh",
+                    "-c",
+                    "printf 'x\\a'; sleep 30",
+                ],
+            );
+        }
+        if let Some(at) = seen.find("\x1b]9;") {
+            break seen[at..].to_string();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no notification reached the terminal; saw: {seen:?}"
+        );
+    };
+
+    let end = notification.find('\x07').expect("a finished sequence");
+    assert!(
+        notification[..end].contains("ringer"),
+        "the notification does not name the session that rang: {notification:?}"
+    );
+    // And the row says so too, for a terminal that raises nothing.
+    assert!(
+        seen.contains("ringer"),
+        "the status row never mentioned it: {seen:?}"
+    );
+
+    let _ = client.kill();
+    let _ = client.wait();
+}

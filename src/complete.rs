@@ -115,6 +115,26 @@ pub fn watched_hosts() -> ArgValueCompleter {
     ArgValueCompleter::new(|current: &OsStr| candidates(prefixed(current, watched())))
 }
 
+/// Setting names, for `config`. A fixed list: nothing here asks a node
+/// anything, which is what keeps a tab from starting one.
+pub fn settings() -> ArgValueCompleter {
+    ArgValueCompleter::new(|current: &OsStr| {
+        let names: Vec<String> = manymux::settings::KEYS
+            .iter()
+            .map(|k| k.to_string())
+            .collect();
+        candidates(prefixed(current, names))
+    })
+}
+
+/// What a setting can be set to.
+pub fn setting_values() -> ArgValueCompleter {
+    ArgValueCompleter::new(|current: &OsStr| {
+        let values = vec!["on".to_string(), "off".to_string()];
+        candidates(prefixed(current, values))
+    })
+}
+
 /// `mm new [host] [command...]`: a machine or a program first, then arguments.
 pub fn new_args() -> ArgValueCompleter {
     ArgValueCompleter::new(NewArgs)

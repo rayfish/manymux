@@ -595,7 +595,8 @@ mod terminal {
     use crate::client::status::{self, Filter, Status};
     use crate::client::{Attached, SessionHalves, SessionReader, SessionWriter, Update};
     use crate::clipboard;
-    use crate::proto::Size;
+    use crate::notify;
+    use crate::proto::{HostedEvent, Size};
 
     /// Sent before attaching.
     ///
@@ -739,7 +740,7 @@ mod terminal {
         let mut status = Status::new(target);
         status.set_mode(mode);
         write_now(&status.setup(terminal_size()));
-        pump(&mut held.keys, session, status, mode).await
+        pump(&mut held.keys, session, status, mode, target).await
     }
 
     /// How long a notice from the client itself stays on the row before the key
@@ -790,6 +791,7 @@ mod terminal {
         session: Attached,
         mut status: Status,
         mode: Mode,
+        target: &str,
     ) -> Result<Outcome> {
         let takes_pastes = session.paste;
         let SessionHalves {
@@ -809,6 +811,10 @@ mod terminal {
         let mut painted = false;
         // When the notice on the row stops being worth showing.
         let mut notice_until: Option<tokio::time::Instant> = None;
+        // Notifications for the terminal, waiting for a safe moment to be
+        // written, and the rule for which of them get one.
+        let mut pending = String::new();
+        let bells = Bells::new(target);
 
         loop {
             tokio::select! {
@@ -824,11 +830,7 @@ mod terminal {
                         status.set_mode(keystrokes.mode);
                         restate = true;
                     }
-                    if restate && output.at_boundary() {
-                        stdout.write_all(status.repaint(terminal_size()).as_bytes()).await?;
-                        stdout.flush().await?;
-                        restate = false;
-                    }
+                    settle(&mut stdout, &output, &status, &mut pending, &mut restate).await?;
                     match keystrokes.action {
                         // Detached either way, so that the node does not hold an
                         // attachment for a client that has gone elsewhere.
@@ -894,11 +896,10 @@ mod terminal {
                         // Only between sequences: a repaint written into the
                         // middle of one would corrupt it. Whatever cleared the
                         // mark stays noted until there is a safe moment.
-                        if output.at_boundary() && (output.take_dirty() || restate) {
-                            stdout.write_all(status.repaint(terminal_size()).as_bytes()).await?;
-                            restate = false;
+                        if output.at_boundary() {
+                            restate |= output.take_dirty();
                         }
-                        stdout.flush().await?;
+                        settle(&mut stdout, &output, &status, &mut pending, &mut restate).await?;
                     }
                     // The screen we asked for. Its own switches are how a dump
                     // paints both buffers, so they are swallowed and dropped
@@ -910,11 +911,20 @@ mod terminal {
                         // The dump put the session's own screen back, mark and
                         // region included, so both are ours to draw again.
                         restate = true;
-                        if output.at_boundary() {
-                            stdout.write_all(status.repaint(terminal_size()).as_bytes()).await?;
-                            restate = false;
+                        settle(&mut stdout, &output, &status, &mut pending, &mut restate).await?;
+                    }
+                    // A bell in one of this machine's other sessions. The
+                    // terminal is asked to raise it, and the row says which
+                    // session it was, for a terminal that raises nothing.
+                    Update::Event(hosted) => {
+                        if let Some(rung) = bells.ring(&hosted) {
+                            pending.push_str(&rung.escape);
+                            status.set_notice(&rung.notice);
+                            notice_until = Some(tokio::time::Instant::now() + NOTICE_FOR);
+                            restate = true;
+                            settle(&mut stdout, &output, &status, &mut pending, &mut restate)
+                                .await?;
                         }
-                        stdout.flush().await?;
                     }
                     // Answered from here rather than inside the reader, which
                     // does not hold the writing half to answer with.
@@ -934,13 +944,85 @@ mod terminal {
                     notice_until = None;
                     status.clear_notice();
                     restate = true;
-                    if output.at_boundary() {
-                        stdout.write_all(status.repaint(terminal_size()).as_bytes()).await?;
-                        stdout.flush().await?;
-                        restate = false;
-                    }
+                    settle(&mut stdout, &output, &status, &mut pending, &mut restate).await?;
                 }
             }
+        }
+    }
+
+    /// Write what has been held back until it was safe to write, and flush.
+    ///
+    /// Both things here would corrupt a sequence the session is halfway through
+    /// if they landed in the middle of one, so both wait for a boundary: the
+    /// mark, which a clear or a full-screen program takes away, and a
+    /// notification for the terminal, which arrives whenever another session
+    /// feels like ringing.
+    async fn settle(
+        stdout: &mut Stdout,
+        output: &Filter,
+        status: &Status,
+        pending: &mut String,
+        restate: &mut bool,
+    ) -> Result<()> {
+        if output.at_boundary() {
+            if !pending.is_empty() {
+                stdout.write_all(pending.as_bytes()).await?;
+                pending.clear();
+            }
+            if *restate {
+                stdout
+                    .write_all(status.repaint(terminal_size()).as_bytes())
+                    .await?;
+                *restate = false;
+            }
+        }
+        stdout.flush().await?;
+        Ok(())
+    }
+
+    /// What a session next door is allowed to say to this terminal.
+    struct Bells {
+        /// The machine as the person typed it, which is what a notification
+        /// should call it: `deploy@prod-1` is not the name that machine has for
+        /// itself, but it is the one they would recognise.
+        host: Option<String>,
+        cooldown: notify::Cooldown,
+    }
+
+    /// A notification on its way to the terminal.
+    struct Rung {
+        escape: String,
+        notice: String,
+    }
+
+    impl Bells {
+        fn new(target: &str) -> Self {
+            Self {
+                host: target.rsplit_once('/').map(|(host, _)| host.to_string()),
+                cooldown: notify::Cooldown::default(),
+            }
+        }
+
+        /// What to write for an event, or `None` for one not worth interrupting
+        /// anybody over.
+        fn ring(&self, hosted: &HostedEvent) -> Option<Rung> {
+            // Asked every time rather than once at attach, so `mm config notify off`
+            // takes hold in the session you are already sitting in.
+            if !notify::to_terminal() {
+                return None;
+            }
+            let host = self.host.as_deref().unwrap_or(&hosted.host);
+            let notification = notify::worth_interrupting(host, &hosted.event)?;
+            if !self
+                .cooldown
+                .allow(&format!("{host}/{}", hosted.event.session))
+            {
+                return None;
+            }
+            Some(Rung {
+                escape: notify::escape(&notification),
+                notice: notify::summary(&hosted.event.session, &notification),
+            })
         }
     }
 
@@ -1029,6 +1111,10 @@ mod terminal {
                     // and every chunk of it is a frame the host counts as this
                     // client being alive.
                     Update::Ping => {}
+                    // A bell during the second a paste takes. Dropped rather
+                    // than queued: this row is showing the paste, and a bell is
+                    // only worth anything while it is news.
+                    Update::Event(_) => {}
                     Update::Exited(code) => return Ok(Pasted::Ended(Outcome::Exited(code))),
                     Update::Disconnected => return Ok(Pasted::Ended(Outcome::Disconnected)),
                 },
@@ -1067,6 +1153,9 @@ pub async fn collect_until(
             // client to no deadline, which is what a caller collecting output
             // without a connection to keep alive wants.
             Update::Ping => continue,
+            // For a caller with no terminal to raise one on. A client that
+            // renders sessions itself reads these from its own subscription.
+            Update::Event(_) => continue,
             Update::Exited(code) => Outcome::Exited(code),
             Update::Disconnected => Outcome::Disconnected,
         };

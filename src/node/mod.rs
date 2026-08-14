@@ -10,7 +10,6 @@
 //! deploy's node, because the socket lives under deploy's runtime directory.
 
 pub mod events;
-pub mod notify;
 pub mod paste;
 pub mod peers;
 pub mod registry;
@@ -28,8 +27,8 @@ use tracing::{debug, info, warn};
 
 use crate::client::Stream;
 use crate::hosts::{Hosts, this_machine};
+use crate::notify::Notifier;
 use crate::proto::{self, FrameReader, HostedEvent, Request, Response, tag};
-use notify::Notifier;
 use peers::Peers;
 use registry::Registry;
 
@@ -225,7 +224,7 @@ impl Node {
                     paste: true,
                 };
                 proto::write_msg(&mut write, tag::RESPONSE, &response).await?;
-                pump_attachment(attached, read, write).await
+                pump_attachment(attached, &name, self.events.subscribe(), read, write).await
             }
 
             Request::Events => {
@@ -313,8 +312,16 @@ fn modified(path: &Path) -> Option<std::time::SystemTime> {
 ///
 /// Whatever ends this loop, the child is untouched: dropping the attachment
 /// only removes the client from the session's size negotiation.
+///
+/// The stream also carries this machine's other sessions' events, unasked. A
+/// client sitting in one session is the nearest thing there is to a person on
+/// this machine, so a bell in the session next door goes to their terminal
+/// rather than to a desktop notifier that may be a continent away. It costs an
+/// older client nothing: it skips a tag it does not know.
 async fn pump_attachment<R, W>(
     attached: session::Attached,
+    name: &str,
+    mut events: broadcast::Receiver<HostedEvent>,
     mut read: FrameReader<R>,
     mut write: W,
 ) -> Result<()>
@@ -341,6 +348,9 @@ where
     // older one, which skips the tag it does not know, keeps working as before.
     let mut answers_pings = false;
     let mut incoming = Paste::default();
+    // Cleared if the bus ever closes, so a closed channel returning at once
+    // cannot turn this loop into a spin.
+    let mut watching = true;
 
     loop {
         tokio::select! {
@@ -387,6 +397,19 @@ where
                     send(&mut write, tag::DATA, attachment.resync().as_bytes()).await?;
                 }
                 Err(RecvError::Closed) => break,
+            },
+            event = events.recv(), if watching => match event {
+                // This machine's own sessions only, and never the one already
+                // on the screen. What a watched peer is doing is the desktop
+                // notifier's business, not this terminal's.
+                Ok(hosted) if hosted.host == this_machine() && hosted.event.session != name => {
+                    send(&mut write, tag::EVENT, &proto::encode(&hosted)?).await?;
+                }
+                Ok(_) => {}
+                // A bell that arrived while the client was busy is not worth
+                // catching up on: it rang, and the moment has passed.
+                Err(RecvError::Lagged(n)) => debug!("client missed {n} events"),
+                Err(RecvError::Closed) => watching = false,
             },
             _ = ping.tick() => {
                 if answers_pings && last_heard.elapsed() > SILENT_FOR {

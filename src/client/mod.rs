@@ -20,7 +20,7 @@ use tokio::process::{Child, ChildStderr};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
-use crate::proto::{self, FrameReader, PasteInfo, Request, Response, Size, tag};
+use crate::proto::{self, FrameReader, HostedEvent, PasteInfo, Request, Response, Size, tag};
 
 type Reader = FrameReader<Box<dyn AsyncRead + Unpin + Send>>;
 type Writer = Box<dyn AsyncWrite + Unpin + Send>;
@@ -442,6 +442,10 @@ pub enum Update {
     /// went away and detach it. Answering once is what opts a client in: one
     /// that never does is held to no deadline.
     Ping,
+    /// Something happened in another session on the same machine: a bell, a
+    /// notification, a session that exited badly. Sent unasked while attached,
+    /// so that the person sitting in one session hears the one next door.
+    Event(HostedEvent),
     /// The session's process exited.
     Exited(i32),
     /// The host went away.
@@ -463,6 +467,7 @@ impl SessionReader {
                 tag::DATA => Update::Output(frame.body),
                 tag::RESYNC => Update::Screen(frame.body),
                 tag::PING => Update::Ping,
+                tag::EVENT => Update::Event(proto::decode(&frame.body)?),
                 tag::EXIT => Update::Exited(proto::decode(&frame.body)?),
                 // Unknown tags are skipped rather than fatal, so a newer host
                 // can add frames without breaking older clients.
