@@ -615,35 +615,32 @@ mod terminal {
         "\x1b[?1049h", // switch to the alternate screen
     );
 
-    /// Terminal state a full-screen program may have left behind, undone when
-    /// we give the terminal back, so a detach never leaves your shell with an
-    /// invisible cursor, a stuck mouse mode, or focus reporting still on.
+    /// Terminal state a full-screen program may have left behind, undone
+    /// whenever the terminal changes hands, so it is never inherited by whoever
+    /// gets it next: a shell left with an invisible cursor, a stuck mouse mode
+    /// or focus reporting still on, and equally the session you hop to.
     ///
     /// The private modes come from the same list a reattach replays: whatever
     /// the node switches back on for the session is exactly what has to be
-    /// switched off again here, or it leaks into the shell you return to.
-    pub(super) fn reset() -> String {
+    /// switched off again here, or it leaks into what follows.
+    fn undone() -> String {
         use std::fmt::Write as _;
 
-        let mut reset = String::new();
+        let mut undone = String::new();
         // Both of these home the cursor, so they go first, while the alternate
         // screen is still up and the cursor there is about to be discarded.
         // Afterwards they would drop the shell's prompt in the top-left corner.
-        reset.push_str("\x1b[r"); // full-height scrolling region
-        reset.push_str("\x1b[?6l"); // absolute cursor addressing, not origin mode
+        undone.push_str("\x1b[r"); // full-height scrolling region
+        undone.push_str("\x1b[?6l"); // absolute cursor addressing, not origin mode
 
-        reset.push_str("\x1b[23;2t"); // pop the title pushed on attach
-        reset.push_str("\x1b[?1047l"); // leave the alternate screen (the older form, which vim uses)
-        reset.push_str("\x1b[?1049l"); // leave the alternate screen
-
-        reset.push_str("\x1b[?25h"); // show the cursor
-        reset.push_str("\x1b[0 q"); // the cursor shape this terminal defaults to
-        reset.push_str("\x1b[0m"); // default attributes
-        reset.push_str("\x1b[?7h"); // autowrap on
-        reset.push_str("\x1b[4l"); // replace mode, not insert
-        reset.push_str("\x1b[?1l\x1b>"); // normal cursor keys and keypad
+        undone.push_str("\x1b[?25h"); // show the cursor
+        undone.push_str("\x1b[0 q"); // the cursor shape this terminal defaults to
+        undone.push_str("\x1b[0m"); // default attributes
+        undone.push_str("\x1b[?7h"); // autowrap on
+        undone.push_str("\x1b[4l"); // replace mode, not insert
+        undone.push_str("\x1b[?1l\x1b>"); // normal cursor keys and keypad
         for mode in crate::node::events::REPLAYED_MODES {
-            let _ = write!(reset, "\x1b[?{mode}l");
+            let _ = write!(undone, "\x1b[?{mode}l");
         }
 
         // The extended-keys protocols, off the same way. A program that asked
@@ -655,8 +652,37 @@ mod terminal {
         // program's and there is no telling how deep it went; popping past the
         // bottom does nothing. The set that follows is for a program that
         // changed the flags without pushing, which the pops cannot undo.
-        reset.push_str("\x1b[<16u\x1b[=0;1u");
-        reset.push_str("\x1b[>4;0m"); // and xterm's older modifyOtherKeys
+        undone.push_str("\x1b[<16u\x1b[=0;1u");
+        undone.push_str("\x1b[>4;0m"); // and xterm's older modifyOtherKeys
+        undone
+    }
+
+    /// Sent before every attach, because the terminal is changing hands there
+    /// too: the session you are leaving switched modes on that the one you are
+    /// arriving at never asked for, and its screen is still up.
+    ///
+    /// The erase is what the screen dump cannot do for itself. It paints from
+    /// the cursor down to its last line with anything on it and stops, so
+    /// without this the session before it shows through underneath, below that
+    /// line and beside a narrower screen. Homing first is the other half:
+    /// a dump of the primary screen starts printing wherever it finds the
+    /// cursor, which on a hop is wherever the last session left it.
+    ///
+    /// The erase comes last on purpose. It clears to the current background,
+    /// so a program that left a pen set would otherwise paint the whole screen
+    /// its colour.
+    pub(super) fn takeover() -> String {
+        format!("{}\x1b[H\x1b[2J", undone())
+    }
+
+    /// Everything [`undone`] undoes, and the terminal itself given back: the
+    /// screen the shell was on, the title it had, and the cursor where it left
+    /// it. A detach, in other words, where a hop stops at [`takeover`].
+    pub(super) fn reset() -> String {
+        let mut reset = undone();
+        reset.push_str("\x1b[23;2t"); // pop the title pushed on attach
+        reset.push_str("\x1b[?1047l"); // leave the alternate screen (the older form, which vim uses)
+        reset.push_str("\x1b[?1049l"); // leave the alternate screen
 
         // Column zero, but no newline: leaving the alternate screen already put
         // the cursor back where the shell left it, on the line after the command
@@ -683,8 +709,10 @@ mod terminal {
     /// this lives, and given back whole when it is dropped.
     ///
     /// Held across a run of attaches rather than one, so switching sessions
-    /// does not flap the alternate screen between every hop. Dropping it is
-    /// what restores the terminal, on the error paths too.
+    /// does not flap the alternate screen between every hop. What makes that
+    /// safe is [`takeover`], written per attach: the screen is one surface, but
+    /// no session inherits the one before it. Dropping this is what restores
+    /// the terminal, on the error paths too.
     pub struct Held {
         /// The keyboard, owned here rather than by an attach, because it
         /// outlives one. See [`keyboard`].
@@ -739,7 +767,9 @@ mod terminal {
     ) -> Result<Outcome> {
         let mut status = Status::new(target);
         status.set_mode(mode);
-        write_now(&status.setup(terminal_size()));
+        // One write, so there is never a frame showing an erased screen with no
+        // mark on it.
+        write_now(&format!("{}{}", takeover(), status.setup(terminal_size())));
         pump(&mut held.keys, session, status, mode, target).await
     }
 
@@ -1246,6 +1276,60 @@ mod tests {
             assert!(
                 reset.contains(sequence),
                 "detaching leaves {sequence:?} unsent"
+            );
+        }
+    }
+
+    /// The bug this was written for: hopping to a session smaller or emptier
+    /// than the one left behind showed the two mixed, because the screen dump
+    /// paints down to its last line with anything on it and no further.
+    #[cfg(feature = "desktop")]
+    #[test]
+    fn a_hop_erases_the_session_before_it() {
+        let takeover = terminal::takeover();
+        let erase = takeover.find("\x1b[2J").expect("a hop erases nothing");
+        assert!(
+            takeover[..erase].contains("\x1b[H"),
+            "a hop erases without homing, so the dump starts where the last session's cursor was"
+        );
+        assert!(
+            takeover[..erase].contains("\x1b[0m"),
+            "the erase runs with a pen the last session set, and paints the screen its colour"
+        );
+    }
+
+    /// The same pair as a detach: a mode switched on for the session you leave
+    /// is a mode left on in the session you land in, which never asked for it.
+    #[cfg(feature = "desktop")]
+    #[test]
+    fn a_hop_undoes_every_mode_the_session_before_it_switched_on() {
+        let takeover = terminal::takeover();
+        for mode in crate::node::events::REPLAYED_MODES {
+            assert!(
+                takeover.contains(&format!("\x1b[?{mode}l")),
+                "hopping leaves private mode {mode} on"
+            );
+        }
+        for sequence in ["\x1b[<16u", "\x1b[=0;1u", "\x1b[>4;0m", "\x1b[0 q"] {
+            assert!(
+                takeover.contains(sequence),
+                "hopping leaves {sequence:?} unsent"
+            );
+        }
+    }
+
+    /// A hop is a detach for the session being left, but not for the terminal:
+    /// the alternate screen and the pushed title belong to the run of attaches,
+    /// not to one of them. Giving either back here would drop the client onto
+    /// the shell's screen on every switch.
+    #[cfg(feature = "desktop")]
+    #[test]
+    fn a_hop_stays_on_the_alternate_screen() {
+        let takeover = terminal::takeover();
+        for sequence in ["\x1b[?1049l", "\x1b[?1047l", "\x1b[23;2t"] {
+            assert!(
+                !takeover.contains(sequence),
+                "hopping sends {sequence:?}, which gives the terminal back mid-attach"
             );
         }
     }

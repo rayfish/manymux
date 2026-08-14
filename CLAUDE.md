@@ -135,7 +135,13 @@ Three consequences run through the whole codebase and are worth keeping intact:
   title would end the sequence and leave the rest to be read as commands.
 - **Modes switched on for a session must be switched off on detach.**
   `events::REPLAYED_MODES` and the teardown in `client::attach` are a pair, and
-  so are `events::Keyboard` and the pops in the same teardown.
+  so are `events::Keyboard` and the pops in the same teardown. A hop counts as a
+  detach for the session being left, so the same undoing happens per attach
+  (`terminal::takeover`), and the screen is erased in the same breath: `avt`'s
+  dump paints from the cursor down to its last line with anything on it and
+  never erases, so without it the session you left shows through below that line
+  and beside a narrower screen. What a hop must *not* undo is the alternate
+  screen or the pushed title, which belong to the whole run of attaches.
 - **The mode key has three spellings, not one.** A program that asks for the
   kitty keyboard protocol (`CSI > 7 u`, which `pi` sends on startup) or for
   xterm's `modifyOtherKeys` changes how the *terminal* encodes every chord, so
