@@ -1,13 +1,16 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::Duration;
 
 use anyhow::{Result, bail};
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
+use tokio::task::JoinHandle;
 use tracing::debug;
 
-use manymux::client::Stream;
-use manymux::client::attach::{self, Outcome};
+use manymux::client::attach::{self, Mode, Outcome};
+use manymux::client::switch::{Cycle, Located};
+use manymux::client::{Attached, Stream};
 use manymux::hosts::{Hosts, LOCAL, Target, is_this_machine, this_machine};
 use manymux::node::{Config, Node};
 use manymux::proto::{HostedSession, Request, Response, SessionInfo, SpawnSpec};
@@ -497,12 +500,66 @@ async fn sessions_on(socket: &Path, host: &str) -> Result<Vec<SessionInfo>> {
     }
 }
 
-async fn do_attach(socket: &Path, host: &str, name: &str) -> Result<u8> {
-    let stream = open(socket, host).await?;
-    let session = stream.attach(name, attach::session_size()).await?;
-    let where_ = qualified(host, name);
+/// How long a switch key waits on a listing that has not landed yet, before
+/// going with whatever it already knows. A machine that is asleep must not
+/// leave the terminal sitting there.
+const LISTING_WAIT: Duration = Duration::from_millis(500);
 
-    match attach::run(session, &where_).await? {
+/// Attach, and keep attaching for as long as the switch keys ask for another
+/// session.
+///
+/// The terminal is held across the whole run rather than per session, so a hop
+/// is a repaint and not a trip out of the alternate screen and back.
+async fn do_attach(socket: &Path, host: &str, name: &str) -> Result<u8> {
+    let mut cycle = Cycle::new(Located::new(host, name));
+    // Asked for before the first attach, so the first switch key has something
+    // to go on.
+    let mut listing = Some(spawn_listing(socket));
+
+    let held = attach::hold()?;
+    let mut mode = Mode::Focus;
+    let mut hopped = false;
+    let (outcome, where_) = loop {
+        let target = cycle.current().clone();
+        let where_ = qualified(&target.host, &target.session);
+        let session = match attach_to(socket, &target).await {
+            Ok(session) => session,
+            // A hop onto a session that has gone since the listing. Stay where
+            // you were and put the dead entry out of the cycle, rather than
+            // throwing away a working attach over it. A second failure in a row
+            // is the machine's, not the listing's, and is reported.
+            Err(e) if hopped => {
+                debug!("could not attach to {where_}: {e:#}");
+                cycle.forget(&target);
+                cycle.undo();
+                hopped = false;
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
+
+        match attach::run(&held, session, &where_, mode).await? {
+            Outcome::Switch(motion) => {
+                take_listing(&mut listing, &mut cycle).await;
+                hopped = false;
+                if let Some(next) = cycle.step(motion) {
+                    cycle.moved_to(next);
+                    hopped = true;
+                    if listing.is_none() {
+                        listing = Some(spawn_listing(socket));
+                    }
+                }
+                // Nowhere to go is not a reason to drop back to focus: the next
+                // key carries on from wherever this one left you.
+                mode = Mode::Control;
+            }
+            outcome => break (outcome, where_),
+        }
+    };
+    // Before the message, which belongs on the screen the shell gets back.
+    drop(held);
+
+    match outcome {
         Outcome::Detached => {
             println!("[detached from {where_}]");
             Ok(OK)
@@ -515,13 +572,52 @@ async fn do_attach(socket: &Path, host: &str, name: &str) -> Result<u8> {
             println!("[disconnected from {where_}]");
             Ok(FAILED)
         }
+        Outcome::Switch(_) => unreachable!("switches never leave the loop above"),
     }
 }
 
-/// A target with its machine resolved.
-struct Located {
-    host: String,
-    session: String,
+/// Open a stream to wherever a session is, and attach to it.
+async fn attach_to(socket: &Path, target: &Located) -> Result<Attached> {
+    let stream = open(socket, &target.host).await?;
+    stream.attach(&target.session, attach::session_size()).await
+}
+
+/// Ask every machine what it is running, off to one side, so that no keystroke
+/// waits on ssh.
+fn spawn_listing(socket: &Path) -> JoinHandle<Vec<Located>> {
+    let socket = socket.to_path_buf();
+    tokio::spawn(async move {
+        match everywhere(&socket).await {
+            Ok(listing) => listing
+                .sessions
+                .into_iter()
+                .map(|hosted| Located::new(hosted.host, hosted.session.name))
+                .collect(),
+            Err(e) => {
+                debug!("could not list sessions for the switch keys: {e:#}");
+                Vec::new()
+            }
+        }
+    })
+}
+
+/// Hand the cycle the listing, if one has arrived or arrives shortly.
+///
+/// What is already known stands rather than being replaced by nothing, and a
+/// listing still out there asking is left running rather than thrown away.
+async fn take_listing(pending: &mut Option<JoinHandle<Vec<Located>>>, cycle: &mut Cycle) {
+    let Some(mut task) = pending.take() else {
+        return;
+    };
+    match tokio::time::timeout(LISTING_WAIT, &mut task).await {
+        Ok(Ok(sessions)) => {
+            if !sessions.is_empty() {
+                cycle.refresh(sessions);
+            }
+        }
+        Ok(Err(e)) => debug!("the listing task did not finish: {e}"),
+        Err(_) => *pending = Some(task),
+    }
 }
 
 /// Work out which machine a target is on.

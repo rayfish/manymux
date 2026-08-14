@@ -8,6 +8,7 @@
 
 pub mod attach;
 pub mod status;
+pub mod switch;
 
 use std::path::Path;
 use std::sync::Arc;

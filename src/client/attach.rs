@@ -12,20 +12,21 @@ use anyhow::Result;
 
 use crate::client::{Attached, SessionHalves, Update};
 
-/// Detach prefix: Ctrl-\ (0x1c).
+/// The key that goes from focus mode to control mode: Ctrl-Space (0x00).
 ///
 /// Not tmux's Ctrl-b or screen's Ctrl-a, because you are quite likely running
 /// one of those *inside* a manymux session: manymux has no panes or tabs, so
 /// splitting a window is still their job, and taking their prefix would mean
-/// swallowing it before it ever reached them. Ctrl-\ is SIGQUIT, which almost
-/// nobody sends deliberately, and `Ctrl-\ Ctrl-\` sends a literal one through.
-pub const DEFAULT_PREFIX: u8 = 0x1c;
+/// swallowing it before it ever reached them. Ctrl-Space is the one most people
+/// rebind a mux to anyway, and shells and vim leave it alone. Emacs does not,
+/// which is what `Ctrl-Space Ctrl-Space` is for: it sends one through.
+pub const DEFAULT_PREFIX: u8 = 0x00;
 
-/// The detach prefix in force, from `MM_PREFIX` if it is set and usable.
+/// The key in force, from `MM_PREFIX` if it is set and usable.
 ///
-/// Accepts `C-b`, `^B` or `\x02`. An unusable value is a warning rather than a
-/// failure: losing the ability to detach because of a typo in an environment
-/// variable would be worse than ignoring it.
+/// Accepts `C-b`, `^B`, `C-Space` or `\x02`. An unusable value is a warning
+/// rather than a failure: losing the ability to detach because of a typo in an
+/// environment variable would be worse than ignoring it.
 pub fn prefix() -> u8 {
     let Some(text) = std::env::var_os("MM_PREFIX") else {
         return DEFAULT_PREFIX;
@@ -34,22 +35,30 @@ pub fn prefix() -> u8 {
     match parse_prefix(&text) {
         Some(byte) => byte,
         None => {
-            eprintln!("mm: MM_PREFIX={text:?} is not a control key; using Ctrl-\\");
+            eprintln!("mm: MM_PREFIX={text:?} is not a control key; using Ctrl-Space");
             DEFAULT_PREFIX
         }
     }
 }
 
-/// Parse a control key: `C-b`, `c-B`, `^b`, a bare `b`, or the raw byte.
+/// Parse a control key: `C-b`, `c-B`, `^b`, a bare `b`, `C-Space`, or the raw
+/// byte.
 ///
 /// A bare letter is read as the control key, since a printable character could
-/// not serve as a prefix anyway: it would arm on every one you typed.
+/// not serve as the key anyway: it would take you out of the session on every
+/// one you typed.
 fn parse_prefix(text: &str) -> Option<u8> {
     let key = text
         .strip_prefix("C-")
         .or_else(|| text.strip_prefix("c-"))
         .or_else(|| text.strip_prefix('^'))
         .unwrap_or(text);
+
+    // Spelled out, because the key it names cannot be written down: the default
+    // is Ctrl-Space and `MM_PREFIX=C- ` is not something anyone would type.
+    if key.eq_ignore_ascii_case("space") {
+        return Some(0x00);
+    }
 
     let mut chars = key.chars();
     let key = chars.next()?;
@@ -66,24 +75,80 @@ fn parse_prefix(text: &str) -> Option<u8> {
     (0x40..0x60).contains(&byte).then_some(byte & 0x1f)
 }
 
+/// Which way a switch key moves through the sessions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Motion {
+    Next,
+    Previous,
+    /// Back to the one you came from.
+    Last,
+}
+
+/// What a key pressed in switch mode asks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Action {
+    Detach,
+    Switch(Motion),
+}
+
 /// How the attach ended.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Outcome {
     Detached,
+    /// A switch key was pressed. Which session it lands on is the caller's to
+    /// work out: this half of the client knows nothing about hosts.
+    Switch(Motion),
     /// The session's process exited with this code.
     Exited(i32),
     /// The host went away.
     Disconnected,
 }
 
-/// Watches the keystroke stream for the detach sequence.
+/// Which of the client's two modes the keyboard is in.
 ///
-/// `Ctrl-\ d` detaches. `Ctrl-\ Ctrl-\` sends a literal Ctrl-\ through, so the
-/// key is still usable (it is SIGQUIT) inside the session. Any other key after
-/// the prefix passes both bytes through unchanged.
+/// Modal like vim, and for the same reason: the keys that drive the client are
+/// the ones a session wants for itself, so rather than reserving a chord for
+/// each of them, one key moves between a mode where everything you type is the
+/// session's and a mode where the keys are the client's.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Mode {
+    /// Every keystroke goes to the session. Where you spend your time.
+    #[default]
+    Focus,
+    /// The keys drive the client: switch sessions, detach, back to focus.
+    Control,
+}
+
+impl Mode {
+    /// What the bottom row calls it.
+    pub fn name(self) -> &'static str {
+        match self {
+            Mode::Focus => "focus",
+            Mode::Control => "control",
+        }
+    }
+}
+
+/// Watches the keystroke stream for the key that changes mode, and reads the
+/// keys that follow it.
+///
+/// Control mode stays on: one `Ctrl-Space` then `tab tab tab` walks through the
+/// sessions. `Esc` or `Enter` goes back to focus, `d` detaches, and
+/// `Ctrl-Space Ctrl-Space` sends a literal one through for whatever wants it
+/// inside the session. Any other key drops back to focus and passes both bytes
+/// through unchanged, so a mistyped mode key costs you visible junk rather than
+/// a silently swallowed line.
 pub struct KeyFilter {
     prefix: u8,
-    armed: bool,
+    mode: Mode,
+    /// Whether the key that turned control mode on is the last one pressed.
+    ///
+    /// It matters for exactly one key: its own. Pressed straight after itself
+    /// it sends one through, and pressed in a control mode that a switch left
+    /// on it starts over instead. So the key always starts a mode key, two in a
+    /// row always send one, and `<key> d` detaches whether or not you were
+    /// already walking the sessions.
+    fresh: bool,
 }
 
 impl Default for KeyFilter {
@@ -92,56 +157,112 @@ impl Default for KeyFilter {
     }
 }
 
-/// What a chunk of keystrokes amounts to once the detach sequence is taken out.
+/// What a chunk of keystrokes amounts to once the client's own keys are taken
+/// out.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Keystrokes {
     /// The bytes to send on to the session.
     pub forward: Vec<u8>,
-    /// Whether the user asked to detach.
-    pub detach: bool,
+    /// What the user asked for, if anything.
+    pub action: Option<Action>,
+    /// The mode the client is in now, for the row at the bottom of the screen.
+    pub mode: Mode,
 }
 
 impl KeyFilter {
     pub fn new(prefix: u8) -> Self {
         Self {
             prefix,
-            armed: false,
+            mode: Mode::Focus,
+            fresh: false,
         }
+    }
+
+    /// Start in a mode. Attaching after a switch starts in control mode, which
+    /// is what makes `tab tab tab` walk the list across the hops.
+    pub fn set_mode(&mut self, mode: Mode) {
+        self.mode = mode;
+        self.fresh = false;
     }
 
     pub fn filter(&mut self, input: &[u8]) -> Keystrokes {
         let mut forward = Vec::with_capacity(input.len());
-        for &b in input {
-            if self.armed {
-                self.armed = false;
-                match b {
-                    b'd' | b'D' => {
-                        return Keystrokes {
-                            forward,
-                            detach: true,
-                        };
-                    }
-                    b if b == self.prefix => forward.push(self.prefix),
-                    other => {
-                        forward.push(self.prefix);
-                        forward.push(other);
-                    }
+        let mut i = 0;
+        while i < input.len() {
+            let b = input[i];
+            i += 1;
+            if self.mode == Mode::Focus {
+                if b == self.prefix {
+                    self.mode = Mode::Control;
+                    self.fresh = true;
+                } else {
+                    forward.push(b);
                 }
-            } else if b == self.prefix {
-                self.armed = true;
-            } else {
-                forward.push(b);
+                continue;
+            }
+            let was_fresh = std::mem::take(&mut self.fresh);
+            let action = match b {
+                // First, so that a mode key which is itself one of the keys
+                // below can still be sent through by pressing it twice.
+                b if b == self.prefix => {
+                    if was_fresh {
+                        forward.push(self.prefix);
+                        self.mode = Mode::Focus;
+                    } else {
+                        self.fresh = true;
+                    }
+                    None
+                }
+                b'd' | b'D' => Some(Action::Detach),
+                b'\t' | b'n' | b'N' => Some(Action::Switch(Motion::Next)),
+                b'p' | b'P' => Some(Action::Switch(Motion::Previous)),
+                b'l' | b'L' => Some(Action::Switch(Motion::Last)),
+                // Shift-Tab, which starts with the same byte as the Esc that
+                // goes back to focus. An Esc with `[Z` behind it in the same
+                // read is the key; one at the end of a read is a real Esc.
+                // Split across two reads it reads as an Esc, which costs a trip
+                // back to focus and nothing else.
+                0x1b if input[i..].starts_with(b"[Z") => {
+                    i += 2;
+                    Some(Action::Switch(Motion::Previous))
+                }
+                0x1b | b'\r' | b'\n' => {
+                    self.mode = Mode::Focus;
+                    None
+                }
+                other => {
+                    self.mode = Mode::Focus;
+                    forward.push(self.prefix);
+                    forward.push(other);
+                    None
+                }
+            };
+            // Whatever is left of the chunk is dropped: nobody types through a
+            // detach or a switch.
+            if let Some(action) = action {
+                // A switch leaves control mode on, so the next key carries on
+                // walking without a mode key of its own.
+                self.mode = match action {
+                    Action::Detach => Mode::Focus,
+                    Action::Switch(_) => Mode::Control,
+                };
+                return Keystrokes {
+                    forward,
+                    action: Some(action),
+                    mode: self.mode,
+                };
             }
         }
         Keystrokes {
             forward,
-            detach: false,
+            action: None,
+            mode: self.mode,
         }
     }
 }
 
 #[cfg(feature = "desktop")]
-pub use terminal::{run, session_size, terminal_size};
+pub use terminal::{Held, hold, run, session_size, terminal_size};
 
 #[cfg(feature = "desktop")]
 mod terminal {
@@ -152,7 +273,7 @@ mod terminal {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::signal::unix::{SignalKind, signal};
 
-    use super::{KeyFilter, Outcome};
+    use super::{Action, KeyFilter, Mode, Outcome};
     use crate::client::status::{self, Filter, Status};
     use crate::client::{Attached, SessionHalves, Update};
     use crate::proto::Size;
@@ -226,38 +347,54 @@ mod terminal {
         status::session_size(terminal_size())
     }
 
-    /// Run the attach loop until the client detaches or the session ends.
+    /// The terminal, held in raw mode on the alternate screen for as long as
+    /// this lives, and given back whole when it is dropped.
     ///
-    /// Puts the terminal in raw mode for the duration and always restores it,
-    /// so even an error path hands back a usable shell.
-    pub async fn run(session: Attached, target: &str) -> Result<Outcome> {
+    /// Held across a run of attaches rather than one, so switching sessions
+    /// does not flap the alternate screen between every hop. Dropping it is
+    /// what restores the terminal, on the error paths too.
+    pub struct Held {
+        _private: (),
+    }
+
+    pub fn hold() -> Result<Held> {
         if !std::io::stdin().is_terminal() {
             bail!("attach needs a terminal on stdin");
         }
-
-        let status = Status::new(target);
         terminal::enable_raw_mode()?;
-        {
-            use std::io::Write;
-            let mut out = std::io::stdout();
-            let _ = out.write_all(SETUP.as_bytes());
-            let _ = out.write_all(status.setup(terminal_size()).as_bytes());
-            let _ = out.flush();
-        }
-        let result = pump(session, &status).await;
-        let _ = terminal::disable_raw_mode();
-
-        // Restore through the real stdout: the async handle may have buffered
-        // writes we no longer own.
-        use std::io::Write;
-        let mut out = std::io::stdout();
-        let _ = out.write_all(reset().as_bytes());
-        let _ = out.flush();
-
-        result
+        write_now(SETUP);
+        Ok(Held { _private: () })
     }
 
-    async fn pump(session: Attached, status: &Status) -> Result<Outcome> {
+    impl Drop for Held {
+        fn drop(&mut self) {
+            let _ = terminal::disable_raw_mode();
+            write_now(&reset());
+        }
+    }
+
+    /// Write straight to the real stdout: the async handle may have buffered
+    /// writes we no longer own.
+    fn write_now(text: &str) {
+        use std::io::Write;
+        let mut out = std::io::stdout();
+        let _ = out.write_all(text.as_bytes());
+        let _ = out.flush();
+    }
+
+    /// Run the attach loop until the client detaches, switches away, or the
+    /// session ends.
+    ///
+    /// `mode` is where the keyboard starts, which is how a hop carries control
+    /// mode through the reattach.
+    pub async fn run(_held: &Held, session: Attached, target: &str, mode: Mode) -> Result<Outcome> {
+        let mut status = Status::new(target);
+        status.set_mode(mode);
+        write_now(&status.setup(terminal_size()));
+        pump(session, status, mode).await
+    }
+
+    async fn pump(session: Attached, mut status: Status, mode: Mode) -> Result<Outcome> {
         let SessionHalves {
             mut reader,
             mut writer,
@@ -266,8 +403,12 @@ mod terminal {
         let mut stdout = tokio::io::stdout();
         let mut winch = signal(SignalKind::window_change())?;
         let mut keys = KeyFilter::default();
+        keys.set_mode(mode);
         let mut output = Filter::default();
         let mut buf = vec![0u8; 8192];
+        // The row no longer says what the keys are doing. Held until there is a
+        // safe moment to draw, the same as a mark the session cleared.
+        let mut restate = false;
 
         loop {
             tokio::select! {
@@ -280,9 +421,27 @@ mod terminal {
                     if !keystrokes.forward.is_empty() {
                         writer.send_input(&keystrokes.forward).await?;
                     }
-                    if keystrokes.detach {
-                        writer.detach().await?;
-                        return Ok(Outcome::Detached);
+                    if keystrokes.mode != status.mode() {
+                        status.set_mode(keystrokes.mode);
+                        restate = true;
+                    }
+                    if restate && output.at_boundary() {
+                        stdout.write_all(status.repaint(terminal_size()).as_bytes()).await?;
+                        stdout.flush().await?;
+                        restate = false;
+                    }
+                    match keystrokes.action {
+                        // Detached either way, so that the node does not hold an
+                        // attachment for a client that has gone elsewhere.
+                        Some(Action::Detach) => {
+                            writer.detach().await?;
+                            return Ok(Outcome::Detached);
+                        }
+                        Some(Action::Switch(motion)) => {
+                            writer.detach().await?;
+                            return Ok(Outcome::Switch(motion));
+                        }
+                        None => {}
                     }
                 }
                 update = reader.next() => match update? {
@@ -291,8 +450,9 @@ mod terminal {
                         // Only between sequences: a repaint written into the
                         // middle of one would corrupt it. Whatever cleared the
                         // mark stays noted until there is a safe moment.
-                        if output.at_boundary() && output.take_dirty() {
+                        if output.at_boundary() && (output.take_dirty() || restate) {
                             stdout.write_all(status.repaint(terminal_size()).as_bytes()).await?;
+                            restate = false;
                         }
                         stdout.flush().await?;
                     }
@@ -355,12 +515,27 @@ pub async fn collect_until(
 mod tests {
     use super::*;
 
+    /// Keystrokes that went straight through, leaving the keyboard in focus.
     fn forwarded(bytes: &[u8]) -> Keystrokes {
         Keystrokes {
             forward: bytes.to_vec(),
-            detach: false,
+            action: None,
+            mode: Mode::Focus,
         }
     }
+
+    /// A key that asked for something, with nothing forwarded alongside it.
+    fn asked(action: Action, mode: Mode) -> Keystrokes {
+        Keystrokes {
+            forward: vec![],
+            action: Some(action),
+            mode,
+        }
+    }
+
+    /// The mode key, whatever it is. Written out because it cannot be typed
+    /// into a byte string: the default is Ctrl-Space, which is a NUL.
+    const KEY: u8 = DEFAULT_PREFIX;
 
     /// A mode the node turns back on for a session, and the client forgets to
     /// turn off, is left on in the shell. Focus reporting was the one that got
@@ -399,21 +574,32 @@ mod tests {
         assert_eq!(parse_prefix("c-B"), Some(0x02));
         assert_eq!(parse_prefix("^b"), Some(0x02));
         assert_eq!(parse_prefix("\u{2}"), Some(0x02));
-        // The default, and the other keys past `Z` that people pick.
-        assert_eq!(parse_prefix("C-\\"), Some(DEFAULT_PREFIX));
+        // The keys past `Z` that people pick.
         assert_eq!(parse_prefix("C-a"), Some(0x01));
+        assert_eq!(parse_prefix("C-\\"), Some(0x1c));
         assert_eq!(parse_prefix("C-]"), Some(0x1d));
     }
 
     #[test]
+    fn the_default_key_can_be_named_even_though_it_cannot_be_typed() {
+        // `MM_PREFIX=C- ` is not something anyone would write, so the word
+        // stands in for the key.
+        assert_eq!(parse_prefix("C-Space"), Some(DEFAULT_PREFIX));
+        assert_eq!(parse_prefix("c-space"), Some(DEFAULT_PREFIX));
+        assert_eq!(parse_prefix("^Space"), Some(DEFAULT_PREFIX));
+        // And the byte itself, however it got into the variable.
+        assert_eq!(parse_prefix("\0"), Some(DEFAULT_PREFIX));
+    }
+
+    #[test]
     fn a_bare_letter_means_the_control_key() {
-        // The only reading that works: a printable prefix would arm on every
-        // one of those characters you typed.
+        // The only reading that works: a printable key would take you out of
+        // the session on every one of those characters you typed.
         assert_eq!(parse_prefix("b"), Some(0x02));
     }
 
     #[test]
-    fn a_prefix_that_is_not_a_key_at_all_is_refused() {
+    fn a_key_that_is_not_a_key_at_all_is_refused() {
         // Refused rather than silently mangled, and the caller then warns and
         // keeps the default, since a typo here must not cost you the ability
         // to detach.
@@ -424,7 +610,7 @@ mod tests {
     }
 
     #[test]
-    fn the_prefix_can_be_tmuxs() {
+    fn the_mode_key_can_be_tmuxs() {
         // `MM_PREFIX=C-b` for muscle memory, at the price of tmux inside a
         // session no longer seeing its own prefix.
         let mut f = KeyFilter::new(0x02);
@@ -432,12 +618,13 @@ mod tests {
             f.filter(b"ls\x02d"),
             Keystrokes {
                 forward: b"ls".to_vec(),
-                detach: true
+                action: Some(Action::Detach),
+                mode: Mode::Focus,
             }
         );
-        // And Ctrl-\ is then just an ordinary keystroke again.
+        // And Ctrl-Space is then just an ordinary keystroke again.
         let mut f = KeyFilter::new(0x02);
-        assert_eq!(f.filter(b"\x1c"), forwarded(b"\x1c"));
+        assert_eq!(f.filter(&[KEY]), forwarded(&[KEY]));
     }
 
     #[test]
@@ -447,40 +634,127 @@ mod tests {
     }
 
     #[test]
-    fn prefix_then_d_detaches_without_forwarding_it() {
+    fn d_in_control_mode_detaches_without_forwarding_it() {
         let mut f = KeyFilter::default();
         assert_eq!(
-            f.filter(b"abc\x1cd"),
+            f.filter(&[b'a', b'b', b'c', KEY, b'd']),
             Keystrokes {
                 forward: b"abc".to_vec(),
-                detach: true
+                action: Some(Action::Detach),
+                mode: Mode::Focus,
             }
         );
     }
 
     #[test]
-    fn doubled_prefix_sends_one_through() {
+    fn control_mode_stays_on_so_tab_walks_the_list() {
+        // The point of the mode: one key, then as many hops as you like.
         let mut f = KeyFilter::default();
-        assert_eq!(f.filter(b"\x1c\x1c"), forwarded(&[DEFAULT_PREFIX]));
+        assert_eq!(
+            f.filter(&[KEY, b'\t']),
+            asked(Action::Switch(Motion::Next), Mode::Control)
+        );
+        assert_eq!(
+            f.filter(b"\t"),
+            asked(Action::Switch(Motion::Next), Mode::Control)
+        );
+        assert_eq!(
+            f.filter(b"p"),
+            asked(Action::Switch(Motion::Previous), Mode::Control)
+        );
+        assert_eq!(
+            f.filter(b"l"),
+            asked(Action::Switch(Motion::Last), Mode::Control)
+        );
+        assert_eq!(
+            f.filter(b"n"),
+            asked(Action::Switch(Motion::Next), Mode::Control)
+        );
+    }
+
+    /// The habit that would otherwise put a stray byte into whatever is
+    /// running: the mode key and `d` typed together without noticing that a
+    /// switch had left control mode on.
+    #[test]
+    fn the_detach_habit_still_detaches_while_walking_the_sessions() {
+        let mut f = KeyFilter::default();
+        assert_eq!(
+            f.filter(&[KEY, b'\t']),
+            asked(Action::Switch(Motion::Next), Mode::Control)
+        );
+        assert_eq!(f.filter(&[KEY, b'd']), asked(Action::Detach, Mode::Focus));
     }
 
     #[test]
-    fn prefix_then_other_key_forwards_both() {
+    fn a_literal_mode_key_still_takes_two_of_them_from_inside_control_mode() {
         let mut f = KeyFilter::default();
-        assert_eq!(f.filter(b"\x1cx"), forwarded(&[DEFAULT_PREFIX, b'x']));
+        assert_eq!(
+            f.filter(&[KEY, b'\t']),
+            asked(Action::Switch(Motion::Next), Mode::Control)
+        );
+        // The first starts over rather than being sent, the second is the one
+        // that goes through, and the keyboard is back in focus afterwards.
+        assert_eq!(f.filter(&[KEY, KEY]), forwarded(&[KEY]));
+        assert_eq!(f.filter(b"x"), forwarded(b"x"));
     }
 
     #[test]
-    fn prefix_state_carries_across_reads() {
+    fn shift_tab_goes_back_and_a_bare_escape_returns_to_focus() {
+        let mut f = KeyFilter::default();
+        assert_eq!(
+            f.filter(&[KEY, 0x1b, b'[', b'Z']),
+            asked(Action::Switch(Motion::Previous), Mode::Control)
+        );
+        // An Esc with nothing behind it in the same read is a real Esc, and
+        // typing carries on into the session.
+        assert_eq!(f.filter(b"\x1b"), forwarded(b""));
+        assert_eq!(f.filter(b"ls"), forwarded(b"ls"));
+    }
+
+    #[test]
+    fn enter_returns_to_focus_without_reaching_the_session() {
+        // Swallowed rather than forwarded: coming back to focus must not also
+        // submit whatever is sitting at the prompt.
+        let mut f = KeyFilter::default();
+        assert_eq!(f.filter(&[KEY, b'\r']), forwarded(b""));
+        assert_eq!(f.filter(b"x"), forwarded(b"x"));
+    }
+
+    #[test]
+    fn a_mistyped_mode_key_returns_to_focus_and_keeps_your_keystrokes() {
+        // Both bytes through, so the line is visibly wrong rather than
+        // silently eaten while the mode sat there unnoticed.
+        let mut f = KeyFilter::default();
+        assert_eq!(
+            f.filter(&[KEY, b'g', b'i', b't']),
+            forwarded(&[KEY, b'g', b'i', b't'])
+        );
+    }
+
+    #[test]
+    fn the_mode_key_twice_sends_one_through() {
+        let mut f = KeyFilter::default();
+        assert_eq!(f.filter(&[KEY, KEY]), forwarded(&[KEY]));
+    }
+
+    #[test]
+    fn an_unbound_key_forwards_both() {
+        let mut f = KeyFilter::default();
+        assert_eq!(f.filter(&[KEY, b'x']), forwarded(&[KEY, b'x']));
+    }
+
+    #[test]
+    fn the_mode_carries_across_reads() {
         // A slow typist splits the sequence across two reads.
         let mut f = KeyFilter::default();
-        assert_eq!(f.filter(b"\x1c"), forwarded(b""));
         assert_eq!(
-            f.filter(b"d"),
+            f.filter(&[KEY]),
             Keystrokes {
                 forward: vec![],
-                detach: true
+                action: None,
+                mode: Mode::Control,
             }
         );
+        assert_eq!(f.filter(b"d"), asked(Action::Detach, Mode::Focus));
     }
 }

@@ -1,19 +1,32 @@
 //! The marks that say you are inside a session rather than at a plain shell.
 //!
-//! Two of them. A dim `● host/name` in the bottom-right corner, on a row the
-//! session is never told about, and `mm ` in front of whatever the session puts
-//! in the window title. Both are drawn by the client and neither is visible to
+//! Two of them. A dim `focus ● host/name` in the bottom-right corner, on a row
+//! the session is never told about, and `mm ` in front of whatever the session
+//! puts in the window title. Both are drawn by the client and neither is visible to
 //! the session: the node keeps the title the program set, so `mm ls` still shows
 //! it unprefixed.
 //!
 //! Everything here is string building and parsing, kept out of
 //! [`super::attach`] so it can be tested without a terminal.
 
+use crate::client::attach::Mode;
 use crate::proto::Size;
 use crate::style;
 
 /// Rows kept for the mark, and so subtracted from the size the session is told.
 const RESERVED: u16 = 1;
+
+/// Blank columns between the mark and the right edge, the same gutter `mm ls`
+/// puts between its columns.
+const GUTTER: u16 = 2;
+
+/// What the keys do, shown while control mode is on. Without it the mode is a
+/// terminal that has stopped taking what you type for no visible reason.
+const HINT: &str = "tab next  p prev  l last  d detach  esc focus";
+
+/// Columns kept for the mode's name, which is the width of the longer of the
+/// two. Fixed, so the mark does not jump sideways when the mode changes.
+const MODE: usize = "control".len();
 
 /// Below this the mark costs more than it is worth, and on a two-row terminal it
 /// would leave the session a single line. Give the whole screen to the session
@@ -38,13 +51,27 @@ pub fn session_size(size: Size) -> Size {
 /// Sequences that paint the mark and hold the row it lives on.
 pub struct Status {
     target: String,
+    /// The mode the row says the keyboard is in.
+    mode: Mode,
 }
 
 impl Status {
     pub fn new(target: &str) -> Self {
         Self {
             target: target.to_string(),
+            mode: Mode::default(),
         }
+    }
+
+    /// Say which mode the row is to show. The caller repaints afterwards.
+    pub fn set_mode(&mut self, mode: Mode) {
+        self.mode = mode;
+    }
+
+    /// What the row currently says, so a caller can tell when it has stopped
+    /// matching the key filter and needs redrawing.
+    pub fn mode(&self) -> Mode {
+        self.mode
     }
 
     /// Sent once, after the alternate screen is up: name the window, fence the
@@ -70,22 +97,40 @@ impl Status {
         format!("\x1b7{}{}\x1b8", region(size), self.mark(size))
     }
 
-    /// The mark itself, drawn at the right end of the reserved row.
+    /// The mark itself, drawn a gutter in from the right end of the reserved
+    /// row, with the key hints beside it while control mode is on.
     fn mark(&self, size: Size) -> String {
-        let text = format!("● {}", self.target);
-        let width = u16::try_from(text.chars().count()).unwrap_or(u16::MAX);
+        let width = columns(&format!("{:>MODE$} ● {}", self.mode.name(), self.target));
         // Right-aligned, and dropped rather than wrapped on a terminal too
-        // narrow to hold it: a wrapped mark would scroll the screen.
-        if width > size.cols {
+        // narrow to hold it and its gutter: a wrapped mark would scroll the
+        // screen.
+        if width + GUTTER > size.cols {
             return String::new();
         }
-        let column = size.cols - width + 1;
+        let column = size.cols - width + 1 - GUTTER;
+        // Amber in control mode, so a mode that takes your keystrokes for
+        // itself is never on without you seeing it.
+        let mode = match self.mode {
+            Mode::Focus => style::faint(&padded(self.mode)),
+            Mode::Control => style::amber(&padded(self.mode)),
+        };
         let dot = style::green("●");
         let name = style::faint(&self.target);
         format!(
-            "\x1b[{row};1H\x1b[2K\x1b[{row};{column}H{dot} {name}",
+            "\x1b[{row};1H\x1b[2K{hint}\x1b[{row};{column}H{mode} {dot} {name}",
             row = size.rows,
+            hint = self.hint(size, width),
         )
+    }
+
+    /// The key hints, at the left end of the same row, while there is room for
+    /// them beside the mark. The mark wins when there is not.
+    fn hint(&self, size: Size, mark: u16) -> String {
+        // A blank column between the two, so they never run together.
+        if self.mode != Mode::Control || columns(HINT) + 1 + mark + GUTTER > size.cols {
+            return String::new();
+        }
+        style::faint(HINT)
     }
 
     /// `mm ` in front of a title, or in front of the target when the session has
@@ -93,6 +138,17 @@ impl Status {
     fn title(&self, text: &str) -> String {
         format!("\x1b]0;{}\x07", prefixed(text))
     }
+}
+
+/// How many columns a piece of unstyled text takes.
+fn columns(text: &str) -> u16 {
+    u16::try_from(text.chars().count()).unwrap_or(u16::MAX)
+}
+
+/// The mode's name in a fixed width, so the mark keeps its column when the
+/// shorter of the two names is showing.
+fn padded(mode: Mode) -> String {
+    format!("{:>MODE$}", mode.name())
 }
 
 /// The scrolling region the session lives in: everything above the mark.
@@ -473,9 +529,45 @@ mod tests {
     }
 
     #[test]
-    fn the_mark_sits_at_the_right_end_of_the_reserved_row() {
+    fn the_mark_sits_a_gutter_in_from_the_right_end_of_the_reserved_row() {
         let painted = Status::new("srv/zsh").repaint(Size::new(80, 24));
-        // `● srv/zsh` is 9 columns, so it starts at column 72 of row 24.
-        assert!(painted.contains("\x1b[24;72H"), "{painted:?}");
+        // `  focus ● srv/zsh` is 17 columns, so with two to spare on the right
+        // it starts at column 62 of row 24.
+        assert!(painted.contains("\x1b[24;62H"), "{painted:?}");
+        assert!(painted.contains("focus"), "{painted:?}");
+    }
+
+    #[test]
+    fn the_mode_keeps_its_width_so_the_mark_does_not_jump() {
+        let focus = Status::new("srv/zsh").repaint(Size::new(80, 24));
+        let mut status = Status::new("srv/zsh");
+        status.set_mode(Mode::Control);
+        let control = status.repaint(Size::new(80, 24));
+
+        assert!(control.contains("control"), "{control:?}");
+        assert!(
+            focus.contains("\x1b[24;62H") && control.contains("\x1b[24;62H"),
+            "the mark moved when the mode changed"
+        );
+    }
+
+    #[test]
+    fn the_hints_only_show_in_control_mode() {
+        let mut status = Status::new("srv/zsh");
+        assert!(!status.repaint(Size::new(80, 24)).contains("tab next"));
+        status.set_mode(Mode::Control);
+        let painted = status.repaint(Size::new(80, 24));
+        assert!(painted.contains("tab next"), "{painted:?}");
+        // And the mark keeps its place beside them.
+        assert!(painted.contains("\x1b[24;62H"), "{painted:?}");
+    }
+
+    #[test]
+    fn a_row_too_narrow_for_both_keeps_the_mark() {
+        let mut status = Status::new("srv/zsh");
+        status.set_mode(Mode::Control);
+        let painted = status.repaint(Size::new(40, 24));
+        assert!(!painted.contains("tab next"), "{painted:?}");
+        assert!(painted.contains("\x1b[24;22H"), "{painted:?}");
     }
 }
