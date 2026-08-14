@@ -340,8 +340,9 @@ mod terminal {
 
     use anyhow::{Result, bail};
     use crossterm::terminal;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt, Stdout};
+    use tokio::io::{AsyncWriteExt, Stdout};
     use tokio::signal::unix::{SignalKind, signal};
+    use tokio::sync::mpsc;
 
     use super::{Action, KeyFilter, Mode, Outcome, PASTE_KEY};
     use crate::client::status::{self, Filter, Status};
@@ -432,6 +433,16 @@ mod terminal {
         if !std::io::stdin().is_terminal() {
             bail!("attach needs a terminal on stdin");
         }
+        // A panic prints to stderr, which while this is held means printing
+        // onto the alternate screen, which the unwind then throws away. Give
+        // the terminal back first, so whatever went wrong is readable on the
+        // screen the shell gets back.
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |panic| {
+            let _ = terminal::disable_raw_mode();
+            write_now(&reset());
+            previous(panic);
+        }));
         terminal::enable_raw_mode()?;
         write_now(SETUP);
         Ok(Held { _private: () })
@@ -469,19 +480,48 @@ mod terminal {
     /// hints have it back. Long enough to read without looking for it.
     const NOTICE_FOR: Duration = Duration::from_secs(5);
 
+    /// Chunks of keystrokes, read on a thread of its own.
+    ///
+    /// `tokio::io::stdin` would do the same reads, but on a blocking pool
+    /// thread, and a read on one of those cannot be cancelled: the runtime
+    /// waits for it before it will shut down. Nobody types at a client whose
+    /// session has just ended, so that wait is forever, and the process hangs
+    /// on with the terminal already given back until a keystroke happens to
+    /// land. A thread nobody joins reads the same bytes and holds up nothing.
+    fn keyboard() -> mpsc::Receiver<Vec<u8>> {
+        // Enough to stay ahead of a paste arriving as one burst, and small
+        // enough that a client not reading stops the thread rather than
+        // growing a queue of stale keystrokes.
+        let (typed, keys) = mpsc::channel(64);
+        std::thread::spawn(move || {
+            let mut stdin = std::io::stdin().lock();
+            let mut buf = [0u8; 8192];
+            loop {
+                match std::io::Read::read(&mut stdin, &mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if typed.blocking_send(buf[..n].to_vec()).is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+        keys
+    }
+
     async fn pump(session: Attached, mut status: Status, mode: Mode) -> Result<Outcome> {
         let takes_pastes = session.paste;
         let SessionHalves {
             mut reader,
             mut writer,
         } = session.split();
-        let mut stdin = tokio::io::stdin();
+        let mut keyboard = keyboard();
         let mut stdout = tokio::io::stdout();
         let mut winch = signal(SignalKind::window_change())?;
         let mut keys = KeyFilter::default();
         keys.set_mode(mode);
         let mut output = Filter::default();
-        let mut buf = vec![0u8; 8192];
         // The row no longer says what the keys are doing. Held until there is a
         // safe moment to draw, the same as a mark the session cleared.
         let mut restate = false;
@@ -490,12 +530,11 @@ mod terminal {
 
         loop {
             tokio::select! {
-                n = stdin.read(&mut buf) => {
-                    let n = match n {
-                        Ok(0) | Err(_) => return Ok(Outcome::Detached),
-                        Ok(n) => n,
+                typed = keyboard.recv() => {
+                    let Some(typed) = typed else {
+                        return Ok(Outcome::Detached);
                     };
-                    let keystrokes = keys.filter(&buf[..n]);
+                    let keystrokes = keys.filter(&typed);
                     if !keystrokes.forward.is_empty() {
                         writer.send_input(&keystrokes.forward).await?;
                     }

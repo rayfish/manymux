@@ -199,10 +199,11 @@ async fn cli() -> ExitCode {
     };
 
     // Exit rather than returning, because `tokio::io::stdin` reads on a
-    // blocking thread that cannot be cancelled: when a session ends by itself,
-    // that thread is still parked in read(2) with nobody about to type
-    // anything, and dropping the runtime waits for it forever. Detaching hid
-    // this, since pressing the detach key is itself the read that completes.
+    // blocking thread that cannot be cancelled: that thread is still parked in
+    // read(2) with nobody about to type anything, and dropping the runtime
+    // waits for it forever. `mm agent` is the one left relying on this, since
+    // it relays stdin for as long as ssh holds the channel open; attaching
+    // reads the keyboard on a thread of its own for the same reason.
     //
     // Nothing here needs unwinding: the terminal was already restored, and the
     // ssh child dies with our end of its pipes. Flush first, though, since a
