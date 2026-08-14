@@ -29,6 +29,9 @@ enum Mm {
     /// Not installed, until the installer runs and leaves it in the home
     /// directory the way `install.sh` does when it cannot write `/usr/local/bin`.
     Missing,
+    /// Beside the point: this machine cannot be reached at all, and ssh itself
+    /// is the one complaining.
+    Unreachable,
 }
 
 /// A temporary world: a local machine, and one reachable as `gpu-box`.
@@ -67,6 +70,11 @@ impl World {
             Mm::OnPath => "mm) ;;",
             Mm::InHome => "*/mm) ;;",
             Mm::Missing => r#"*/mm) [ -f "$installed" ] || exit 127 ;;"#,
+            // ssh's own failure, which has nothing to do with the ladder and
+            // has to reach the terminal whatever the ladder is doing.
+            Mm::Unreachable => {
+                r#"*) echo "ssh: connect to host $host port 22: No route to host" >&2; exit 255 ;;"#
+            }
         };
         let script = format!(
             r#"#!/bin/sh
@@ -89,10 +97,12 @@ case "$1" in
     *install.sh*) echo "$1" > "$installed"; exit 0 ;;
 esac
 
-# Which names this machine answers to. Anything else is not found.
+# Which names this machine answers to. Anything else is not found, and a shell
+# says so on stderr on its way out, which is the noise the client has to keep
+# off the terminal while it is still working out how this machine is spelled.
 case "$1" in
     {answers_to}
-    *) exit 127 ;;
+    *) echo "$1: command not found" >&2; exit 127 ;;
 esac
 exec env MM_CONFIG_DIR="{dir}/$host" "{mm}" --socket "{dir}/$host.sock" agent
 "#,
@@ -806,6 +816,39 @@ fn a_machine_with_mm_only_in_its_home_directory_is_still_reached() {
 
     // Finding it did not involve putting anything on the machine.
     assert_eq!(world.installer_ran_on("gpu-box"), None);
+}
+
+/// Working out how a machine spells `mm` is nobody's business but the client's.
+/// The first name tried comes back 127 with the remote shell saying so, and
+/// that line, printed, lands on the terminal of every single command that
+/// reaches such a machine, including one about to repaint a session over it.
+#[test]
+fn finding_mm_elsewhere_is_done_without_saying_anything() {
+    let world = World::where_mm_is("quiet-ladder", Mm::InHome);
+
+    let out = world.run("laptop", &["ls", "gpu-box"]);
+    assert!(out.status.success(), "listing a reachable machine failed");
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !said.contains("command not found"),
+        "the probe was overheard: {said}"
+    );
+}
+
+/// The other half of that, and the reason the noise is held rather than thrown
+/// away at the source: ssh has failures of its own to report, and its account
+/// is the only one there is.
+#[test]
+fn a_machine_ssh_cannot_reach_still_says_why() {
+    let world = World::where_mm_is("no-route", Mm::Unreachable);
+
+    let out = world.run("laptop", &["ls", "gpu-box"]);
+    assert!(!out.status.success(), "an unreachable machine was listed");
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        said.contains("No route to host"),
+        "ssh's reason went missing: {said}"
+    );
 }
 
 /// Fetching a script onto someone else's machine is not something to do on the

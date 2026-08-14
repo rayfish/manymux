@@ -112,7 +112,11 @@ Three consequences run through the whole codebase and are worth keeping intact:
   Resending the request afterwards is safe *because* 127 means nothing ran; any
   other failure must not be retried that way. Consent is a callback the CLI
   supplies, so the daemon watching peers and tab completion pass `None` and can
-  never install anything on their own.
+  never install anything on their own. Climbing the ladder is silent: ssh's
+  stderr is piped and held by `client::relay`, thrown away on the rung that
+  answered 127 and printed on anything else, because the remote shell's
+  `mm: command not found` is the probe working and would otherwise be printed on
+  every command that reaches such a machine.
 - **`mm agent` must leave stdout strictly alone**: the protocol is on it. Only
   the daemon opens a log file; everything else logs to stderr.
 - **Modes switched on for a session must be switched off on detach.**

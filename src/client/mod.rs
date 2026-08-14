@@ -14,9 +14,11 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::UnixStream;
-use tokio::process::Child;
+use tokio::process::{Child, ChildStderr};
+use tokio::sync::oneshot;
+use tokio::task::JoinHandle;
 
 use crate::proto::{self, FrameReader, PasteInfo, Request, Response, Size, tag};
 
@@ -27,6 +29,79 @@ type Writer = Box<dyn AsyncWrite + Unpin + Send>;
 /// which is why it travels with the stream rather than being left behind.
 struct Carrier {
     child: Child,
+    /// Say the word and ssh's stderr is printed, and keeps being printed.
+    /// Dropped instead, it is thrown away. See [`relay`].
+    voice: Option<oneshot::Sender<()>>,
+    /// The relay itself, for waiting on when the word has been said and the
+    /// process is about to end.
+    spoken: Option<JoinHandle<()>>,
+}
+
+impl Carrier {
+    fn new(child: Child, stderr: Option<ChildStderr>) -> Self {
+        let (voice, spoken) = match stderr {
+            Some(stderr) => {
+                let (voice, spoken) = relay(stderr);
+                (Some(voice), Some(spoken))
+            }
+            None => (None, None),
+        };
+        Self {
+            child,
+            voice,
+            spoken,
+        }
+    }
+}
+
+/// Read ssh's stderr, holding it back until this way onto the machine has
+/// proved itself.
+///
+/// The first of [`PROGRAMS`] fails on every machine whose `mm` is in a home
+/// directory, and what it leaves on stderr is the remote shell's `mm: command
+/// not found`. That is the probe working rather than anything wrong, so a
+/// person watching should never see it, least of all on a terminal that is
+/// about to go into raw mode and repaint a session over it.
+///
+/// What is worth showing is everything else ssh says, and the same pipe
+/// carries it: no route to the host, a refused key, a connection dropped an
+/// hour into a session. So none of it is discarded on a guess about its
+/// contents. Sending on the returned channel prints what has arrived so far
+/// and lets the rest through as it comes; dropping it throws the lot away,
+/// which is what the attempt that answered 127 has earned.
+fn relay(mut stderr: ChildStderr) -> (oneshot::Sender<()>, JoinHandle<()>) {
+    let (voice, mut asked) = oneshot::channel();
+    let relaying = tokio::spawn(async move {
+        let mut held = Vec::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            tokio::select! {
+                answer = &mut asked => {
+                    // The other end is gone: so is any reason to keep this.
+                    if answer.is_err() {
+                        return;
+                    }
+                    break;
+                }
+                read = stderr.read(&mut buf) => match read {
+                    Ok(0) | Err(_) => {
+                        // ssh has said its piece and gone. Whether anyone wants
+                        // to hear it is still open, so wait to be told.
+                        if asked.await.is_ok() {
+                            let _ = tokio::io::stderr().write_all(&held).await;
+                        }
+                        return;
+                    }
+                    Ok(n) => held.extend_from_slice(&buf[..n]),
+                },
+            }
+        }
+        let _ = tokio::io::stderr().write_all(&held).await;
+        // Past here this is the connection carrying a session, and its troubles
+        // are the user's as they happen.
+        let _ = tokio::io::copy(&mut stderr, &mut tokio::io::stderr()).await;
+    });
+    (voice, relaying)
 }
 
 /// The names `mm` might answer to on another machine, tried in order.
@@ -127,7 +202,7 @@ impl Stream {
         Ok(Self {
             read: FrameReader::new(Box::new(agent.stdout)),
             write: Box::new(agent.stdin),
-            carrier: Some(Carrier { child: agent.child }),
+            carrier: Some(Carrier::new(agent.child, agent.stderr)),
             ssh: Some(ssh),
         })
     }
@@ -173,6 +248,10 @@ impl Stream {
                 }
                 bail!("the host closed the connection without responding");
             };
+            // A frame came back, so this is a machine with an `mm` on it and
+            // the probing is over. Anything ssh has to say from here is worth
+            // hearing.
+            self.speak_up();
             if frame.tag != tag::RESPONSE {
                 bail!("expected a response, got tag {:#x}", frame.tag);
             }
@@ -191,9 +270,13 @@ impl Stream {
     /// than a missing `mm` is left alone for the caller to report.
     async fn reopen(&mut self) -> Result<bool> {
         let Some(mut ssh) = self.ssh.take() else {
+            self.speak_up();
             return Ok(false);
         };
         if !self.said_no_mm().await {
+            // Not a missing `mm`, so ssh's own account of it is the only one
+            // there is, and the caller is about to report a failure without it.
+            self.speak_now().await;
             self.ssh = Some(ssh);
             return Ok(false);
         }
@@ -216,9 +299,32 @@ impl Stream {
         let agent = (ssh.open)(&ssh.host, PROGRAMS[ssh.program])?;
         self.read = FrameReader::new(Box::new(agent.stdout));
         self.write = Box::new(agent.stdin);
-        self.carrier = Some(Carrier { child: agent.child });
+        // The old carrier goes here, taking the "command not found" it earned
+        // with it.
+        self.carrier = Some(Carrier::new(agent.child, agent.stderr));
         self.ssh = Some(ssh);
         Ok(true)
+    }
+
+    /// Let ssh be heard on this stream, now and for as long as it lasts.
+    fn speak_up(&mut self) {
+        if let Some(carrier) = &mut self.carrier
+            && let Some(voice) = carrier.voice.take()
+        {
+            let _ = voice.send(());
+        }
+    }
+
+    /// The same, waited on. Only for an ssh already reaped, and only where the
+    /// caller is about to fail: a spawned relay dies with the runtime, and the
+    /// runtime is one returned error away from stopping.
+    async fn speak_now(&mut self) {
+        self.speak_up();
+        if let Some(carrier) = &mut self.carrier
+            && let Some(relaying) = carrier.spoken.take()
+        {
+            let _ = relaying.await;
+        }
     }
 
     /// Whether the ssh carrying this stream gave up because it found no `mm`.

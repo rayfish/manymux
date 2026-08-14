@@ -29,6 +29,9 @@ pub struct Agent {
     pub child: Child,
     pub stdin: tokio::process::ChildStdin,
     pub stdout: tokio::process::ChildStdout,
+    /// Piped by [`agent`] and left for the caller to deal with, `None` from
+    /// [`agent_quietly`], which throws it away at the source.
+    pub stderr: Option<tokio::process::ChildStderr>,
 }
 
 /// Start `program agent` on `host` and hand back its pipes.
@@ -39,9 +42,14 @@ pub struct Agent {
 /// see [`crate::client::PROGRAMS`] for why there is more than one answer.
 pub fn agent(host: &str, program: &str) -> Result<Agent> {
     let mut command = command(host);
-    // Let ssh's own errors (host key, permission denied) reach the user's
-    // terminal rather than vanishing.
-    command.stderr(Stdio::inherit());
+    // Piped rather than inherited, though ssh's own errors (host key,
+    // permission denied) do have to reach the user in the end. The first
+    // program tried is a probe, and on a machine whose `mm` is in a home
+    // directory it makes the remote shell say so on this pipe; inheriting
+    // would put that line on the terminal of every command that reaches such a
+    // machine. Whether any of it is worth showing is decided by whoever holds
+    // the ladder, in `client::Stream`.
+    command.stderr(Stdio::piped());
     spawn(command, host, program)
 }
 
@@ -82,10 +90,12 @@ fn spawn(mut command: Command, host: &str, program: &str) -> Result<Agent> {
 
     let stdin = child.stdin.take().expect("stdin was piped");
     let stdout = child.stdout.take().expect("stdout was piped");
+    let stderr = child.stderr.take();
     Ok(Agent {
         child,
         stdin,
         stdout,
+        stderr,
     })
 }
 
