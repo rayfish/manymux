@@ -299,21 +299,32 @@ A bare tab stays on this machine and offers `host/` as a way in, because a
 keystroke should not wait on ssh. Only naming a machine goes out to it, and it
 gives up rather than hanging if that machine is asleep.
 
-`--install` writes to `~/.local/share/zsh/site-functions`, which zsh does not
-search unless you put it on the `fpath` before `compinit` runs. If that is a
-line you would rather not add, source the script instead, at the end of
-`~/.zshrc`:
+For zsh, `--install` asks zsh which directories it autoloads from and writes to
+the first one you can write in: `$PREFIX/share/zsh/site-functions` on Termux,
+`/usr/local/share/zsh/site-functions` on a Homebrew mac. Nothing needs adding to
+any file in that case, and nothing is said beyond where the script went.
+
+Where none of them is yours, which is the usual case on a shared Linux box, the
+script goes to `~/.local/share/zsh/site-functions` and that directory has to go
+on the `fpath` before `compinit` runs:
+
+```bash
+fpath=(~/.local/share/zsh/site-functions $fpath)
+autoload -Uz compinit && compinit
+```
+
+`mm` prints those two lines once, and stops printing them once `.zshrc` names
+the directory. If it is a line you would rather not add, source the script
+instead, at the end of `~/.zshrc`:
 
 ```bash
 echo 'source <(mm completions zsh)' >> ~/.zshrc
 ```
 
-Termux is the exception. Its shells are built against `$PREFIX` and search
-there rather than under `$HOME`, so the script goes to
-`$PREFIX/share/zsh/site-functions`, which is on zsh's `fpath` already and wants
-no line in `.zshrc`. bash there reads its own completion directory only once
-`pkg install bash-completion` has happened, which is not part of the Termux
-base and is not something `mm` can do for you.
+bash under Termux is the other exception: it searches `$PREFIX` rather than
+`$HOME`, so its script goes there too, and it reads any completion directory
+only once `pkg install bash-completion` has happened, which is not part of the
+Termux base and is not something `mm` can do for you.
 
 ## Install details
 

@@ -162,7 +162,7 @@ pub async fn apply(available: &Available) -> Result<PathBuf> {
 /// `access` rather than reading the mode bits, because the mode is not the
 /// whole answer: macOS ACLs can grant or deny past it, and root ignores it
 /// entirely. Asking the kernel gets all three right.
-fn writable(dir: &Path) -> bool {
+pub fn writable(dir: &Path) -> bool {
     use std::os::unix::ffi::OsStrExt;
 
     let Ok(path) = std::ffi::CString::new(dir.as_os_str().as_bytes()) else {
