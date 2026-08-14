@@ -116,6 +116,20 @@ enum Command {
         force: bool,
     },
 
+    /// Start this machine's node, if one is not already running.
+    ///
+    /// Nothing needs this: `mm new` and an incoming `mm agent` both start one
+    /// on demand. It is here for when you want the node up before anything
+    /// asks, and to have a name for the thing `stop` and `restart` act on.
+    Start,
+
+    /// Stop this machine's node. Every session on it dies with it.
+    Stop {
+        /// Stop it even though sessions are running.
+        #[arg(long)]
+        force: bool,
+    },
+
     /// Restart this machine's node so it picks up the binary on disk.
     ///
     /// An update replaces the file; the node is a long-running process still
@@ -319,6 +333,29 @@ async fn run(cli: Cli) -> Result<u8> {
 
         Command::Update { check, force } => update(&socket, check, force).await,
 
+        Command::Start => {
+            if manymux::update::running(&socket).await.is_some() {
+                println!("a node is already running");
+                return Ok(OK);
+            }
+            manymux::node::ensure_running(&socket).await?;
+            println!("{} started the node", style::green("✓"));
+            Ok(OK)
+        }
+
+        Command::Stop { force } => {
+            let Some(running) = manymux::update::running(&socket).await else {
+                println!("no node is running");
+                return Ok(OK);
+            };
+            if !agreed(running.sessions, force, "mm stop", "stopping it")? {
+                return Ok(OK);
+            }
+            manymux::node::stop(&socket).await?;
+            println!("{} stopped the node", style::green("✓"));
+            Ok(OK)
+        }
+
         Command::Restart { force } => {
             let Some(running) = manymux::update::running(&socket).await else {
                 manymux::node::ensure_running(&socket).await?;
@@ -405,21 +442,75 @@ async fn update(socket: &Path, check: bool, force: bool) -> Result<u8> {
 /// to lose. `command` is what to suggest `--force` on, since both `mm update`
 /// and `mm restart` end up here.
 async fn restart(socket: &Path, sessions: usize, force: bool, command: &str) -> Result<u8> {
-    if sessions > 0 && !force {
-        println!(
-            "{} the node is still on the old binary, and restarting it would end \
-             {} running session{}.\n  `{command} --force` to restart anyway, or leave it \
-             until they are done.",
-            style::amber("!"),
-            sessions,
-            if sessions == 1 { "" } else { "s" }
-        );
+    if !agreed(sessions, force, command, "restarting it")? {
         return Ok(OK);
     }
 
-    manymux::update::restart_node(socket).await?;
+    manymux::node::restart(socket).await?;
     println!("{} restarted the node", style::green("✓"));
     Ok(OK)
+}
+
+/// Whether to go ahead with something that takes running sessions down.
+///
+/// The node owns the PTYs, so its sessions are its children and go when it
+/// goes. Nothing here can tell whether the work in them is finished, so with
+/// someone at the keyboard it asks them, and without one it refuses and says
+/// which flag repeats the command without the question.
+fn agreed(sessions: usize, force: bool, command: &str, doing: &str) -> Result<bool> {
+    if sessions == 0 || force {
+        return Ok(true);
+    }
+    let cost = format!(
+        "{doing} would end {} running session{}",
+        sessions,
+        if sessions == 1 { "" } else { "s" }
+    );
+    match confirm(&format!("{cost}. Go ahead?"))? {
+        Answer::Yes => Ok(true),
+        Answer::No => {
+            println!("left alone");
+            Ok(false)
+        }
+        Answer::NobodyThere => {
+            println!(
+                "{} {cost}.\n  `{command} --force` to do it anyway, or leave it until they \
+                 are done.",
+                style::amber("!")
+            );
+            Ok(false)
+        }
+    }
+}
+
+enum Answer {
+    Yes,
+    No,
+    /// Nothing on the other end of stdin to ask.
+    NobodyThere,
+}
+
+/// Put a yes/no question to whoever is running this, defaulting to no.
+///
+/// A pipe is not a person: `ssh box mm update` from a script, or a service
+/// unit, must not stop on a prompt nobody will ever see. Those get told what
+/// the command would have cost and are left to decide with a flag.
+fn confirm(question: &str) -> Result<Answer> {
+    use std::io::{IsTerminal, Write};
+
+    let stdin = std::io::stdin();
+    if !stdin.is_terminal() {
+        return Ok(Answer::NobodyThere);
+    }
+    print!("{question} [y/N] ");
+    std::io::stdout().flush()?;
+
+    let mut answer = String::new();
+    stdin.read_line(&mut answer)?;
+    Ok(match answer.trim().to_ascii_lowercase().as_str() {
+        "y" | "yes" => Answer::Yes,
+        _ => Answer::No,
+    })
 }
 
 /// Open a stream to a machine: this one's socket, or `mm agent` over ssh.

@@ -324,9 +324,9 @@ fn a_restart_replaces_the_node_and_takes_its_sessions_with_it() {
 
     world.ok("laptop", &["new", "-d", "-n", "doomed", "sleep", "60"]);
 
-    // Sessions are the node's children, so they cannot outlive it. Refusing
-    // until asked twice is the point: it is the caller who knows whether the
-    // work in them is finished.
+    // Sessions are the node's children, so they cannot outlive it. Nothing is
+    // on the other end of stdin here, so it refuses and names the flag rather
+    // than putting a prompt into a pipe.
     let refused = world.ok("laptop", &["restart"]);
     assert!(
         refused.contains("1 running session"),
@@ -351,6 +351,47 @@ fn a_restart_replaces_the_node_and_takes_its_sessions_with_it() {
     assert!(
         !listed.contains("doomed"),
         "the session outlived the node that owned it: {listed}"
+    );
+}
+
+/// `stop` and `start` are the two halves of a restart, for when you want one
+/// without the other: a machine to leave quiet, or one to have ready.
+#[test]
+fn a_stop_ends_the_node_and_a_start_brings_one_back() {
+    let world = World::new("stopstart");
+
+    let quiet = world.ok("laptop", &["stop"]);
+    assert!(
+        quiet.contains("no node is running"),
+        "nothing to stop is not an error: {quiet}"
+    );
+
+    world.ok("laptop", &["new", "-d", "-n", "doomed", "sleep", "60"]);
+    let refused = world.ok("laptop", &["stop"]);
+    assert!(
+        refused.contains("1 running session"),
+        "a stop should say what it would cost: {refused}"
+    );
+
+    let stopped = world.ok("laptop", &["stop", "--force"]);
+    assert!(stopped.contains("stopped the node"), "{stopped}");
+    assert!(
+        !world.run("laptop", &["ls", "local"]).status.success(),
+        "the node is still answering after being stopped"
+    );
+
+    let started = world.ok("laptop", &["start"]);
+    assert!(started.contains("started the node"), "{started}");
+    let listed = world.ok("laptop", &["ls", "local"]);
+    assert!(
+        !listed.contains("doomed"),
+        "the session outlived the node that owned it: {listed}"
+    );
+
+    let again = world.ok("laptop", &["start"]);
+    assert!(
+        again.contains("already running"),
+        "starting a running node is a no-op, not a second node: {again}"
     );
 }
 

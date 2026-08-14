@@ -507,6 +507,74 @@ pub async fn ensure_running(socket: &Path) -> Result<()> {
     start_node(socket).await
 }
 
+/// Stop the node on this machine, and wait for it to actually be gone.
+///
+/// Every session it owns dies with it: they are its children, holding PTYs it
+/// owns. Nothing here asks whether that is wanted, so the caller has to.
+pub async fn stop(socket: &Path) -> Result<()> {
+    // A node older than this binary has never heard of `Stop`: it fails to
+    // decode the request and hangs up, so asking politely reports nothing more
+    // useful than a closed connection. It still has to go, or a new binary
+    // lands on the next reboot and not before, so fall back to the pid holding
+    // the socket. Every machine gets this once, on the update that reaches it.
+    if let Err(e) = ask_to_stop(socket).await {
+        debug!("the node did not take a stop request: {e:#}");
+        signal_node(socket)
+            .await
+            .context("stopping a node that did not answer a stop request")?;
+    }
+
+    // Waiting matters: whatever starts a node next has to bind the socket
+    // rather than lose a race with the one on its way out.
+    for _ in 0..100 {
+        if tokio::net::UnixStream::connect(socket).await.is_err() {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    bail!("the node was asked to stop but is still listening on {socket:?}")
+}
+
+/// Stop the node and start one again, which is how a new binary is picked up.
+pub async fn restart(socket: &Path) -> Result<()> {
+    stop(socket).await?;
+    // A service manager will have started one already; this covers a node that
+    // was started on demand.
+    ensure_running(socket).await
+}
+
+async fn ask_to_stop(socket: &Path) -> Result<()> {
+    let mut stream = Stream::local(socket)
+        .await
+        .context("connecting to the node")?;
+    stream.call(&Request::Stop).await?;
+    Ok(())
+}
+
+/// Terminate the node by the pid the kernel reports for its socket.
+///
+/// SIGTERM rather than SIGKILL: the difference to the sessions is nil (they die
+/// with the node either way, being its children), but the node still gets to
+/// flush its log.
+async fn signal_node(socket: &Path) -> Result<()> {
+    let stream = tokio::net::UnixStream::connect(socket)
+        .await
+        .context("connecting to the node")?;
+    let pid = crate::ipc::peer_pid(&stream).context("asking the kernel who holds the socket")?;
+    drop(stream);
+
+    // SAFETY: kill touches no memory. A pid that has already exited gives ESRCH,
+    // which is the outcome we wanted anyway.
+    let sent = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+    if sent != 0 {
+        let e = std::io::Error::last_os_error();
+        if e.raw_os_error() != Some(libc::ESRCH) {
+            bail!("signalling the node (pid {pid}): {e}");
+        }
+    }
+    Ok(())
+}
+
 /// Start a node in the background and wait for its socket to appear.
 async fn start_node(socket: &Path) -> Result<()> {
     let binary = std::env::current_exe().context("finding the mm binary")?;

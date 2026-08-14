@@ -232,11 +232,16 @@ behaving like the old build: a client that pastes images into a session hosted
 by an older node gets told the host cannot take one, however current its own
 binary is. `mm update` asks the node what it is running and offers the restart
 when the two differ, including when there was nothing to download. Every session
-dies with the node, so it takes `--force` while any are open:
+dies with the node, so it asks first, and `--force` answers in advance:
 
 ```bash
-mm restart --force
+mm restart          # asks, if there are sessions to lose
+mm restart --force  # does not
 ```
+
+Run from a script or over ssh there is nobody to ask, so it says what the
+restart would cost and leaves it. `mm stop` and `mm start` are the same thing in
+halves, for a machine to leave quiet or one to have ready before anything asks.
 
 The machine that has to be current is the one the *session* lives on, which for
 a remote session is the far end: `ssh gpu-box mm update`.
@@ -261,7 +266,7 @@ mm kill <target>                     SIGHUP a session's process group
 mm rename <target> <title>           set a sticky title
 mm add <host> | hosts | rm <host>    which machines to list and watch
 mm update [--check] [--force]        replace this binary with the published one
-mm restart [--force]                 restart the node so it picks up that binary
+mm start | stop | restart [--force]  this machine's node: up, down, and again
 mm service install|uninstall         run the node at boot
 mm completions [shell] [--install]   tab completion, with your session names in it
 mm daemon | agent                    the node, and what ssh runs on the far side
