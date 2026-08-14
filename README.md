@@ -11,9 +11,10 @@ when a session wants attention it reaches the machine you are sitting at.
 curl -fsSL https://raw.githubusercontent.com/rayfish/manymux/master/install.sh | sh
 ```
 
-Run that here and on each machine you want to manage. There is nothing else to
-set up: no pairing, no keys to exchange, no hosts to register. If you can `ssh`
-it, you can `mm` it.
+Run that here. The machines you reach over ssh get it when you first name one:
+`mm new gpu-box` offers to install it there, and `mm setup gpu-box` does it
+ahead of time. There is nothing else to set up: no pairing, no keys to exchange,
+no hosts to register. If you can `ssh` it, you can `mm` it.
 
 ## A first session
 

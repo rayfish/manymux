@@ -149,7 +149,10 @@ impl Node {
     }
 
     async fn subscribe_once(&self, host: &str) -> Result<()> {
-        let mut stream = Stream::over_ssh(host).await?;
+        // No consent: this reconnects in a loop with nobody watching, and a
+        // machine the daemon cannot reach is one to keep trying, not one to
+        // start putting software on.
+        let mut stream = Stream::over_ssh(host, None).await?;
         match stream.call(&Request::Events).await? {
             Response::Ok => {}
             other => bail!("unexpected response to events: {other:?}"),

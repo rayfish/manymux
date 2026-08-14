@@ -14,6 +14,23 @@ use std::time::{Duration, Instant};
 /// The binary under test, built by cargo for this integration test.
 const MM: &str = env!("CARGO_BIN_EXE_mm");
 
+/// Where `mm` is on the far machine, which is the one thing the stub ssh has
+/// to model beyond running the agent.
+///
+/// A shell started by sshd for a command reads no profile, so its PATH is
+/// whatever sshd hands out: a system install is on it and a per-user one is
+/// not. That difference is the whole reason the client has more than one name
+/// to try.
+enum Mm {
+    /// Installed with root, on the PATH every ssh gets.
+    OnPath,
+    /// Installed without root, reachable only by naming the path outright.
+    InHome,
+    /// Not installed, until the installer runs and leaves it in the home
+    /// directory the way `install.sh` does when it cannot write `/usr/local/bin`.
+    Missing,
+}
+
 /// A temporary world: a local machine, and one reachable as `gpu-box`.
 struct World {
     dir: PathBuf,
@@ -21,6 +38,10 @@ struct World {
 
 impl World {
     fn new(name: &str) -> Self {
+        Self::where_mm_is(name, Mm::OnPath)
+    }
+
+    fn where_mm_is(name: &str, mm: Mm) -> Self {
         // Sockets live here, and a Unix socket path is capped around 104 bytes,
         // so keep it short rather than nesting under the target directory.
         let dir = std::env::temp_dir().join(format!("mm-t-{name}-{}", std::process::id()));
@@ -28,20 +49,31 @@ impl World {
         std::fs::create_dir_all(&dir).unwrap();
 
         let world = Self { dir };
-        world.write_stub_ssh();
+        world.write_stub_ssh(mm);
         world
     }
 
     /// A stand-in for ssh: drop the ssh options, take the destination, and run
     /// that machine's agent. What a real ssh does, minus the network and the
     /// authentication, both of which are ssh's business rather than ours.
-    fn write_stub_ssh(&self) {
+    ///
+    /// Unlike a real ssh it does not put the remote command through a shell, so
+    /// `~` never expands and the words arrive exactly as the client sent them.
+    /// That is what makes them worth matching on.
+    fn write_stub_ssh(&self, mm: Mm) {
+        // Exit 127 is what a shell says about a command it cannot find, and is
+        // the only signal the client gets that a machine has no `mm`.
+        let answers_to = match mm {
+            Mm::OnPath => "mm) ;;",
+            Mm::InHome => "*/mm) ;;",
+            Mm::Missing => r#"*/mm) [ -f "$installed" ] || exit 127 ;;"#,
+        };
         let script = format!(
             r#"#!/bin/sh
 host=
 while [ $# -gt 0 ]; do
     case "$1" in
-        -T) shift ;;
+        -T|-t) shift ;;
         -o) shift 2 ;;
         --) shift; break ;;
         *) host="$1"; shift ;;
@@ -49,6 +81,19 @@ while [ $# -gt 0 ]; do
 done
 # `greet` runs `true` to get prompts out of the way; nothing to do for that.
 if [ "$1" = "true" ]; then exit 0; fi
+
+installed="{dir}/$host.installed"
+
+# The installer, which lands in the home directory when it has no root.
+case "$1" in
+    *install.sh*) echo "$1" > "$installed"; exit 0 ;;
+esac
+
+# Which names this machine answers to. Anything else is not found.
+case "$1" in
+    {answers_to}
+    *) exit 127 ;;
+esac
 exec env MM_CONFIG_DIR="{dir}/$host" "{mm}" --socket "{dir}/$host.sock" agent
 "#,
             dir = self.dir.display(),
@@ -58,6 +103,11 @@ exec env MM_CONFIG_DIR="{dir}/$host" "{mm}" --socket "{dir}/$host.sock" agent
         std::fs::write(&path, script).unwrap();
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// What the installer was asked to run on `machine`, if it ran at all.
+    fn installer_ran_on(&self, machine: &str) -> Option<String> {
+        std::fs::read_to_string(self.dir.join(format!("{machine}.installed"))).ok()
     }
 
     fn ssh_stub(&self) -> PathBuf {
@@ -115,6 +165,41 @@ exec env MM_CONFIG_DIR="{dir}/$host" "{mm}" --socket "{dir}/$host.sock" agent
             .collect()
     }
 
+    /// Run a manymux command with a terminal on the other end of it, and answer
+    /// whatever it asks with `typed`.
+    ///
+    /// A question only gets put to something that looks like a person, so a
+    /// pipe cannot exercise the asking at all. Gives back whether the command
+    /// succeeded and everything that appeared on the terminal.
+    fn on_a_terminal(&self, machine: &str, args: &[&str], typed: &str) -> (bool, String) {
+        use std::io::{Read, Write};
+
+        let (mut pty, pts) = pty_process::blocking::open().unwrap();
+        let mut child = pty_process::blocking::Command::new(MM)
+            .arg("--socket")
+            .arg(self.socket(machine))
+            .args(args)
+            .env("MM_CONFIG_DIR", self.dir.join(machine))
+            .env("MM_SSH", self.ssh_stub())
+            .env("MM_LOG", "manymux=warn")
+            .spawn(pts)
+            .expect("running manymux on a terminal");
+        pty.write_all(typed.as_bytes()).unwrap();
+
+        // A pty answers with EIO rather than EOF once nothing holds the far
+        // end, so the error is how this ends rather than a problem.
+        let mut seen = Vec::new();
+        let mut buf = [0u8; 1024];
+        while let Ok(read @ 1..) = pty.read(&mut buf) {
+            seen.extend_from_slice(&buf[..read]);
+        }
+        let status = child.wait().expect("waiting for manymux");
+        (
+            status.success(),
+            String::from_utf8_lossy(&seen).into_owned(),
+        )
+    }
+
     fn ok(&self, machine: &str, args: &[&str]) -> String {
         let out = self.run(machine, args);
         assert!(
@@ -145,8 +230,16 @@ exec env MM_CONFIG_DIR="{dir}/$host" "{mm}" --socket "{dir}/$host.sock" agent
             let path = entry.path();
             if path.extension().is_some_and(|e| e == "sock") {
                 let machine = path.file_stem().unwrap().to_string_lossy().into_owned();
+                // A node that is already gone leaves its socket behind, and a
+                // test that ran on a terminal takes every node in the tree with
+                // it when the terminal closes. Nothing left to kill, then.
+                let listed = self.run(&machine, &["ls", "local"]);
+                if !listed.status.success() {
+                    continue;
+                }
                 // Killing sessions first stops orphaned shells outliving the test.
-                for session in sessions(&self.ok(&machine, &["ls", "local"])) {
+                let listed = String::from_utf8_lossy(&listed.stdout);
+                for session in sessions(&listed) {
                     let _ = self.run(&machine, &["kill", &format!("local/{session}")]);
                 }
             }
@@ -696,4 +789,104 @@ fn nodes_do_not_outlive_their_world() {
         world.dir.clone()
     };
     assert!(!Path::new(&dir).exists(), "the world was not cleaned up");
+}
+
+/// An install without root lands in `~/.local/bin`, which no non-interactive
+/// ssh has on its PATH. Naming the path outright is the only way to reach such
+/// a machine, and it costs nothing on the machines where a bare `mm` works.
+#[test]
+fn a_machine_with_mm_only_in_its_home_directory_is_still_reached() {
+    let world = World::where_mm_is("in-home", Mm::InHome);
+
+    let started = world.ok(
+        "laptop",
+        &["new", "-d", "-n", "api", "gpu-box", "sleep", "60"],
+    );
+    assert_eq!(started.trim(), "gpu-box/api");
+
+    // Finding it did not involve putting anything on the machine.
+    assert_eq!(world.installer_ran_on("gpu-box"), None);
+}
+
+/// Fetching a script onto someone else's machine is not something to do on the
+/// strength of a command that never mentioned it.
+#[test]
+fn a_machine_without_mm_is_left_alone_when_there_is_nobody_to_ask() {
+    let world = World::where_mm_is("no-mm-quiet", Mm::Missing);
+
+    let out = world.run(
+        "laptop",
+        &["new", "-d", "-n", "api", "gpu-box", "sleep", "60"],
+    );
+    assert!(
+        !out.status.success(),
+        "a machine with no mm started a session"
+    );
+    assert_eq!(world.installer_ran_on("gpu-box"), None);
+
+    // Nothing was asked, so say what would have done it.
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert!(said.contains("mm setup gpu-box"), "{said}");
+}
+
+/// The point of the whole thing: a machine you can ssh into is a machine you
+/// can start a session on, without a separate trip to set it up first.
+#[test]
+fn saying_yes_puts_mm_on_a_machine_that_has_none() {
+    let world = World::where_mm_is("no-mm-yes", Mm::Missing);
+
+    let (ok, seen) = world.on_a_terminal(
+        "laptop",
+        &["new", "-d", "-n", "api", "gpu-box", "sleep", "60"],
+        "y\n",
+    );
+    assert!(ok, "{seen}");
+    assert!(seen.contains("gpu-box/api"), "{seen}");
+
+    let installer = world
+        .installer_ran_on("gpu-box")
+        .expect("nothing was installed");
+    assert!(installer.contains("install.sh"), "{installer}");
+}
+
+/// Answering the question is what makes it a question.
+#[test]
+fn saying_no_leaves_the_machine_as_it_was() {
+    let world = World::where_mm_is("no-mm-no", Mm::Missing);
+
+    let (ok, seen) = world.on_a_terminal(
+        "laptop",
+        &["new", "-d", "-n", "api", "gpu-box", "sleep", "60"],
+        "n\n",
+    );
+    assert!(!ok, "{seen}");
+    assert_eq!(world.installer_ran_on("gpu-box"), None);
+}
+
+/// Pressing tab is not asking to have software put on anything.
+#[test]
+fn a_tab_never_installs_anything() {
+    // Watched from back when it had mm on it, which is the only way a tab goes
+    // out to a machine at all.
+    let world = World::new("tab-no-mm");
+    world.ok("laptop", &["add", "gpu-box"]);
+    world.write_stub_ssh(Mm::Missing);
+
+    let offered = world.complete("laptop", &["a", "gpu-box/"]);
+    assert!(offered.is_empty(), "{offered:?}");
+    assert_eq!(world.installer_ran_on("gpu-box"), None);
+}
+
+/// Setting a machine up before anything needs it, which is also the only way a
+/// script gets it done.
+#[test]
+fn setup_puts_mm_on_a_machine() {
+    let world = World::where_mm_is("setup", Mm::Missing);
+
+    world.ok("laptop", &["setup", "gpu-box"]);
+
+    let installer = world
+        .installer_ran_on("gpu-box")
+        .expect("nothing was installed");
+    assert!(installer.contains("install.sh"), "{installer}");
 }

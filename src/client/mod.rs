@@ -26,7 +26,41 @@ type Writer = Box<dyn AsyncWrite + Unpin + Send>;
 /// The ssh process carrying a stream to another machine. Dropping it hangs up,
 /// which is why it travels with the stream rather than being left behind.
 struct Carrier {
-    _child: Child,
+    child: Child,
+}
+
+/// The names `mm` might answer to on another machine, tried in order.
+///
+/// A bare `mm` is the one that should work: the installer puts it in
+/// `/usr/local/bin`, which is on the PATH sshd hands a command. An install
+/// without root lands in the home directory instead, and the shell behind
+/// `ssh host mm agent` reads no profile that would put that on the PATH, so
+/// such a machine has to be named outright or it looks like it has no `mm` at
+/// all. The remote shell expands the `~` without reading anything.
+pub const PROGRAMS: [&str; 2] = ["mm", "~/.local/bin/mm"];
+
+/// What a shell exits with for a command it could not find, and the only sign
+/// the far end gives that it has no `mm` on it.
+const NOT_FOUND: i32 = 127;
+
+/// Whether to put `mm` on a machine that turns out not to have it, asked of
+/// whoever is running this. Returning false leaves the machine alone.
+///
+/// The question reaches a person only on the CLI; a library consumer that wants
+/// nothing installed anywhere simply never supplies one.
+pub type Consent = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+
+/// How to get back to a machine when the way in did not work.
+struct Ssh {
+    host: String,
+    /// The quiet spawn for questions nobody asked, the loud one otherwise.
+    open: fn(&str, &str) -> Result<crate::ssh::Agent>,
+    consent: Option<Consent>,
+    /// Which of [`PROGRAMS`] the open stream is using.
+    program: usize,
+    /// Whether the installer has already been run, so a machine that still has
+    /// no `mm` afterwards is answered with an error rather than a second go.
+    installed: bool,
 }
 
 /// One request/response exchange, which an `Attach` extends into a byte pipe.
@@ -34,6 +68,9 @@ pub struct Stream {
     read: Reader,
     write: Writer,
     carrier: Option<Carrier>,
+    /// Set only on a stream over ssh, and only while it can still be reopened
+    /// a different way.
+    ssh: Option<Ssh>,
 }
 
 impl Stream {
@@ -50,6 +87,7 @@ impl Stream {
             read: FrameReader::new(Box::new(read)),
             write: Box::new(write),
             carrier: None,
+            ssh: None,
         })
     }
 
@@ -57,26 +95,40 @@ impl Stream {
     ///
     /// `host` is an ssh destination, so anything your ssh config can reach,
     /// this can reach, and sshd decides whether you are allowed in.
-    pub async fn over_ssh(host: &str) -> Result<Self> {
-        Self::carried_by(crate::ssh::agent(host)?)
+    ///
+    /// A machine with no `mm` on it is offered one, if `consent` says so; see
+    /// [`Consent`] and [`PROGRAMS`].
+    pub async fn over_ssh(host: &str, consent: Option<Consent>) -> Result<Self> {
+        Self::carried_by(host, crate::ssh::agent, consent)
     }
 
     /// Like [`Stream::over_ssh`], but ssh stays silent and does not prompt.
     ///
     /// For asking a question on someone's behalf, such as tab completion, where
     /// a password prompt or a host-key warning would land in the middle of the
-    /// line they are typing.
+    /// line they are typing. Nothing gets installed on a keystroke either.
     pub async fn over_ssh_quietly(host: &str) -> Result<Self> {
-        Self::carried_by(crate::ssh::agent_quietly(host)?)
+        Self::carried_by(host, crate::ssh::agent_quietly, None)
     }
 
-    fn carried_by(agent: crate::ssh::Agent) -> Result<Self> {
+    fn carried_by(
+        host: &str,
+        open: fn(&str, &str) -> Result<crate::ssh::Agent>,
+        consent: Option<Consent>,
+    ) -> Result<Self> {
+        let ssh = Ssh {
+            host: host.to_string(),
+            open,
+            consent,
+            program: 0,
+            installed: false,
+        };
+        let agent = (ssh.open)(&ssh.host, PROGRAMS[ssh.program])?;
         Ok(Self {
             read: FrameReader::new(Box::new(agent.stdout)),
             write: Box::new(agent.stdin),
-            carrier: Some(Carrier {
-                _child: agent.child,
-            }),
+            carrier: Some(Carrier { child: agent.child }),
+            ssh: Some(ssh),
         })
     }
 
@@ -87,27 +139,99 @@ impl Stream {
             read: FrameReader::new(read),
             write,
             carrier: None,
+            ssh: None,
         }
     }
 
     /// Send a request and read its response.
     pub async fn request(&mut self, request: &Request) -> Result<Response> {
-        proto::write_msg(&mut self.write, tag::REQUEST, request).await?;
-        let Some(frame) = self.read.next().await? else {
-            // An ssh that failed to connect, or a remote with no `mm` on it,
-            // leaves nothing on the pipe. Its exit status says far more than
-            // "the stream ended", so go and look.
-            if let Some(carrier) = &mut self.carrier
-                && let Ok(Some(status)) = carrier._child.try_wait()
-            {
-                bail!("ssh exited with {status} before answering");
+        loop {
+            // An ssh that has already given up leaves nothing to write to, and
+            // whether it gave up because the machine has no `mm` is worth far
+            // more than the broken pipe. Which of the two happens is a race
+            // between the write and the far end's shell, so both lead here.
+            let frame = match proto::write_msg(&mut self.write, tag::REQUEST, request).await {
+                Ok(()) => self.read.next().await?,
+                Err(e) => {
+                    if self.reopen().await? {
+                        continue;
+                    }
+                    return Err(e);
+                }
+            };
+            let Some(frame) = frame else {
+                // An ssh that failed to connect, or a remote with no `mm` on
+                // it, leaves nothing on the pipe. Its exit status says far more
+                // than "the stream ended", so go and look.
+                if self.reopen().await? {
+                    continue;
+                }
+                if let Some(carrier) = &mut self.carrier
+                    && let Ok(Some(status)) = carrier.child.try_wait()
+                {
+                    bail!("ssh exited with {status} before answering");
+                }
+                bail!("the host closed the connection without responding");
+            };
+            if frame.tag != tag::RESPONSE {
+                bail!("expected a response, got tag {:#x}", frame.tag);
             }
-            bail!("the host closed the connection without responding");
-        };
-        if frame.tag != tag::RESPONSE {
-            bail!("expected a response, got tag {:#x}", frame.tag);
+            return proto::decode(&frame.body);
         }
-        proto::decode(&frame.body)
+    }
+
+    /// Find another way onto a machine that turned out to have no `mm`, so the
+    /// request that got nowhere can be sent again.
+    ///
+    /// Sending it twice is safe for exactly the reason this is reachable at
+    /// all: 127 is the far end's shell saying it never ran anything, so the
+    /// frame reached no node and nothing can happen a second time.
+    ///
+    /// Returns whether there is now a stream worth resending on. Anything other
+    /// than a missing `mm` is left alone for the caller to report.
+    async fn reopen(&mut self) -> Result<bool> {
+        let Some(mut ssh) = self.ssh.take() else {
+            return Ok(false);
+        };
+        if !self.said_no_mm().await {
+            self.ssh = Some(ssh);
+            return Ok(false);
+        }
+
+        if ssh.program + 1 < PROGRAMS.len() {
+            ssh.program += 1;
+        } else if !ssh.installed && ssh.consent.as_ref().is_some_and(|ask| ask(&ssh.host)) {
+            crate::ssh::install(&ssh.host).await?;
+            // Back to the top of the ladder: the installer takes root when it
+            // can get it, and where it landed is its decision rather than ours.
+            ssh.installed = true;
+            ssh.program = 0;
+        } else {
+            bail!(
+                "{}: no mm there, or none on the PATH a non-interactive ssh gets",
+                ssh.host
+            );
+        }
+
+        let agent = (ssh.open)(&ssh.host, PROGRAMS[ssh.program])?;
+        self.read = FrameReader::new(Box::new(agent.stdout));
+        self.write = Box::new(agent.stdin);
+        self.carrier = Some(Carrier { child: agent.child });
+        self.ssh = Some(ssh);
+        Ok(true)
+    }
+
+    /// Whether the ssh carrying this stream gave up because it found no `mm`.
+    ///
+    /// Waits rather than polling: its stdout is at EOF by the time this is
+    /// asked, and a process whose only job was to relay that stdout has
+    /// therefore exited, so the wait returns at once. `try_wait` would race the
+    /// reap and read a machine with no `mm` as one that merely hung up.
+    async fn said_no_mm(&mut self) -> bool {
+        let Some(carrier) = &mut self.carrier else {
+            return false;
+        };
+        matches!(carrier.child.wait().await, Ok(status) if status.code() == Some(NOT_FOUND))
     }
 
     /// Send a request whose answer is success or an error message.

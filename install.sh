@@ -433,7 +433,7 @@ ${SYSTEM_DIR} when you can."
   ok "Next: start a session somewhere you can already ssh into"
   echo "    mm new <host>"
   echo
-  echo "  That host needs mm on its PATH too; run this same line there."
+  echo "  That host needs mm too, and will offer to install it when you name it."
   echo "  Then \`mm ls\` shows every session on every machine you use."
 
   # The one thing that behaves differently here, and the one command that fixes

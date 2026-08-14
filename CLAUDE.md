@@ -42,7 +42,8 @@ A **client** (`src/client/`) is everything else: `mm ls`, `mm attach`, and a
 mobile app. It talks to a node over a `Stream`, which is either that Unix socket
 or the stdin/stdout pipes of `ssh <host> mm agent`. `mm agent` (`node::agent`)
 just bridges its own stdio to the local socket, starting a node on demand the
-way tmux starts its server.
+way tmux starts its server. A machine with no `mm` on it at all is offered one:
+see the bootstrap rule below.
 
 Three consequences run through the whole codebase and are worth keeping intact:
 
@@ -99,8 +100,19 @@ Three consequences run through the whole codebase and are worth keeping intact:
   `/tmp` being world-writable is why `ensure_runtime_dir` checks the owner and
   mode, and why `ipc` touches the socket every few hours: `systemd-tmpfiles`
   deletes what looks unused for ten days.
-- **A tab completion never starts a node and never waits on ssh unless the word
-  already names a machine** (`src/complete.rs`). Both are tested.
+- **A tab completion never starts a node, never installs anything, and never
+  waits on ssh unless the word already names a machine** (`src/complete.rs`).
+  All three are tested.
+- **A machine that answers 127 has no `mm`, and that is the only sign there is.**
+  `client::PROGRAMS` is the ladder of names to try, and it exists because an
+  install without root lands in `~/.local/bin`, which is not on the PATH sshd
+  hands a command, so such a machine looks empty until it is named outright.
+  When the ladder runs out, `Stream::reopen` asks for consent and runs
+  `install.sh` over ssh (`mm setup <host>` does the same thing by hand).
+  Resending the request afterwards is safe *because* 127 means nothing ran; any
+  other failure must not be retried that way. Consent is a callback the CLI
+  supplies, so the daemon watching peers and tab completion pass `None` and can
+  never install anything on their own.
 - **`mm agent` must leave stdout strictly alone**: the protocol is on it. Only
   the daemon opens a log file; everything else logs to stderr.
 - **Modes switched on for a session must be switched off on detach.**

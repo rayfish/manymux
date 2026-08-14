@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Result, anyhow, bail};
@@ -92,6 +93,13 @@ enum Command {
         target: String,
         title: String,
     },
+
+    /// Put mm on a machine you can ssh into, by running the installer there.
+    ///
+    /// Nothing needs this: naming a machine that has no mm offers to do it.
+    /// It is here for setting one up ahead of time, and for a script, which is
+    /// never asked anything.
+    Setup { host: String },
 
     /// Watch a machine without starting a session on it. Starting one adds it
     /// anyway; this is for machines you only want to see in `mm ls`.
@@ -234,6 +242,14 @@ async fn run(cli: Cli) -> Result<u8> {
         }
 
         Command::Ls { host } => list(&socket, host).await,
+
+        Command::Setup { host } => {
+            if is_this_machine(&host) {
+                bail!("{host} is this machine, and mm is already on it");
+            }
+            manymux::ssh::install(&host).await?;
+            Ok(OK)
+        }
 
         Command::New {
             name,
@@ -520,7 +536,28 @@ async fn open(socket: &Path, host: &str) -> Result<Stream> {
     if is_this_machine(host) {
         return Stream::local(socket).await;
     }
-    Stream::over_ssh(host).await
+    Stream::over_ssh(host, Some(Arc::new(offer_to_install))).await
+}
+
+/// Ask whether to put `mm` on a machine that turns out not to have it.
+///
+/// Reaching a machine you can ssh into should not need a separate trip to set
+/// it up, but it does mean fetching a script onto someone else's box, so it is
+/// asked rather than assumed. A pipe is not a person: a script gets the command
+/// that would have done it and decides for itself.
+fn offer_to_install(host: &str) -> bool {
+    match confirm(&format!("{host} has no mm on it. Install it there?")) {
+        Ok(Answer::Yes) => true,
+        Ok(Answer::No) => false,
+        Ok(Answer::NobodyThere) => {
+            eprintln!("mm: {host} has no mm on it; `mm setup {host}` puts it there");
+            false
+        }
+        Err(e) => {
+            eprintln!("mm: {e:#}");
+            false
+        }
+    }
 }
 
 /// Like [`open`], but starts this machine's node first if it is not running.

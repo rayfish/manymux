@@ -31,17 +31,18 @@ pub struct Agent {
     pub stdout: tokio::process::ChildStdout,
 }
 
-/// Start `mm agent` on `host` and hand back its pipes.
+/// Start `program agent` on `host` and hand back its pipes.
 ///
 /// `host` is an ssh destination, so `gpu-box`, `dario@gpu-box` and any `Host`
 /// alias from your ssh config all work, along with whatever `ProxyCommand` or
-/// `ProxyJump` that alias carries.
-pub fn agent(host: &str) -> Result<Agent> {
+/// `ProxyJump` that alias carries. `program` is how `mm` is named over there;
+/// see [`crate::client::PROGRAMS`] for why there is more than one answer.
+pub fn agent(host: &str, program: &str) -> Result<Agent> {
     let mut command = command(host);
     // Let ssh's own errors (host key, permission denied) reach the user's
     // terminal rather than vanishing.
     command.stderr(Stdio::inherit());
-    spawn(command, host)
+    spawn(command, host, program)
 }
 
 /// Like [`agent`], but for a question nobody asked out loud.
@@ -50,8 +51,8 @@ pub fn agent(host: &str) -> Result<Agent> {
 /// host key or a passphrase, and must not print over the line being typed. A
 /// machine that cannot be reached without a conversation simply has no sessions
 /// to offer, which is the right answer for a tab.
-pub fn agent_quietly(host: &str) -> Result<Agent> {
-    let mut command = base();
+pub fn agent_quietly(host: &str, program: &str) -> Result<Agent> {
+    let mut command = base(Tty::No);
     command
         // Fail rather than prompt, and give up on a machine that is not
         // answering instead of sitting on the default 2 minute connect timeout.
@@ -61,17 +62,17 @@ pub fn agent_quietly(host: &str) -> Result<Agent> {
         .arg("ConnectTimeout=1")
         .arg(host)
         .stderr(Stdio::null());
-    spawn(command, host)
+    spawn(command, host, program)
 }
 
-fn spawn(mut command: Command, host: &str) -> Result<Agent> {
+fn spawn(mut command: Command, host: &str, program: &str) -> Result<Agent> {
     let mut child = command
         .arg("--")
-        // Plain `mm`, found on the PATH a non-interactive ssh gets, which is
-        // why the installer puts it in /usr/local/bin. Probing for it here
-        // instead would mean either sourcing profiles, whose output would
-        // corrupt the protocol on stdout, or guessing at directories.
-        .arg("mm")
+        // Never a probe first: working out where `mm` is by asking the far end
+        // would mean either sourcing profiles, whose output would corrupt the
+        // protocol on stdout, or a round trip before every command. Naming one
+        // and reading the exit status costs nothing when the guess is right.
+        .arg(program)
         .arg("agent")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -110,26 +111,68 @@ pub async fn greet(host: &str) -> Result<()> {
     Ok(())
 }
 
+/// Put `mm` on a machine you can already ssh into, by running the published
+/// installer there.
+///
+/// With a terminal, unlike everything else here. The installer takes root when
+/// it can, because `/usr/local/bin` is the only directory on the PATH sshd
+/// hands a command and so the only place an install is reachable from another
+/// machine. Without a tty, sudo has no way to ask, and every machine with a
+/// password on it would quietly take the per-user fallback instead.
+pub async fn install(host: &str) -> Result<()> {
+    let status = base(Tty::Wanted)
+        .arg(host)
+        .arg("--")
+        // One string, because it is a pipeline for the remote shell to read
+        // rather than a program and its arguments.
+        .arg(format!("curl -fsSL {INSTALLER} | sh"))
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .await
+        .with_context(|| format!("running ssh {host}"))?;
+    if !status.success() {
+        bail!("installing mm on {host} failed ({status})");
+    }
+    Ok(())
+}
+
+/// The installer, the same one-liner the README gives.
+const INSTALLER: &str = "https://raw.githubusercontent.com/rayfish/manymux/master/install.sh";
+
 /// An ssh invocation set up to share one connection per host.
 ///
 /// `MM_SSH` replaces the program, for anyone whose ssh lives somewhere
 /// unusual or who wraps it in a script. Tests use it to stand in for a second
 /// machine without needing a real sshd.
 pub fn command(host: &str) -> Command {
-    let mut command = base();
+    let mut command = base(Tty::No);
     command.arg(host);
     command
+}
+
+/// Whether the remote command gets a terminal. Only the installer wants one,
+/// and only so sudo can ask for a password.
+enum Tty {
+    No,
+    Wanted,
 }
 
 /// The options every invocation shares, with no destination yet. ssh reads
 /// everything after the destination as the remote command, so a caller wanting
 /// options of its own has to add them before naming the host.
-fn base() -> Command {
+fn base(tty: Tty) -> Command {
     let program = std::env::var("MM_SSH").unwrap_or_else(|_| "ssh".to_string());
     let mut command = Command::new(program);
     command
-        // No PTY: this carries a framed protocol, and a PTY would mangle it.
-        .arg("-T")
+        .arg(match tty {
+            // No PTY: this carries a framed protocol, and a PTY would mangle
+            // it. `-T` also wins over `-t` whichever order they arrive in, so
+            // this is a choice rather than a default to override later.
+            Tty::No => "-T",
+            Tty::Wanted => "-t",
+        })
         // Share one connection per destination, so the second command to a
         // host skips the handshake entirely.
         .arg("-o")

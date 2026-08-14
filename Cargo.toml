@@ -68,6 +68,8 @@ tracing-subscriber = { version = "0.3.23", features = [
 ], optional = true }
 
 [dev-dependencies]
+# A terminal to run the binary on, for the prompts it only puts to a person.
+pty-process = "0.5.3"
 # `start_paused`, so a test can sit out the client-liveness deadline without
 # spending three quarters of a minute of real time on it.
 tokio = { version = "1.53.1", features = ["test-util"] }
