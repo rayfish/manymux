@@ -112,6 +112,18 @@ Three consequences run through the whole codebase and are worth keeping intact:
   session down at once, with no line in the log because the node is killed
   before it can write one. A node started by the service unit is already clear
   of this, which is why the symptom only ever appears on the on-demand path.
+- **A node on its way out hangs its sessions up itself, and outlives none of
+  them** (`Node::shutdown`, reached from `Request::Stop` and from a SIGTERM
+  handler in `main`). Closing the PTY masters would end them anyway, but the
+  kernel sends that hangup to the terminal's *foreground* group, which is
+  whatever the shell last put there: a shell sitting behind a full-screen
+  program is not in it and finds out only by reading EIO, well past writing its
+  history. So the group is signalled deliberately, given `GRACE` to go, and what
+  is left is killed. The kill is the child alone and never the group, because
+  something that survived a hangup sent to it is ignoring hangups on purpose,
+  and `nohup` has to keep meaning what it means. `GRACE` also has to stay inside
+  the window `node::stop` gives the socket to go quiet, or `mm stop` reports a
+  node still listening when it is only still saying goodbye.
 - **A tab completion never starts a node, never installs anything, and never
   waits on ssh unless the word already names a machine** (`src/complete.rs`).
   All three are tested.

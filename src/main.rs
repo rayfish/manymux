@@ -7,6 +7,7 @@ use std::time::Duration;
 use anyhow::{Result, anyhow, bail};
 use clap::{Parser, Subcommand, ValueHint};
 use clap_complete::Shell;
+use tokio::signal::unix::{SignalKind, signal};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use tracing::debug;
@@ -280,6 +281,8 @@ async fn run(cli: Cli) -> Result<u8> {
                 notifications: !no_notify,
             })
             .await;
+            let signalled = Arc::clone(&node);
+            tokio::spawn(async move { stop_when_signalled(signalled).await });
             node.serve(&socket).await?;
             Ok(OK)
         }
@@ -653,6 +656,39 @@ fn offer_to_install(host: &str) -> bool {
             false
         }
     }
+}
+
+/// End the node's sessions properly when something asks the process to go,
+/// rather than by default action.
+///
+/// SIGTERM is how a service manager stops the unit, how a reboot starts, and
+/// what `mm stop` falls back to against a node too old to answer a request.
+/// SIGINT is whoever ran `mm daemon` in a terminal. Untreated, both take every
+/// session down without a word to any of them; see [`Node::shutdown`] for what
+/// that costs.
+async fn stop_when_signalled(node: Arc<Node>) {
+    let mut term = match signal(SignalKind::terminate()) {
+        Ok(term) => term,
+        // Nothing to fall back to, and a node that cannot listen for a signal
+        // is still a working node. It just goes the abrupt way when it goes.
+        Err(e) => {
+            debug!("cannot listen for SIGTERM: {e}");
+            return;
+        }
+    };
+    let mut interrupt = match signal(SignalKind::interrupt()) {
+        Ok(interrupt) => interrupt,
+        Err(e) => {
+            debug!("cannot listen for SIGINT: {e}");
+            return;
+        }
+    };
+    tokio::select! {
+        _ = term.recv() => debug!("SIGTERM"),
+        _ = interrupt.recv() => debug!("SIGINT"),
+    }
+    node.shutdown(manymux::node::GRACE).await;
+    std::process::exit(0);
 }
 
 /// Like [`open`], but starts this machine's node first if it is not running.

@@ -2256,7 +2256,7 @@ mod tests {
             // Weighted towards the bytes sequences are made of, so the sweep
             // spends its time on shapes that nearly parse.
             const LIKELY: &[u8] = b"\x1b[<;OM~muZAB0123456789";
-            if seed % 3 == 0 {
+            if seed.is_multiple_of(3) {
                 (seed >> 33) as u8
             } else {
                 LIKELY[(seed >> 33) as usize % LIKELY.len()]

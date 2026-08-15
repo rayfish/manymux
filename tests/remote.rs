@@ -1044,6 +1044,73 @@ fn a_setting_is_written_where_the_next_command_reads_it() {
     );
 }
 
+/// Stopping a node ends its sessions either way, since the PTY masters close
+/// with it. How it ends them is what this covers: a hangup sent deliberately,
+/// with a moment to act on it, and no process left running against a terminal
+/// that no longer exists.
+///
+/// Both halves are here because they trade against each other. Wait for
+/// everyone and a session that ignores hangups holds the node forever; kill
+/// everyone at once and a shell never reaches the line where it writes its
+/// history.
+#[test]
+fn a_node_hangs_its_sessions_up_before_it_goes_and_outlasts_none_of_them() {
+    let world = World::new("graceful-stop");
+    let farewell = world.dir.join("farewell");
+    let stubborn = world.dir.join("stubborn.pid");
+
+    // One session that takes the hint, and writes on its way out so that its
+    // hangup is visible at all.
+    let polite = format!(
+        "trap 'echo bye > {}; exit 0' HUP; sleep 300",
+        farewell.display()
+    );
+    world.ok("laptop", &["new", "-d", "-n", "polite", "sh", "-c", &polite]);
+
+    // And one that does not, which is what the grace period ends in a kill for:
+    // otherwise it is left reading EIO from a PTY whose master went with the
+    // node, with nothing left to reap it.
+    let deaf = format!("trap '' HUP; echo $$ > {}; sleep 300", stubborn.display());
+    world.ok("laptop", &["new", "-d", "-n", "deaf", "sh", "-c", &deaf]);
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline && !stubborn.exists() {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let pid = std::fs::read_to_string(&stubborn)
+        .expect("the second session never started")
+        .trim()
+        .to_string();
+    assert!(alive(&pid), "the second session was never running");
+
+    world.ok("laptop", &["stop", "--force"]);
+
+    assert!(
+        farewell.exists(),
+        "the shell was never hung up, or was given no moment to say so"
+    );
+    // The signal goes out before the node does; being reaped is a moment
+    // behind it, and that moment is not what is being tested.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && alive(&pid) {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        !alive(&pid),
+        "a session that ignored the hangup outlived the node that held its terminal"
+    );
+}
+
+/// Whether a pid is still there, asked the way a shell would.
+fn alive(pid: &str) -> bool {
+    Command::new("sh")
+        .arg("-c")
+        .arg(format!("kill -0 {pid} 2>/dev/null"))
+        .status()
+        .expect("running kill")
+        .success()
+}
+
 /// `daemon` and `agent` are machinery, not commands: one is started by the
 /// service unit or by a client that found no node, the other is what ssh runs.
 /// Hiding them keeps `mm --help` to the things a person types, and this is the

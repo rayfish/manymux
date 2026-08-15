@@ -399,14 +399,45 @@ impl Session {
     /// Ask the child to go away. SIGHUP to the whole process group, the way a
     /// terminal closing would, so shells and their children both get it.
     pub fn kill(&self) {
+        self.signal(libc::SIGHUP);
+    }
+
+    /// Stop asking, for a child still there when the grace period on the way
+    /// out runs out. Otherwise it is left running against a PTY whose master
+    /// has closed, where every read gives EIO and nothing will reap it.
+    ///
+    /// This one is the child alone, not its group, and the difference is the
+    /// point: something still running after a hangup it was sent deliberately
+    /// is ignoring hangups, which is what `nohup` is for. A build left running
+    /// on purpose survives the node that started it. Only the process holding
+    /// the terminal has to go.
+    ///
+    /// Safe from the pid-reuse this would otherwise invite, because it is only
+    /// reached while the child is unreaped: [`Session::has_exited`] is false
+    /// until the reaper has waited on it, and until then the pid is still this
+    /// child's.
+    pub fn kill_now(&self) {
+        if self.pid == 0 {
+            return;
+        }
+        // SAFETY: kill on an unreaped child of ours; a failure is not fatal.
+        unsafe {
+            libc::kill(self.pid as libc::pid_t, libc::SIGKILL);
+        }
+    }
+
+    fn signal(&self, signal: libc::c_int) {
         if self.pid == 0 {
             return;
         }
         // The child is a session leader (pty-process makes it one), so its pid
-        // is also its process-group id.
+        // is also its process-group id. The group rather than the pid, because
+        // the kernel's own hangup on the last close goes to the terminal's
+        // *foreground* group, which is whatever the shell last put there and
+        // not necessarily the shell itself.
         // SAFETY: killpg on a pid we spawned; a failure here is not fatal.
         unsafe {
-            libc::killpg(self.pid as libc::pid_t, libc::SIGHUP);
+            libc::killpg(self.pid as libc::pid_t, signal);
         }
     }
 

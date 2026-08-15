@@ -26,6 +26,7 @@ use anyhow::{Context, Result, bail};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::broadcast;
 use tokio::sync::broadcast::error::RecvError;
+use tokio::time::{Instant, timeout};
 use tracing::{debug, info, warn};
 
 use crate::client::Stream;
@@ -53,6 +54,15 @@ const EVENT_BACKLOG: usize = 256;
 /// size and keeps counting as attached in `mm ls`.
 const PING_EVERY: Duration = Duration::from_secs(15);
 const SILENT_FOR: Duration = Duration::from_secs(45);
+
+/// How long a session's process group gets between the hangup and being killed
+/// outright, on the way out.
+///
+/// Long enough for a shell to write its history and an editor to write its swap
+/// file, short enough to fit inside the window [`stop`] gives the socket to go
+/// quiet: overrun that and `mm stop` reports a node still listening when it is
+/// only still saying goodbye.
+pub const GRACE: Duration = Duration::from_secs(2);
 
 /// What a node needs to start.
 pub struct Config {
@@ -186,6 +196,48 @@ impl Node {
         .await
     }
 
+    /// End every session on this machine, as gently as a process on its way out
+    /// can manage.
+    ///
+    /// Exiting alone would end them anyway: closing the last fd on a PTY master
+    /// hangs the terminal up. But it ends them badly, in two ways. The kernel
+    /// sends that hangup to the terminal's *foreground* process group, which is
+    /// whatever the shell last put there: a shell sitting behind a full-screen
+    /// program is not in it, and learns its terminal is gone only by reading
+    /// EIO, long past the point where it would have written its history. And
+    /// nothing waits for any of it, since the node is already gone.
+    ///
+    /// So: hang up each session's own group deliberately, the way `mm kill`
+    /// does, wait for the children to be reaped, and kill what is still there
+    /// when the grace runs out rather than leave it on a dead terminal.
+    pub async fn shutdown(&self, grace: Duration) {
+        let sessions = self.registry.all();
+        if sessions.is_empty() {
+            return;
+        }
+        info!(sessions = sessions.len(), "hanging up every session");
+        for session in &sessions {
+            session.kill();
+        }
+
+        // One deadline across all of them rather than one each: they were hung
+        // up together, so they are going away together, and waiting in turn
+        // costs nothing.
+        let deadline = Instant::now() + grace;
+        for session in &sessions {
+            let mut exited = session.exit_rx();
+            let left = deadline.saturating_duration_since(Instant::now());
+            let _ = timeout(left, exited.wait_for(|code| code.is_some())).await;
+        }
+
+        for session in &sessions {
+            if !session.has_exited() {
+                warn!(session = %session.name, "still there after the hangup; killing it");
+                session.kill_now();
+            }
+        }
+    }
+
     /// Serve one stream: a single request, then either a response or, for
     /// `Attach` and `Events`, something lasting until the client goes away.
     pub async fn handle<R, W>(&self, read: R, mut write: W) -> Result<()>
@@ -247,14 +299,14 @@ impl Node {
             Request::Stop => {
                 proto::write_msg(&mut write, tag::RESPONSE, &Response::Ok).await?;
                 info!(sessions = self.registry.list().len(), "stopping on request");
+                self.shutdown(GRACE).await;
                 // The reply is in the socket buffer, not yet read. A moment for
                 // the caller to take it costs nothing and saves a confusing
-                // "connection reset" on the way out.
-                tokio::spawn(async {
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                    std::process::exit(0);
-                });
-                Ok(())
+                // "connection reset" on the way out. Still needed after the
+                // shutdown above, which returns at once when there is nothing
+                // to hang up.
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                std::process::exit(0);
             }
 
             request => reply(&mut write, self.answer(request)).await,

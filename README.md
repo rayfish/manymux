@@ -310,6 +310,13 @@ Run from a script or over ssh there is nobody to ask, so it says what the
 restart would cost and leaves it. `mm stop` and `mm start` are the same thing in
 halves, for a machine to leave quiet or one to have ready before anything asks.
 
+The sessions do go, but they are hung up first and given a couple of seconds,
+so shells write their history and editors write their swap files rather than
+finding the terminal gone mid-write. Whatever is still running when that time
+is up is killed rather than left on a terminal that no longer exists. The same
+happens on SIGTERM, so stopping the service or rebooting is no more abrupt than
+`mm stop`.
+
 The machine that has to be current is the one the *session* lives on, which for
 a remote session is the far end: `ssh gpu-box mm update`.
 
