@@ -1130,10 +1130,13 @@ mod terminal {
         let mut winch = signal(SignalKind::window_change())?;
         let mut keys = KeyFilter::default();
         keys.set_mode(mode);
-        // There is a history to look at only on a screen the client owns.
-        // Inline the terminal has the lines in its own buffer, and its own
-        // wheel is better than anything here.
-        keys.set_scroll(screen.mode().owns_the_screen() && scrolls);
+        // The key is the client's on a screen the client owns, whether or not
+        // the host can answer for a window: a host that cannot is worth saying
+        // out loud, and a key that quietly does nothing is the one thing worse
+        // than not having it. Inline it is the session's, since the terminal
+        // has the lines in its own buffer and its own wheel is better than
+        // anything here.
+        keys.set_scroll(screen.mode().owns_the_screen());
         let mut output = Filter::new(screen);
         // The view over the session's history, while it is up.
         let mut scrolling: Option<Scrollback> = None;
@@ -1183,6 +1186,24 @@ mod terminal {
                         Some(Action::Switch(motion)) => {
                             writer.detach().await?;
                             return Ok(Outcome::Switch(motion));
+                        }
+                        // A host from before the view existed answers for no
+                        // window, so there is nothing to open. Said on the row
+                        // rather than swallowed, because a key that does
+                        // nothing and says nothing reads as a broken client.
+                        // The keyboard goes back where it was: a mode with no
+                        // view behind it would say `scroll` on the row and
+                        // take every key you typed.
+                        Some(Action::Scroll(_)) if !scrolls => {
+                            keys.set_mode(Mode::Focus);
+                            status.set_mode(Mode::Focus);
+                            status.set_notice(
+                                "this host is too old to scroll back; `mm restart` there",
+                            );
+                            notice_until = Some(tokio::time::Instant::now() + NOTICE_FOR);
+                            restate = true;
+                            settle(&mut stdout, &output, &status, &mut pending, &mut restate)
+                                .await?;
                         }
                         // Back to the live screen, which the view has been
                         // drawing over: the node's model is the only place it
@@ -1283,7 +1304,7 @@ mod terminal {
                         // The session may have just asked for the mouse, or
                         // given it back. Only between sequences, like the mark.
                         if output.at_boundary() {
-                            let ours = keys.scrolls() && !output.session_mouse();
+                            let ours = keys.scrolls() && scrolls && !output.session_mouse();
                             own_the_wheel(&mut stdout, &mut keys, &mut wheel, ours).await?;
                         }
                         // A screen switch went no further than this client, so
@@ -1882,11 +1903,12 @@ mod tests {
         );
     }
 
-    /// On a screen the terminal owns there is nothing here to look at, and on a
-    /// host too old to send a window there is nothing to look at with. Either
-    /// way the key is the session's, which is where an unbound one goes.
+    /// Inline the terminal has the history in its own buffer and its own wheel
+    /// scrolls it, so there is no view to open and the key is the session's,
+    /// which is where an unbound one goes. A host too old to send a window is a
+    /// different case: the key stays the client's there, so that it can say so.
     #[test]
-    fn the_scroll_key_is_the_sessions_where_there_is_no_history_to_look_at() {
+    fn the_scroll_key_is_the_sessions_where_the_terminal_owns_the_history() {
         let mut f = KeyFilter::new(KEY);
         f.set_scroll(false);
         assert_eq!(f.filter(&[KEY, SCROLL_KEY]), forwarded(&[KEY, SCROLL_KEY]));
