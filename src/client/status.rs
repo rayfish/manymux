@@ -11,6 +11,7 @@
 
 use crate::client::attach::Mode;
 use crate::proto::Size;
+use crate::settings::Screen;
 use crate::style;
 
 /// Rows kept for the mark, and so subtracted from the size the session is told.
@@ -201,14 +202,26 @@ fn prefixed(text: &str) -> String {
 /// Everything else passes through byte for byte. This is not a terminal
 /// emulator and must never become one: it tracks just enough state to know a
 /// title sequence from anything else, and to know when it is between sequences.
-#[derive(Default)]
 pub struct Filter {
+    /// Whether the client's screen mode owns the screen, and so whether the
+    /// session's own switches between the two are its to make.
+    owns_the_screen: bool,
     state: State,
     /// Bytes of a sequence that may yet turn out to be a title, held back until
     /// it is clear whether they need rewriting.
     held: Vec<u8>,
     dirty: bool,
     switched: bool,
+    /// Whether the session has the terminal on its alternate screen. Only
+    /// inline, where the switches reach the terminal, is this the terminal's
+    /// state as well as the session's.
+    alternate: bool,
+}
+
+impl Default for Filter {
+    fn default() -> Self {
+        Self::new(Screen::default())
+    }
 }
 
 #[derive(Default, Clone, Copy, PartialEq, Eq)]
@@ -238,6 +251,24 @@ enum State {
 const MAX_OSC: usize = 4096;
 
 impl Filter {
+    pub fn new(screen: Screen) -> Self {
+        Self {
+            owns_the_screen: screen.mode().owns_the_screen(),
+            state: State::default(),
+            held: Vec::new(),
+            dirty: false,
+            switched: false,
+            alternate: false,
+        }
+    }
+
+    /// Whether the session is sitting in a full-screen program's alternate
+    /// screen. Inline that is the terminal's screen too, so the teardown has to
+    /// pop it or a detach from inside vim hands back vim's screen.
+    pub fn on_alternate(&self) -> bool {
+        self.alternate
+    }
+
     /// Feed a chunk of session output, and get back what to write to the
     /// terminal.
     pub fn feed(&mut self, chunk: &[u8]) -> Vec<u8> {
@@ -371,16 +402,18 @@ impl Filter {
         true
     }
 
-    /// A full-screen program switching screens, which is the one thing the
-    /// session may not do.
+    /// A full-screen program switching screens.
     ///
-    /// The client is already on the alternate screen and draws the mark there.
-    /// Letting `?1049l` through pops the terminal back to the shell's screen
-    /// while the client is still attached, so the session and the mark end up
-    /// painted over the scrollback of the terminal you started from. The node
-    /// makes the same choice on the way in: `events::REPLAYED_MODES` leaves
-    /// these out, so attaching to a session sitting in a full-screen program
-    /// draws its screen without switching yours.
+    /// Inline the switch is the session's to make and the terminal's to
+    /// remember, so it goes through and is only noted. On a screen the client
+    /// owns it cannot: the client is already there and draws the mark there, so
+    /// letting `?1049l` through would pop the terminal back to the shell's
+    /// screen while the client is still attached, and the session and the mark
+    /// would end up painted over the scrollback of the terminal you started
+    /// from. The node makes the same choice on the way in:
+    /// `events::REPLAYED_MODES` leaves these out, so attaching to a session
+    /// sitting in a full-screen program draws its screen without switching
+    /// yours.
     ///
     /// Other modes in the same sequence are none of our business and go on
     /// without the ones taken out.
@@ -400,6 +433,10 @@ impl Filter {
         // The screen underneath is about to be a different one, and the mark
         // and its region do not survive the trip either way.
         self.dirty = true;
+        self.alternate = final_byte == b'h';
+        if !self.owns_the_screen {
+            return true;
+        }
         self.switched = true;
         if kept.is_empty() {
             return false;
@@ -556,6 +593,35 @@ mod tests {
             assert!(filter.take_dirty(), "{switch}");
             assert!(filter.at_boundary());
         }
+    }
+
+    /// Inline the screen the session switches to is the terminal's own, so the
+    /// switch is the session's to make: vim gets the terminal's alternate
+    /// screen and the scrollback underneath it is left alone.
+    #[test]
+    fn a_session_switches_the_screen_itself_when_it_is_the_terminals() {
+        let mut filter = Filter::new(Screen::Inline);
+        assert_eq!(through(&mut filter, "a\x1b[?1049hb"), "a\x1b[?1049hb");
+        assert!(
+            !filter.take_switched(),
+            "nothing was swallowed to owe a screen for"
+        );
+        assert!(filter.take_dirty(), "the mark does not survive the switch");
+        assert!(filter.on_alternate());
+
+        assert_eq!(through(&mut filter, "\x1b[?1049l"), "\x1b[?1049l");
+        assert!(!filter.on_alternate());
+    }
+
+    /// Which is what the teardown needs: detaching from inside a full-screen
+    /// program has to put the terminal back on the screen the shell is on.
+    #[test]
+    fn the_older_spelling_of_the_switch_counts_too() {
+        let mut filter = Filter::new(Screen::Inline);
+        through(&mut filter, "\x1b[?1047h");
+        assert!(filter.on_alternate());
+        through(&mut filter, "\x1b[?1047l");
+        assert!(!filter.on_alternate());
     }
 
     #[test]
