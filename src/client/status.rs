@@ -1,6 +1,6 @@
 //! The marks that say you are inside a session rather than at a plain shell.
 //!
-//! Two of them. A dim `focus ● host/name` in the bottom-right corner, on a row
+//! Two of them. A dim `● host/name` in the bottom-right corner, on a row
 //! the session is never told about, and `mm ` in front of whatever the session
 //! puts in the window title. Both are drawn by the client and neither is visible to
 //! the session: the node keeps the title the program set, so `mm ls` still shows
@@ -50,10 +50,6 @@ const HINT_GAP: &str = "  ";
 /// different again and the screen is showing something the session did not
 /// print just now.
 const SCROLL_HINT: &str = "pgup/pgdn page  g/G ends  esc live";
-
-/// Columns kept for the mode's name, which is the width of the longer of the
-/// two. Fixed, so the mark does not jump sideways when the mode changes.
-const MODE: usize = "control".len();
 
 /// Below this the mark costs more than it is worth, and on a two-row terminal it
 /// would leave the session a single line. Give the whole screen to the session
@@ -200,7 +196,7 @@ impl Status {
     /// The mark itself, drawn a gutter in from the right end of the reserved
     /// row, with the key hints beside it while control mode is on.
     fn mark(&self, size: Size) -> String {
-        let width = columns(&format!("{:>MODE$} ● {}", self.mode.name(), self.target));
+        let width = columns(&format!("● {}", self.target));
         // Right-aligned, and dropped rather than wrapped on a terminal too
         // narrow to hold it and its gutter: a wrapped mark would scroll the
         // screen.
@@ -208,17 +204,19 @@ impl Status {
             return String::new();
         }
         let column = size.cols - width + 1 - GUTTER;
-        // Amber in control mode and in the view, so a mode that takes your
-        // keystrokes for itself, or a screen that is not showing the session as
-        // it stands, is never on without you seeing it.
-        let mode = match self.mode {
-            Mode::Focus => style::faint(&padded(self.mode)),
-            Mode::Control | Mode::Scroll | Mode::Rename => style::amber(&padded(self.mode)),
+        // The dot is the mode, and the row does not name one. Filled and green
+        // while the session has the keyboard; hollow and amber the moment the
+        // client takes it, so a mode that eats your keystrokes, or a screen not
+        // showing the session as it stands, is never on without you seeing it.
+        // Which mode is beside it already: control puts the hints there, the
+        // view how far back it is, a rename what is being typed.
+        let dot = match self.mode {
+            Mode::Focus => style::green("●"),
+            Mode::Control | Mode::Scroll | Mode::Rename => style::amber("○"),
         };
-        let dot = style::green("●");
         let name = style::faint(&self.target);
         format!(
-            "\x1b[{row};1H\x1b[2K{hint}\x1b[{row};{column}H{mode} {dot} {name}",
+            "\x1b[{row};1H\x1b[2K{hint}\x1b[{row};{column}H{dot} {name}",
             row = size.rows,
             hint = self.hint(size, width),
         )
@@ -309,12 +307,6 @@ fn hints(room: u16) -> String {
 /// How many columns a piece of unstyled text takes.
 fn columns(text: &str) -> u16 {
     u16::try_from(text.chars().count()).unwrap_or(u16::MAX)
-}
-
-/// The mode's name in a fixed width, so the mark keeps its column when the
-/// shorter of the two names is showing.
-fn padded(mode: Mode) -> String {
-    format!("{:>MODE$}", mode.name())
 }
 
 /// The scrolling region the session lives in: everything above the mark.
@@ -964,24 +956,28 @@ mod tests {
     #[test]
     fn the_mark_sits_a_gutter_in_from_the_right_end_of_the_reserved_row() {
         let painted = Status::new("srv/zsh").repaint(Size::new(80, 24));
-        // `  focus ● srv/zsh` is 17 columns, so with two to spare on the right
-        // it starts at column 62 of row 24.
-        assert!(painted.contains("\x1b[24;62H"), "{painted:?}");
-        assert!(painted.contains("focus"), "{painted:?}");
+        // `● srv/zsh` is 9 columns, so with two to spare on the right it starts
+        // at column 70 of row 24.
+        assert!(painted.contains("\x1b[24;70H"), "{painted:?}");
+        assert!(painted.contains("● "), "{painted:?}");
     }
 
+    /// The row names no mode: what mode it is is said by what sits beside the
+    /// mark, and the dot only has to say whether the keyboard is the session's.
     #[test]
-    fn the_mode_keeps_its_width_so_the_mark_does_not_jump() {
+    fn the_dot_is_hollow_whenever_the_client_has_the_keyboard() {
         let focus = Status::new("srv/zsh").repaint(Size::new(80, 24));
-        let mut status = Status::new("srv/zsh");
-        status.set_mode(Mode::Control);
-        let control = status.repaint(Size::new(80, 24));
+        assert!(focus.contains("●") && !focus.contains("○"), "{focus:?}");
+        assert!(!focus.contains("focus"), "{focus:?}");
 
-        assert!(control.contains("control"), "{control:?}");
-        assert!(
-            focus.contains("\x1b[24;62H") && control.contains("\x1b[24;62H"),
-            "the mark moved when the mode changed"
-        );
+        for mode in [Mode::Control, Mode::Scroll, Mode::Rename] {
+            let mut status = Status::new("srv/zsh");
+            status.set_mode(mode);
+            let painted = status.repaint(Size::new(80, 24));
+            assert!(painted.contains("○"), "{mode:?}: {painted:?}");
+            // And the mark keeps its column: both dots are one glyph wide.
+            assert!(painted.contains("\x1b[24;70H"), "{mode:?}: {painted:?}");
+        }
     }
 
     #[test]
@@ -996,7 +992,7 @@ mod tests {
         assert!(painted.contains("r rename"), "{painted:?}");
         assert!(painted.contains("d detach"), "{painted:?}");
         // And the mark keeps its place beside them.
-        assert!(painted.contains("\x1b[24;62H"), "{painted:?}");
+        assert!(painted.contains("\x1b[24;70H"), "{painted:?}");
     }
 
     /// The wheel no longer opens the view, because the mouse is the terminal's
@@ -1019,16 +1015,16 @@ mod tests {
         let painted = status.repaint(Size::new(40, 24));
         assert!(painted.contains("tab next  p prev"), "{painted:?}");
         assert!(!painted.contains("l last"), "{painted:?}");
-        assert!(painted.contains("\x1b[24;22H"), "{painted:?}");
+        assert!(painted.contains("\x1b[24;30H"), "{painted:?}");
     }
 
     #[test]
     fn a_row_too_narrow_for_any_of_them_keeps_the_mark() {
         let mut status = Status::new("srv/zsh");
         status.set_mode(Mode::Control);
-        let painted = status.repaint(Size::new(24, 24));
+        let painted = status.repaint(Size::new(19, 24));
         assert!(!painted.contains("tab next"), "{painted:?}");
-        assert!(painted.contains("\x1b[24;6H"), "{painted:?}");
+        assert!(painted.contains("\x1b[24;9H"), "{painted:?}");
     }
 
     /// The row is the only place a name being typed shows, so it has to say
@@ -1041,12 +1037,10 @@ mod tests {
         status.set_renaming(Some("nightly-bench".to_string()));
         let painted = status.repaint(Size::new(80, 24));
         assert!(painted.contains("rename nightly-bench"), "{painted:?}");
-        assert!(
-            painted.contains("rename ●"),
-            "the mode is named {painted:?}"
-        );
-        // And the mark keeps the column it has in every other mode.
-        assert!(painted.contains("\x1b[24;62H"), "{painted:?}");
+        // And the mark keeps the column it has in every other mode, hollow
+        // because what is typed here is not the session's.
+        assert!(painted.contains("○"), "{painted:?}");
+        assert!(painted.contains("\x1b[24;70H"), "{painted:?}");
     }
 
     /// A rename the host agreed to: the mark names the session it is called

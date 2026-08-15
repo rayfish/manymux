@@ -455,18 +455,6 @@ pub enum Mode {
     Rename,
 }
 
-impl Mode {
-    /// What the bottom row calls it.
-    pub fn name(self) -> &'static str {
-        match self {
-            Mode::Focus => "focus",
-            Mode::Control => "control",
-            Mode::Scroll => "scroll",
-            Mode::Rename => "rename",
-        }
-    }
-}
-
 /// One mouse report, in the SGR spelling (`CSI < button ; col ; row M`).
 ///
 /// Only that spelling, because it is the one the client asks for when it turns
