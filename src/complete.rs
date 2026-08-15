@@ -127,12 +127,32 @@ pub fn settings() -> ArgValueCompleter {
     })
 }
 
-/// What a setting can be set to.
+/// What a setting can be set to, which depends on which setting is being set:
+/// `notify` is on or off, `screen` is a screen. Read off the line being
+/// completed the same way the socket is.
 pub fn setting_values() -> ArgValueCompleter {
     ArgValueCompleter::new(|current: &OsStr| {
-        let values = vec!["on".to_string(), "off".to_string()];
+        let key = typed_setting(std::env::args_os()).unwrap_or_default();
+        let values: Vec<String> = manymux::settings::values(&key)
+            .iter()
+            .map(|value| value.to_string())
+            .collect();
         candidates(prefixed(current, values))
     })
+}
+
+/// The setting a `mm config <key> <tab>` is setting, if there is one.
+fn typed_setting<I>(args: I) -> Option<String>
+where
+    I: IntoIterator<Item = OsString>,
+{
+    let mut args = args.into_iter().skip_while(|arg| arg != "--").skip(1);
+    while let Some(arg) = args.next() {
+        if arg == "config" {
+            return args.next()?.to_str().map(str::to_string);
+        }
+    }
+    None
 }
 
 /// `mm new [host] [command...]`: a machine or a program first, then arguments.

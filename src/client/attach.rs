@@ -582,7 +582,10 @@ pub use terminal::{Held, hold, run, session_size, terminal_size};
 
 #[cfg(feature = "desktop")]
 mod terminal {
+    use std::fmt::Write as _;
     use std::io::IsTerminal;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
 
     use anyhow::{Result, bail};
@@ -592,28 +595,23 @@ mod terminal {
     use tokio::sync::mpsc;
 
     use super::{Action, KeyFilter, Mode, Outcome};
+    use crate::client::screen::ScreenMode;
     use crate::client::status::{self, Filter, Status};
     use crate::client::{Attached, SessionHalves, SessionReader, SessionWriter, Update};
     use crate::clipboard;
     use crate::notify;
     use crate::proto::{HostedEvent, Size};
+    use crate::settings::Screen;
 
     /// Sent before attaching.
     ///
-    /// The alternate screen is the important part. A session's repaint places
-    /// everything by absolute coordinates, because that is what a screen dump
-    /// is, so painting it onto your shell's screen writes the session over your
-    /// scrollback and leaves the cursor at the session's row 1 rather than
-    /// where the session's prompt appears to be. Anything you then type lands
-    /// at the top of the terminal. On a surface of its own the coordinates mean
-    /// what they say, and detaching gives your shell's screen back untouched.
-    ///
-    /// The title is pushed for the same reason: detaching should give you back
-    /// the tab name you had, not leave it named after a session you left.
-    const SETUP: &str = concat!(
-        "\x1b[22;2t",  // push the window title
-        "\x1b[?1049h", // switch to the alternate screen
-    );
+    /// The title is pushed because detaching should give you back the tab name
+    /// you had, not leave it named after a session you left. What the mode adds
+    /// is the screen, and why it adds what it adds is in
+    /// [`crate::client::screen`].
+    fn setup(mode: &dyn ScreenMode) -> String {
+        format!("\x1b[22;2t{}", mode.setup()) // push the window title
+    }
 
     /// Terminal state a full-screen program may have left behind, undone
     /// whenever the terminal changes hands, so it is never inherited by whoever
@@ -661,18 +659,10 @@ mod terminal {
     /// too: the session you are leaving switched modes on that the one you are
     /// arriving at never asked for, and its screen is still up.
     ///
-    /// The erase is what the screen dump cannot do for itself. It paints from
-    /// the cursor down to its last line with anything on it and stops, so
-    /// without this the session before it shows through underneath, below that
-    /// line and beside a narrower screen. Homing first is the other half:
-    /// a dump of the primary screen starts printing wherever it finds the
-    /// cursor, which on a hop is wherever the last session left it.
-    ///
-    /// The erase comes last on purpose. It clears to the current background,
-    /// so a program that left a pen set would otherwise paint the whole screen
-    /// its colour.
-    pub(super) fn takeover() -> String {
-        format!("{}\x1b[H\x1b[2J", undone())
+    /// What to do about that screen is the mode's, since only one of the two
+    /// owns it.
+    pub(super) fn takeover(mode: &dyn ScreenMode) -> String {
+        format!("{}{}", undone(), mode.takeover())
     }
 
     /// Written before a screen the node sent in answer to a resize.
@@ -701,20 +691,17 @@ mod terminal {
         "\x1b[H",  // and home again, where the dump starts printing
     );
 
-    /// Everything [`undone`] undoes, and the terminal itself given back: the
-    /// screen the shell was on, the title it had, and the cursor where it left
-    /// it. A detach, in other words, where a hop stops at [`takeover`].
-    pub(super) fn reset() -> String {
+    /// Everything [`undone`] undoes, the title given back, and the screen left
+    /// however the mode leaves it. A detach, in other words, where a hop stops
+    /// at [`takeover`].
+    ///
+    /// `on_alternate` is whether the session has the terminal on a full-screen
+    /// program's own screen, which only the attach loop can see and which only
+    /// the inline mode has to do anything about.
+    pub(super) fn reset(mode: &dyn ScreenMode, on_alternate: bool) -> String {
         let mut reset = undone();
         reset.push_str("\x1b[23;2t"); // pop the title pushed on attach
-        reset.push_str("\x1b[?1047l"); // leave the alternate screen (the older form, which vim uses)
-        reset.push_str("\x1b[?1049l"); // leave the alternate screen
-
-        // Column zero, but no newline: leaving the alternate screen already put
-        // the cursor back where the shell left it, on the line after the command
-        // you typed. A newline here would print the detach message one blank
-        // line further down for no reason.
-        reset.push('\r');
+        let _ = write!(reset, "{}", mode.reset(terminal_size(), on_alternate));
         reset
     }
 
@@ -743,31 +730,45 @@ mod terminal {
         /// The keyboard, owned here rather than by an attach, because it
         /// outlives one. See [`keyboard`].
         keys: mpsc::Receiver<Vec<u8>>,
+        screen: Screen,
+        /// Whether the session has the terminal on its own alternate screen,
+        /// which only the attach loop can see and which both the teardown and
+        /// the panic hook need.
+        on_alternate: Arc<AtomicBool>,
     }
 
-    pub fn hold() -> Result<Held> {
+    pub fn hold(screen: Screen) -> Result<Held> {
         if !std::io::stdin().is_terminal() {
             bail!("attach needs a terminal on stdin");
         }
+        let on_alternate = Arc::new(AtomicBool::new(false));
         // A panic prints to stderr, which while this is held means printing
-        // onto the alternate screen, which the unwind then throws away. Give
-        // the terminal back first, so whatever went wrong is readable on the
-        // screen the shell gets back.
+        // over the session's screen, and on a screen of the client's own the
+        // unwind then throws it away. Give the terminal back first, so whatever
+        // went wrong is readable on the screen the shell gets back.
         let previous = std::panic::take_hook();
+        let flagged = Arc::clone(&on_alternate);
         std::panic::set_hook(Box::new(move |panic| {
             let _ = terminal::disable_raw_mode();
-            write_now(&reset());
+            write_now(&reset(screen.mode(), flagged.load(Ordering::Relaxed)));
             previous(panic);
         }));
         terminal::enable_raw_mode()?;
-        write_now(SETUP);
-        Ok(Held { keys: keyboard() })
+        write_now(&setup(screen.mode()));
+        Ok(Held {
+            keys: keyboard(),
+            screen,
+            on_alternate,
+        })
     }
 
     impl Drop for Held {
         fn drop(&mut self) {
             let _ = terminal::disable_raw_mode();
-            write_now(&reset());
+            write_now(&reset(
+                self.screen.mode(),
+                self.on_alternate.load(Ordering::Relaxed),
+            ));
         }
     }
 
@@ -793,10 +794,25 @@ mod terminal {
     ) -> Result<Outcome> {
         let mut status = Status::new(target);
         status.set_mode(mode);
+        let screen = held.screen;
+        let on_alternate = Arc::clone(&held.on_alternate);
         // One write, so there is never a frame showing an erased screen with no
         // mark on it.
-        write_now(&format!("{}{}", takeover(), status.setup(terminal_size())));
-        pump(&mut held.keys, session, status, mode, target).await
+        write_now(&format!(
+            "{}{}",
+            takeover(screen.mode()),
+            status.setup(terminal_size())
+        ));
+        pump(
+            &mut held.keys,
+            session,
+            status,
+            mode,
+            target,
+            screen,
+            on_alternate,
+        )
+        .await
     }
 
     /// How long a notice from the client itself stays on the row before the key
@@ -848,6 +864,8 @@ mod terminal {
         mut status: Status,
         mode: Mode,
         target: &str,
+        screen: Screen,
+        on_alternate: Arc<AtomicBool>,
     ) -> Result<Outcome> {
         let takes_pastes = session.paste;
         let SessionHalves {
@@ -858,7 +876,7 @@ mod terminal {
         let mut winch = signal(SignalKind::window_change())?;
         let mut keys = KeyFilter::default();
         keys.set_mode(mode);
-        let mut output = Filter::default();
+        let mut output = Filter::new(screen);
         // The row no longer says what the keys are doing. Held until there is a
         // safe moment to draw, the same as a mark the session cleared.
         let mut restate = false;
@@ -941,14 +959,27 @@ mod terminal {
                 }
                 update = reader.next() => match update? {
                     Update::Output(bytes) => {
+                        // The repaint, and it needs the screen underneath it
+                        // blank: the dump paints by absolute coordinates from
+                        // the top. A screen of the client's own was erased in
+                        // the takeover; the terminal's own is rolled into its
+                        // scrollback instead, after any history, which is
+                        // written as it arrives.
+                        if !painted {
+                            let before = screen.mode().before_repaint(terminal_size());
+                            stdout.write_all(before.as_bytes()).await?;
+                        }
                         stdout.write_all(&output.feed(&bytes)).await?;
+                        on_alternate.store(output.on_alternate(), Ordering::Relaxed);
                         // A screen switch went no further than this client, so
                         // the terminal is still showing the screen the session
                         // has just left. Ask for the other one, which exists
                         // only in the node's model of the session. The frame
                         // that repaints on attach is a dump like the answer
                         // would be, and asking for another of those is a round
-                        // trip that paints the same screen twice.
+                        // trip that paints the same screen twice. Inline this
+                        // never fires: the terminal made the switch itself and
+                        // kept both screens.
                         if output.take_switched() && painted {
                             writer.resync().await?;
                         }
@@ -970,6 +1001,7 @@ mod terminal {
                             stdout.write_all(REGROWN.as_bytes()).await?;
                         }
                         stdout.write_all(&output.feed(&bytes)).await?;
+                        on_alternate.store(output.on_alternate(), Ordering::Relaxed);
                         output.take_switched();
                         output.take_dirty();
                         // The dump put the session's own screen back, mark and
@@ -1235,6 +1267,8 @@ pub async fn collect_until(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "desktop")]
+    use crate::settings::Screen;
 
     /// Keystrokes that went straight through, leaving the keyboard in focus.
     fn forwarded(bytes: &[u8]) -> Keystrokes {
@@ -1275,7 +1309,7 @@ mod tests {
     #[cfg(feature = "desktop")]
     #[test]
     fn detaching_undoes_every_mode_a_reattach_replays() {
-        let reset = terminal::reset();
+        let reset = terminal::reset(Screen::Alternate.mode(), false);
         for mode in crate::node::events::REPLAYED_MODES {
             assert!(
                 reset.contains(&format!("\x1b[?{mode}l")),
@@ -1306,7 +1340,7 @@ mod tests {
     #[cfg(feature = "desktop")]
     #[test]
     fn detaching_undoes_the_keyboard_protocols_too() {
-        let reset = terminal::reset();
+        let reset = terminal::reset(Screen::Alternate.mode(), false);
         for sequence in [
             "\x1b[<16u",  // pop kitty's stack, however deep the program went
             "\x1b[=0;1u", // and clear flags it set without pushing
@@ -1325,7 +1359,7 @@ mod tests {
     #[cfg(feature = "desktop")]
     #[test]
     fn a_hop_erases_the_session_before_it() {
-        let takeover = terminal::takeover();
+        let takeover = terminal::takeover(Screen::Alternate.mode());
         let erase = takeover.find("\x1b[2J").expect("a hop erases nothing");
         assert!(
             takeover[..erase].contains("\x1b[H"),
@@ -1342,7 +1376,7 @@ mod tests {
     #[cfg(feature = "desktop")]
     #[test]
     fn a_hop_undoes_every_mode_the_session_before_it_switched_on() {
-        let takeover = terminal::takeover();
+        let takeover = terminal::takeover(Screen::Alternate.mode());
         for mode in crate::node::events::REPLAYED_MODES {
             assert!(
                 takeover.contains(&format!("\x1b[?{mode}l")),
@@ -1364,7 +1398,7 @@ mod tests {
     #[cfg(feature = "desktop")]
     #[test]
     fn a_hop_stays_on_the_alternate_screen() {
-        let takeover = terminal::takeover();
+        let takeover = terminal::takeover(Screen::Alternate.mode());
         for sequence in ["\x1b[?1049l", "\x1b[?1047l", "\x1b[23;2t"] {
             assert!(
                 !takeover.contains(sequence),

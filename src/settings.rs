@@ -144,6 +144,16 @@ fn flag(key: &str, value: &str) -> Result<bool> {
     }
 }
 
+/// What a setting can be set to, for a tab completing a value. Empty for a key
+/// that is not one, since a tab has no way to complain.
+pub fn values(key: &str) -> &'static [&'static str] {
+    match key {
+        "notify" => &["on", "off"],
+        "screen" => &["alternate", "inline"],
+        _ => &[],
+    }
+}
+
 /// Read the screen setting the way a person writes one.
 fn screen(key: &str, value: &str) -> Result<Screen> {
     match value.trim().to_ascii_lowercase().as_str() {

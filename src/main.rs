@@ -16,7 +16,7 @@ use manymux::client::{Attached, Stream};
 use manymux::hosts::{Hosts, LOCAL, Target, is_this_machine, this_machine};
 use manymux::node::{Config, Node};
 use manymux::proto::{HostedSession, Request, Response, SessionInfo, SpawnSpec};
-use manymux::settings::Settings;
+use manymux::settings::{Screen, Settings};
 use manymux::update::Channel;
 use manymux::{config, log, style, term};
 
@@ -72,6 +72,12 @@ enum Command {
         /// Start the session but stay where you are.
         #[arg(short, long)]
         detached: bool,
+        /// Whose screen to paint on. `alternate` gives the session a screen of
+        /// its own; `inline` paints on the terminal's, so its scrollback keeps
+        /// the session's history and the wheel scrolls it. Defaults to the
+        /// `screen` setting.
+        #[arg(long, value_enum)]
+        screen: Option<Screen>,
         /// `[host] [command...]`. Defaults to your login shell, here.
         #[arg(trailing_var_arg = true, add = complete::new_args())]
         args: Vec<String>,
@@ -85,6 +91,12 @@ enum Command {
     Attach {
         #[arg(add = complete::targets())]
         target: String,
+        /// Whose screen to paint on. `alternate` gives the session a screen of
+        /// its own; `inline` paints on the terminal's, so its scrollback keeps
+        /// the session's history and the wheel scrolls it. Defaults to the
+        /// `screen` setting.
+        #[arg(long, value_enum)]
+        screen: Option<Screen>,
     },
     /// Send SIGHUP to a session's process group.
     #[command(visible_alias = "k")]
@@ -280,6 +292,7 @@ async fn run(cli: Cli) -> Result<u8> {
         Command::New {
             name,
             detached,
+            screen,
             args,
         } => {
             let Started { host, command } = where_to_start(args)?;
@@ -302,12 +315,12 @@ async fn run(cli: Cli) -> Result<u8> {
                 println!("{}", qualified(&host, &name));
                 return Ok(OK);
             }
-            do_attach(&socket, &host, &name).await
+            do_attach(&socket, &host, &name, chosen(screen)).await
         }
 
-        Command::Attach { target } => {
+        Command::Attach { target, screen } => {
             let target = locate(&socket, &target, Bare::OrMachine).await?;
-            do_attach(&socket, &target.host, &target.session).await
+            do_attach(&socket, &target.host, &target.session, chosen(screen)).await
         }
 
         Command::Kill { target } => {
@@ -794,18 +807,26 @@ async fn sessions_on(socket: &Path, host: &str) -> Result<Vec<SessionInfo>> {
 /// leave the terminal sitting there.
 const LISTING_WAIT: Duration = Duration::from_millis(500);
 
+/// The screen to paint on: what was asked for, else what the settings say.
+///
+/// A flag rather than only a setting because the choice is per attach: trying
+/// inline costs nothing and going back is closing the window.
+fn chosen(screen: Option<Screen>) -> Screen {
+    screen.unwrap_or_else(|| Settings::or_default().screen)
+}
+
 /// Attach, and keep attaching for as long as the switch keys ask for another
 /// session.
 ///
 /// The terminal is held across the whole run rather than per session, so a hop
-/// is a repaint and not a trip out of the alternate screen and back.
-async fn do_attach(socket: &Path, host: &str, name: &str) -> Result<u8> {
+/// is a repaint and not a trip through the whole setup and back.
+async fn do_attach(socket: &Path, host: &str, name: &str, screen: Screen) -> Result<u8> {
     let mut cycle = Cycle::new(Located::new(host, name));
     // Asked for before the first attach, so the first switch key has something
     // to go on.
     let mut listing = Some(spawn_listing(socket));
 
-    let mut held = attach::hold()?;
+    let mut held = attach::hold(screen)?;
     let mut mode = Mode::Focus;
     let mut hopped = false;
     let (outcome, where_) = loop {

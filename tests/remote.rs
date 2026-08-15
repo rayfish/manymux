@@ -1011,22 +1011,36 @@ fn setup_puts_mm_on_a_machine() {
 fn a_setting_is_written_where_the_next_command_reads_it() {
     let world = World::new("config");
 
-    assert_eq!(world.ok("laptop", &["config"]).trim(), "notify on");
+    assert_eq!(
+        world.ok("laptop", &["config"]).trim(),
+        "notify on\nscreen alternate"
+    );
 
     world.ok("laptop", &["config", "notify", "off"]);
     assert_eq!(world.ok("laptop", &["config", "notify"]).trim(), "off");
-    assert_eq!(world.ok("laptop", &["config"]).trim(), "notify off");
+    assert_eq!(
+        world.ok("laptop", &["config"]).trim(),
+        "notify off\nscreen alternate"
+    );
 
     // A refusal rather than a file with a typo in it that changes nothing.
     let out = world.run("laptop", &["config", "notify", "maybe"]);
     assert!(!out.status.success());
     assert_eq!(world.ok("laptop", &["config", "notify"]).trim(), "off");
 
-    // And a tab knows what there is to set, without asking a node anything.
-    assert_eq!(world.complete("laptop", &["config", ""]), vec!["notify"]);
+    // And a tab knows what there is to set, without asking a node anything,
+    // including that what a setting takes depends on which one it is.
+    assert_eq!(
+        world.complete("laptop", &["config", ""]),
+        vec!["notify", "screen"]
+    );
     assert_eq!(
         world.complete("laptop", &["config", "notify", ""]),
         vec!["on", "off"]
+    );
+    assert_eq!(
+        world.complete("laptop", &["config", "screen", ""]),
+        vec!["alternate", "inline"]
     );
 }
 
