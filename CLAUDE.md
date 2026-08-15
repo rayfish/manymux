@@ -145,11 +145,32 @@ Three consequences run through the whole codebase and are worth keeping intact:
   `events::REPLAYED_MODES` and the teardown in `client::attach` are a pair, and
   so are `events::Keyboard` and the pops in the same teardown. A hop counts as a
   detach for the session being left, so the same undoing happens per attach
-  (`terminal::takeover`), and the screen is erased in the same breath: `avt`'s
+  (`terminal::takeover`), and the screen is cleared in the same breath: `avt`'s
   dump paints from the cursor down to its last line with anything on it and
   never erases, so without it the session you left shows through below that line
-  and beside a narrower screen. What a hop must *not* undo is the alternate
-  screen or the pushed title, which belong to the whole run of attaches.
+  and beside a narrower screen. What a hop must *not* undo is the pushed title,
+  which belongs to the whole run of attaches, nor the screen, which belongs to
+  whichever mode is in use.
+- **There are two screen modes, and everything that differs between them is in
+  one trait** (`src/client/screen.rs`, chosen with `--screen` or the `screen`
+  setting, alternate by default). `alternate` takes the terminal's second screen
+  buffer for the run of attaches and erases it per attach. `inline` takes no
+  screen at all: the session paints on the terminal's own, so a hop rolls the
+  session you left into the terminal's scrollback instead of erasing it, because
+  a line erased is a line you cannot scroll back to, and the node sends the
+  lines behind the screen (`node::history`, `tag::HISTORY`) so a terminal you
+  just walked up to has something to scroll. The order per attach is history,
+  roll, repaint, and getting it wrong paints over the lines it was meant to
+  save.
+- **The wheel is the terminal's to route, not ours.** A program that asked for
+  mouse tracking gets SGR reports, one on its own alternate screen without
+  tracking gets the terminal's alternate-scroll arrows, and ordinary output
+  leaves the wheel scrolling the terminal's own scrollback. All three are right
+  only while the session's screen switches and mouse modes reach the terminal,
+  which is what inline allows and what `Filter::owns_the_screen` decides.
+  Nothing in the client reads a wheel event and nothing should: that way lies
+  tmux's copy mode, and between `avt` on the node and the terminal's own
+  scrollback there is nothing left for it to do.
 - **A resize is repainted from the node, not left to the session.** Telling the
   node the new size redraws nothing: a shell that printed and went quiet has no
   answer to a SIGWINCH, so the screen keeps the old geometry, marks on rows that

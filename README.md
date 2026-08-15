@@ -84,8 +84,9 @@ row, the title and the terminal back.
 Copying out of a session is your terminal's job, over OSC 52, which manymux
 passes through untouched. Most terminals refuse clipboard writes until you say
 otherwise (iTerm2: Settings > General > Selection; Terminal.app has no OSC 52 at
-all). A session is drawn on the alternate screen, so mouse selection covers what
-is on screen and not what has scrolled past it.
+all). A session is drawn on a screen of its own by default, so mouse selection
+covers what is on screen and not what has scrolled past it. See
+[Scrollback](#scrollback) for the other way round.
 
 Targets are `host/name` for another machine and a bare `name` for this one. A
 bare name is looked for here first, then across every machine, so this finds the
@@ -229,6 +230,28 @@ It takes hold at once, in the session you are already attached to and in any
 node already running. `MM_NOTIFY=off` does the same for one command, and
 `mm daemon --no-notify` runs the node but stays silent.
 
+## Scrollback
+
+Attaching takes a screen of its own, the way tmux does, so your terminal's
+scrollbar still shows the shell you attached from and the wheel does nothing
+useful. If you would rather your terminal kept the session's history:
+
+```bash
+mm attach --screen inline web01     # this attach only
+mm config screen inline             # from now on
+```
+
+Inline paints on the terminal's own screen, so what the session prints scrolls
+into your terminal's scrollback, and the wheel, the find bar and selection are
+your terminal's own. Attaching also brings the last thousand lines the session
+printed while you were away, so a build you were not there for is there to
+scroll. A full-screen program in the session (vim, less) reaches for the
+terminal's alternate screen itself, exactly as it would over plain ssh.
+
+The catch is that the mark on the bottom row is fenced off with a scrolling
+region, and a terminal that throws away what scrolls out of one keeps nothing.
+iTerm2 keeps it. If yours does not, `--screen alternate` is the way back.
+
 ## Keeping it running
 
 The node starts on demand, the way tmux starts its server, so nothing has to be
@@ -290,11 +313,11 @@ actually running the same thing.
 ```
 mm ls [host]                         list sessions, everywhere or on one machine
 mm new [host] [-n name] [-d] [cmd]   start a session (default: your login shell)
-mm attach <target>                   attach; Ctrl-] then tab switches, d detaches
+mm attach <target> [--screen ...]    attach; Ctrl-] then tab switches, d detaches
 mm kill <target>                     SIGHUP a session's process group
 mm rename <target> <title>           set a sticky title
 mm add <host> | hosts | rm <host>    which machines to list and watch
-mm config [key] [value]              show or change a setting: notify on|off
+mm config [key] [value]              show or change a setting: notify, screen
 mm update [--check] [--nightly]      replace this binary with the published one
 mm start | stop | restart [--force]  this machine's node: up, down, and again
 mm service install|uninstall         run the node at boot

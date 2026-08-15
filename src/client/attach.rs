@@ -7,6 +7,9 @@
 //! The client stays deliberately dumb: raw mode, forward keystrokes, paint what
 //! arrives, watch for the detach key. All the state lives on the server, which
 //! is what makes detaching free.
+//!
+//! Whose screen it paints on is [`crate::client::screen`]'s to say, and the two
+//! answers are different enough to be worth reading before this file.
 
 use std::time::{Duration, Instant};
 
