@@ -1065,7 +1065,10 @@ fn a_node_hangs_its_sessions_up_before_it_goes_and_outlasts_none_of_them() {
         "trap 'echo bye > {}; exit 0' HUP; sleep 300",
         farewell.display()
     );
-    world.ok("laptop", &["new", "-d", "-n", "polite", "sh", "-c", &polite]);
+    world.ok(
+        "laptop",
+        &["new", "-d", "-n", "polite", "sh", "-c", &polite],
+    );
 
     // And one that does not, which is what the grace period ends in a kill for:
     // otherwise it is left reading EIO from a PTY whose master went with the
@@ -1144,7 +1147,9 @@ fn the_two_commands_nobody_types_are_hidden_but_still_run() {
     // parser.
     let offered = world.complete("laptop", &[""]);
     assert!(
-        !offered.iter().any(|word| word == "daemon" || word == "agent"),
+        !offered
+            .iter()
+            .any(|word| word == "daemon" || word == "agent"),
         "a tab offered machinery: {offered:?}"
     );
     assert!(offered.iter().any(|word| word == "a"), "{offered:?}");

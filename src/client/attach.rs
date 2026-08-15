@@ -2020,10 +2020,7 @@ mod tests {
         let mut f = KeyFilter::new(KEY);
         f.set_scroll(true);
         f.set_wheel(true);
-        assert_eq!(
-            f.filter(b"\x1b[<64;1;1M\x1b[<65;1;1M"),
-            forwarded(b"")
-        );
+        assert_eq!(f.filter(b"\x1b[<64;1;1M\x1b[<65;1;1M"), forwarded(b""));
     }
 
     /// The client asked the terminal for these reports; the session did not.

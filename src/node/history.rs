@@ -267,10 +267,13 @@ mod tests {
         for i in 1..=4 {
             vt.feed_str(&format!("line {i}\r\n"));
         }
-        let view = window(&vt, &ViewRequest {
-            from: 999,
-            lines: 3,
-        });
+        let view = window(
+            &vt,
+            &ViewRequest {
+                from: 999,
+                lines: 3,
+            },
+        );
         assert_eq!(view.from, 4, "the top of a five line buffer");
         assert_eq!(view.lines, vec!["line 1"]);
 
