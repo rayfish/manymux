@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::{ExitCode, Stdio};
 use std::sync::Arc;
@@ -138,10 +139,11 @@ enum Command {
     /// desktop notification a watching node raises, and the one an attached
     /// terminal is asked to show.
     Config {
-        /// `notify`. Left out, every setting is listed.
+        /// `notify` or `screen`. Left out, every setting is listed.
         #[arg(add = complete::settings())]
         key: Option<String>,
-        /// `on` or `off`. Left out, the setting is printed rather than changed.
+        /// What to set it to. Left out, the setting is printed rather than
+        /// changed.
         #[arg(add = complete::setting_values())]
         value: Option<String>,
     },
@@ -829,10 +831,19 @@ async fn do_attach(socket: &Path, host: &str, name: &str, screen: Screen) -> Res
     let mut held = attach::hold(screen)?;
     let mut mode = Mode::Focus;
     let mut hopped = false;
+    // Sessions whose history this run has already put in the terminal's
+    // scrollback. Without this, walking the list with the switch key would dump
+    // a thousand lines on every hop.
+    let mut seeded: HashSet<String> = HashSet::new();
     let (outcome, where_) = loop {
         let target = cycle.current().clone();
         let where_ = qualified(&target.host, &target.session);
-        let session = match attach_to(socket, &target).await {
+        let history = if seeded.insert(where_.clone()) {
+            screen.mode().history()
+        } else {
+            0
+        };
+        let session = match attach_to(socket, &target, history).await {
             Ok(session) => session,
             // A hop onto a session that has gone since the listing. Stay where
             // you were and put the dead entry out of the cycle, rather than
@@ -887,10 +898,10 @@ async fn do_attach(socket: &Path, host: &str, name: &str, screen: Screen) -> Res
 }
 
 /// Open a stream to wherever a session is, and attach to it.
-async fn attach_to(socket: &Path, target: &Located) -> Result<Attached> {
+async fn attach_to(socket: &Path, target: &Located, history: u32) -> Result<Attached> {
     let stream = open(socket, &target.host).await?;
     stream
-        .attach(&target.session, attach::session_size(), 0)
+        .attach(&target.session, attach::session_size(), history)
         .await
 }
 

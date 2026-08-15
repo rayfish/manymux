@@ -1009,9 +1009,13 @@ mod terminal {
                         restate = true;
                         settle(&mut stdout, &output, &status, &mut pending, &mut restate).await?;
                     }
-                    // Nothing asks for history until the client knows where to
-                    // put it, which is the task after this one.
-                    Update::History(_) => {}
+                    // Straight out, ahead of the roll that scrolls it into the
+                    // terminal's own scrollback. Not through the filter: these
+                    // are lines the node rendered, not the session speaking, so
+                    // there is no title to prefix and no mark to put back.
+                    Update::History(bytes) => {
+                        stdout.write_all(&bytes).await?;
+                    }
                     // A bell in one of this machine's other sessions. The
                     // terminal is asked to raise it, and the row says which
                     // session it was, for a terminal that raises nothing.
