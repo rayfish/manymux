@@ -16,7 +16,36 @@ use serde::{Deserialize, Serialize};
 use crate::config;
 
 /// Every key `mm config` takes, in the order it lists them.
-pub const KEYS: &[&str] = &["notify"];
+pub const KEYS: &[&str] = &["notify", "screen"];
+
+/// Whose screen an attached client paints on.
+///
+/// `alternate` takes the terminal's second screen buffer, which is what every
+/// attach did before inline existed: the session gets a surface of its own and
+/// detaching gives your shell's screen back untouched. `inline` paints on the
+/// terminal's own screen instead, so what the session prints scrolls into the
+/// terminal's scrollback and the wheel, find and select are the terminal's.
+///
+/// Alternate is the default because it behaves the same on every terminal.
+/// Inline needs one that keeps what scrolls out of a scrolling region, since
+/// the mark's row is fenced off with one.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "desktop", derive(clap::ValueEnum))]
+#[serde(rename_all = "lowercase")]
+pub enum Screen {
+    #[default]
+    Alternate,
+    Inline,
+}
+
+impl Screen {
+    fn word(self) -> &'static str {
+        match self {
+            Screen::Alternate => "alternate",
+            Screen::Inline => "inline",
+        }
+    }
+}
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
 pub struct Settings {
@@ -24,6 +53,9 @@ pub struct Settings {
     /// daemon, and the ones an attached client hands to your terminal.
     #[serde(default = "on")]
     pub notify: bool,
+    /// Whose screen an attached client paints on.
+    #[serde(default)]
+    pub screen: Screen,
 }
 
 fn on() -> bool {
@@ -32,7 +64,10 @@ fn on() -> bool {
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { notify: true }
+        Self {
+            notify: true,
+            screen: Screen::default(),
+        }
     }
 }
 
@@ -69,6 +104,7 @@ impl Settings {
     pub fn get(&self, key: &str) -> Result<String> {
         match key {
             "notify" => Ok(word(self.notify).to_string()),
+            "screen" => Ok(self.screen.word().to_string()),
             _ => bail!("no setting called `{key}`; known settings: {}", list()),
         }
     }
@@ -76,6 +112,7 @@ impl Settings {
     pub fn set(&mut self, key: &str, value: &str) -> Result<()> {
         match key {
             "notify" => self.notify = flag(key, value)?,
+            "screen" => self.screen = screen(key, value)?,
             _ => bail!("no setting called `{key}`; known settings: {}", list()),
         }
         Ok(())
@@ -104,6 +141,15 @@ fn flag(key: &str, value: &str) -> Result<bool> {
         "on" | "true" | "yes" | "1" => Ok(true),
         "off" | "false" | "no" | "0" => Ok(false),
         other => bail!("`{key}` is on or off, not {other:?}"),
+    }
+}
+
+/// Read the screen setting the way a person writes one.
+fn screen(key: &str, value: &str) -> Result<Screen> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "alternate" | "alt" => Ok(Screen::Alternate),
+        "inline" => Ok(Screen::Inline),
+        other => bail!("`{key}` is alternate or inline, not {other:?}"),
     }
 }
 
@@ -156,8 +202,29 @@ mod tests {
     }
 
     #[test]
+    fn the_screen_is_named_the_way_people_name_it() {
+        let mut settings = Settings::default();
+        assert_eq!(settings.get("screen").unwrap(), "alternate");
+
+        for inline in ["inline", "INLINE", " inline "] {
+            settings.set("screen", inline).unwrap();
+            assert_eq!(settings.get("screen").unwrap(), "inline", "{inline:?}");
+        }
+        settings.set("screen", "alternate").unwrap();
+        assert_eq!(settings.screen, Screen::Alternate);
+
+        assert!(settings.set("screen", "maybe").is_err());
+    }
+
+    #[test]
     fn every_key_can_be_listed() {
         let all = Settings::default().all();
-        assert_eq!(all, vec![("notify", "on".to_string())]);
+        assert_eq!(
+            all,
+            vec![
+                ("notify", "on".to_string()),
+                ("screen", "alternate".to_string())
+            ]
+        );
     }
 }
