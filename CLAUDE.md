@@ -104,6 +104,14 @@ Three consequences run through the whole codebase and are worth keeping intact:
   `/tmp` being world-writable is why `ensure_runtime_dir` checks the owner and
   mode, and why `ipc` touches the socket every few hours: `systemd-tmpfiles`
   deletes what looks unused for ten days.
+- **A node started on demand leaves the client's process group and session**
+  (`setsid` in `node::start_node`, tested in `tests/detached.rs`). It owns every
+  session on the machine from then on, while the client is a command someone
+  typed: without the split, a terminal signalling its foreground group (a Ctrl-C
+  at the wrong moment, the window closing) reaches the node too and takes every
+  session down at once, with no line in the log because the node is killed
+  before it can write one. A node started by the service unit is already clear
+  of this, which is why the symptom only ever appears on the on-demand path.
 - **A tab completion never starts a node, never installs anything, and never
   waits on ssh unless the word already names a machine** (`src/complete.rs`).
   All three are tested.

@@ -15,7 +15,9 @@ pub mod peers;
 pub mod registry;
 pub mod session;
 
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -628,19 +630,38 @@ async fn signal_node(socket: &Path) -> Result<()> {
 }
 
 /// Start a node in the background and wait for its socket to appear.
+///
+/// The node has to leave the client behind completely, because from here on it
+/// owns every session on the machine and the client is a command someone typed.
+/// A child keeps its parent's process group and session, and a terminal signals
+/// the whole foreground group: a Ctrl-C at the wrong moment, or the window
+/// closing, would reach the node along with the client and take every session
+/// down at once, without even leaving a line in the log to say so.
 async fn start_node(socket: &Path) -> Result<()> {
     let binary = std::env::current_exe().context("finding the mm binary")?;
     info!("no node running, starting one");
     note_a_node_left_behind(socket).await;
-    std::process::Command::new(&binary)
+    let mut command = Command::new(&binary);
+    command
         .arg("--socket")
         .arg(socket)
         .arg("daemon")
         // Nothing is watching its output, and inheriting ssh's pipes would hold
         // the ssh session open for as long as the node lived.
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    // SAFETY: this runs in the forked child before the exec, where only
+    // async-signal-safe calls are allowed. `setsid` is one, and it is the only
+    // thing here. It cannot fail the one way it is documented to: that needs
+    // the caller to already lead a process group, and a fresh child never does.
+    unsafe {
+        command.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        })
+    };
+    command
         .spawn()
         .with_context(|| format!("starting {}", binary.display()))?;
 
