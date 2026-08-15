@@ -1583,6 +1583,7 @@ mod terminal {
         let takes_pastes = session.paste;
         let scrolls = session.scroll;
         let renames = session.rename;
+        let carries_events = session.events;
         let SessionHalves {
             mut reader,
             mut writer,
@@ -1621,6 +1622,19 @@ mod terminal {
         // written, and the rule for which of them get one.
         let mut pending = String::new();
         let bells = Bells::new(naming.host);
+
+        // A host from before the attach stream carried events will never send
+        // one, and there is no key here to find that out with: the other
+        // capabilities go quiet under a keystroke somebody chose to press,
+        // while this one goes quiet under a bell nobody was watching for. Said
+        // once, on the row, and only to someone who has bells switched on,
+        // since silence is what the rest asked for. The first repaint paints
+        // it, which is why nothing is written here.
+        if !carries_events && notify::to_terminal() {
+            status.set_notice("this host is too old to relay bells; `mm restart` there");
+            notice_until = Some(tokio::time::Instant::now() + NOTICE_FOR);
+            restate = true;
+        }
 
         loop {
             tokio::select! {

@@ -271,6 +271,17 @@ pub enum Response {
         /// and for the same reason as the two above.
         #[serde(default)]
         rename: bool,
+        /// Whether this host sends [`tag::EVENT`] on an attach stream, which is
+        /// how a bell in the session next door reaches the terminal in front of
+        /// you. False on a host from before it did.
+        ///
+        /// This one has no key behind it, which is what makes saying so matter
+        /// more rather than less: the others go quiet on a keystroke somebody
+        /// chose to press, and this one goes quiet on a bell nobody was waiting
+        /// at the screen for. Without the flag an old host is indistinguishable
+        /// from a quiet machine.
+        #[serde(default)]
+        events: bool,
     },
     /// What the node is running. `build` is the SHA-256 of the binary it
     /// started from, taken at startup: the version alone cannot answer the
@@ -585,6 +596,7 @@ mod tests {
             paste,
             scroll,
             rename,
+            events,
         } = decoded
         else {
             panic!("an old answer should still be an attach");
@@ -596,6 +608,10 @@ mod tests {
             "nor answer for a window of a history it cannot send"
         );
         assert!(!rename, "nor rename a session on a tag it never heard of");
+        assert!(
+            !events,
+            "nor put the session next door's bells on this stream"
+        );
 
         // And the other way: an old client reading a new host's answer, which
         // is a fleet updated from the far end first.
@@ -604,6 +620,7 @@ mod tests {
             paste: true,
             scroll: true,
             rename: true,
+            events: true,
         })
         .unwrap();
         assert!(matches!(decode::<Old>(&new).unwrap(), Old::Attached { .. }));

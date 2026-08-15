@@ -402,6 +402,7 @@ impl Stream {
                 paste,
                 scroll,
                 rename,
+                events,
             } => Ok(Attached {
                 read: self.read,
                 write: self.write,
@@ -410,6 +411,7 @@ impl Stream {
                 paste,
                 scroll,
                 rename,
+                events,
             }),
             Response::Error(message) => bail!(message),
             other => bail!("unexpected response to attach: {other:?}"),
@@ -436,6 +438,11 @@ pub struct Attached {
     /// same reason: a rename key that quietly did nothing would read as a
     /// broken client rather than an old host.
     pub rename: bool,
+    /// Whether this host puts its other sessions' events on this stream, which
+    /// is what rings the terminal for a bell in the session next door. False on
+    /// a host from before it did, where silence is otherwise the same shape as
+    /// nothing having happened.
+    pub events: bool,
 }
 
 /// The two halves of an attached session, so output can be read while input is

@@ -1229,10 +1229,17 @@ fn a_bell_next_door_lands_on_the_terminal_of_whoever_is_attached() {
         );
     };
 
-    let end = notification.find('\x07').expect("a finished sequence");
+    let end = notification.find("\x1b\\").expect("a finished sequence");
     assert!(
         notification[..end].contains("ringer"),
         "the notification does not name the session that rang: {notification:?}"
+    );
+    // The bell after it, on solid ground. A notification is seen and not heard,
+    // so the terminal is rung as well as written to: an OSC ended with a BEL
+    // would have that byte eaten as its terminator and ring nothing.
+    assert!(
+        notification[end..].starts_with("\x1b\\\x07"),
+        "the sequence is closed with ST and rung after: {notification:?}"
     );
     // And the row says so too, for a terminal that raises nothing.
     assert!(

@@ -153,6 +153,14 @@ Three consequences run through the whole codebase and are worth keeping intact:
   written only at a `Filter::at_boundary()` moment, like the mark, and the text
   is scrubbed first: it comes from the program in the session, and a BEL in a
   title would end the sequence and leave the rest to be read as commands.
+- **A relayed bell is an OSC 9 *and* a bell** (`notify::escape`). OSC 9 is seen
+  and not heard: a terminal that has it shows a banner and never rings or marks
+  the tab, and one that does not throws the whole thing away, so a bell relayed
+  as a notification alone rang nowhere. Which is why the OSC ends with ST rather
+  than the BEL it once did: a terminator is eaten by the parser and can never be
+  a bell, so the sequence is closed the other way and the bell that follows it
+  lands on solid ground. The session on the screen is not relayed at all; its
+  own BEL is already in the stream.
 - **Modes switched on for a session must be switched off on detach.**
   `events::REPLAYED_MODES` and the teardown in `client::attach` are a pair, and
   so are `events::Keyboard` and the pops in the same teardown. A hop counts as a
@@ -253,8 +261,16 @@ Three consequences run through the whole codebase and are worth keeping intact:
   a name the way `tag::VIEW` and `tag::FIND` carry their questions, and the node
   has the session right there at the other end. What that costs is an answer: a
   node too old to know the tag skips it in silence, so `Response::Attached`
-  carries a flag per capability (`paste`, `scroll`, `rename`) and the client
-  says "this host is too old" rather than leaving a key that does nothing.
+  carries a flag per capability (`paste`, `scroll`, `rename`, `events`) and the
+  client says "this host is too old" rather than leaving a key that does
+  nothing. `events` is the odd one and the reason the rule is worth stating
+  twice: it has no key behind it, so an old node is not a key that does nothing
+  but a machine that never rings, which is the same shape as a quiet one and was
+  undiagnosable from the client. It is said once on attach rather than on a
+  press, and only to somebody who has bells switched on. Note also that
+  replacing the binary is not enough for any of these: the node keeps running
+  the build it started from until `mm restart`, which `update::is_stale` says
+  for this machine and nothing says for a host you reach over ssh.
 - **Both prompts are one prompt** (`attach::Prompt`). The search and the rename
   are typed the same way, so the editing lives in one place and only the action
   handed back says which one is open. A prompt swallows the whole chunk, because

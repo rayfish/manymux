@@ -164,19 +164,31 @@ pub fn summary(session: &str, notification: &Notification) -> String {
 
 /// The notification as a sequence to write to a terminal: OSC 9, which iTerm2,
 /// kitty, ghostty, WezTerm, foot, VS Code and Windows Terminal turn into a
-/// desktop notification, and which everything else parses and throws away.
+/// desktop notification, and which everything else parses and throws away,
+/// followed by a bell.
+///
+/// The bell is the half that carries across every terminal there is: OSC 9 is
+/// seen and not heard, so a bell relayed as a notification alone is a bell that
+/// rang nowhere, left no mark on the tab, and on a terminal without OSC 9
+/// happened at all. The two together are what a program ringing in your own
+/// terminal would have produced.
+///
+/// Which is why the OSC ends with ST rather than the BEL it used to: the
+/// terminator is eaten by the parser, so a BEL there is the end of a sequence
+/// and never a bell. With ST closing it, the one that follows is on solid
+/// ground and rings.
 ///
 /// The text is scrubbed of control characters first. Both halves of it were
-/// chosen by whatever is running in the session, and a title holding a BEL
-/// would end the sequence early and leave the rest of itself being read as
-/// commands by the terminal of whoever attached.
+/// chosen by whatever is running in the session, and a title holding a BEL or
+/// an ST would end the sequence early and leave the rest of itself being read
+/// as commands by the terminal of whoever attached.
 pub fn escape(notification: &Notification) -> String {
     let text = if notification.body.is_empty() {
         notification.title.clone()
     } else {
         format!("{}: {}", notification.title, notification.body)
     };
-    format!("\x1b]9;{}\x07", printable(&text))
+    format!("\x1b]9;{}\x1b\\\x07", printable(&text))
 }
 
 /// `text` with anything a terminal would act on taken out, and cut to a length
@@ -292,8 +304,24 @@ mod tests {
         let notification = worth_interrupting("gpu-box", &event(EventKind::Bell, 0)).unwrap();
         assert_eq!(
             escape(&notification),
-            "\x1b]9;gpu-box/api: fixing the parser\x07"
+            "\x1b]9;gpu-box/api: fixing the parser\x1b\\\x07"
         );
+    }
+
+    /// A notification is seen and not heard, so the bell goes with it: a
+    /// terminal with no OSC 9 still rings, and one with it also marks the tab
+    /// the way a program ringing in your own terminal would.
+    #[test]
+    fn a_relayed_bell_is_heard_as_well_as_shown() {
+        let notification = worth_interrupting("gpu-box", &event(EventKind::Bell, 0)).unwrap();
+        let escaped = escape(&notification);
+        assert!(
+            escaped.ends_with("\x1b\\\x07"),
+            "the OSC ends with ST and the bell rings after it: {escaped:?}"
+        );
+        // Not the terminator: a BEL closing the OSC would be eaten by the
+        // parser, which is the bug this pairing exists to fix.
+        assert_eq!(escaped.matches('\x07').count(), 1);
     }
 
     /// The title is whatever the program in the session set, and it is written
@@ -306,13 +334,18 @@ mod tests {
             body: "done\x07\x1b]0;pwned\x07".into(),
         };
         let escaped = escape(&notification);
-        assert_eq!(escaped, "\x1b]9;box/api: done  ]0;pwned\x07");
+        assert_eq!(escaped, "\x1b]9;box/api: done  ]0;pwned\x1b\\\x07");
+        // The only BEL is the one rung deliberately, at the end, and the only
+        // escapes are the ones opening and closing the sequence: nothing the
+        // session chose is left to be read as either.
         assert_eq!(
             escaped.matches('\x07').count(),
             1,
             "one sequence: {escaped:?}"
         );
-        assert!(!escaped[2..].contains('\x1b'));
+        let payload = &escaped[2..escaped.len() - 3];
+        assert!(!payload.contains('\x1b'));
+        assert!(!payload.contains('\x07'));
     }
 
     #[test]
@@ -321,7 +354,7 @@ mod tests {
             title: "box/api".into(),
             body: String::new(),
         };
-        assert_eq!(escape(&notification), "\x1b]9;box/api\x07");
+        assert_eq!(escape(&notification), "\x1b]9;box/api\x1b\\\x07");
     }
 
     #[test]
@@ -330,7 +363,9 @@ mod tests {
             title: "box/api".into(),
             body: "x".repeat(10_000),
         };
-        assert!(escape(&notification).chars().count() <= MAX_TEXT + 5);
+        // `ESC ] 9 ;` then the text, then `ESC \` and the bell.
+        let wrapper = "\x1b]9;\x1b\\\x07".chars().count();
+        assert!(escape(&notification).chars().count() <= MAX_TEXT + wrapper);
     }
 
     #[test]

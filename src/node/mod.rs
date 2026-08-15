@@ -285,6 +285,7 @@ impl Node {
                     paste: true,
                     scroll: true,
                     rename: true,
+                    events: true,
                 };
                 proto::write_msg(&mut write, tag::RESPONSE, &response).await?;
                 pump_attachment(
