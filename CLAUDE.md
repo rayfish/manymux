@@ -219,8 +219,25 @@ Three consequences run through the whole codebase and are worth keeping intact:
   left. `attach::Encoded` reads all three, and drops the repeats, releases and
   bare modifier keys that the same protocols add, since in control mode letting
   go of ctrl would otherwise read as a keystroke.
+- **What an attached client asks for goes on the attach stream, never down a
+  second connection.** An `Attached` holds neither the socket nor the host it
+  arrived by, on purpose: that is the one thing this half of the client is kept
+  from knowing, and a mobile app drives the same type. So `tag::RENAME` carries
+  a title the way `tag::VIEW` and `tag::FIND` carry their questions, and the
+  node has the session right there at the other end. What that costs is an
+  answer: a node too old to know the tag skips it in silence, so
+  `Response::Attached` carries a flag per capability (`paste`, `scroll`,
+  `rename`) and the client says "this host is too old" rather than leaving a key
+  that does nothing.
+- **Both prompts are one prompt** (`attach::Prompt`). The search and the rename
+  are typed the same way, so the editing lives in one place and only the action
+  handed back says which one is open. A prompt swallows the whole chunk, because
+  typing arrives in chunks and one action per byte would drop the rest of each;
+  and a rub takes a whole character, not a byte, or one press of an accented key
+  leaves half of it behind.
 - Session names are sanitised in `node::registry` because they appear in
-  `host/name` paths and in the terminal.
+  `host/name` paths and in the terminal. Titles are not: they are free text, and
+  `Session::rename` reads an empty one as "take the sticky title off".
 
 ### Tests
 

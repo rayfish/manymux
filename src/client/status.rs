@@ -68,11 +68,12 @@ pub struct Status {
     /// A place of its own rather than a notice, because a notice goes away
     /// after a few seconds and this is true for as long as the view is.
     scrolled: Option<u64>,
-    /// What is being typed at the search prompt, while one is open. Outranks
-    /// everything else on the row: it is the only thing there that is being
-    /// changed a keystroke at a time, and a row that does not show what you are
-    /// typing is a row you cannot type into.
-    prompt: Option<String>,
+    /// What is being typed at a prompt, while one is open: the mark that says
+    /// which prompt it is, and the text so far. Outranks everything else on the
+    /// row: it is the only thing there that is being changed a keystroke at a
+    /// time, and a row that does not show what you are typing is a row you
+    /// cannot type into.
+    prompt: Option<(&'static str, String)>,
     /// What the last search found, once it has been run.
     searching: Option<String>,
 }
@@ -101,7 +102,14 @@ impl Status {
 
     /// Show what is being typed at the search prompt, or take the prompt away.
     pub fn set_prompt(&mut self, needle: Option<String>) {
-        self.prompt = needle;
+        self.prompt = needle.map(|text| ("/", text));
+    }
+
+    /// The same for the prompt that titles the session, told apart by being
+    /// spelled out: `/` is what a search is called everywhere, and a rename is
+    /// called nothing in particular.
+    pub fn set_renaming(&mut self, title: Option<String>) {
+        self.prompt = title.map(|text| ("rename ", text));
     }
 
     /// Show what the last search found: the needle, and which match of how
@@ -170,7 +178,7 @@ impl Status {
         // it stands, is never on without you seeing it.
         let mode = match self.mode {
             Mode::Focus => style::faint(&padded(self.mode)),
-            Mode::Control | Mode::Scroll => style::amber(&padded(self.mode)),
+            Mode::Control | Mode::Scroll | Mode::Rename => style::amber(&padded(self.mode)),
         };
         let dot = style::green("●");
         let name = style::faint(&self.target);
@@ -187,8 +195,8 @@ impl Status {
     fn hint(&self, size: Size, mark: u16) -> String {
         // A prompt being typed into outranks the lot: it is the only thing on
         // this row that changes a keystroke at a time.
-        if let Some(prompt) = &self.prompt {
-            let typed = format!("/{prompt}");
+        if let Some((label, prompt)) = &self.prompt {
+            let typed = format!("{label}{prompt}");
             return if columns(&typed) + 1 + mark + GUTTER > size.cols {
                 String::new()
             } else {
@@ -210,7 +218,9 @@ impl Status {
             // the session printed a moment ago.
             (None, Some(scrolled), _) => (scrolled.as_str(), style::amber as fn(&str) -> String),
             (None, None, Mode::Control) => (HINT, style::faint as fn(&str) -> String),
-            (None, None, Mode::Focus | Mode::Scroll) => return String::new(),
+            // Rename is here for the sake of the match: that mode is never on
+            // without a prompt, which was answered above.
+            (None, None, Mode::Focus | Mode::Scroll | Mode::Rename) => return String::new(),
         };
         // A blank column between the two, so they never run together.
         if columns(text) + 1 + mark + GUTTER > size.cols {
@@ -922,5 +932,43 @@ mod tests {
         let painted = status.repaint(Size::new(40, 24));
         assert!(!painted.contains("tab next"), "{painted:?}");
         assert!(painted.contains("\x1b[24;22H"), "{painted:?}");
+    }
+
+    /// The row is the only place a title being typed shows, so it has to say
+    /// which prompt is open as well as what is in it: a `/` and a word are not
+    /// the same question.
+    #[test]
+    fn the_rename_prompt_says_so_and_shows_what_is_typed() {
+        let mut status = Status::new("srv/zsh");
+        status.set_mode(Mode::Rename);
+        status.set_renaming(Some("nightly bench".to_string()));
+        let painted = status.repaint(Size::new(80, 24));
+        assert!(painted.contains("rename nightly bench"), "{painted:?}");
+        assert!(
+            painted.contains("rename ●"),
+            "the mode is named {painted:?}"
+        );
+        // And the mark keeps the column it has in every other mode.
+        assert!(painted.contains("\x1b[24;62H"), "{painted:?}");
+    }
+
+    /// One prompt slot, so opening one takes the other's place rather than
+    /// drawing both on top of each other.
+    #[test]
+    fn a_prompt_outranks_the_hints_and_the_notice_alike() {
+        let mut status = Status::new("srv/zsh");
+        status.set_mode(Mode::Control);
+        status.set_notice("pasted 2.1 MB");
+        assert!(status.repaint(Size::new(80, 24)).contains("pasted"));
+
+        status.set_renaming(Some("api".to_string()));
+        let painted = status.repaint(Size::new(80, 24));
+        assert!(painted.contains("rename api"), "{painted:?}");
+        assert!(!painted.contains("pasted"), "{painted:?}");
+        assert!(!painted.contains("tab next"), "{painted:?}");
+
+        // And taking it away gives the row back to whatever was under it.
+        status.set_renaming(None);
+        assert!(status.repaint(Size::new(80, 24)).contains("pasted"));
     }
 }

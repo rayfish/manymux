@@ -95,6 +95,15 @@ impl Client {
         proto::write_frame(&mut self.write, tag::PONG, &[]).await
     }
 
+    /// Give the session a title from the stream it is attached to, which is
+    /// what the client's own rename prompt sends. Nothing answers it, so what
+    /// it did is read off the registry.
+    async fn rename(&mut self, title: &str) {
+        proto::write_msg(&mut self.write, tag::RENAME, &title)
+            .await
+            .expect("renaming");
+    }
+
     /// Ask for a window of the session's history, and read past whatever else
     /// is on the stream until it comes back.
     async fn ask_for_view(&mut self, request: &ViewRequest) -> proto::View {
@@ -161,6 +170,33 @@ impl Client {
         .await;
         found.expect("a bell within the deadline")
     }
+}
+
+/// What the node calls a session now.
+fn title_of(node: &Arc<Node>, name: &str) -> String {
+    node.registry
+        .list()
+        .into_iter()
+        .find(|session| session.name == name)
+        .expect("the session")
+        .title
+}
+
+/// Wait for the title to be what it should be. A wait rather than a look,
+/// because a rename is answered with nothing: there is no frame to read that
+/// would say the node has got to it yet.
+async fn titled(node: &Arc<Node>, name: &str, want: &str) {
+    let settled = tokio::time::timeout(Duration::from_secs(10), async {
+        while title_of(node, name) != want {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(
+        settled.is_ok(),
+        "the session is called {:?}, not {want:?}",
+        title_of(node, name)
+    );
 }
 
 fn alive(pid: u32) -> bool {
@@ -904,4 +940,45 @@ async fn a_bell_next_door_reaches_an_attached_client_and_this_ones_does_not() {
 
     registry.kill(&name).unwrap();
     registry.kill(&next_door.name).unwrap();
+}
+
+/// Renaming from inside the session, which is what `Ctrl-] r` sends: the same
+/// sticky title `mm rename` sets, on the stream the session is already on.
+///
+/// It goes there rather than down a second connection because an attached
+/// client has neither the socket nor the host it arrived by, and the node has
+/// the session right there at the other end of this stream.
+#[tokio::test]
+async fn a_title_typed_at_an_attached_client_reaches_the_session() {
+    let node = test_node().await;
+    let Spawned { name, .. } = spawn_session(&node, &["/bin/sh", "-c", "sleep 300"]).await;
+    let called = title_of(&node, &name);
+
+    let mut client = Client::connect(&node);
+    let attached = client
+        .send(&Request::Attach {
+            name: name.clone(),
+            size: Size::new(80, 24),
+            history: 0,
+        })
+        .await
+        .unwrap();
+    let Response::Attached { rename, .. } = attached else {
+        panic!("attaching failed: {attached:?}");
+    };
+    assert!(
+        rename,
+        "a node that takes a title has to say so, or the client cannot tell it \
+         from one too old to and has to leave a key doing nothing"
+    );
+
+    client.rename("nightly bench").await;
+    titled(&node, &name, "nightly bench").await;
+
+    // Empty is not a mistake: it is how the sticky title comes off again, and
+    // the session goes back to being called whatever it was calling itself.
+    client.rename("").await;
+    titled(&node, &name, &called).await;
+
+    node.registry.kill(&name).unwrap();
 }

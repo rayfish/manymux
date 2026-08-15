@@ -284,6 +284,7 @@ impl Node {
                     size: attached.size,
                     paste: true,
                     scroll: true,
+                    rename: true,
                 };
                 proto::write_msg(&mut write, tag::RESPONSE, &response).await?;
                 pump_attachment(attached, &name, self.events.subscribe(), read, write).await
@@ -454,6 +455,16 @@ where
                         let request: FindRequest = proto::decode(&frame.body)?;
                         let found = attachment.find(&request.needle);
                         proto::write_msg(&mut write, tag::FIND, &found).await?;
+                    }
+                    // A title typed at the client's own prompt, which is the
+                    // same sticky title `mm rename` sets. Nothing is sent back:
+                    // there is nothing here that can refuse it, and no way to
+                    // say anything on this stream that would not land in the
+                    // middle of whatever the program is drawing.
+                    tag::RENAME => {
+                        let title: String = proto::decode(&frame.body)?;
+                        debug!(session = %name, %title, "renamed from an attached client");
+                        attachment.rename(&title);
                     }
                     tag::PASTE => incoming.take(frame.body),
                     tag::PASTE_END => {

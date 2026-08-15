@@ -401,6 +401,7 @@ impl Stream {
                 size,
                 paste,
                 scroll,
+                rename,
             } => Ok(Attached {
                 read: self.read,
                 write: self.write,
@@ -408,6 +409,7 @@ impl Stream {
                 size,
                 paste,
                 scroll,
+                rename,
             }),
             Response::Error(message) => bail!(message),
             other => bail!("unexpected response to attach: {other:?}"),
@@ -430,6 +432,10 @@ pub struct Attached {
     /// Whether this host can be scrolled back through, for the same reason and
     /// with the same answer when it cannot.
     pub scroll: bool,
+    /// Whether this host takes a title from an attached client, again for the
+    /// same reason: a rename key that quietly did nothing would read as a
+    /// broken client rather than an old host.
+    pub rename: bool,
 }
 
 /// The two halves of an attached session, so output can be read while input is
@@ -583,6 +589,16 @@ impl SessionWriter {
             needle: needle.to_string(),
         };
         proto::write_msg(&mut self.write, tag::FIND, &request).await
+    }
+
+    /// Give the session a sticky title, the one `mm rename` sets and `mm ls`
+    /// shows. An empty one clears it, and the program's own title is back.
+    ///
+    /// Nothing answers: there is nothing on the host that can refuse it, and a
+    /// reply would have to come back down the same pipe the session's output is
+    /// on. What went in is on the row the client drew it on.
+    pub async fn rename(&mut self, title: &str) -> Result<()> {
+        proto::write_msg(&mut self.write, tag::RENAME, &title).await
     }
 
     /// Answer an [`Update::Ping`], which is how the host tells a client that is

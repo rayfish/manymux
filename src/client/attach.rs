@@ -252,6 +252,8 @@ pub enum Action {
     /// filter, since that is what a keyboard mode is; everything done with it
     /// is the caller's.
     Find(Find),
+    /// The same, for the prompt that gives the session a title.
+    Rename(Rename),
 }
 
 /// What a key did to the search.
@@ -268,6 +270,23 @@ pub enum Find {
     /// The next match further back, and the one back towards the live screen.
     Next,
     Previous,
+}
+
+/// What a key did to the rename prompt.
+///
+/// The same four as a search, minus the two that walk matches: a title is
+/// typed and then either sent or given up on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Rename {
+    /// The prompt is open and empty. Draw it.
+    Open,
+    /// The title changed. Draw it again.
+    Typed,
+    /// Enter: give the session what has been typed. An empty one is not a
+    /// mistake, it is how the sticky title is cleared.
+    Run,
+    /// Esc, or a rub with nothing left to rub out: the title stays as it was.
+    Cancel,
 }
 
 /// A move through the history. Opening the view is not one of these: any of
@@ -317,6 +336,10 @@ pub enum Mode {
     /// the keys move it. Only on a screen the client owns, where the terminal
     /// has no scrollback of its own to offer.
     Scroll,
+    /// A title is being typed on the mark row. A mode of its own because the
+    /// keyboard here is neither the session's nor doing control keys: every
+    /// letter is text, and the row is the only place it shows.
+    Rename,
 }
 
 impl Mode {
@@ -326,6 +349,7 @@ impl Mode {
             Mode::Focus => "focus",
             Mode::Control => "control",
             Mode::Scroll => "scroll",
+            Mode::Rename => "rename",
         }
     }
 }
@@ -438,13 +462,56 @@ pub struct KeyFilter {
     /// takes nothing from the session, and dropping the ones that are not the
     /// wheel keeps a stray click from typing into a shell.
     wheel: bool,
-    /// What is being typed at the search prompt, while one is open.
+    /// What is being typed at a prompt, while one is open, and which prompt
+    /// it is.
     ///
     /// Kept here rather than by the caller because it is keyboard state, and
-    /// because a chunk holding several typed bytes has to become one needle
+    /// because a chunk holding several typed bytes has to become one line
     /// rather than one action per byte, which is a shape this returns nothing
     /// for.
-    needle: Option<Vec<u8>>,
+    prompt: Option<Prompt>,
+}
+
+/// A line being typed at one of the client's prompts.
+///
+/// The editing is the same either way, which is the reason there is one of
+/// these rather than one per prompt: a rub is a rub, and only the action
+/// handed back says which prompt it happened at.
+struct Prompt {
+    what: Prompting,
+    typed: Vec<u8>,
+}
+
+/// Which prompt is open.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Prompting {
+    /// A search through the session's history.
+    Find,
+    /// The session's title.
+    Rename,
+}
+
+impl Prompting {
+    /// The same four things happen at either prompt; which action carries them
+    /// is all that differs, so the pair is named at the one place it matters.
+    fn action(self, find: Find, rename: Rename) -> Action {
+        match self {
+            Prompting::Find => Action::Find(find),
+            Prompting::Rename => Action::Rename(rename),
+        }
+    }
+}
+
+/// Take the last character off a line being typed, and say whether there was
+/// one to take.
+///
+/// A character rather than a byte, because one press of a key that put three
+/// bytes in has to take all three out again. UTF-8 continuation bytes are
+/// `0b10xxxxxx`, so the character starts at the last byte that is not one.
+fn pop_char(typed: &mut Vec<u8>) -> Option<()> {
+    let start = typed.iter().rposition(|b| b & 0xc0 != 0x80)?;
+    typed.truncate(start);
+    Some(())
 }
 
 /// Opens the view, from control mode. tmux's copy-mode key, for the hands that
@@ -504,20 +571,30 @@ impl KeyFilter {
             spelling: vec![prefix],
             scroll: false,
             wheel: false,
-            needle: None,
+            prompt: None,
         }
     }
 
-    /// What is being typed at the search prompt, if one is open.
+    /// What is being typed at the search prompt, if that is the one open.
     pub fn needle(&self) -> Option<String> {
-        self.needle
-            .as_ref()
-            .map(|typed| String::from_utf8_lossy(typed).into_owned())
+        self.typed(Prompting::Find)
     }
 
-    /// Close the prompt, keeping whatever was typed out of the next search.
+    /// What is being typed at the rename prompt, if that is the one open.
+    pub fn title(&self) -> Option<String> {
+        self.typed(Prompting::Rename)
+    }
+
+    fn typed(&self, what: Prompting) -> Option<String> {
+        self.prompt
+            .as_ref()
+            .filter(|prompt| prompt.what == what)
+            .map(|prompt| String::from_utf8_lossy(&prompt.typed).into_owned())
+    }
+
+    /// Close the prompt, keeping whatever was typed out of the next one.
     pub fn stop_typing(&mut self) {
-        self.needle = None;
+        self.prompt = None;
     }
 
     /// How the terminal spelled the last key the client took for itself, for a
@@ -547,6 +624,10 @@ impl KeyFilter {
             // and leaves you there. Cancelling the prompt is cancelling the
             // prompt, not leaving.
             Action::Find(_) => Mode::Scroll,
+            // The rename prompt is its own mode, and the only ways out of it
+            // are sending the title and giving up on it.
+            Action::Rename(Rename::Run | Rename::Cancel) => Mode::Focus,
+            Action::Rename(_) => Mode::Rename,
         }
     }
 
@@ -597,8 +678,9 @@ impl KeyFilter {
             // search and not a detach. The whole chunk at once, because typing
             // arrives in chunks and one action per byte would drop the rest of
             // each of them.
-            if self.needle.is_some() {
+            if self.prompt.is_some() {
                 let action = self.typing(&input[i..]);
+                self.mode = Self::after(action);
                 return Keystrokes {
                     forward,
                     action: Some(action),
@@ -692,7 +774,7 @@ impl KeyFilter {
                 };
                 if let Some(found) = found {
                     if found == Find::Open {
-                        self.needle = Some(Vec::new());
+                        self.open(Prompting::Find);
                     }
                     return Keystrokes {
                         forward,
@@ -770,8 +852,17 @@ impl KeyFilter {
                 // Straight from control mode into a search, which is the whole
                 // gesture: `Ctrl-] /`, type, Enter.
                 FIND_KEY if self.scroll => {
-                    self.needle = Some(Vec::new());
+                    self.open(Prompting::Find);
                     Some(Action::Find(Find::Open))
+                }
+                // And the same gesture for the title: `Ctrl-] r`, type, Enter.
+                // Nothing here asks the host first, so it is bound whether or
+                // not the host turns out to take it: an old one is answered
+                // with a sentence on the row, which is more use than a letter
+                // that lands in the shell.
+                b'r' | b'R' => {
+                    self.open(Prompting::Rename);
+                    Some(Action::Rename(Rename::Open))
                 }
                 // Shift-Tab, which starts with the same byte as the Esc that
                 // goes back to focus. An Esc with `[Z` behind it in the same
@@ -811,42 +902,51 @@ impl KeyFilter {
         }
     }
 
-    /// Everything typed at an open search prompt, in one go.
+    /// Open a prompt, empty.
+    fn open(&mut self, what: Prompting) {
+        self.prompt = Some(Prompt {
+            what,
+            typed: Vec::new(),
+        });
+    }
+
+    /// Everything typed at an open prompt, in one go.
     ///
     /// Stops at the first key that ends the typing, and drops whatever followed
     /// it: nobody types through an Enter, the same way nobody types through a
     /// detach. Bytes that are not printable are dropped rather than added to
-    /// the needle, which keeps an arrow key from becoming three characters of
-    /// search text.
+    /// the line, which keeps an arrow key from becoming three characters of
+    /// search text or of title.
     fn typing(&mut self, input: &[u8]) -> Action {
-        let Some(needle) = self.needle.as_mut() else {
+        let Some(prompt) = self.prompt.as_mut() else {
             return Action::Find(Find::Cancel);
         };
+        let what = prompt.what;
         for &b in input {
             match b {
-                b'\r' | b'\n' => return Action::Find(Find::Run),
+                b'\r' | b'\n' => return what.action(Find::Run, Rename::Run),
                 0x1b => {
-                    self.needle = None;
-                    return Action::Find(Find::Cancel);
+                    self.prompt = None;
+                    return what.action(Find::Cancel, Rename::Cancel);
                 }
                 // Backspace, in both spellings terminals send.
                 0x08 | 0x7f => {
                     // A rub with nothing left to rub out closes the prompt,
                     // which is where a hand that changed its mind ends up.
-                    if needle.pop().is_none() {
-                        self.needle = None;
-                        return Action::Find(Find::Cancel);
+                    if pop_char(&mut prompt.typed).is_none() {
+                        self.prompt = None;
+                        return what.action(Find::Cancel, Rename::Cancel);
                     }
                 }
                 // Ctrl-U, which is what a shell means by "start again".
-                0x15 => needle.clear(),
+                0x15 => prompt.typed.clear(),
                 // Printable, and the bytes of a multi-byte character, which
                 // are all above 0x7f and go in as they come.
-                0x20..=0x7e | 0x80.. => needle.push(b),
+                0x20..=0x7e | 0x80.. => prompt.typed.push(b),
                 _ => {}
             }
         }
-        Action::Find(Find::Typed)
+        what.action(Find::Typed, Rename::Typed)
     }
 
     /// One key in the terminal's own spelling. Returns what it asked for, if it
@@ -935,7 +1035,7 @@ mod terminal {
     use tokio::signal::unix::{SignalKind, signal};
     use tokio::sync::mpsc;
 
-    use super::{Action, Find, KeyFilter, Mode, Outcome, Scroll};
+    use super::{Action, Find, KeyFilter, Mode, Outcome, Rename, Scroll};
     use crate::client::screen::ScreenMode;
     use crate::client::scroll::Scrollback;
     use crate::client::status::{self, Filter, Status};
@@ -1244,6 +1344,7 @@ mod terminal {
     ) -> Result<Outcome> {
         let takes_pastes = session.paste;
         let scrolls = session.scroll;
+        let renames = session.rename;
         let SessionHalves {
             mut reader,
             mut writer,
@@ -1412,6 +1513,49 @@ mod terminal {
                                 .write_all(status.repaint(terminal_size()).as_bytes())
                                 .await?;
                             stdout.flush().await?;
+                        }
+                        // The same shape as a search, and the same reason for
+                        // it: the title lives in the key filter until Enter, so
+                        // all there is to do until then is keep the row saying
+                        // what is in it.
+                        Some(Action::Rename(_)) if !renames => {
+                            keys.stop_typing();
+                            keys.set_mode(Mode::Focus);
+                            status.set_mode(Mode::Focus);
+                            status.set_renaming(None);
+                            status.set_notice(
+                                "this host is too old to rename from here; `mm rename` instead",
+                            );
+                            notice_until = Some(tokio::time::Instant::now() + NOTICE_FOR);
+                            restate = true;
+                            settle(&mut stdout, &output, &status, &mut pending, &mut restate)
+                                .await?;
+                        }
+                        Some(Action::Rename(step)) => {
+                            match step {
+                                Rename::Open | Rename::Typed => {
+                                    status.set_renaming(keys.title());
+                                }
+                                Rename::Cancel => status.set_renaming(None),
+                                Rename::Run => {
+                                    let title = keys.title().unwrap_or_default();
+                                    keys.stop_typing();
+                                    status.set_renaming(None);
+                                    writer.rename(&title).await?;
+                                    // Nothing comes back, so the row is the
+                                    // only word there is that it went.
+                                    status.set_notice(&renamed(&title));
+                                    notice_until =
+                                        Some(tokio::time::Instant::now() + NOTICE_FOR);
+                                }
+                            }
+                            // Through `settle` rather than written on the spot,
+                            // unlike the search: that one runs with the view
+                            // owning the screen, and this one runs with the
+                            // session still painting on it.
+                            restate = true;
+                            settle(&mut stdout, &output, &status, &mut pending, &mut restate)
+                                .await?;
                         }
                         Some(Action::Paste) => {
                             // The key as the terminal spelled it, since it goes
@@ -1613,6 +1757,19 @@ mod terminal {
                     settle(&mut stdout, &output, &status, &mut pending, &mut restate).await?;
                 }
             }
+        }
+    }
+
+    /// What the row says once a title has gone to the host.
+    ///
+    /// Said at all because nothing else changes on the screen: the mark keeps
+    /// naming the session `host/name`, which is still what it is called, and
+    /// the title only shows in `mm ls` and the window's own name.
+    fn renamed(title: &str) -> String {
+        if title.is_empty() {
+            "title cleared".to_string()
+        } else {
+            format!("renamed to {title}")
         }
     }
 
@@ -2206,6 +2363,133 @@ mod tests {
         assert_eq!(
             f.filter(b"N"),
             asked(Action::Find(Find::Previous), Mode::Scroll)
+        );
+    }
+
+    /// One backspace undoes one keypress, whatever the terminal spent on it.
+    /// Popping a byte left half a character behind, which showed on the row as
+    /// a replacement character and went to the host as one.
+    #[test]
+    fn a_rub_takes_a_whole_character_off_however_many_bytes_it_was() {
+        let mut f = KeyFilter::new(KEY);
+        f.set_scroll(true);
+        f.filter(&[KEY, FIND_KEY]);
+        f.filter("día".as_bytes());
+        f.filter(&[0x7f]);
+        assert_eq!(f.needle().as_deref(), Some("dí"));
+        f.filter(&[0x7f]);
+        assert_eq!(f.needle().as_deref(), Some("d"));
+    }
+
+    /// The whole gesture, the same as a search: `Ctrl-] r`, type, Enter. The
+    /// title stays in the filter until it is run, for the same reason the
+    /// needle does.
+    #[test]
+    fn a_title_is_typed_at_the_prompt_and_sent_with_enter() {
+        let mut f = KeyFilter::new(KEY);
+        assert_eq!(
+            f.filter(&[KEY, b'r']),
+            asked(Action::Rename(Rename::Open), Mode::Rename)
+        );
+        assert_eq!(f.title().as_deref(), Some(""));
+
+        assert_eq!(
+            f.filter("nightly bench".as_bytes()),
+            asked(Action::Rename(Rename::Typed), Mode::Rename)
+        );
+        assert_eq!(f.title().as_deref(), Some("nightly bench"));
+
+        // And back to the session, which is where you were before.
+        assert_eq!(
+            f.filter(b"\r"),
+            asked(Action::Rename(Rename::Run), Mode::Focus)
+        );
+    }
+
+    /// Nothing typed at the prompt reaches the session, keys that do things
+    /// elsewhere included: a title beginning with `d` is a title, not a detach,
+    /// and the tab that would walk the sessions is dropped the way every other
+    /// unprintable key is.
+    #[test]
+    fn nothing_typed_at_the_rename_prompt_reaches_the_session() {
+        let mut f = KeyFilter::new(KEY);
+        f.filter(&[KEY, b'r']);
+        assert_eq!(
+            f.filter(b"deploy\tp"),
+            asked(Action::Rename(Rename::Typed), Mode::Rename)
+        );
+        assert_eq!(f.title().as_deref(), Some("deployp"));
+    }
+
+    /// Enter on an empty prompt is not a mistake: it is the only way to say
+    /// "back to whatever the program calls itself", the same as
+    /// `mm rename <target> ""`.
+    #[test]
+    fn an_empty_title_is_how_the_sticky_one_is_taken_off() {
+        let mut f = KeyFilter::new(KEY);
+        f.filter(&[KEY, b'r']);
+        assert_eq!(
+            f.filter(b"\r"),
+            asked(Action::Rename(Rename::Run), Mode::Focus)
+        );
+        assert_eq!(f.title().as_deref(), Some(""));
+    }
+
+    #[test]
+    fn the_rename_prompt_can_be_rubbed_out_and_backed_out_of() {
+        let mut f = KeyFilter::new(KEY);
+        f.filter(&[KEY, b'r']);
+        f.filter(b"abc");
+        f.filter(&[0x7f]);
+        assert_eq!(f.title().as_deref(), Some("ab"));
+
+        assert_eq!(
+            f.filter(&[0x1b]),
+            asked(Action::Rename(Rename::Cancel), Mode::Focus)
+        );
+        assert_eq!(f.title(), None);
+
+        // And the rub with nothing left to rub out, which is the other way a
+        // hand that changed its mind gets out.
+        f.filter(&[KEY, b'r']);
+        assert_eq!(
+            f.filter(&[0x7f]),
+            asked(Action::Rename(Rename::Cancel), Mode::Focus)
+        );
+        assert_eq!(f.title(), None);
+    }
+
+    /// Two prompts, one buffer. What is typed at one must never turn up at the
+    /// other.
+    #[test]
+    fn the_two_prompts_do_not_share_what_is_typed_at_them() {
+        let mut f = KeyFilter::new(KEY);
+        f.set_scroll(true);
+        f.filter(&[KEY, FIND_KEY]);
+        f.filter(b"error");
+        assert_eq!(f.title(), None, "a needle is not a title");
+
+        // Running the search leaves the needle for the caller to read, which is
+        // what closes the prompt, and then the view is left the usual way.
+        f.filter(b"\r");
+        f.stop_typing();
+        f.set_mode(Mode::Focus);
+
+        f.filter(&[KEY, b'r']);
+        assert_eq!(f.needle(), None, "a title is not a needle");
+        assert_eq!(f.title().as_deref(), Some(""), "and it starts empty");
+    }
+
+    /// The key is bound whether or not the host takes a title, so that an old
+    /// one can be answered with a sentence. Without that it would be a letter
+    /// landing in the shell.
+    #[test]
+    fn the_rename_key_does_not_wait_to_hear_whether_the_host_takes_one() {
+        let mut f = KeyFilter::new(KEY);
+        f.set_scroll(false);
+        assert_eq!(
+            f.filter(&[KEY, b'r']),
+            asked(Action::Rename(Rename::Open), Mode::Rename)
         );
     }
 

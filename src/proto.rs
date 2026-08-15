@@ -101,6 +101,20 @@ pub mod tag {
     /// lines are already in memory on the node and walking the matches is then
     /// local: `n` on a machine two hops away should not be a round trip.
     pub const FIND: u8 = 0x1c;
+
+    /// A new sticky title for the session this stream is attached to, as a
+    /// msgpack string. Client to server only, and the same thing `mm rename`
+    /// asks for over a stream of its own: an empty one clears it.
+    ///
+    /// On the attached stream rather than a second connection because that is
+    /// where the session already is. An [`super::Attached`] holds no socket and
+    /// no host, so a client that wanted to send a `Request` would have to know
+    /// how it got here, which is the one thing this half of the client is kept
+    /// from knowing.
+    ///
+    /// A node too old to know the tag skips it in silence, which is why
+    /// [`super::Response::Attached`] says whether this one does.
+    pub const RENAME: u8 = 0x1d;
 }
 
 /// The largest file a paste may carry. A screenshot is a couple of megabytes;
@@ -244,6 +258,11 @@ pub enum Response {
         /// it existed, so the key says so rather than doing nothing.
         #[serde(default)]
         scroll: bool,
+        /// Whether this host takes [`tag::RENAME`], so the title can be set
+        /// from inside the session rather than only by `mm rename`. False the
+        /// same way and for the same reason as the two above.
+        #[serde(default)]
+        rename: bool,
     },
     /// What the node is running. `build` is the SHA-256 of the binary it
     /// started from, taken at startup: the version alone cannot answer the
@@ -544,6 +563,7 @@ mod tests {
             size,
             paste,
             scroll,
+            rename,
         } = decoded
         else {
             panic!("an old answer should still be an attach");
@@ -554,6 +574,7 @@ mod tests {
             !scroll,
             "nor answer for a window of a history it cannot send"
         );
+        assert!(!rename, "nor take a title on a tag it has never heard of");
 
         // And the other way: an old client reading a new host's answer, which
         // is a fleet updated from the far end first.
@@ -561,6 +582,7 @@ mod tests {
             size: Size::new(80, 24),
             paste: true,
             scroll: true,
+            rename: true,
         })
         .unwrap();
         assert!(matches!(decode::<Old>(&new).unwrap(), Old::Attached { .. }));

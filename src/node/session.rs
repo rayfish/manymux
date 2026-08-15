@@ -168,6 +168,12 @@ impl Attachment {
         super::history::find(&state.vt, needle)
     }
 
+    /// Set the session's sticky title from inside it, which is the same thing
+    /// `mm rename` does from outside and so takes the same empty-clears rule.
+    pub fn rename(&self, title: &str) {
+        self.session.rename(title);
+    }
+
     pub fn exit_rx(&self) -> watch::Receiver<Option<i32>> {
         self.session.exit_rx.clone()
     }

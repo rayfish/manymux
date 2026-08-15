@@ -114,7 +114,7 @@ If it says the host is too old to take pasted files, that is the *node* holding
 the session, not the binary you typed into: see [Keeping it
 running](#keeping-it-running).
 
-## Two modes
+## Modes
 
 Modal, like vim, and for the same reason: the keys worth having are the ones a
 session wants for itself.
@@ -133,8 +133,14 @@ word goes amber, and the row spells out what the keys do. It stays on, so one
 | `h` | next machine |
 | `H` | previous machine |
 | `l` | the one you came from |
+| `r` | rename this session |
 | `d` | detach |
 | `esc`, `enter`, `Ctrl-]` | back to focus |
+
+`r` opens a prompt on the mark row: type a title, `enter` sets it, `esc` leaves
+it alone, and `enter` with nothing typed takes a sticky title off again. It is
+the same title `mm rename` sets, so see [Titles, bells and
+notifications](#titles-bells-and-notifications) for what it does.
 
 Two levels, because that is how your sessions are arranged. `tab` stays on the
 machine you are on and wraps around its sessions; `h` moves you to the next
@@ -201,6 +207,10 @@ it is working on. `mm rename` overrides it with something sticky:
 ```bash
 mm rename gpu-box/build "nightly bench"
 ```
+
+From inside the session it is `Ctrl-] r`, then the title, then `enter`. Either
+way, an empty title takes the sticky one off and the program gets to name itself
+again.
 
 When a session rings the bell or asks for a notification outright (OSC 9,
 OSC 777) and nobody is attached to see it, you are told. Where depends on where
