@@ -23,7 +23,24 @@ const GUTTER: u16 = 2;
 
 /// What the keys do, shown while control mode is on. Without it the mode is a
 /// terminal that has stopped taking what you type for no visible reason.
-const HINT: &str = "tab next  p prev  h host  l last  d detach  esc focus";
+///
+/// Cut from the end when the row cannot hold all of it, rather than dropped
+/// whole: the mark takes what it takes, a long target name leaves little
+/// beside it, and there are more keys than an eighty-column row has room for.
+/// So they are in the order a hand reaches for them, and the last ones are the
+/// ones a session can be driven without.
+const HINTS: &[&str] = &[
+    "tab next",
+    "p prev",
+    "r rename",
+    "d detach",
+    "esc focus",
+    "h host",
+    "l last",
+];
+
+/// What sits between one hint and the next, the same gutter again.
+const HINT_GAP: &str = "  ";
 
 /// The same, for the view over the session's history, where the keys are
 /// different again and the screen is showing something the session did not
@@ -190,8 +207,9 @@ impl Status {
     }
 
     /// What sits at the left end of the same row: whatever the client has to
-    /// say, else the key hints while control mode is on, while there is room
-    /// for it beside the mark. The mark wins when there is not.
+    /// say, else the key hints while control mode is on, in as much room as the
+    /// mark leaves beside it. The mark wins when there is none: everything here
+    /// is either dropped or, in the hints' case, cut short to fit.
     fn hint(&self, size: Size, mark: u16) -> String {
         // A prompt being typed into outranks the lot: it is the only thing on
         // this row that changes a keystroke at a time.
@@ -200,7 +218,10 @@ impl Status {
             return if columns(&typed) + 1 + mark + GUTTER > size.cols {
                 String::new()
             } else {
-                style::amber(&typed)
+                // The label is the client talking, and stays the colour every
+                // other mode marker on this row is. What follows it is text
+                // being typed, and reads as text rather than as more chrome.
+                format!("{}{}", style::amber(label), style::value(prompt))
             };
         }
         let scrolled = self.scrolled.map(|lines| match &self.searching {
@@ -217,7 +238,15 @@ impl Status {
             // cannot say: it is showing lines that look exactly like the ones
             // the session printed a moment ago.
             (None, Some(scrolled), _) => (scrolled.as_str(), style::amber as fn(&str) -> String),
-            (None, None, Mode::Control) => (HINT, style::faint as fn(&str) -> String),
+            // The one thing on this row that can be shortened to fit, and is.
+            (None, None, Mode::Control) => {
+                let hints = hints(size.cols.saturating_sub(1 + mark + GUTTER));
+                return if hints.is_empty() {
+                    String::new()
+                } else {
+                    style::faint(&hints)
+                };
+            }
             // Rename is here for the sake of the match: that mode is never on
             // without a prompt, which was answered above.
             (None, None, Mode::Focus | Mode::Scroll | Mode::Rename) => return String::new(),
@@ -234,6 +263,29 @@ impl Status {
     fn title(&self, text: &str) -> String {
         format!("\x1b]0;{}\x07", prefixed(text))
     }
+}
+
+/// As many of the hints as fit in `room` columns, in their own order and with
+/// the same gutter between them as the rest of the row uses.
+///
+/// The first one that does not fit ends it, rather than being stepped over for
+/// a shorter one behind it: the order is what says which keys matter, and a
+/// list that reorders itself as the window is dragged is a list nobody can
+/// learn.
+fn hints(room: u16) -> String {
+    let mut text = String::new();
+    for hint in HINTS {
+        let next = if text.is_empty() {
+            (*hint).to_string()
+        } else {
+            format!("{text}{HINT_GAP}{hint}")
+        };
+        if columns(&next) > room {
+            break;
+        }
+        text = next;
+    }
+    text
 }
 
 /// How many columns a piece of unstyled text takes.
@@ -921,17 +973,33 @@ mod tests {
         status.set_mode(Mode::Control);
         let painted = status.repaint(Size::new(80, 24));
         assert!(painted.contains("tab next"), "{painted:?}");
+        // Including the keys that are their own gesture rather than a motion,
+        // which are the ones a session can be driven without knowing.
+        assert!(painted.contains("r rename"), "{painted:?}");
+        assert!(painted.contains("d detach"), "{painted:?}");
         // And the mark keeps its place beside them.
         assert!(painted.contains("\x1b[24;62H"), "{painted:?}");
     }
 
+    /// A row with room for some of them shows some of them, in order, rather
+    /// than going blank because the last one would not fit.
     #[test]
-    fn a_row_too_narrow_for_both_keeps_the_mark() {
+    fn a_row_too_narrow_for_all_the_hints_cuts_them_from_the_end() {
         let mut status = Status::new("srv/zsh");
         status.set_mode(Mode::Control);
         let painted = status.repaint(Size::new(40, 24));
-        assert!(!painted.contains("tab next"), "{painted:?}");
+        assert!(painted.contains("tab next  p prev"), "{painted:?}");
+        assert!(!painted.contains("l last"), "{painted:?}");
         assert!(painted.contains("\x1b[24;22H"), "{painted:?}");
+    }
+
+    #[test]
+    fn a_row_too_narrow_for_any_of_them_keeps_the_mark() {
+        let mut status = Status::new("srv/zsh");
+        status.set_mode(Mode::Control);
+        let painted = status.repaint(Size::new(24, 24));
+        assert!(!painted.contains("tab next"), "{painted:?}");
+        assert!(painted.contains("\x1b[24;6H"), "{painted:?}");
     }
 
     /// The row is the only place a title being typed shows, so it has to say
