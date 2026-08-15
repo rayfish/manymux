@@ -93,7 +93,11 @@ impl Registry {
         let mut sessions = self.sessions.lock().unwrap();
         prune(&mut sessions);
         let mut out: Vec<_> = sessions.values().map(|s| s.info()).collect();
-        out.sort_by(|a, b| a.name.cmp(&b.name));
+        // Oldest first, and by name only to break a tie: two sessions opened in
+        // the same instant have to come out one way round every time, and a
+        // host too old to stamp them at all ties every one of them, which is
+        // how it keeps the name order it has always had.
+        out.sort_by(|a, b| (a.started, &a.name).cmp(&(b.started, &b.name)));
         out
     }
 

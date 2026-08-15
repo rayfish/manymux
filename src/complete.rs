@@ -358,6 +358,8 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::time::SystemTime;
+
     use super::*;
     use manymux::proto::Size;
 
@@ -371,6 +373,7 @@ mod tests {
             attached: 0,
             idle: 0,
             bells: 0,
+            started: SystemTime::now(),
         }
     }
 

@@ -153,6 +153,8 @@ pub fn duration(secs: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::time::SystemTime;
+
     use super::*;
     use crate::proto::Size;
 
@@ -166,6 +168,7 @@ mod tests {
             attached,
             idle,
             bells,
+            started: SystemTime::now(),
         }
     }
 

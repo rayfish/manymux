@@ -9,6 +9,12 @@
 //! run meant tabbing off the end of the machine you were working on landed you
 //! on another one without asking, and left no way to say "the next machine"
 //! outright. Machines are their own motion now.
+//!
+//! The order is the one the listing arrives in, which is by machine and then by
+//! when each session was opened, oldest first. It used to be by name, and a
+//! name is the one thing about a session that moves: renaming one shuffled the
+//! cycle under whoever was tabbing through it, so the key that had been
+//! reaching the session next door quietly started reaching a different one.
 
 use crate::client::attach::Motion;
 
@@ -75,12 +81,16 @@ impl Cycle {
         &self.current
     }
 
-    /// Take a new listing, ordered the way `mm ls` orders one so that walking
-    /// the cycle matches what you would have read off the table. Sorting by
-    /// machine first is also what makes each machine's sessions a run, which is
-    /// how the host motions find the first session on one.
-    pub fn refresh(&mut self, mut sessions: Vec<Located>) {
-        sessions.sort_by(|a, b| (&a.host, &a.session).cmp(&(&b.host, &b.session)));
+    /// Take a new listing, in the order it was listed in, so that walking the
+    /// cycle matches what you would have read off the `mm ls` table.
+    ///
+    /// The order is not worked out here because it cannot be: it is by the
+    /// time each session was opened, and a [`Located`] is an address rather
+    /// than a session, on purpose. Two sessions that swapped names are the same
+    /// two places in the cycle, and one that was renamed has not moved at all,
+    /// which is the whole point of ordering by the one thing that never
+    /// changes.
+    pub fn refresh(&mut self, sessions: Vec<Located>) {
         self.sessions = sessions;
     }
 
@@ -102,10 +112,14 @@ impl Cycle {
             }
             Motion::NextHost | Motion::PreviousHost => {
                 // The machines in listing order, which is the order the runs
-                // above appear in.
+                // above appear in. Each is taken where it first appears rather
+                // than wherever it stops being the last one seen, so a listing
+                // that arrived with a machine's sessions split up is a cycle
+                // that is merely in an odd order, not one with a machine in it
+                // twice.
                 let mut hosts: Vec<&str> = Vec::new();
                 for session in &self.sessions {
-                    if hosts.last() != Some(&session.host.as_str()) {
+                    if !hosts.contains(&session.host.as_str()) {
                         hosts.push(&session.host);
                     }
                 }
@@ -130,8 +144,19 @@ impl Cycle {
 
     /// The session you are in is called something else now. Not a hop, so
     /// `Motion::Last` is left pointing where it was: nobody moved.
+    ///
+    /// The listing is corrected in place rather than left to the next refresh,
+    /// which may be a while: one is only asked for after a hop. An entry under
+    /// the old name is one the cycle cannot find you at, and not being in the
+    /// listing is not the same as being at its start, so the next tab would
+    /// have gone back to the first session on the machine.
     pub fn renamed(&mut self, name: &str) {
-        self.current.session = name.to_string();
+        let was = std::mem::replace(&mut self.current.session, name.to_string());
+        for session in &mut self.sessions {
+            if session.host == self.current.host && session.session == was {
+                session.session = name.to_string();
+            }
+        }
     }
 
     /// Take back the last hop, leaving no trail: for one that could not be
@@ -206,16 +231,28 @@ mod tests {
     #[test]
     fn tab_walks_this_machine_in_the_order_mm_ls_shows_it() {
         let mut cycle = Cycle::new(Located::new("here", "api"));
+        // The listing as it arrives: by machine, and oldest first within one,
+        // so this machine reads web, api, db whatever they are called.
         cycle.refresh(vec![
-            Located::new("here", "web"),
             Located::new("gpu-box", "train"),
+            Located::new("here", "web"),
             Located::new("here", "api"),
             Located::new("here", "db"),
         ]);
-        // Sorted by machine, then name, so this machine reads api, db, web.
         assert_eq!(hop(&cycle, Motion::Next).as_deref(), Some("here/db"));
         // Around the end of this machine rather than into gpu-box.
         assert_eq!(hop(&cycle, Motion::Previous).as_deref(), Some("here/web"));
+    }
+
+    /// The reason the listing is ordered by when a session opened: a rename
+    /// used to move it, so the key that reached the session next door reached
+    /// somewhere else once you had named one of them.
+    #[test]
+    fn a_rename_leaves_every_session_where_it_was_in_the_cycle() {
+        let mut cycle = cycle(&["api", "build", "web"], "build");
+        cycle.renamed("zzz-nightly");
+        assert_eq!(step(&cycle, Motion::Next).as_deref(), Some("web"));
+        assert_eq!(step(&cycle, Motion::Previous).as_deref(), Some("api"));
     }
 
     #[test]
@@ -233,11 +270,29 @@ mod tests {
 
     #[test]
     fn the_host_keys_land_on_the_first_session_there() {
+        // The oldest session on the machine, which is the first one listed
+        // under it and not the first alphabetically.
         let cycle = spread(
             &[("box", "zulu"), ("box", "alpha"), ("here", "api")],
             ("here", "api"),
         );
-        assert_eq!(hop(&cycle, Motion::NextHost).as_deref(), Some("box/alpha"));
+        assert_eq!(hop(&cycle, Motion::NextHost).as_deref(), Some("box/zulu"));
+    }
+
+    /// A machine appears in the cycle once, at the first session listed under
+    /// it, so a listing that came in with a machine's sessions split up is odd
+    /// rather than broken.
+    #[test]
+    fn a_machine_whose_sessions_are_not_together_is_still_one_machine() {
+        let cycle = spread(
+            &[("box", "one"), ("here", "api"), ("box", "two")],
+            ("here", "api"),
+        );
+        assert_eq!(hop(&cycle, Motion::NextHost).as_deref(), Some("box/one"));
+        assert_eq!(
+            hop(&cycle, Motion::PreviousHost).as_deref(),
+            Some("box/one")
+        );
     }
 
     #[test]

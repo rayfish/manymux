@@ -302,6 +302,20 @@ Three consequences run through the whole codebase and are worth keeping intact:
   the name it was spawned under, which by then may be a *different*, live
   session, and `pump_attachment` compares an event against `attachment.name()`
   so a client does not hear its own bells as the session next door's.
+- **Every listing is ordered by when each session was opened, oldest first,
+  and never by name.** `SessionInfo::started` is stamped once in
+  `Session::spawn` and nothing writes it again, which is the whole reason it is
+  the sort key: a name moves, so ordering by one shuffled the switch keys'
+  cycle under whoever was tabbing through it, and the key that reached the
+  session next door started reaching a different one as soon as anything was
+  renamed. The three places that sort are `Registry::list`, `everywhere` in
+  `main.rs`, and nothing in `client::switch`: a `Located` is an address rather
+  than a session, so `Cycle::refresh` takes the listing in the order it came in
+  and `Cycle::renamed` corrects that snapshot in place rather than waiting for
+  a refresh that only a hop asks for. The field is `#[serde(default = "epoch")]`
+  because `SystemTime` has no `Default`, and a host too old to send it ties all
+  of its sessions at the epoch, where the name tiebreak leaves them in the order
+  they have always been in.
 
 ### Tests
 

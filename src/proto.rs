@@ -22,6 +22,8 @@
 
 use anyhow::{Result, bail};
 use bytes::BytesMut;
+use std::time::SystemTime;
+
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
@@ -429,6 +431,23 @@ pub struct SessionInfo {
     pub idle: u64,
     /// Bells rung since the last attach.
     pub bells: u64,
+    /// When the session was opened. What every listing is ordered by, so that
+    /// the order is the one thing about a session that never moves: a rename
+    /// changes the name a listing sorts on, and a switch key that landed
+    /// somewhere else afterwards is a key you cannot press without looking.
+    ///
+    /// Defaulted rather than required, because a node from before this existed
+    /// says nothing and would otherwise fail to decode. Every session on such a
+    /// host reads as the epoch, ties, and falls back to the name order it has
+    /// always had.
+    #[serde(default = "epoch")]
+    pub started: SystemTime,
+}
+
+/// What a host too old to stamp a session with its start time is taken to have
+/// said. `SystemTime` has no `Default` of its own to borrow for this.
+fn epoch() -> SystemTime {
+    SystemTime::UNIX_EPOCH
 }
 
 pub async fn write_frame<W>(w: &mut W, tag: u8, body: &[u8]) -> Result<()>
@@ -665,6 +684,61 @@ mod tests {
         })
         .unwrap();
         assert_eq!(decode::<Old>(&new).unwrap().session, "api");
+    }
+
+    /// And for the listing, where an undecodable answer would be an `mm ls`
+    /// that says a machine is unreachable when it is only running last week's
+    /// build.
+    #[test]
+    fn an_older_hosts_listing_still_decodes() {
+        /// `SessionInfo` as it was before a session was stamped with the time
+        /// it opened.
+        #[derive(Serialize, Deserialize)]
+        struct Old {
+            name: String,
+            title: String,
+            command: String,
+            pid: u32,
+            size: Size,
+            attached: usize,
+            idle: u64,
+            bells: u64,
+        }
+
+        let old = encode(&Old {
+            name: "api".into(),
+            title: "zsh".into(),
+            command: "zsh".into(),
+            pid: 1,
+            size: Size::new(80, 24),
+            attached: 0,
+            idle: 0,
+            bells: 0,
+        })
+        .unwrap();
+        let info: SessionInfo = decode(&old).unwrap();
+        assert_eq!(info.name, "api");
+        assert_eq!(
+            info.started,
+            SystemTime::UNIX_EPOCH,
+            "a host that cannot say when a session opened leaves them all tied"
+        );
+
+        // And an old client reading a new host's listing, which is the same
+        // fleet from the other end.
+        let new = encode(&SessionInfo {
+            name: "api".into(),
+            title: "zsh".into(),
+            command: "zsh".into(),
+            pid: 1,
+            size: Size::new(80, 24),
+            attached: 0,
+            idle: 0,
+            bells: 0,
+            started: SystemTime::now(),
+        })
+        .unwrap();
+        assert_eq!(decode::<Old>(&new).unwrap().name, "api");
     }
 
     /// What makes an unanswered version request an answer in itself: a node

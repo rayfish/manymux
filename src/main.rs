@@ -829,9 +829,15 @@ async fn everywhere(socket: &Path) -> Result<Listing> {
         }
     }
 
-    listing
-        .sessions
-        .sort_by(|a, b| (&a.host, &a.session.name).cmp(&(&b.host, &b.session.name)));
+    // By machine first, which is what makes each one's sessions a run in the
+    // table and in the switch keys' cycle, then oldest first within it.
+    listing.sessions.sort_by(|a, b| {
+        (&a.host, a.session.started, &a.session.name).cmp(&(
+            &b.host,
+            b.session.started,
+            &b.session.name,
+        ))
+    });
     listing.unreachable.sort_by(|a, b| a.host.cmp(&b.host));
     Ok(listing)
 }

@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Instant, SystemTime};
 
 use anyhow::{Context, Result};
 use avt::Vt;
@@ -46,6 +46,10 @@ pub struct Session {
     name: Mutex<String>,
     pub command: String,
     pub pid: u32,
+    /// When this was opened. Outside the lock above because it is the one
+    /// thing about a session that nothing changes, which is exactly why every
+    /// listing is ordered by it.
+    pub started: SystemTime,
     input_tx: mpsc::UnboundedSender<Input>,
     output_tx: broadcast::Sender<Arc<[u8]>>,
     state: Mutex<State>,
@@ -242,6 +246,7 @@ impl Session {
             name: Mutex::new(name.clone()),
             command: label,
             pid,
+            started: SystemTime::now(),
             input_tx,
             output_tx: output_tx.clone(),
             state: Mutex::new(State {
@@ -473,6 +478,7 @@ impl Session {
             attached: state.clients.len(),
             idle: state.last_activity.elapsed().as_secs(),
             bells: state.bells,
+            started: self.started,
         }
     }
 }

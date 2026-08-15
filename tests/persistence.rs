@@ -732,6 +732,34 @@ async fn a_session_disappears_from_the_list_once_its_child_exits() {
     assert!(registry.list().is_empty());
 }
 
+/// The listing is in the order the sessions were opened, so that the order a
+/// switch key walks is fixed at spawn and nothing moves in it afterwards. By
+/// name it was not: naming a session put it somewhere else in the cycle, and
+/// the key that reached the one next door reached something else instead.
+#[tokio::test]
+async fn the_listing_is_in_the_order_the_sessions_were_opened() {
+    let node = test_node().await;
+    let registry = &node.registry;
+    for name in ["web", "api", "db"] {
+        registry
+            .spawn(&SpawnSpec {
+                name: Some(name.to_string()),
+                command: vec!["/bin/sh".into(), "-c".into(), "sleep 300".into()],
+                ..Default::default()
+            })
+            .unwrap();
+    }
+    assert_eq!(names(&node), ["web", "api", "db"], "{:?}", names(&node));
+
+    // And a rename does not move one: the name is not what the order is on.
+    registry.rename("api", "aaa").unwrap();
+    assert_eq!(names(&node), ["web", "aaa", "db"], "{:?}", names(&node));
+
+    for name in ["web", "aaa", "db"] {
+        registry.kill(name).unwrap();
+    }
+}
+
 /// A session that exits takes its own entry out of the registry and nobody
 /// else's. Found by what has exited rather than by the name it was spawned
 /// under: a rename since has moved it, and that name may since have been taken
