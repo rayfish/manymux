@@ -18,7 +18,7 @@ use tokio::sync::{broadcast, mpsc, watch};
 use tracing::{debug, warn};
 
 use super::events::{Event, Scanner, Utf8Decoder};
-use crate::proto::{EventKind, SessionEvent, SessionInfo, Size, SpawnSpec};
+use crate::proto::{EventKind, SessionEvent, SessionInfo, Size, SpawnSpec, View, ViewRequest};
 use crate::user;
 
 /// Lines of scrollback kept per session. Enough to scroll back through a long
@@ -151,6 +151,13 @@ impl Attachment {
     /// rendering a hole.
     pub fn resync(&self) -> String {
         self.session.state.lock().unwrap().repaint()
+    }
+
+    /// A window of the session's history, for a client scrolling back through
+    /// it on a screen the terminal keeps no scrollback for.
+    pub fn window(&self, request: &ViewRequest) -> View {
+        let state = self.session.state.lock().unwrap();
+        super::history::window(&state.vt, request)
     }
 
     pub fn exit_rx(&self) -> watch::Receiver<Option<i32>> {

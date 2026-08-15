@@ -11,6 +11,8 @@
 
 use avt::{Color, Line, Pen, Vt};
 
+use crate::proto::{View, ViewRequest};
+
 /// The last `lines` lines of history, rendered with the pen sequences that
 /// coloured them, each ending in a carriage return and a newline.
 ///
@@ -27,6 +29,33 @@ pub fn render(vt: &Vt, lines: usize) -> String {
         write_line(line, &mut out);
     }
     out
+}
+
+/// A window of the buffer for a client scrolling back through it, screen
+/// included: scrolling up from the bottom has to be continuous, and the screen
+/// is where the bottom is.
+///
+/// Both ends are clamped rather than refused. A client asking past the top of a
+/// buffer that has trimmed under it gets what is there, and the `total` it
+/// comes back with is how it learns where the end went.
+pub fn window(vt: &Vt, request: &ViewRequest) -> View {
+    let all: Vec<&Line> = vt.lines().collect();
+    let total = all.len() as u64;
+    let from = request.from.min(total.saturating_sub(1));
+    // `from` counts back from the newest line, so the window ends here.
+    let bottom = total.saturating_sub(from);
+    let top = bottom.saturating_sub(u64::from(request.lines));
+    let lines = all[top as usize..bottom as usize]
+        .iter()
+        .map(|line| {
+            let mut rendered = String::new();
+            write_line(line, &mut rendered);
+            // The client places every line itself, so it wants the text and
+            // not the newline that would move the cursor for it.
+            rendered.trim_end_matches("\r\n").to_string()
+        })
+        .collect();
+    View { from, total, lines }
 }
 
 fn write_line(line: &Line, out: &mut String) {
@@ -165,6 +194,44 @@ mod tests {
             rendered.starts_with("\x1b[0;31mred\x1b[0m plain\r\n"),
             "{rendered:?}"
         );
+    }
+
+    /// The window a scrolling client reads. The screen is part of it: scrolling
+    /// up from the bottom has to be continuous, and the bottom is the screen.
+    #[test]
+    fn a_window_counts_back_from_the_newest_line() {
+        let mut vt = vt(20, 3);
+        for i in 1..=6 {
+            vt.feed_str(&format!("line {i}\r\n"));
+        }
+        // Seven lines: six printed and the one the cursor sits on.
+        let view = window(&vt, &ViewRequest { from: 0, lines: 3 });
+        assert_eq!(view.total, 7);
+        assert_eq!(view.from, 0);
+        assert_eq!(view.lines, vec!["line 5", "line 6", ""]);
+
+        // Two lines further back.
+        let view = window(&vt, &ViewRequest { from: 2, lines: 3 });
+        assert_eq!(view.lines, vec!["line 3", "line 4", "line 5"]);
+    }
+
+    /// A client asking past either end gets what is there. The buffer trims
+    /// from the top while it is being read, so running off it is ordinary.
+    #[test]
+    fn a_window_off_the_end_is_clamped_rather_than_refused() {
+        let mut vt = vt(20, 3);
+        for i in 1..=4 {
+            vt.feed_str(&format!("line {i}\r\n"));
+        }
+        let view = window(&vt, &ViewRequest {
+            from: 999,
+            lines: 3,
+        });
+        assert_eq!(view.from, 4, "the top of a five line buffer");
+        assert_eq!(view.lines, vec!["line 1"]);
+
+        let view = window(&vt, &ViewRequest { from: 0, lines: 99 });
+        assert_eq!(view.lines.len(), 5, "everything there is");
     }
 
     #[test]

@@ -31,7 +31,7 @@ use tracing::{debug, info, warn};
 use crate::client::Stream;
 use crate::hosts::{Hosts, this_machine};
 use crate::notify::Notifier;
-use crate::proto::{self, FrameReader, HostedEvent, Request, Response, tag};
+use crate::proto::{self, FrameReader, HostedEvent, Request, Response, ViewRequest, tag};
 use peers::Peers;
 use registry::Registry;
 
@@ -229,6 +229,7 @@ impl Node {
                 let response = Response::Attached {
                     size: attached.size,
                     paste: true,
+                    scroll: true,
                 };
                 proto::write_msg(&mut write, tag::RESPONSE, &response).await?;
                 pump_attachment(attached, &name, self.events.subscribe(), read, write).await
@@ -381,6 +382,15 @@ where
                     // picture still exists.
                     tag::RESYNC => {
                         send(&mut write, tag::RESYNC, attachment.resync().as_bytes()).await?
+                    }
+                    // A client scrolling back through what the session printed.
+                    // Answered from the model, which is the only place those
+                    // lines still exist: the terminal a client on a screen of
+                    // its own is sitting at keeps no scrollback for that screen.
+                    tag::VIEW => {
+                        let request: ViewRequest = proto::decode(&frame.body)?;
+                        let view = attachment.window(&request);
+                        proto::write_msg(&mut write, tag::VIEW, &view).await?;
                     }
                     tag::PASTE => incoming.take(frame.body),
                     tag::PASTE_END => {

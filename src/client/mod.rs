@@ -21,7 +21,9 @@ use tokio::process::{Child, ChildStderr};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
-use crate::proto::{self, FrameReader, HostedEvent, PasteInfo, Request, Response, Size, tag};
+use crate::proto::{
+    self, FrameReader, HostedEvent, PasteInfo, Request, Response, Size, ViewRequest, tag,
+};
 
 type Reader = FrameReader<Box<dyn AsyncRead + Unpin + Send>>;
 type Writer = Box<dyn AsyncWrite + Unpin + Send>;
@@ -378,12 +380,17 @@ impl Stream {
             history,
         };
         match self.request(&request).await? {
-            Response::Attached { size, paste } => Ok(Attached {
+            Response::Attached {
+                size,
+                paste,
+                scroll,
+            } => Ok(Attached {
                 read: self.read,
                 write: self.write,
                 carrier: self.carrier,
                 size,
                 paste,
+                scroll,
             }),
             Response::Error(message) => bail!(message),
             other => bail!("unexpected response to attach: {other:?}"),
@@ -403,6 +410,9 @@ pub struct Attached {
     /// from before pasting existed, which is worth saying out loud rather than
     /// leaving a key that does nothing.
     pub paste: bool,
+    /// Whether this host can be scrolled back through, for the same reason and
+    /// with the same answer when it cannot.
+    pub scroll: bool,
 }
 
 /// The two halves of an attached session, so output can be read while input is
@@ -446,6 +456,9 @@ pub enum Update {
     /// asked for them. Written to the terminal as they are, so its own
     /// scrollback holds what the session printed before this attach.
     History(Vec<u8>),
+    /// A window of the session's history, in answer to
+    /// [`SessionWriter::view`]. What a client scrolling back paints.
+    View(proto::View),
     /// The host is checking this client is still there. Answer it with
     /// [`SessionWriter::pong`], or the host will eventually conclude the client
     /// went away and detach it. Answering once is what opts a client in: one
@@ -476,6 +489,7 @@ impl SessionReader {
                 tag::DATA => Update::Output(frame.body),
                 tag::RESYNC => Update::Screen(frame.body),
                 tag::HISTORY => Update::History(frame.body),
+                tag::VIEW => Update::View(proto::decode(&frame.body)?),
                 tag::PING => Update::Ping,
                 tag::EVENT => Update::Event(proto::decode(&frame.body)?),
                 tag::EXIT => Update::Exited(proto::decode(&frame.body)?),
@@ -529,6 +543,16 @@ impl SessionWriter {
     /// the switch has to come from the node's model instead.
     pub async fn resync(&mut self) -> Result<()> {
         proto::write_frame(&mut self.write, tag::RESYNC, &[]).await
+    }
+
+    /// Ask for a window of the session's history, answered with an
+    /// [`Update::View`].
+    ///
+    /// A block rather than a screenful: scrolling inside what has already
+    /// arrived costs nothing, and a request per wheel notch would be a round
+    /// trip over ssh per wheel notch.
+    pub async fn view(&mut self, request: &ViewRequest) -> Result<()> {
+        proto::write_msg(&mut self.write, tag::VIEW, request).await
     }
 
     /// Answer an [`Update::Ping`], which is how the host tells a client that is

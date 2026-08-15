@@ -1022,6 +1022,8 @@ mod terminal {
                     Update::History(bytes) => {
                         stdout.write_all(&bytes).await?;
                     }
+                    // The view is wired to this a step from here.
+                    Update::View(_) => {}
                     // A bell in one of this machine's other sessions. The
                     // terminal is asked to raise it, and the row says which
                     // session it was, for a terminal that raises nothing.
@@ -1230,8 +1232,9 @@ mod terminal {
                     // only worth anything while it is news.
                     Update::Event(_) => {}
                     // Unreachable: history comes at the start of an attach,
-                    // before there has been a key to press.
-                    Update::History(_) => {}
+                    // before there has been a key to press, and the view is
+                    // never open while a paste is running.
+                    Update::History(_) | Update::View(_) => {}
                     Update::Exited(code) => return Ok(Pasted::Ended(Outcome::Exited(code))),
                     Update::Disconnected => return Ok(Pasted::Ended(Outcome::Disconnected)),
                 },
@@ -1275,6 +1278,8 @@ pub async fn collect_until(
             // For a caller with no terminal to raise one on. A client that
             // renders sessions itself reads these from its own subscription.
             Update::Event(_) => continue,
+            // Nothing here scrolls, so nothing here asked for a window.
+            Update::View(_) => continue,
             Update::Exited(code) => Outcome::Exited(code),
             Update::Disconnected => Outcome::Disconnected,
         };

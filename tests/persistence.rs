@@ -10,7 +10,7 @@ use std::time::Duration;
 use anyhow::Result;
 use manymux::node::{Config, Node};
 use manymux::proto::{
-    self, EventKind, FrameReader, HostedEvent, Request, Response, Size, SpawnSpec, tag,
+    self, EventKind, FrameReader, HostedEvent, Request, Response, Size, SpawnSpec, ViewRequest, tag,
 };
 use tokio::io::{AsyncRead, DuplexStream, WriteHalf, split};
 
@@ -92,6 +92,27 @@ impl Client {
 
     async fn pong(&mut self) -> Result<()> {
         proto::write_frame(&mut self.write, tag::PONG, &[]).await
+    }
+
+    /// Ask for a window of the session's history, and read past whatever else
+    /// is on the stream until it comes back.
+    async fn ask_for_view(&mut self, request: &ViewRequest) -> proto::View {
+        proto::write_frame(
+            &mut self.write,
+            tag::VIEW,
+            &proto::encode(request).expect("a request"),
+        )
+        .await
+        .expect("asking");
+        loop {
+            match self.next_frame().await {
+                Some(frame) if frame.tag == tag::VIEW => {
+                    return proto::decode(&frame.body).expect("a window");
+                }
+                Some(_) => {}
+                None => panic!("the stream closed before the window arrived"),
+            }
+        }
     }
 
     /// The next bell an attached client is told about, whichever session it
@@ -205,6 +226,58 @@ async fn history_reaches_a_client_that_asks_before_the_screen_does() {
     assert!(history.contains("line 1\r\n"), "{history:?}");
     // The screen is the dump's to paint, so its lines are not in here twice.
     assert!(!history.contains("line 60"), "{history:?}");
+}
+
+/// Scrolling back on a screen the terminal keeps no scrollback for: the lines
+/// come from the node's model, counted back from the newest so that a buffer
+/// trimming under the reader still means the same thing.
+#[tokio::test]
+async fn a_client_can_scroll_back_through_what_a_session_printed() {
+    let node = test_node().await;
+    let Spawned { name, .. } = spawn_session(
+        &node,
+        &[
+            "/bin/sh",
+            "-c",
+            "i=1; while [ $i -le 60 ]; do echo line $i; i=$((i+1)); done; sleep 300",
+        ],
+    )
+    .await;
+
+    let mut client = Client::connect(&node);
+    client
+        .send(&Request::Attach {
+            name: name.clone(),
+            size: Size::new(80, 24),
+            history: 0,
+        })
+        .await
+        .unwrap();
+    client.read_until("line 60").await;
+
+    let view = client
+        .ask_for_view(&ViewRequest { from: 30, lines: 5 })
+        .await;
+    assert_eq!(view.lines.len(), 5);
+    assert_eq!(view.from, 30);
+    assert!(view.total >= 61, "60 lines and a prompt: {}", view.total);
+    // Counted back from the newest line, so 30 back from the bottom of a
+    // buffer holding 1 to 60 lands in the twenties.
+    assert!(
+        view.lines.iter().any(|line| line.contains("line 2")),
+        "{:?}",
+        view.lines
+    );
+
+    // The top is clamped rather than refused, because the buffer trims from
+    // the top while it is being read.
+    let top = client
+        .ask_for_view(&ViewRequest {
+            from: u64::MAX,
+            lines: 5,
+        })
+        .await;
+    assert_eq!(top.lines.len(), 1, "one line left above the top");
 }
 
 /// And a client that asks for none gets the frames it always got.
@@ -357,11 +430,19 @@ async fn detaching_leaves_the_child_running_and_reattach_repaints() {
 /// The other half of the same promise: a client that stays is told when the
 /// session ends, and told what it ended with. Nothing covered this path, which
 /// is the one an attached client is sitting in when you type `exit`.
+///
+/// The session waits to be told to go rather than exiting on its own, so that
+/// the attach below cannot lose a race with it: a session that has already gone
+/// is one there is nothing to attach to, and on a loaded machine that is what
+/// used to happen every few runs.
 #[tokio::test]
 async fn a_client_watching_a_session_end_is_told_what_it_ended_with() {
     let node = test_node().await;
-    let Spawned { name, .. } =
-        spawn_session(&node, &["/bin/sh", "-c", "echo about-to-go; exit 130"]).await;
+    let Spawned { name, .. } = spawn_session(
+        &node,
+        &["/bin/sh", "-c", "echo about-to-go; read go; exit 130"],
+    )
+    .await;
 
     let mut client = Client::connect(&node);
     assert!(matches!(
@@ -375,6 +456,8 @@ async fn a_client_watching_a_session_end_is_told_what_it_ended_with() {
             .unwrap(),
         Response::Attached { .. }
     ));
+    client.read_until("about-to-go").await;
+    client.type_line("go").await.unwrap();
 
     let exit = tokio::time::timeout(Duration::from_secs(10), async {
         loop {

@@ -84,6 +84,14 @@ pub mod tag {
     /// only to a client that asked, so the tag never reaches one that would
     /// have to skip it.
     pub const HISTORY: u8 = 0x1a;
+
+    /// A window of a session's history, asked for and answered on the same
+    /// tag: the request is a [`super::ViewRequest`], the answer a
+    /// [`super::View`].
+    ///
+    /// What a client scrolling back through a session reads, on a screen of
+    /// its own where the terminal has no scrollback of its own to offer.
+    pub const VIEW: u8 = 0x1b;
 }
 
 /// The largest file a paste may carry. A screenshot is a couple of megabytes;
@@ -222,6 +230,11 @@ pub enum Response {
         /// host's answer gets `false` rather than a decode error.
         #[serde(default)]
         paste: bool,
+        /// Whether this host answers [`tag::VIEW`], which is what a client on a
+        /// screen of its own scrolls back through. False on a host from before
+        /// it existed, so the key says so rather than doing nothing.
+        #[serde(default)]
+        scroll: bool,
     },
     /// What the node is running. `build` is the SHA-256 of the binary it
     /// started from, taken at startup: the version alone cannot answer the
@@ -233,6 +246,34 @@ pub enum Response {
         build: Option<String>,
     },
     Error(String),
+}
+
+/// A window of a session's history, as a scrolling client asks for it.
+///
+/// Counted back from the newest line rather than forward from the oldest,
+/// because the buffer trims from the top as the session keeps printing: an
+/// index from the start would name a different line a minute later, and the
+/// view would drift while you read it.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct ViewRequest {
+    /// Lines back from the newest line that the window's bottom edge sits at.
+    /// Zero is the bottom of the buffer.
+    pub from: u64,
+    /// How many lines to send, ending at `from` and going back.
+    pub lines: u32,
+}
+
+/// The answer: rendered lines, oldest first, with the pen sequences that
+/// coloured them.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct View {
+    /// Where the window actually starts, which is not what was asked for when
+    /// the request ran off one end of the buffer.
+    pub from: u64,
+    /// Lines in the whole buffer, screen included, so a client knows where the
+    /// ends are without asking.
+    pub total: u64,
+    pub lines: Vec<String>,
 }
 
 /// Something that happened in a session, as it goes over the wire.
@@ -473,17 +514,27 @@ mod tests {
         })
         .unwrap();
         let decoded: Response = decode(&old).unwrap();
-        let Response::Attached { size, paste } = decoded else {
+        let Response::Attached {
+            size,
+            paste,
+            scroll,
+        } = decoded
+        else {
             panic!("an old answer should still be an attach");
         };
         assert_eq!(size, Size::new(80, 24));
         assert!(!paste, "a host that never heard of pasting cannot take one");
+        assert!(
+            !scroll,
+            "nor answer for a window of a history it cannot send"
+        );
 
         // And the other way: an old client reading a new host's answer, which
         // is a fleet updated from the far end first.
         let new = encode(&Response::Attached {
             size: Size::new(80, 24),
             paste: true,
+            scroll: true,
         })
         .unwrap();
         assert!(matches!(decode::<Old>(&new).unwrap(), Old::Attached { .. }));
