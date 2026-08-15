@@ -70,6 +70,20 @@ pub mod tag {
     /// A node too old to know the tag skips it, and the screen stays as it was
     /// until the session next paints, which is what happened before it existed.
     pub const RESYNC: u8 = 0x19;
+
+    /// Lines of a session's history, sent before the repaint to a client that
+    /// asked for them, so the terminal it is sitting at has something in its
+    /// own scrollback. Server to client, chunked when it is large.
+    ///
+    /// Its own tag rather than part of the repaint because the client has to
+    /// scroll what it writes out of the way before the screen is painted over
+    /// it, and where the screen starts is not something the node can know: the
+    /// mark and its scrolling region are the client's.
+    ///
+    /// A node too old to know the tag sends none, and a new node sends them
+    /// only to a client that asked, so the tag never reaches one that would
+    /// have to skip it.
+    pub const HISTORY: u8 = 0x1a;
 }
 
 /// The largest file a paste may carry. A screenshot is a couple of megabytes;
@@ -163,6 +177,13 @@ pub enum Request {
     Attach {
         name: String,
         size: Size,
+        /// Lines of history to send before the screen. Zero from a client
+        /// painting on a screen of its own, where there is nowhere to put them.
+        ///
+        /// Defaulted rather than required, so an older client's request still
+        /// decodes and attaches with no history at all.
+        #[serde(default)]
+        history: u32,
     },
     /// Turn this stream into a feed of everything happening in this machine's
     /// sessions. What lets a bell reach you when nothing is attached to see it.
@@ -552,6 +573,39 @@ mod tests {
             decode::<Old>(&encode(&Request::List).unwrap()).unwrap(),
             Old::List
         ));
+    }
+
+    /// A client that asks a node from before the field existed still attaches:
+    /// the key is dropped on the way in, and the answer is the screen alone.
+    #[test]
+    fn an_older_node_ignores_the_history_a_client_asks_for() {
+        /// `Request::Attach` as it was before history existed.
+        #[derive(Serialize, Deserialize)]
+        enum Old {
+            Attach { name: String, size: Size },
+        }
+
+        let asked = encode(&Request::Attach {
+            name: "api".into(),
+            size: Size::new(80, 24),
+            history: 1000,
+        })
+        .unwrap();
+        let Old::Attach { name, size } = decode(&asked).unwrap();
+        assert_eq!(name, "api");
+        assert_eq!(size, Size::new(80, 24));
+
+        // And a new node reading an older client's request, which is the same
+        // fleet halfway through an update the other way round.
+        let old = encode(&Old::Attach {
+            name: "api".into(),
+            size: Size::new(80, 24),
+        })
+        .unwrap();
+        let Request::Attach { history, .. } = decode(&old).unwrap() else {
+            panic!("an attach should decode as one");
+        };
+        assert_eq!(history, 0, "a client that cannot ask for history gets none");
     }
 
     #[test]

@@ -216,7 +216,11 @@ impl Node {
         };
 
         match request {
-            Request::Attach { name, size } => {
+            Request::Attach {
+                name,
+                size,
+                history: _,
+            } => {
                 let Some(session) = self.registry.get(&name) else {
                     return reply(&mut write, Err(anyhow::anyhow!("no session named {name}")))
                         .await;

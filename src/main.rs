@@ -889,7 +889,9 @@ async fn do_attach(socket: &Path, host: &str, name: &str, screen: Screen) -> Res
 /// Open a stream to wherever a session is, and attach to it.
 async fn attach_to(socket: &Path, target: &Located) -> Result<Attached> {
     let stream = open(socket, &target.host).await?;
-    stream.attach(&target.session, attach::session_size()).await
+    stream
+        .attach(&target.session, attach::session_size(), 0)
+        .await
 }
 
 /// Ask every machine what it is running, off to one side, so that no keystroke

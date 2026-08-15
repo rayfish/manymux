@@ -1009,6 +1009,9 @@ mod terminal {
                         restate = true;
                         settle(&mut stdout, &output, &status, &mut pending, &mut restate).await?;
                     }
+                    // Nothing asks for history until the client knows where to
+                    // put it, which is the task after this one.
+                    Update::History(_) => {}
                     // A bell in one of this machine's other sessions. The
                     // terminal is asked to raise it, and the row says which
                     // session it was, for a terminal that raises nothing.
@@ -1216,6 +1219,9 @@ mod terminal {
                     // than queued: this row is showing the paste, and a bell is
                     // only worth anything while it is news.
                     Update::Event(_) => {}
+                    // Unreachable: history comes at the start of an attach,
+                    // before there has been a key to press.
+                    Update::History(_) => {}
                     Update::Exited(code) => return Ok(Pasted::Ended(Outcome::Exited(code))),
                     Update::Disconnected => return Ok(Pasted::Ended(Outcome::Disconnected)),
                 },
@@ -1241,7 +1247,9 @@ pub async fn collect_until(
     let mut output = Vec::new();
     loop {
         let outcome = match reader.next().await? {
-            Update::Output(bytes) | Update::Screen(bytes) => {
+            // History counts as output here: a caller collecting a session's
+            // bytes asked for the lines it asked for.
+            Update::Output(bytes) | Update::Screen(bytes) | Update::History(bytes) => {
                 output.extend_from_slice(&bytes);
                 if stop(&output) {
                     Outcome::Detached

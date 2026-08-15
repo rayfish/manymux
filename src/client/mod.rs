@@ -368,10 +368,14 @@ impl Stream {
     }
 
     /// Attach to a session, turning this stream into its byte pipe.
-    pub async fn attach(mut self, name: &str, size: Size) -> Result<Attached> {
+    ///
+    /// `history` is how many lines of the session's scrollback to ask for,
+    /// which arrive as [`Update::History`] before the repaint.
+    pub async fn attach(mut self, name: &str, size: Size, history: u32) -> Result<Attached> {
         let request = Request::Attach {
             name: name.to_string(),
             size,
+            history,
         };
         match self.request(&request).await? {
             Response::Attached { size, paste } => Ok(Attached {
@@ -438,6 +442,10 @@ pub enum Update {
     /// its screen switches for the session's would ask for another dump
     /// forever.
     Screen(Vec<u8>),
+    /// Lines of the session's history, sent before the repaint when a client
+    /// asked for them. Written to the terminal as they are, so its own
+    /// scrollback holds what the session printed before this attach.
+    History(Vec<u8>),
     /// The host is checking this client is still there. Answer it with
     /// [`SessionWriter::pong`], or the host will eventually conclude the client
     /// went away and detach it. Answering once is what opts a client in: one
@@ -467,6 +475,7 @@ impl SessionReader {
             return Ok(match frame.tag {
                 tag::DATA => Update::Output(frame.body),
                 tag::RESYNC => Update::Screen(frame.body),
+                tag::HISTORY => Update::History(frame.body),
                 tag::PING => Update::Ping,
                 tag::EVENT => Update::Event(proto::decode(&frame.body)?),
                 tag::EXIT => Update::Exited(proto::decode(&frame.body)?),

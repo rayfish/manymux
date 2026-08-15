@@ -168,6 +168,7 @@ async fn a_client_that_stops_answering_is_detached() {
     let attach = Request::Attach {
         name: name.clone(),
         size: Size::new(80, 24),
+        history: 0,
     };
     assert!(matches!(
         client.send(&attach).await.unwrap(),
@@ -214,6 +215,7 @@ async fn a_client_that_never_answers_is_left_alone() {
     let attach = Request::Attach {
         name: name.clone(),
         size: Size::new(80, 24),
+        history: 0,
     };
     assert!(matches!(
         client.send(&attach).await.unwrap(),
@@ -245,6 +247,7 @@ async fn detaching_leaves_the_child_running_and_reattach_repaints() {
     let attach = Request::Attach {
         name: name.clone(),
         size: Size::new(80, 24),
+        history: 0,
     };
     assert!(matches!(
         client.send(&attach).await.unwrap(),
@@ -293,6 +296,7 @@ async fn a_client_watching_a_session_end_is_told_what_it_ended_with() {
             .send(&Request::Attach {
                 name: name.clone(),
                 size: Size::new(80, 24),
+                history: 0,
             })
             .await
             .unwrap(),
@@ -330,6 +334,7 @@ async fn asking_for_the_screen_again_gets_the_screen_again() {
             .send(&Request::Attach {
                 name: name.clone(),
                 size: Size::new(80, 24),
+                history: 0,
             })
             .await
             .unwrap(),
@@ -377,6 +382,7 @@ async fn output_produced_while_detached_is_on_the_screen_when_you_return() {
     let attach = Request::Attach {
         name: name.clone(),
         size: Size::new(80, 24),
+        history: 0,
     };
     assert!(matches!(
         client.send(&attach).await.unwrap(),
@@ -398,6 +404,7 @@ async fn resizing_a_client_resizes_the_child_terminal() {
     let attach = Request::Attach {
         name: name.clone(),
         size: Size::new(80, 24),
+        history: 0,
     };
     assert!(matches!(
         client.send(&attach).await.unwrap(),
@@ -467,6 +474,7 @@ async fn two_clients_share_one_session_at_the_smaller_size() {
         .send(&Request::Attach {
             name: name.clone(),
             size: Size::new(120, 40),
+            history: 0,
         })
         .await
         .unwrap()
@@ -480,6 +488,7 @@ async fn two_clients_share_one_session_at_the_smaller_size() {
         .send(&Request::Attach {
             name: name.clone(),
             size: Size::new(80, 50),
+            history: 0,
         })
         .await
         .unwrap()
@@ -525,6 +534,7 @@ async fn reattaching_restores_mouse_reporting_and_the_title() {
     let attach = Request::Attach {
         name: name.clone(),
         size: Size::new(80, 24),
+        history: 0,
     };
     assert!(matches!(
         client.send(&attach).await.unwrap(),
@@ -571,6 +581,7 @@ async fn a_pasted_image_is_written_on_the_host_and_its_path_typed_into_the_sessi
     let attach = Request::Attach {
         name: name.clone(),
         size: Size::new(200, 24),
+        history: 0,
     };
     let Response::Attached { paste, .. } = client.send(&attach).await.unwrap() else {
         panic!("attach failed");
@@ -635,6 +646,7 @@ async fn a_bell_next_door_reaches_an_attached_client_and_this_ones_does_not() {
     let attach = Request::Attach {
         name: name.clone(),
         size: Size::new(80, 24),
+        history: 0,
     };
     assert!(matches!(
         client.send(&attach).await.unwrap(),
