@@ -93,7 +93,7 @@ fn relay(mut stderr: ChildStderr) -> (oneshot::Sender<()>, JoinHandle<()>) {
                         // ssh has said its piece and gone. Whether anyone wants
                         // to hear it is still open, so wait to be told.
                         if asked.await.is_ok() {
-                            let _ = tokio::io::stderr().write_all(&held).await;
+                            say(&held).await;
                         }
                         return;
                     }
@@ -101,12 +101,27 @@ fn relay(mut stderr: ChildStderr) -> (oneshot::Sender<()>, JoinHandle<()>) {
                 },
             }
         }
-        let _ = tokio::io::stderr().write_all(&held).await;
+        say(&held).await;
         // Past here this is the connection carrying a session, and its troubles
         // are the user's as they happen.
         let _ = tokio::io::copy(&mut stderr, &mut tokio::io::stderr()).await;
     });
     (voice, relaying)
+}
+
+/// Put something on stderr and wait for it to actually be there.
+///
+/// The flush is the point. `tokio::io::stderr` hands its bytes to a blocking
+/// thread and `write_all` returns as soon as they are queued, not when the
+/// thread has run; only the flush waits for that. `mm` ends by calling
+/// `process::exit` rather than by returning, so nothing drops the runtime and
+/// waits for that thread on the way out, and an unflushed write is simply lost.
+/// What got lost was ssh's account of a machine it could not reach, on the one
+/// path where that account is the only one there is.
+async fn say(text: &[u8]) {
+    let mut stderr = tokio::io::stderr();
+    let _ = stderr.write_all(text).await;
+    let _ = stderr.flush().await;
 }
 
 /// The names `mm` might answer to on another machine, tried in order.
