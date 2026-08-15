@@ -274,18 +274,18 @@ pub enum Find {
 
 /// What a key did to the rename prompt.
 ///
-/// The same four as a search, minus the two that walk matches: a title is
-/// typed and then either sent or given up on.
+/// The same four as a search, minus the two that walk matches: a name is typed
+/// and then either sent or given up on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Rename {
     /// The prompt is open and empty. Draw it.
     Open,
-    /// The title changed. Draw it again.
+    /// The name changed. Draw it again.
     Typed,
-    /// Enter: give the session what has been typed. An empty one is not a
-    /// mistake, it is how the sticky title is cleared.
+    /// Enter: ask the host for the name that has been typed. It answers with
+    /// the name that stuck, or with why it refused.
     Run,
-    /// Esc, or a rub with nothing left to rub out: the title stays as it was.
+    /// Esc, or a rub with nothing left to rub out: the name stays as it was.
     Cancel,
 }
 
@@ -336,7 +336,7 @@ pub enum Mode {
     /// the keys move it. Only on a screen the client owns, where the terminal
     /// has no scrollback of its own to offer.
     Scroll,
-    /// A title is being typed on the mark row. A mode of its own because the
+    /// A name is being typed on the mark row. A mode of its own because the
     /// keyboard here is neither the session's nor doing control keys: every
     /// letter is text, and the row is the only place it shows.
     Rename,
@@ -581,7 +581,7 @@ impl KeyFilter {
     }
 
     /// What is being typed at the rename prompt, if that is the one open.
-    pub fn title(&self) -> Option<String> {
+    pub fn wanted_name(&self) -> Option<String> {
         self.typed(Prompting::Rename)
     }
 
@@ -625,7 +625,7 @@ impl KeyFilter {
             // prompt, not leaving.
             Action::Find(_) => Mode::Scroll,
             // The rename prompt is its own mode, and the only ways out of it
-            // are sending the title and giving up on it.
+            // are sending the name and giving up on it.
             Action::Rename(Rename::Run | Rename::Cancel) => Mode::Focus,
             Action::Rename(_) => Mode::Rename,
         }
@@ -1042,7 +1042,7 @@ mod terminal {
     use crate::client::{Attached, SessionHalves, SessionReader, SessionWriter, Update};
     use crate::clipboard;
     use crate::notify;
-    use crate::proto::{HostedEvent, Size};
+    use crate::proto::{HostedEvent, Renamed, Size};
     use crate::settings::Screen;
 
     /// Sent before attaching.
@@ -1229,12 +1229,15 @@ mod terminal {
     ///
     /// `mode` is where the keyboard starts, which is how a hop carries control
     /// mode through the reattach.
+    /// The name the session answers to at the end comes back with the outcome:
+    /// a rename from inside the session changes what the caller has to call it,
+    /// and this half of the client has no way to tell it any other way.
     pub async fn run(
         held: &mut Held,
         session: Attached,
         target: &str,
         mode: Mode,
-    ) -> Result<Outcome> {
+    ) -> Result<(Outcome, Option<String>)> {
         let mut status = Status::new(target);
         status.set_mode(mode);
         let screen = held.screen;
@@ -1248,16 +1251,50 @@ mod terminal {
             takeover(screen.mode(), on_alternate.swap(false, Ordering::Relaxed)),
             status.setup(terminal_size())
         ));
-        pump(
+        let mut called = session_of(target).to_string();
+        let outcome = pump(
             &mut held.keys,
             session,
             status,
             mode,
-            target,
+            Naming {
+                host: host_of(target),
+                called: &mut called,
+            },
             screen,
             on_alternate,
         )
-        .await
+        .await?;
+        let renamed = called != session_of(target);
+        Ok((outcome, renamed.then_some(called)))
+    }
+
+    /// Which session the client is sitting in, as the mark row names it: the
+    /// machine, which an attach never leaves, and the name, which a rename
+    /// moves under everything holding it.
+    struct Naming<'a> {
+        host: Option<&'a str>,
+        called: &'a mut String,
+    }
+
+    impl Naming<'_> {
+        /// The two together, the way a target is spelled everywhere else.
+        fn target(&self) -> String {
+            match self.host {
+                Some(host) => format!("{host}/{}", self.called),
+                None => self.called.clone(),
+            }
+        }
+    }
+
+    /// The session's own name, out of a `host/name` target.
+    fn session_of(target: &str) -> &str {
+        target.rsplit_once('/').map_or(target, |(_, name)| name)
+    }
+
+    /// The machine's, which a target that came without one does not have.
+    fn host_of(target: &str) -> Option<&str> {
+        target.rsplit_once('/').map(|(host, _)| host)
     }
 
     /// How long a notice from the client itself stays on the row before the key
@@ -1333,12 +1370,14 @@ mod terminal {
         keys
     }
 
+    /// The name in `naming` is written back when a rename lands: the mark row
+    /// is not the only thing that has to follow it.
     async fn pump(
         keyboard: &mut mpsc::Receiver<Vec<u8>>,
         session: Attached,
         mut status: Status,
         mode: Mode,
-        target: &str,
+        naming: Naming<'_>,
         screen: Screen,
         on_alternate: Arc<AtomicBool>,
     ) -> Result<Outcome> {
@@ -1382,7 +1421,7 @@ mod terminal {
         // Notifications for the terminal, waiting for a safe moment to be
         // written, and the rule for which of them get one.
         let mut pending = String::new();
-        let bells = Bells::new(target);
+        let bells = Bells::new(naming.host);
 
         loop {
             tokio::select! {
@@ -1515,7 +1554,7 @@ mod terminal {
                             stdout.flush().await?;
                         }
                         // The same shape as a search, and the same reason for
-                        // it: the title lives in the key filter until Enter, so
+                        // it: the name lives in the key filter until Enter, so
                         // all there is to do until then is keep the row saying
                         // what is in it.
                         Some(Action::Rename(_)) if !renames => {
@@ -1534,19 +1573,17 @@ mod terminal {
                         Some(Action::Rename(step)) => {
                             match step {
                                 Rename::Open | Rename::Typed => {
-                                    status.set_renaming(keys.title());
+                                    status.set_renaming(keys.wanted_name());
                                 }
                                 Rename::Cancel => status.set_renaming(None),
                                 Rename::Run => {
-                                    let title = keys.title().unwrap_or_default();
+                                    let wanted = keys.wanted_name().unwrap_or_default();
                                     keys.stop_typing();
                                     status.set_renaming(None);
-                                    writer.rename(&title).await?;
-                                    // Nothing comes back, so the row is the
-                                    // only word there is that it went.
-                                    status.set_notice(&renamed(&title));
-                                    notice_until =
-                                        Some(tokio::time::Instant::now() + NOTICE_FOR);
+                                    // Nothing is said here: the row keeps
+                                    // naming the session what it is still
+                                    // called until the host says otherwise.
+                                    writer.rename(&wanted).await?;
                                 }
                             }
                             // Through `settle` rather than written on the spot,
@@ -1702,6 +1739,25 @@ mod terminal {
                             stdout.flush().await?;
                         }
                     }
+                    // What the session is called now. The mark row is the only
+                    // place on the screen that says so, and the window's name
+                    // goes with it, for a session that has set no title of its
+                    // own and so is showing the target there.
+                    Update::Renamed(answer) => {
+                        match answer {
+                            Renamed::Name(name) => {
+                                *naming.called = name;
+                                status.set_target(&naming.target());
+                                pending.push_str(&status.retitle());
+                                status.set_notice(&format!("renamed to {}", naming.called));
+                            }
+                            Renamed::Refused(why) => status.set_notice(&why),
+                        }
+                        notice_until = Some(tokio::time::Instant::now() + NOTICE_FOR);
+                        restate = true;
+                        settle(&mut stdout, &output, &status, &mut pending, &mut restate)
+                            .await?;
+                    }
                     // A bell in one of this machine's other sessions. The
                     // terminal is asked to raise it, and the row says which
                     // session it was, for a terminal that raises nothing.
@@ -1760,19 +1816,6 @@ mod terminal {
         }
     }
 
-    /// What the row says once a title has gone to the host.
-    ///
-    /// Said at all because nothing else changes on the screen: the mark keeps
-    /// naming the session `host/name`, which is still what it is called, and
-    /// the title only shows in `mm ls` and the window's own name.
-    fn renamed(title: &str) -> String {
-        if title.is_empty() {
-            "title cleared".to_string()
-        } else {
-            format!("renamed to {title}")
-        }
-    }
-
     /// Write what has been held back until it was safe to write, and flush.
     ///
     /// Both things here would corrupt a sequence the session is halfway through
@@ -1819,9 +1862,9 @@ mod terminal {
     }
 
     impl Bells {
-        fn new(target: &str) -> Self {
+        fn new(host: Option<&str>) -> Self {
             Self {
-                host: target.rsplit_once('/').map(|(host, _)| host.to_string()),
+                host: host.map(str::to_string),
                 cooldown: notify::Cooldown::default(),
             }
         }
@@ -1940,8 +1983,12 @@ mod terminal {
                     Update::Event(_) => {}
                     // Unreachable: history comes at the start of an attach,
                     // before there has been a key to press, and neither the
-                    // view nor a search is open while a paste is running.
-                    Update::History(_) | Update::View(_) | Update::Found(_) => {}
+                    // view, a search nor a rename is open while a paste is
+                    // running.
+                    Update::History(_)
+                    | Update::View(_)
+                    | Update::Found(_)
+                    | Update::Renamed(_) => {}
                     Update::Exited(code) => return Ok(Pasted::Ended(Outcome::Exited(code))),
                     Update::Disconnected => return Ok(Pasted::Ended(Outcome::Disconnected)),
                 },
@@ -1986,8 +2033,8 @@ pub async fn collect_until(
             // renders sessions itself reads these from its own subscription.
             Update::Event(_) => continue,
             // Nothing here scrolls, so nothing here asked for a window or went
-            // looking through one.
-            Update::View(_) | Update::Found(_) => continue,
+            // looking through one, and nothing here renames.
+            Update::View(_) | Update::Found(_) | Update::Renamed(_) => continue,
             Update::Exited(code) => Outcome::Exited(code),
             Update::Disconnected => Outcome::Disconnected,
         };
@@ -2382,22 +2429,22 @@ mod tests {
     }
 
     /// The whole gesture, the same as a search: `Ctrl-] r`, type, Enter. The
-    /// title stays in the filter until it is run, for the same reason the
-    /// needle does.
+    /// name stays in the filter until it is run, for the same reason the needle
+    /// does.
     #[test]
-    fn a_title_is_typed_at_the_prompt_and_sent_with_enter() {
+    fn a_name_is_typed_at_the_prompt_and_sent_with_enter() {
         let mut f = KeyFilter::new(KEY);
         assert_eq!(
             f.filter(&[KEY, b'r']),
             asked(Action::Rename(Rename::Open), Mode::Rename)
         );
-        assert_eq!(f.title().as_deref(), Some(""));
+        assert_eq!(f.wanted_name().as_deref(), Some(""));
 
         assert_eq!(
-            f.filter("nightly bench".as_bytes()),
+            f.filter("nightly-bench".as_bytes()),
             asked(Action::Rename(Rename::Typed), Mode::Rename)
         );
-        assert_eq!(f.title().as_deref(), Some("nightly bench"));
+        assert_eq!(f.wanted_name().as_deref(), Some("nightly-bench"));
 
         // And back to the session, which is where you were before.
         assert_eq!(
@@ -2407,7 +2454,7 @@ mod tests {
     }
 
     /// Nothing typed at the prompt reaches the session, keys that do things
-    /// elsewhere included: a title beginning with `d` is a title, not a detach,
+    /// elsewhere included: a name beginning with `d` is a name, not a detach,
     /// and the tab that would walk the sessions is dropped the way every other
     /// unprintable key is.
     #[test]
@@ -2418,21 +2465,21 @@ mod tests {
             f.filter(b"deploy\tp"),
             asked(Action::Rename(Rename::Typed), Mode::Rename)
         );
-        assert_eq!(f.title().as_deref(), Some("deployp"));
+        assert_eq!(f.wanted_name().as_deref(), Some("deployp"));
     }
 
-    /// Enter on an empty prompt is not a mistake: it is the only way to say
-    /// "back to whatever the program calls itself", the same as
-    /// `mm rename <target> ""`.
+    /// Enter on an empty prompt is still a rename, sent and refused by the
+    /// host: there is no name in it, and the client says so with the sentence
+    /// the host sent back rather than deciding for itself.
     #[test]
-    fn an_empty_title_is_how_the_sticky_one_is_taken_off() {
+    fn an_empty_prompt_is_still_sent() {
         let mut f = KeyFilter::new(KEY);
         f.filter(&[KEY, b'r']);
         assert_eq!(
             f.filter(b"\r"),
             asked(Action::Rename(Rename::Run), Mode::Focus)
         );
-        assert_eq!(f.title().as_deref(), Some(""));
+        assert_eq!(f.wanted_name().as_deref(), Some(""));
     }
 
     #[test]
@@ -2441,13 +2488,13 @@ mod tests {
         f.filter(&[KEY, b'r']);
         f.filter(b"abc");
         f.filter(&[0x7f]);
-        assert_eq!(f.title().as_deref(), Some("ab"));
+        assert_eq!(f.wanted_name().as_deref(), Some("ab"));
 
         assert_eq!(
             f.filter(&[0x1b]),
             asked(Action::Rename(Rename::Cancel), Mode::Focus)
         );
-        assert_eq!(f.title(), None);
+        assert_eq!(f.wanted_name(), None);
 
         // And the rub with nothing left to rub out, which is the other way a
         // hand that changed its mind gets out.
@@ -2456,7 +2503,7 @@ mod tests {
             f.filter(&[0x7f]),
             asked(Action::Rename(Rename::Cancel), Mode::Focus)
         );
-        assert_eq!(f.title(), None);
+        assert_eq!(f.wanted_name(), None);
     }
 
     /// Two prompts, one buffer. What is typed at one must never turn up at the
@@ -2467,7 +2514,7 @@ mod tests {
         f.set_scroll(true);
         f.filter(&[KEY, FIND_KEY]);
         f.filter(b"error");
-        assert_eq!(f.title(), None, "a needle is not a title");
+        assert_eq!(f.wanted_name(), None, "a needle is not a name");
 
         // Running the search leaves the needle for the caller to read, which is
         // what closes the prompt, and then the view is left the usual way.
@@ -2476,11 +2523,11 @@ mod tests {
         f.set_mode(Mode::Focus);
 
         f.filter(&[KEY, b'r']);
-        assert_eq!(f.needle(), None, "a title is not a needle");
-        assert_eq!(f.title().as_deref(), Some(""), "and it starts empty");
+        assert_eq!(f.needle(), None, "a name is not a needle");
+        assert_eq!(f.wanted_name().as_deref(), Some(""), "and it starts empty");
     }
 
-    /// The key is bound whether or not the host takes a title, so that an old
+    /// The key is bound whether or not the host takes a rename, so that an old
     /// one can be answered with a sentence. Without that it would be a letter
     /// landing in the shell.
     #[test]

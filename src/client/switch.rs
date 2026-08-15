@@ -128,6 +128,12 @@ impl Cycle {
         self.previous = Some(std::mem::replace(&mut self.current, next));
     }
 
+    /// The session you are in is called something else now. Not a hop, so
+    /// `Motion::Last` is left pointing where it was: nobody moved.
+    pub fn renamed(&mut self, name: &str) {
+        self.current.session = name.to_string();
+    }
+
     /// Take back the last hop, leaving no trail: for one that could not be
     /// made, where coming back must not become the place `Motion::Last` goes.
     pub fn undo(&mut self) {
@@ -173,6 +179,17 @@ mod tests {
         cycle
             .step(motion)
             .map(|next| format!("{}/{}", next.host, next.session))
+    }
+
+    /// A rename from inside the session moves where you are, and leaves where
+    /// you came from alone: nobody hopped.
+    #[test]
+    fn a_rename_moves_where_you_are_and_not_where_you_came_from() {
+        let mut cycle = cycle(&["api", "build", "web"], "api");
+        cycle.moved_to(Located::new("here", "build"));
+        cycle.renamed("nightly");
+        assert_eq!(cycle.current().session, "nightly");
+        assert_eq!(step(&cycle, Motion::Last).as_deref(), Some("api"));
     }
 
     #[test]

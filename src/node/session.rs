@@ -39,7 +39,11 @@ enum Input {
 }
 
 pub struct Session {
-    pub name: String,
+    /// What the session is addressed by, in `host/name` and everywhere else.
+    /// Behind a lock because a rename changes it under whatever is reading it:
+    /// the registry's key moves with it, but an event published from the PTY
+    /// reader carries the name too.
+    name: Mutex<String>,
     pub command: String,
     pub pid: u32,
     input_tx: mpsc::UnboundedSender<Input>,
@@ -61,8 +65,6 @@ struct State {
     vt: Vt,
     scanner: Scanner,
     decoder: Utf8Decoder,
-    /// Title set by `mm rename`, which wins over the one the program sets.
-    sticky_title: Option<String>,
     bells: u64,
     last_activity: Instant,
     /// Requested size per attached client. The effective size is the smallest
@@ -72,10 +74,13 @@ struct State {
 }
 
 impl State {
+    /// What the session calls itself: the last title the program set, else the
+    /// command it was started with. It follows the program rather than the
+    /// session's name, which is what a rename changes: the name says which
+    /// session this is, and the title says what it is doing.
     fn title(&self, command: &str) -> String {
-        self.sticky_title
-            .as_deref()
-            .or_else(|| self.scanner.title())
+        self.scanner
+            .title()
             .filter(|title| !title.is_empty())
             .unwrap_or(command)
             .to_string()
@@ -168,10 +173,11 @@ impl Attachment {
         super::history::find(&state.vt, needle)
     }
 
-    /// Set the session's sticky title from inside it, which is the same thing
-    /// `mm rename` does from outside and so takes the same empty-clears rule.
-    pub fn rename(&self, title: &str) {
-        self.session.rename(title);
+    /// What the session is called, which is what a rename asked for from here
+    /// has to be looked up by: the registry keys sessions by name, and this is
+    /// the only end of the stream that knows which one it is attached to.
+    pub fn name(&self) -> String {
+        self.session.name()
     }
 
     pub fn exit_rx(&self) -> watch::Receiver<Option<i32>> {
@@ -233,7 +239,7 @@ impl Session {
         let (exit_tx, exit_rx) = watch::channel(None);
 
         let session = Arc::new(Session {
-            name: name.clone(),
+            name: Mutex::new(name.clone()),
             command: label,
             pid,
             input_tx,
@@ -245,7 +251,6 @@ impl Session {
                     .build(),
                 scanner: Scanner::new(),
                 decoder: Utf8Decoder::new(),
-                sticky_title: None,
                 bells: 0,
                 last_activity: Instant::now(),
                 clients: HashMap::new(),
@@ -298,7 +303,7 @@ impl Session {
             let code = match child.wait().await {
                 Ok(status) => status.code().unwrap_or(-1),
                 Err(e) => {
-                    warn!(session = %s.name, "waiting on child failed: {e}");
+                    warn!(session = %s.name(), "waiting on child failed: {e}");
                     -1
                 }
             };
@@ -345,7 +350,7 @@ impl Session {
             (state.title(&self.command), state.clients.len())
         };
         let _ = self.events.send(SessionEvent {
-            session: self.name.clone(),
+            session: self.name(),
             title,
             kind,
             attached,
@@ -393,13 +398,15 @@ impl Session {
         let _ = self.input_tx.send(Input::Resize(size));
     }
 
-    pub fn rename(&self, title: &str) {
-        let mut state = self.state.lock().unwrap();
-        state.sticky_title = if title.is_empty() {
-            None
-        } else {
-            Some(title.to_string())
-        };
+    pub fn name(&self) -> String {
+        self.name.lock().unwrap().clone()
+    }
+
+    /// Answer to a different name from now on. The registry does the deciding,
+    /// since it owns the names and is the only place a clash can be seen; this
+    /// is the session's half of what it decided.
+    pub fn set_name(&self, name: &str) {
+        *self.name.lock().unwrap() = name.to_string();
     }
 
     /// Ask the child to go away. SIGHUP to the whole process group, the way a
@@ -458,7 +465,7 @@ impl Session {
     pub fn info(&self) -> SessionInfo {
         let state = self.state.lock().unwrap();
         SessionInfo {
-            name: self.name.clone(),
+            name: self.name(),
             title: state.title(&self.command),
             command: self.command.clone(),
             pid: self.pid,
@@ -605,7 +612,6 @@ mod tests {
             vt: Vt::new(80, 24),
             scanner: Scanner::new(),
             decoder: Utf8Decoder::new(),
-            sticky_title: None,
             bells: 0,
             last_activity: Instant::now(),
             clients,
@@ -614,13 +620,14 @@ mod tests {
         assert_eq!(state.effective_size(), Size::new(80, 40));
     }
 
+    /// The title is the program's to set and nobody else's: renaming a session
+    /// changes what it is called, not what it says it is doing.
     #[test]
-    fn sticky_title_wins_over_the_one_the_program_sets() {
+    fn the_title_follows_the_program() {
         let mut state = State {
             vt: Vt::new(80, 24),
             scanner: Scanner::new(),
             decoder: Utf8Decoder::new(),
-            sticky_title: None,
             bells: 0,
             last_activity: Instant::now(),
             clients: HashMap::new(),
@@ -631,7 +638,9 @@ mod tests {
         state.scanner.feed(b"\x1b]0;from the program\x07", |_| {});
         assert_eq!(state.title("zsh"), "from the program");
 
-        state.sticky_title = Some("mine".into());
-        assert_eq!(state.title("zsh"), "mine");
+        // An empty one is a program clearing its title, and the command is
+        // still a better answer than nothing at all.
+        state.scanner.feed(b"\x1b]0;\x07", |_| {});
+        assert_eq!(state.title("zsh"), "zsh");
     }
 }

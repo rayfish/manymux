@@ -137,10 +137,10 @@ word goes amber, and the row spells out what the keys do. It stays on, so one
 | `d` | detach |
 | `esc`, `enter`, `Ctrl-]` | back to focus |
 
-`r` opens a prompt on the mark row: type a title, `enter` sets it, `esc` leaves
-it alone, and `enter` with nothing typed takes a sticky title off again. It is
-the same title `mm rename` sets, so see [Titles, bells and
-notifications](#titles-bells-and-notifications) for what it does.
+`r` opens a prompt on the mark row: type a name, `enter` renames the session,
+`esc` leaves it alone. It is the same rename `mm rename` does, so the mark and
+`mm ls` say the new name from then on, and the row says so if the host refused
+it because another session is already called that.
 
 Two levels, because that is how your sessions are arranged. `tab` stays on the
 machine you are on and wraps around its sessions; `h` moves you to the next
@@ -198,19 +198,26 @@ mm kill gpu-box/build     # SIGHUP to the process group
 Exiting the shell inside a session ends it too, and it drops out of the listing
 on its own.
 
+## Names
+
+A session is addressed by `host/name`, and the name is yours to change:
+
+```bash
+mm rename gpu-box/zsh-3 build
+```
+
+From inside the session it is `Ctrl-] r`, then the name, then `enter`. Names go
+in paths and in the terminal, so they keep to letters, digits, `-`, `_` and `.`:
+a space becomes a dash and anything else is dropped, and what you end up called
+is what the mark row and `mm ls` show. A name another session on that machine
+already has is refused rather than made unique behind your back.
+
 ## Titles, bells and notifications
 
 Sessions name themselves. Whatever the program sets as its terminal title
 (OSC 0/1/2) shows up in `mm ls`, so a Claude Code session appears under whatever
-it is working on. `mm rename` overrides it with something sticky:
-
-```bash
-mm rename gpu-box/build "nightly bench"
-```
-
-From inside the session it is `Ctrl-] r`, then the title, then `enter`. Either
-way, an empty title takes the sticky one off and the program gets to name itself
-again.
+it is working on. That column follows the program and nothing else: the name is
+what you set, the title is what it is doing.
 
 When a session rings the bell or asks for a notification outright (OSC 9,
 OSC 777) and nobody is attached to see it, you are told. Where depends on where
@@ -347,7 +354,7 @@ mm ls [host]                         list sessions, everywhere or on one machine
 mm new [host] [-n name] [-d] [cmd]   start a session (default: your login shell)
 mm attach <target> [--screen ...]    attach; Ctrl-] then tab switches, d detaches
 mm kill <target>                     SIGHUP a session's process group
-mm rename <target> <title>           set a sticky title
+mm rename <target> <name>            give a session a different name
 mm add <host> | hosts | rm <host>    which machines to list and watch
 mm config [key] [value]              show or change a setting: notify, screen
 mm update [--check] [--nightly]      replace this binary with the published one

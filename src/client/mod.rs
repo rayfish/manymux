@@ -485,6 +485,9 @@ pub enum Update {
     /// Where a search found what it was looking for, in answer to
     /// [`SessionWriter::find`].
     Found(proto::Found),
+    /// What the session is called now, in answer to [`SessionWriter::rename`],
+    /// or why it is still called what it was.
+    Renamed(proto::Renamed),
     /// The host is checking this client is still there. Answer it with
     /// [`SessionWriter::pong`], or the host will eventually conclude the client
     /// went away and detach it. Answering once is what opts a client in: one
@@ -517,6 +520,7 @@ impl SessionReader {
                 tag::HISTORY => Update::History(frame.body),
                 tag::VIEW => Update::View(proto::decode(&frame.body)?),
                 tag::FIND => Update::Found(proto::decode(&frame.body)?),
+                tag::RENAME => Update::Renamed(proto::decode(&frame.body)?),
                 tag::PING => Update::Ping,
                 tag::EVENT => Update::Event(proto::decode(&frame.body)?),
                 tag::EXIT => Update::Exited(proto::decode(&frame.body)?),
@@ -591,14 +595,15 @@ impl SessionWriter {
         proto::write_msg(&mut self.write, tag::FIND, &request).await
     }
 
-    /// Give the session a sticky title, the one `mm rename` sets and `mm ls`
-    /// shows. An empty one clears it, and the program's own title is back.
+    /// Rename the session, the same thing `mm rename` asks for from outside,
+    /// answered with an [`Update::Renamed`].
     ///
-    /// Nothing answers: there is nothing on the host that can refuse it, and a
-    /// reply would have to come back down the same pipe the session's output is
-    /// on. What went in is on the row the client drew it on.
-    pub async fn rename(&mut self, title: &str) -> Result<()> {
-        proto::write_msg(&mut self.write, tag::RENAME, &title).await
+    /// Answered because the host can refuse: the name may be another session's,
+    /// or nothing may survive the sanitising every session name goes through.
+    /// Until the answer arrives the client is still showing the old name, which
+    /// is the right thing to be showing.
+    pub async fn rename(&mut self, name: &str) -> Result<()> {
+        proto::write_msg(&mut self.write, tag::RENAME, &name).await
     }
 
     /// Answer an [`Update::Ping`], which is how the host tells a client that is

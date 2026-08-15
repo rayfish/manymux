@@ -114,12 +114,15 @@ enum Command {
         #[arg(add = complete::targets())]
         target: String,
     },
-    /// Set a session's title, overriding whatever the program sets.
+    /// Give a session a different name, the one it is addressed by.
+    ///
+    /// The title is the program's and stays the program's: it says what the
+    /// session is doing, and the name says which session it is.
     #[command(visible_alias = "r")]
     Rename {
         #[arg(add = complete::targets())]
         target: String,
-        title: String,
+        name: String,
     },
 
     /// Put mm on a machine you can ssh into, by running the installer there.
@@ -347,13 +350,13 @@ async fn run(cli: Cli) -> Result<u8> {
             Ok(OK)
         }
 
-        Command::Rename { target, title } => {
+        Command::Rename { target, name } => {
             let target = locate(&socket, &target, Bare::Session).await?;
             let mut stream = open(&socket, &target.host).await?;
             stream
                 .call(&Request::Rename {
                     name: target.session,
-                    title,
+                    to: name,
                 })
                 .await?;
             Ok(OK)
@@ -881,7 +884,7 @@ async fn do_attach(socket: &Path, host: &str, name: &str, screen: Screen) -> Res
     let mut seeded: HashSet<String> = HashSet::new();
     let (outcome, where_) = loop {
         let target = cycle.current().clone();
-        let where_ = qualified(&target.host, &target.session);
+        let mut where_ = qualified(&target.host, &target.session);
         let history = if seeded.insert(where_.clone()) {
             screen.mode().history()
         } else {
@@ -903,7 +906,15 @@ async fn do_attach(socket: &Path, host: &str, name: &str, screen: Screen) -> Res
             Err(e) => return Err(e),
         };
 
-        match attach::run(&mut held, session, &where_, mode).await? {
+        let (outcome, renamed) = attach::run(&mut held, session, &where_, mode).await?;
+        // Renamed from inside, so the name this run has been using is nobody's
+        // now: the cycle would hop to a session that is not there, and the line
+        // printed on the way out would name it too.
+        if let Some(name) = renamed {
+            where_ = qualified(&target.host, &name);
+            cycle.renamed(&name);
+        }
+        match outcome {
             Outcome::Switch(motion) => {
                 take_listing(&mut listing, &mut cycle).await;
                 hopped = false;

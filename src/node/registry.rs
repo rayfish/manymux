@@ -45,16 +45,7 @@ impl Registry {
         prune(&mut sessions);
 
         let name = match &spec.name {
-            Some(n) => {
-                let n = sanitize(n);
-                if n.is_empty() {
-                    bail!("session name must contain at least one usable character");
-                }
-                if sessions.contains_key(&n) {
-                    bail!("session {n} already exists");
-                }
-                n
-            }
+            Some(n) => vet(&sessions, n)?,
             None => unique_name(&sanitize(&default_name(spec)), |n| sessions.contains_key(n)),
         };
 
@@ -69,14 +60,16 @@ impl Registry {
         session.publish(EventKind::Started);
 
         // Drop the session once the child exits so `mm ls` reflects reality
-        // and the PTY fd is released promptly.
+        // and the PTY fd is released promptly. By what has exited rather than
+        // by the name captured here, which a rename since would have moved:
+        // removing that key takes another session's entry or none at all.
         let registry = Arc::clone(self);
+        let exited = Arc::clone(&session);
         let mut exit_rx = session.exit_rx();
-        let name = session.name.clone();
         tokio::spawn(async move {
             let _ = exit_rx.wait_for(|code| code.is_some()).await;
-            registry.sessions.lock().unwrap().remove(&name);
-            info!(session = %name, "exited");
+            prune(&mut registry.sessions.lock().unwrap());
+            info!(session = %exited.name(), "exited");
         });
 
         Ok(session)
@@ -110,11 +103,44 @@ impl Registry {
         Ok(())
     }
 
-    pub fn rename(&self, name: &str, title: &str) -> Result<()> {
-        let session = self.get(name).ok_or_else(|| no_such(name))?;
-        session.rename(title);
-        Ok(())
+    /// Move a session to a different name, and answer with the name it ended
+    /// up with: what was asked for goes through the same sanitising a spawn's
+    /// does, so the two are not always the same string.
+    ///
+    /// Refused rather than made unique when the name is another session's. A
+    /// spawn has nobody to tell, so it takes the next free counter; a rename
+    /// was typed at a prompt with somebody sitting in front of it, and quietly
+    /// landing them on `build-2` is worse than saying the name is taken.
+    pub fn rename(&self, name: &str, to: &str) -> Result<String> {
+        let mut sessions = self.sessions.lock().unwrap();
+        prune(&mut sessions);
+        if !sessions.contains_key(name) {
+            return Err(no_such(name));
+        }
+        // Its own name is not a clash, so a rename to what it is called already
+        // is a rename with nothing to do rather than an error.
+        if sanitize(to) == name {
+            return Ok(name.to_string());
+        }
+        let wanted = vet(&sessions, to)?;
+        let session = sessions.remove(name).expect("checked just above");
+        session.set_name(&wanted);
+        sessions.insert(wanted.clone(), session);
+        info!(from = %name, to = %wanted, "renamed");
+        Ok(wanted)
     }
+}
+
+/// A name a caller asked for, ready to key a session by, or why it cannot be.
+fn vet(sessions: &HashMap<String, Arc<Session>>, wanted: &str) -> Result<String> {
+    let name = sanitize(wanted);
+    if name.is_empty() {
+        bail!("session name must contain at least one usable character");
+    }
+    if sessions.contains_key(&name) {
+        bail!("session {name} already exists");
+    }
+    Ok(name)
 }
 
 fn no_such(name: &str) -> anyhow::Error {
@@ -129,8 +155,14 @@ fn prune(sessions: &mut HashMap<String, Arc<Session>>) {
 
 /// Session names appear in `host/name` paths and in the terminal, so keep them
 /// to something unambiguous and safe to print.
+///
+/// A space becomes a dash rather than going the way of everything else that is
+/// dropped: two words typed at the rename prompt are two words, and running
+/// them together into `rayfishipv6` is nobody's idea of the name they asked
+/// for.
 fn sanitize(name: &str) -> String {
     name.chars()
+        .map(|c| if c.is_whitespace() { '-' } else { c })
         .filter(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | '.'))
         .take(64)
         .collect()
@@ -155,7 +187,7 @@ mod tests {
     #[test]
     fn sanitize_strips_path_and_control_characters() {
         assert_eq!(sanitize("../etc/passwd"), "..etcpasswd");
-        assert_eq!(sanitize("my session\x07"), "mysession");
+        assert_eq!(sanitize("my session\x07"), "my-session");
         assert_eq!(sanitize("build-1_a.b"), "build-1_a.b");
     }
 

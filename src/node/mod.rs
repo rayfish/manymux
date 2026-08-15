@@ -33,7 +33,7 @@ use crate::client::Stream;
 use crate::hosts::{Hosts, this_machine};
 use crate::notify::Notifier;
 use crate::proto::{
-    self, FindRequest, FrameReader, HostedEvent, Request, Response, ViewRequest, tag,
+    self, FindRequest, FrameReader, HostedEvent, Renamed, Request, Response, ViewRequest, tag,
 };
 use peers::Peers;
 use registry::Registry;
@@ -232,7 +232,7 @@ impl Node {
 
         for session in &sessions {
             if !session.has_exited() {
-                warn!(session = %session.name, "still there after the hangup; killing it");
+                warn!(session = %session.name(), "still there after the hangup; killing it");
                 session.kill_now();
             }
         }
@@ -287,7 +287,14 @@ impl Node {
                     rename: true,
                 };
                 proto::write_msg(&mut write, tag::RESPONSE, &response).await?;
-                pump_attachment(attached, &name, self.events.subscribe(), read, write).await
+                pump_attachment(
+                    attached,
+                    &self.registry,
+                    self.events.subscribe(),
+                    read,
+                    write,
+                )
+                .await
             }
 
             Request::Events => {
@@ -319,12 +326,10 @@ impl Node {
         match request {
             Request::List => Ok(Response::Sessions(self.registry.list())),
             Request::Spawn(spec) => self.registry.spawn(&spec).map(|session| Response::Spawned {
-                name: session.name.clone(),
+                name: session.name(),
             }),
             Request::Kill { name } => self.registry.kill(&name).map(|()| Response::Ok),
-            Request::Rename { name, title } => {
-                self.registry.rename(&name, &title).map(|()| Response::Ok)
-            }
+            Request::Rename { name, to } => self.registry.rename(&name, &to).map(|_| Response::Ok),
             Request::Version => Ok(Response::Version {
                 version: crate::VERSION.to_string(),
                 build: self.build.clone(),
@@ -383,7 +388,7 @@ fn modified(path: &Path) -> Option<std::time::SystemTime> {
 /// older client nothing: it skips a tag it does not know.
 async fn pump_attachment<R, W>(
     attached: session::Attached,
-    name: &str,
+    registry: &Registry,
     mut events: broadcast::Receiver<HostedEvent>,
     mut read: FrameReader<R>,
     mut write: W,
@@ -456,15 +461,20 @@ where
                         let found = attachment.find(&request.needle);
                         proto::write_msg(&mut write, tag::FIND, &found).await?;
                     }
-                    // A title typed at the client's own prompt, which is the
-                    // same sticky title `mm rename` sets. Nothing is sent back:
-                    // there is nothing here that can refuse it, and no way to
-                    // say anything on this stream that would not land in the
-                    // middle of whatever the program is drawing.
+                    // A name typed at the client's own prompt, which is the
+                    // same rename `mm rename` asks for from outside. Answered,
+                    // unlike a resize: the registry can refuse it, and the
+                    // client is showing the old name until it hears otherwise.
                     tag::RENAME => {
-                        let title: String = proto::decode(&frame.body)?;
-                        debug!(session = %name, %title, "renamed from an attached client");
-                        attachment.rename(&title);
+                        let wanted: String = proto::decode(&frame.body)?;
+                        let answer = match registry.rename(&attachment.name(), &wanted) {
+                            Ok(name) => Renamed::Name(name),
+                            Err(e) => {
+                                debug!("refusing a rename from an attached client: {e:#}");
+                                Renamed::Refused(format!("{e:#}"))
+                            }
+                        };
+                        proto::write_msg(&mut write, tag::RENAME, &answer).await?;
                     }
                     tag::PASTE => incoming.take(frame.body),
                     tag::PASTE_END => {
@@ -500,7 +510,15 @@ where
                 // This machine's own sessions only, and never the one already
                 // on the screen. What a watched peer is doing is the desktop
                 // notifier's business, not this terminal's.
-                Ok(hosted) if hosted.host == this_machine() && hosted.event.session != name => {
+                //
+                // Asked of the session rather than remembered from the attach:
+                // a rename since would leave this comparing against a name
+                // nothing is called any more, and the client would hear its own
+                // bells as the session next door's.
+                Ok(hosted)
+                    if hosted.host == this_machine()
+                        && hosted.event.session != attachment.name() =>
+                {
                     send(&mut write, tag::EVENT, &proto::encode(&hosted)?).await?;
                 }
                 Ok(_) => {}

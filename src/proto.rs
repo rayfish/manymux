@@ -102,15 +102,19 @@ pub mod tag {
     /// local: `n` on a machine two hops away should not be a round trip.
     pub const FIND: u8 = 0x1c;
 
-    /// A new sticky title for the session this stream is attached to, as a
-    /// msgpack string. Client to server only, and the same thing `mm rename`
-    /// asks for over a stream of its own: an empty one clears it.
+    /// A new name for the session this stream is attached to, asked for as a
+    /// msgpack string and answered on the same tag with a [`super::Renamed`].
     ///
     /// On the attached stream rather than a second connection because that is
     /// where the session already is. An [`super::Attached`] holds no socket and
     /// no host, so a client that wanted to send a `Request` would have to know
     /// how it got here, which is the one thing this half of the client is kept
     /// from knowing.
+    ///
+    /// Answered rather than sent and forgotten, unlike a resize: a name can be
+    /// taken by another session or be nothing at all once it has been through
+    /// the same sanitising a spawn goes through, and the client has the old one
+    /// on its mark row until it hears which it is.
     ///
     /// A node too old to know the tag skips it in silence, which is why
     /// [`super::Response::Attached`] says whether this one does.
@@ -201,9 +205,13 @@ pub enum Request {
     Kill {
         name: String,
     },
+    /// Give a live session a different name, the one it is addressed by in
+    /// `host/name`. The field is not the one this request used to carry, so a
+    /// node too old to know it cannot decode the request and says so, which is
+    /// a better answer than silently setting something else.
     Rename {
         name: String,
-        title: String,
+        to: String,
     },
     Attach {
         name: String,
@@ -258,9 +266,9 @@ pub enum Response {
         /// it existed, so the key says so rather than doing nothing.
         #[serde(default)]
         scroll: bool,
-        /// Whether this host takes [`tag::RENAME`], so the title can be set
-        /// from inside the session rather than only by `mm rename`. False the
-        /// same way and for the same reason as the two above.
+        /// Whether this host takes [`tag::RENAME`], so a session can be renamed
+        /// from inside it rather than only by `mm rename`. False the same way
+        /// and for the same reason as the two above.
         #[serde(default)]
         rename: bool,
     },
@@ -319,6 +327,19 @@ pub struct FindRequest {
 pub struct Found {
     pub needle: String,
     pub lines: Vec<u64>,
+}
+
+/// What came of a rename asked for on [`tag::RENAME`].
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub enum Renamed {
+    /// The name the session answers to now, which is the one asked for after
+    /// the sanitising every session name goes through. The client shows this
+    /// rather than what was typed, or the mark row would name a session that
+    /// is not there.
+    Name(String),
+    /// Why the session is still called what it was: the name is another
+    /// session's, or there was nothing usable left of it.
+    Refused(String),
 }
 
 /// Something that happened in a session, as it goes over the wire.
@@ -574,7 +595,7 @@ mod tests {
             !scroll,
             "nor answer for a window of a history it cannot send"
         );
-        assert!(!rename, "nor take a title on a tag it has never heard of");
+        assert!(!rename, "nor rename a session on a tag it never heard of");
 
         // And the other way: an old client reading a new host's answer, which
         // is a fleet updated from the far end first.
@@ -672,6 +693,28 @@ mod tests {
             decode::<Old>(&encode(&Request::List).unwrap()).unwrap(),
             Old::List
         ));
+    }
+
+    /// A rename used to set a title and now moves the session's name, which is
+    /// a different thing done to the same session. A node that still does the
+    /// old one has no business doing it on a request that meant the new one, so
+    /// the field is not the field it knows: it cannot decode the request and
+    /// says so, and "that machine is behind" is a better answer than a session
+    /// quietly retitled instead of renamed.
+    #[test]
+    fn a_node_that_still_renames_titles_cannot_decode_a_rename() {
+        /// `Request::Rename` as it was when it set a title.
+        #[derive(Serialize, Deserialize)]
+        enum Old {
+            Rename { name: String, title: String },
+        }
+
+        let asked = encode(&Request::Rename {
+            name: "api".into(),
+            to: "build".into(),
+        })
+        .unwrap();
+        assert!(decode::<Old>(&asked).is_err());
     }
 
     /// A client that asks a node from before the field existed still attaches:

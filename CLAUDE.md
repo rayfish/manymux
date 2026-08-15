@@ -223,21 +223,35 @@ Three consequences run through the whole codebase and are worth keeping intact:
   second connection.** An `Attached` holds neither the socket nor the host it
   arrived by, on purpose: that is the one thing this half of the client is kept
   from knowing, and a mobile app drives the same type. So `tag::RENAME` carries
-  a title the way `tag::VIEW` and `tag::FIND` carry their questions, and the
-  node has the session right there at the other end. What that costs is an
-  answer: a node too old to know the tag skips it in silence, so
-  `Response::Attached` carries a flag per capability (`paste`, `scroll`,
-  `rename`) and the client says "this host is too old" rather than leaving a key
-  that does nothing.
+  a name the way `tag::VIEW` and `tag::FIND` carry their questions, and the node
+  has the session right there at the other end. What that costs is an answer: a
+  node too old to know the tag skips it in silence, so `Response::Attached`
+  carries a flag per capability (`paste`, `scroll`, `rename`) and the client
+  says "this host is too old" rather than leaving a key that does nothing.
 - **Both prompts are one prompt** (`attach::Prompt`). The search and the rename
   are typed the same way, so the editing lives in one place and only the action
   handed back says which one is open. A prompt swallows the whole chunk, because
   typing arrives in chunks and one action per byte would drop the rest of each;
   and a rub takes a whole character, not a byte, or one press of an accented key
   leaves half of it behind.
-- Session names are sanitised in `node::registry` because they appear in
-  `host/name` paths and in the terminal. Titles are not: they are free text, and
-  `Session::rename` reads an empty one as "take the sticky title off".
+- **A rename moves the name, and the title stays the program's.** The name says
+  which session this is and goes in `host/name`, so it is sanitised in
+  `node::registry` and refused when another session already holds it: a spawn
+  has nobody to tell and takes the next free counter, but a rename was typed at
+  a prompt by somebody who would rather hear "that name is taken" than land on
+  `build-2`. The title is the last one the program set, else the command, and
+  nothing else ever writes it. Which is why `Registry::rename` answers with the
+  name that stuck rather than `Ok(())`: what was typed and what the session
+  ended up called are not always the same string, and the client is drawing one
+  of them on the mark row.
+- **A session's name can change under whatever is holding it.** `Session::name`
+  is behind a lock and read through `name()`, because the registry's key moves
+  with a rename and so does every event the session publishes. Anything that
+  remembers a name instead of asking is wrong by the next rename: the exit
+  watcher in `registry::spawn` prunes by what has exited rather than removing
+  the name it was spawned under, which by then may be a *different*, live
+  session, and `pump_attachment` compares an event against `attachment.name()`
+  so a client does not hear its own bells as the session next door's.
 
 ### Tests
 

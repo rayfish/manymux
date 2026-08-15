@@ -447,9 +447,13 @@ fn a_bare_name_finds_a_session_on_another_machine() {
     );
 
     // No host given: it should be found on gpu-box and renamed there.
-    world.ok("laptop", &["rename", "solo", "renamed remotely"]);
+    world.ok("laptop", &["rename", "solo", "moved"]);
     let listed = world.ok("laptop", &["ls", "gpu-box"]);
-    assert!(listed.contains("renamed remotely"), "{listed}");
+    assert!(listed.contains("gpu-box/moved"), "{listed}");
+    assert!(
+        !listed.contains("solo"),
+        "the old name is nobody's: {listed}"
+    );
 }
 
 #[test]

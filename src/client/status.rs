@@ -107,6 +107,20 @@ impl Status {
         }
     }
 
+    /// Show a different session name, for the one thing that changes it while
+    /// an attach is up: a rename the host has agreed to. The caller repaints,
+    /// and gives the window the new name with [`Self::retitle`].
+    pub fn set_target(&mut self, target: &str) {
+        self.target = target.to_string();
+    }
+
+    /// Name the window again, for when the target has changed under it. The
+    /// same sequence [`Self::setup`] opens with, and it lasts exactly as long:
+    /// until the session sets a title of its own.
+    pub fn retitle(&self) -> String {
+        self.title(&self.target)
+    }
+
     /// Say how far back the view is, or that it has gone. The caller repaints.
     pub fn set_scrolled(&mut self, lines: Option<u64>) {
         self.scrolled = lines;
@@ -122,11 +136,11 @@ impl Status {
         self.prompt = needle.map(|text| ("/", text));
     }
 
-    /// The same for the prompt that titles the session, told apart by being
+    /// The same for the prompt that renames the session, told apart by being
     /// spelled out: `/` is what a search is called everywhere, and a rename is
     /// called nothing in particular.
-    pub fn set_renaming(&mut self, title: Option<String>) {
-        self.prompt = title.map(|text| ("rename ", text));
+    pub fn set_renaming(&mut self, name: Option<String>) {
+        self.prompt = name.map(|text| ("rename ", text));
     }
 
     /// Show what the last search found: the needle, and which match of how
@@ -1002,22 +1016,35 @@ mod tests {
         assert!(painted.contains("\x1b[24;6H"), "{painted:?}");
     }
 
-    /// The row is the only place a title being typed shows, so it has to say
+    /// The row is the only place a name being typed shows, so it has to say
     /// which prompt is open as well as what is in it: a `/` and a word are not
     /// the same question.
     #[test]
     fn the_rename_prompt_says_so_and_shows_what_is_typed() {
         let mut status = Status::new("srv/zsh");
         status.set_mode(Mode::Rename);
-        status.set_renaming(Some("nightly bench".to_string()));
+        status.set_renaming(Some("nightly-bench".to_string()));
         let painted = status.repaint(Size::new(80, 24));
-        assert!(painted.contains("rename nightly bench"), "{painted:?}");
+        assert!(painted.contains("rename nightly-bench"), "{painted:?}");
         assert!(
             painted.contains("rename ●"),
             "the mode is named {painted:?}"
         );
         // And the mark keeps the column it has in every other mode.
         assert!(painted.contains("\x1b[24;62H"), "{painted:?}");
+    }
+
+    /// A rename the host agreed to: the mark names the session it is called
+    /// now, and the window is named again with it, for one that has set no
+    /// title of its own and so is showing the target.
+    #[test]
+    fn the_mark_follows_a_rename() {
+        let mut status = Status::new("srv/zsh");
+        status.set_target("srv/build");
+        let painted = status.repaint(Size::new(80, 24));
+        assert!(painted.contains("srv/build"), "{painted:?}");
+        assert!(!painted.contains("srv/zsh"), "{painted:?}");
+        assert_eq!(status.retitle(), "\x1b]0;mm srv/build\x07");
     }
 
     /// One prompt slot, so opening one takes the other's place rather than

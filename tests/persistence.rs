@@ -95,13 +95,22 @@ impl Client {
         proto::write_frame(&mut self.write, tag::PONG, &[]).await
     }
 
-    /// Give the session a title from the stream it is attached to, which is
-    /// what the client's own rename prompt sends. Nothing answers it, so what
-    /// it did is read off the registry.
-    async fn rename(&mut self, title: &str) {
-        proto::write_msg(&mut self.write, tag::RENAME, &title)
+    /// Rename the session from the stream it is attached to, which is what the
+    /// client's own rename prompt sends, and read past whatever else is on the
+    /// stream until the answer comes back.
+    async fn rename(&mut self, name: &str) -> proto::Renamed {
+        proto::write_msg(&mut self.write, tag::RENAME, &name)
             .await
             .expect("renaming");
+        loop {
+            match self.next_frame().await {
+                Some(frame) if frame.tag == tag::RENAME => {
+                    return proto::decode(&frame.body).expect("an answer");
+                }
+                Some(_) => {}
+                None => panic!("the stream closed before the rename came back"),
+            }
+        }
     }
 
     /// Ask for a window of the session's history, and read past whatever else
@@ -172,7 +181,7 @@ impl Client {
     }
 }
 
-/// What the node calls a session now.
+/// What the node says a session is doing, which is the program's title.
 fn title_of(node: &Arc<Node>, name: &str) -> String {
     node.registry
         .list()
@@ -182,21 +191,13 @@ fn title_of(node: &Arc<Node>, name: &str) -> String {
         .title
 }
 
-/// Wait for the title to be what it should be. A wait rather than a look,
-/// because a rename is answered with nothing: there is no frame to read that
-/// would say the node has got to it yet.
-async fn titled(node: &Arc<Node>, name: &str, want: &str) {
-    let settled = tokio::time::timeout(Duration::from_secs(10), async {
-        while title_of(node, name) != want {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await;
-    assert!(
-        settled.is_ok(),
-        "the session is called {:?}, not {want:?}",
-        title_of(node, name)
-    );
+/// Every session the node has, by name.
+fn names(node: &Arc<Node>) -> Vec<String> {
+    node.registry
+        .list()
+        .into_iter()
+        .map(|session| session.name)
+        .collect()
 }
 
 fn alive(pid: u32) -> bool {
@@ -731,6 +732,39 @@ async fn a_session_disappears_from_the_list_once_its_child_exits() {
     assert!(registry.list().is_empty());
 }
 
+/// A session that exits takes its own entry out of the registry and nobody
+/// else's. Found by what has exited rather than by the name it was spawned
+/// under: a rename since has moved it, and that name may since have been taken
+/// by a session that is still running.
+#[tokio::test]
+async fn a_renamed_session_exiting_leaves_whoever_took_its_old_name() {
+    let node = test_node().await;
+    let registry = &node.registry;
+    let Spawned { name, .. } = spawn_session(&node, &["/bin/sh", "-c", "sleep 300"]).await;
+    registry.rename(&name, "moved").unwrap();
+
+    let took_it = registry
+        .spawn(&SpawnSpec {
+            name: Some(name.clone()),
+            command: vec!["/bin/sh".into(), "-c".into(), "sleep 300".into()],
+            ..Default::default()
+        })
+        .unwrap();
+
+    registry.kill("moved").unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while registry.get("moved").is_some() {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the renamed session should have been reaped");
+
+    assert_eq!(names(&node), vec![name.clone()], "{:?}", names(&node));
+    assert!(!took_it.has_exited());
+    registry.kill(&name).unwrap();
+}
+
 #[tokio::test]
 async fn two_clients_share_one_session_at_the_smaller_size() {
     let node = test_node().await;
@@ -943,16 +977,16 @@ async fn a_bell_next_door_reaches_an_attached_client_and_this_ones_does_not() {
 }
 
 /// Renaming from inside the session, which is what `Ctrl-] r` sends: the same
-/// sticky title `mm rename` sets, on the stream the session is already on.
+/// rename `mm rename` asks for, on the stream the session is already on.
 ///
 /// It goes there rather than down a second connection because an attached
 /// client has neither the socket nor the host it arrived by, and the node has
 /// the session right there at the other end of this stream.
 #[tokio::test]
-async fn a_title_typed_at_an_attached_client_reaches_the_session() {
+async fn a_name_typed_at_an_attached_client_renames_the_session() {
     let node = test_node().await;
     let Spawned { name, .. } = spawn_session(&node, &["/bin/sh", "-c", "sleep 300"]).await;
-    let called = title_of(&node, &name);
+    let doing = title_of(&node, &name);
 
     let mut client = Client::connect(&node);
     let attached = client
@@ -968,17 +1002,68 @@ async fn a_title_typed_at_an_attached_client_reaches_the_session() {
     };
     assert!(
         rename,
-        "a node that takes a title has to say so, or the client cannot tell it \
+        "a node that takes a rename has to say so, or the client cannot tell it \
          from one too old to and has to leave a key doing nothing"
     );
 
-    client.rename("nightly bench").await;
-    titled(&node, &name, "nightly bench").await;
+    let answer = client.rename("nightly-bench").await;
+    assert_eq!(answer, proto::Renamed::Name("nightly-bench".into()));
+    assert_eq!(names(&node), vec!["nightly-bench".to_string()]);
+    assert_eq!(
+        title_of(&node, "nightly-bench"),
+        doing,
+        "the title is the program's and a rename does not touch it"
+    );
 
-    // Empty is not a mistake: it is how the sticky title comes off again, and
-    // the session goes back to being called whatever it was calling itself.
-    client.rename("").await;
-    titled(&node, &name, &called).await;
+    // The sanitising a spawn's name goes through, and the answer says what it
+    // left: the client puts this on its mark row, so it cannot be what was
+    // typed. A space is the dash it was going to be anyway; the rest goes.
+    let answer = client.rename("nightly bench!").await;
+    assert_eq!(answer, proto::Renamed::Name("nightly-bench".into()));
+
+    node.registry.kill("nightly-bench").unwrap();
+}
+
+/// A name that is another session's, and one that is nothing at all once it has
+/// been sanitised. Both are refused rather than made unique: somebody is
+/// sitting at the prompt, and landing them on `build-2` without a word is worse
+/// than saying the name is taken.
+#[tokio::test]
+async fn a_rename_that_cannot_be_done_is_refused_with_a_reason() {
+    let node = test_node().await;
+    let Spawned { name, .. } = spawn_session(&node, &["/bin/sh", "-c", "sleep 300"]).await;
+    let next_door = node
+        .registry
+        .spawn(&SpawnSpec {
+            name: Some("taken".into()),
+            command: vec!["/bin/sh".into(), "-c".into(), "sleep 300".into()],
+            ..Default::default()
+        })
+        .unwrap();
+
+    let mut client = Client::connect(&node);
+    client
+        .send(&Request::Attach {
+            name: name.clone(),
+            size: Size::new(80, 24),
+            history: 0,
+        })
+        .await
+        .unwrap();
+
+    let proto::Renamed::Refused(why) = client.rename("taken").await else {
+        panic!("a name another session holds is not there to be taken");
+    };
+    assert!(why.contains("already exists"), "{why:?}");
+
+    let proto::Renamed::Refused(why) = client.rename("///").await else {
+        panic!("a name with nothing usable in it is not a name");
+    };
+    assert!(why.contains("usable character"), "{why:?}");
+
+    // Still where it was, under the name it started with.
+    assert!(names(&node).contains(&name), "{:?}", names(&node));
 
     node.registry.kill(&name).unwrap();
+    node.registry.kill(&next_door.name()).unwrap();
 }
