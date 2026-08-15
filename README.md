@@ -337,10 +337,14 @@ mm update [--check] [--nightly]      replace this binary with the published one
 mm start | stop | restart [--force]  this machine's node: up, down, and again
 mm service install|uninstall         run the node at boot
 mm completions [shell] [--install]   tab completion, with your session names in it
-mm daemon | agent                    the node, and what ssh runs on the far side
 ```
 
 The ones you type often have a short form: `l`, `n`, `a`, `k`, `r`, `h`, `up`.
+
+Two more exist and are hidden from `mm --help`, because nothing types them:
+`mm daemon` is the node itself, run by the service unit or by a client that
+found none running, and `mm agent` is what `ssh <host> mm agent` runs. See
+[How it works](#how-it-works).
 
 ## Tab completion
 

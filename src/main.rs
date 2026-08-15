@@ -42,7 +42,11 @@ struct Cli {
 enum Command {
     /// Run this machine's node: own its sessions, and watch the machines you
     /// have added for anything wanting attention. Usually a service.
-    #[command(alias = "server")]
+    ///
+    /// Hidden because nothing types it: the service unit runs it, and so does
+    /// a client that found no node on the machine. `mm start`, `mm stop` and
+    /// `mm restart` are how a person says the same things.
+    #[command(alias = "server", hide = true)]
     Daemon {
         /// Watch for events but do not raise desktop notifications.
         #[arg(long)]
@@ -50,7 +54,11 @@ enum Command {
     },
     /// Bridge stdin and stdout to this machine's node, starting it if needed.
     ///
-    /// This is what `ssh <host> mm agent` runs. You do not normally type it.
+    /// This is what `ssh <host> mm agent` runs, and the only thing that ever
+    /// does. Hidden for the same reason as `daemon`: it is the transport, not
+    /// a command. Both still run when named, so ssh and the service unit are
+    /// unaffected, and `mm agent --help` still explains itself.
+    #[command(hide = true)]
     Agent,
 
     /// List sessions, on every added machine by default.

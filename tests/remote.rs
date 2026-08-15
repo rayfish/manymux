@@ -1044,6 +1044,45 @@ fn a_setting_is_written_where_the_next_command_reads_it() {
     );
 }
 
+/// `daemon` and `agent` are machinery, not commands: one is started by the
+/// service unit or by a client that found no node, the other is what ssh runs.
+/// Hiding them keeps `mm --help` to the things a person types, and this is the
+/// test that the hiding stopped there: ssh names `mm agent` outright and the
+/// service unit names `mm daemon`, so a hidden command that stopped running
+/// would take every remote command on every machine with it.
+#[test]
+fn the_two_commands_nobody_types_are_hidden_but_still_run() {
+    let world = World::new("hidden");
+
+    let help = world.ok("laptop", &["--help"]);
+    for hidden in ["daemon", "agent"] {
+        assert!(
+            !help.lines().any(|line| line.trim().starts_with(hidden)),
+            "{hidden} is listed in --help:\n{help}"
+        );
+    }
+    // The ones that replaced them for a person are still there.
+    for shown in ["start", "stop", "restart"] {
+        assert!(
+            help.lines().any(|line| line.trim().starts_with(shown)),
+            "{shown} is missing from --help:\n{help}"
+        );
+    }
+
+    // Named outright, both still work, which is all ssh and systemd ever do.
+    assert!(world.ok("laptop", &["agent", "--help"]).contains("stdin"));
+    assert!(world.ok("laptop", &["daemon", "--help"]).contains("node"));
+
+    // And a tab offers neither, since the generated script comes from the same
+    // parser.
+    let offered = world.complete("laptop", &[""]);
+    assert!(
+        !offered.iter().any(|word| word == "daemon" || word == "agent"),
+        "a tab offered machinery: {offered:?}"
+    );
+    assert!(offered.iter().any(|word| word == "a"), "{offered:?}");
+}
+
 /// The whole path on a real terminal: a bell in one session, and an OSC 9 on
 /// the terminal of whoever is attached to another one next door. Everything
 /// under it is tested in pieces; this is the only thing that shows the pieces
