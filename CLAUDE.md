@@ -163,6 +163,18 @@ Three consequences run through the whole codebase and are worth keeping intact:
   and beside a narrower screen. What a hop must *not* undo is the pushed title,
   which belongs to the whole run of attaches, nor the screen, which belongs to
   whichever mode is in use.
+- **A dump is both buffers, so a swallowed switch owes an erase**
+  (`status::SWITCHED`). `avt` paints the primary screen, names the switch to the
+  alternate one, and paints that. On a screen the client owns the switch is
+  swallowed, and swallowing it alone left the two painted on one surface: a
+  session sitting in a full-screen program showed the scrollback of the shell
+  that started it wherever the program had not painted, which no takeover can
+  reach because it runs before the dump arrives. The erase goes where the switch
+  was, before the next byte that paints, and it is *owed* rather than written on
+  the spot because two switches with nothing painted between them are a round
+  trip that owes nothing: a dump of a session on the primary screen that has
+  used the alternate one names both and paints between neither, and erasing
+  there blanks the screen the same dump just painted.
 - **There are two screen modes, and everything that differs between them is in
   one trait** (`src/client/screen.rs`, chosen with `--screen` or the `screen`
   setting, alternate by default). `alternate` takes the terminal's second screen

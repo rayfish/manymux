@@ -1330,6 +1330,87 @@ fn a_resize_repaints_the_screen_at_the_size_it_now_has() {
     let _ = client.wait();
 }
 
+/// Attaching to a session sitting in a full-screen program paints that program
+/// on a screen with nothing else on it.
+///
+/// A screen dump is both buffers: the primary one, then the switch to the
+/// alternate one, then that. The switch is the client's to swallow, and
+/// swallowing it and nothing else left the two painted on one screen, so the
+/// scrollback of the shell that started the program showed through wherever the
+/// program had not painted.
+#[test]
+fn a_full_screen_program_is_painted_on_a_screen_with_nothing_under_it() {
+    use std::io::Read;
+    use std::os::fd::AsFd;
+    use std::sync::mpsc;
+
+    let world = World::new("both-buffers");
+    world.ok(
+        "laptop",
+        &[
+            "new",
+            "-d",
+            "-n",
+            "editing",
+            "sh",
+            "-c",
+            // A shell with something on its screen, and then a program on the
+            // screen of its own that a dump paints second.
+            "printf 'SHELL\\n\\033[?1049h\\033[HPROGRAM\\n'; sleep 30",
+        ],
+    );
+    world.wait_for_node("laptop");
+
+    let (pty, pts) = pty_process::blocking::open().unwrap();
+    pty.resize(pty_process::Size::new(24, 80)).unwrap();
+    let mut client = pty_process::blocking::Command::new(MM)
+        .arg("--socket")
+        .arg(world.socket("laptop"))
+        .args(["attach", "editing"])
+        .env("MM_CONFIG_DIR", world.dir.join("laptop"))
+        .env("MM_SSH", world.ssh_stub())
+        .env("MM_LOG", "manymux=warn")
+        .env("TERM", "xterm-256color")
+        .spawn(pts)
+        .expect("attaching on a terminal");
+
+    let (seen_tx, seen_rx) = mpsc::channel();
+    let mut reading =
+        unsafe { pty_process::blocking::Pty::from_fd(pty.as_fd().try_clone_to_owned().unwrap()) };
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 1024];
+        while let Ok(read @ 1..) = reading.read(&mut buf) {
+            if seen_tx.send(buf[..read].to_vec()).is_err() {
+                return;
+            }
+        }
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut seen = String::new();
+    while !seen.contains("PROGRAM") {
+        if let Ok(chunk) = seen_rx.recv_timeout(Duration::from_millis(200)) {
+            seen.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the program never reached the terminal; saw: {seen:?}"
+        );
+    }
+
+    // The dump paints the shell's screen, and the program's has to land on an
+    // erased one rather than on top of it.
+    let shell = seen.find("SHELL").expect("the shell went unpainted");
+    let program = seen.find("PROGRAM").unwrap();
+    assert!(
+        seen[shell..program].contains("\x1b[2J"),
+        "the program was painted over the screen underneath it: {seen:?}"
+    );
+
+    let _ = client.kill();
+    let _ = client.wait();
+}
+
 /// `mm a devbox` reads as "put me on devbox", and there is usually one thing
 /// running there. Naming the session as well repeats a lookup you have just
 /// done with `mm ls`.

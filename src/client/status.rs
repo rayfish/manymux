@@ -242,6 +242,16 @@ fn region(size: Size) -> String {
     format!("\x1b[1;{}r", size.rows - RESERVED)
 }
 
+/// Whether a byte on solid ground puts something on the screen.
+///
+/// The control bytes that get here move the cursor or ring the bell, and a
+/// dump's line breaks are among them: an erase owed to the screen must not be
+/// spent on one of those, or it lands before the first glyph of the screen it
+/// was meant to make room for rather than after the last of the one before.
+fn paints(b: u8) -> bool {
+    b >= 0x20 && b != 0x7f
+}
+
 /// The prefix, applied once. A title the session repeats every prompt must not
 /// grow an `mm mm mm ` in front of it.
 fn prefixed(text: &str) -> String {
@@ -252,13 +262,32 @@ fn prefixed(text: &str) -> String {
     }
 }
 
+/// The erase a swallowed screen switch owes the terminal.
+///
+/// Switching buffers is how a terminal is told the screen is about to be a
+/// different one, and it clears the one being switched to. Swallowing the
+/// switch leaves that undone, so it is done here instead, in the one place that
+/// knows the switch happened.
+///
+/// The pen goes back to default because the erase clears to the current
+/// background, and a program that left one set would otherwise paint the whole
+/// screen its colour. The cursor is saved and put back because this lands
+/// wherever the session had it, and what comes next is written there.
+const SWITCHED: &str = concat!(
+    "\x1b7",   // save the cursor, and the pen with it
+    "\x1b[0m", // default attributes, so the erase clears to the usual background
+    "\x1b[2J", // the screen the other buffer had
+    "\x1b8",   // the pen and the cursor back
+);
+
 /// Rewrites the session's output on its way to the terminal.
 ///
 /// Three jobs, all needing the same parse. Titles get the prefix, so the tab
 /// says `mm` however often the remote shell renames it. Sequences that would
 /// take the mark or its scrolling region with them are noted, so the client can
 /// put both back. And the session's own switches between the primary and
-/// alternate screens are swallowed, because that screen is the client's.
+/// alternate screens are swallowed, because that screen is the client's, and
+/// [`SWITCHED`] is written in their place before whatever paints next.
 ///
 /// Everything else passes through byte for byte. This is not a terminal
 /// emulator and must never become one: it tracks just enough state to know a
@@ -281,6 +310,15 @@ pub struct Filter {
     /// mouse. While it has, the wheel is its business and the client neither
     /// turns tracking on nor reads a report.
     mouse: bool,
+    /// Whether a swallowed switch has left the screen owing an erase, taken by
+    /// the next byte that paints.
+    ///
+    /// Toggled rather than set, because two switches with nothing painted
+    /// between them are a round trip back to the buffer already on the screen
+    /// and owe nothing. `avt` emits exactly that: a dump of a session on the
+    /// primary screen that has used the alternate one names both switches and
+    /// paints between neither.
+    owed: bool,
 }
 
 impl Default for Filter {
@@ -325,6 +363,7 @@ impl Filter {
             switched: false,
             alternate: false,
             mouse: false,
+            owed: false,
         }
     }
 
@@ -353,7 +392,17 @@ impl Filter {
                         self.state = State::Escape;
                         self.held.push(b);
                     }
-                    _ => out.push(b),
+                    _ => {
+                        // The first thing to paint since a switch was
+                        // swallowed, and so the last moment the screen the
+                        // other buffer had can be erased without taking this
+                        // byte with it.
+                        if self.owed && paints(b) {
+                            out.extend_from_slice(SWITCHED.as_bytes());
+                            self.owed = false;
+                        }
+                        out.push(b);
+                    }
                 },
                 State::Escape => {
                     self.held.push(b);
@@ -519,6 +568,9 @@ impl Filter {
             return true;
         }
         self.switched = true;
+        // The screen the terminal would have cleared for itself, owed until
+        // there is something to clear it for.
+        self.owed = !self.owed;
         if kept.is_empty() {
             return false;
         }
@@ -669,11 +721,67 @@ mod tests {
     fn a_session_never_gets_to_switch_the_screen_out_from_under_the_client() {
         for switch in ["\x1b[?1049h", "\x1b[?1049l", "\x1b[?1047l", "\x1b[?47h"] {
             let mut filter = Filter::default();
-            assert_eq!(through(&mut filter, &format!("a{switch}b")), "ab");
+            // The switch itself never reaches the terminal. What takes its
+            // place is the erase it would have done, and it goes before the
+            // first thing painted on the screen it was owed for.
+            assert_eq!(
+                through(&mut filter, &format!("a{switch}b")),
+                format!("a{SWITCHED}b")
+            );
             assert!(filter.take_switched(), "{switch}");
             assert!(filter.take_dirty(), "{switch}");
             assert!(filter.at_boundary());
         }
+    }
+
+    /// The bug this was written for: a dump paints the primary buffer, names
+    /// the switch to the alternate one, and paints that. Swallowing the switch
+    /// and nothing else left both buffers on one screen, so a session sitting
+    /// in a full-screen program showed the scrollback of the shell that started
+    /// it wherever the program had not painted.
+    #[test]
+    fn a_dump_paints_the_alternate_screen_on_an_erased_one() {
+        let mut filter = Filter::default();
+        let dump = through(&mut filter, "shell\r\n\x1b[?1047h\x1b[1;1Hprogram");
+        let erase = dump.find("\x1b[2J").expect("nothing was erased");
+        assert!(
+            dump[..erase].contains("shell"),
+            "the screen was erased before the buffer under it was painted: {dump:?}"
+        );
+        assert!(
+            dump[erase..].contains("program"),
+            "the alternate screen paints on what the primary one left: {dump:?}"
+        );
+    }
+
+    /// A dump of a session on the primary screen that has used the alternate
+    /// one names both switches and paints between neither, and erasing there
+    /// would throw away the screen the same dump had just painted.
+    #[test]
+    fn a_screen_the_session_only_passed_through_is_not_erased() {
+        let mut filter = Filter::default();
+        let dump = through(&mut filter, "shell\x1b[?1047h\x1b[?1047l\x1b[2;1H$ ");
+        assert!(!dump.contains("\x1b[2J"), "{dump:?}");
+    }
+
+    /// The other direction, which is a full-screen program exiting while you
+    /// are attached: the screen it had is not the shell's, and the shell must
+    /// not come back to it.
+    #[test]
+    fn a_program_leaving_the_alternate_screen_erases_before_the_shell_paints() {
+        let mut filter = Filter::default();
+        assert_eq!(through(&mut filter, "\x1b[?1049l"), "");
+        assert_eq!(through(&mut filter, "\r\n$ "), format!("\r\n{SWITCHED}$ "));
+    }
+
+    /// Inline the terminal made the switch itself and cleared or kept the
+    /// screen the way it always does. An erase of ours on top of that is a
+    /// screenful of the scrollback thrown away.
+    #[test]
+    fn a_screen_the_terminal_switches_itself_is_never_erased_by_us() {
+        let mut filter = Filter::new(Screen::Inline);
+        let out = through(&mut filter, "\x1b[?1049hprogram");
+        assert!(!out.contains("\x1b[2J"), "{out:?}");
     }
 
     /// Inline the screen the session switches to is the terminal's own, so the
