@@ -142,6 +142,14 @@ Three consequences run through the whole codebase and are worth keeping intact:
   never erases, so without it the session you left shows through below that line
   and beside a narrower screen. What a hop must *not* undo is the alternate
   screen or the pushed title, which belong to the whole run of attaches.
+- **A resize is repainted from the node, not left to the session.** Telling the
+  node the new size redraws nothing: a shell that printed and went quiet has no
+  answer to a SIGWINCH, so the screen keeps the old geometry, marks on rows that
+  are no longer the bottom included. The client asks for the screen back
+  (`SessionWriter::resync`) and paints it over an erased, homed screen
+  (`terminal::REGROWN`), for the same reason a hop erases. The scrolling region
+  goes out first: the dump paints with newlines, and they would scroll against
+  the old fence.
 - **The mode key has three spellings, not one.** A program that asks for the
   kitty keyboard protocol (`CSI > 7 u`, which `pi` sends on startup) or for
   xterm's `modifyOtherKeys` changes how the *terminal* encodes every chord, so

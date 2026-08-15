@@ -675,6 +675,32 @@ mod terminal {
         format!("{}\x1b[H\x1b[2J", undone())
     }
 
+    /// Written before a screen the node sent in answer to a resize.
+    ///
+    /// Nothing in the session redraws for a size it was never told about: a
+    /// shell that printed and went quiet has nothing to say about the window
+    /// changing shape, so the node's model is the only place the screen exists
+    /// at its new size. Painting it needs the same two things a hop needs, and
+    /// for the same reasons: the erase, because the dump paints from the cursor
+    /// down to its last line with anything on it and never erases, so the old
+    /// geometry shows through under and beside it, marks on what used to be the
+    /// bottom row included; and the home, because that is where the dump starts
+    /// printing.
+    ///
+    /// Where a hop resets the terminal first, this cannot: the session is still
+    /// running and still owns every mode it switched on. So the pen is put back
+    /// by hand instead, since the erase clears to the current background and a
+    /// program that left one set would otherwise paint the whole screen its
+    /// colour.
+    const REGROWN: &str = concat!(
+        "\x1b7",   // save the cursor, and the pen with it
+        "\x1b[0m", // default attributes, so the erase clears to the usual background
+        "\x1b[H",  // home, since erasing does not move the cursor
+        "\x1b[2J", // the screen the old size left behind
+        "\x1b8",   // the pen and the cursor back
+        "\x1b[H",  // and home again, where the dump starts printing
+    );
+
     /// Everything [`undone`] undoes, and the terminal itself given back: the
     /// screen the shell was on, the title it had, and the cursor where it left
     /// it. A detach, in other words, where a hop stops at [`takeover`].
@@ -839,6 +865,10 @@ mod terminal {
         // Whether the frame that repaints the screen on attach has been and
         // gone. Everything after it is the session speaking for itself.
         let mut painted = false;
+        // Screens still owed for a resize, and so still to be painted onto one
+        // wiped first. Counted rather than flagged because a drag across the
+        // desktop asks more than once before the first answer arrives.
+        let mut owed = 0usize;
         // When the notice on the row stops being worth showing.
         let mut notice_until: Option<tokio::time::Instant> = None;
         // Notifications for the terminal, waiting for a safe moment to be
@@ -935,6 +965,10 @@ mod terminal {
                     // paints both buffers, so they are swallowed and dropped
                     // rather than answered with another request.
                     Update::Screen(bytes) => {
+                        if owed > 0 {
+                            owed -= 1;
+                            stdout.write_all(REGROWN.as_bytes()).await?;
+                        }
                         stdout.write_all(&output.feed(&bytes)).await?;
                         output.take_switched();
                         output.take_dirty();
@@ -965,9 +999,14 @@ mod terminal {
                 _ = winch.recv() => {
                     let size = terminal_size();
                     writer.resize(status::session_size(size)).await?;
-                    // The new geometry moved the mark and the region with it.
+                    // The new geometry moved the mark and the region with it,
+                    // and the region goes first because the screen asked for
+                    // below is painted with newlines that would scroll against
+                    // the old fence.
                     stdout.write_all(status.repaint(size).as_bytes()).await?;
                     stdout.flush().await?;
+                    writer.resync().await?;
+                    owed += 1;
                 }
                 // A notice the client put on the row has been up long enough.
                 _ = expire(notice_until) => {

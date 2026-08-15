@@ -1114,3 +1114,98 @@ fn a_bell_next_door_lands_on_the_terminal_of_whoever_is_attached() {
     let _ = client.kill();
     let _ = client.wait();
 }
+
+/// Resizing the window repaints the session at the size it now has. Nothing
+/// else will: a shell that printed and went quiet redraws nothing for a
+/// SIGWINCH, so what the terminal keeps of the old screen is all there is, and
+/// the marks the client left on rows that have moved stay where they were.
+#[test]
+fn a_resize_repaints_the_screen_at_the_size_it_now_has() {
+    use std::io::Read;
+    use std::os::fd::AsFd;
+    use std::sync::mpsc;
+
+    let world = World::new("resize-terminal");
+    world.ok(
+        "laptop",
+        &[
+            "new",
+            "-d",
+            "-n",
+            "grown",
+            "sh",
+            "-c",
+            "printf 'HELLO\\n'; sleep 30",
+        ],
+    );
+    world.wait_for_node("laptop");
+
+    let (pty, pts) = pty_process::blocking::open().unwrap();
+    pty.resize(pty_process::Size::new(24, 80)).unwrap();
+    let mut client = pty_process::blocking::Command::new(MM)
+        .arg("--socket")
+        .arg(world.socket("laptop"))
+        .args(["attach", "grown"])
+        .env("MM_CONFIG_DIR", world.dir.join("laptop"))
+        .env("MM_SSH", world.ssh_stub())
+        .env("MM_LOG", "manymux=warn")
+        .env("TERM", "xterm-256color")
+        .spawn(pts)
+        .expect("attaching on a terminal");
+
+    // The reader gets a descriptor of its own, because the resize below is on
+    // this thread and a read on a pty blocks until something arrives.
+    let (seen_tx, seen_rx) = mpsc::channel();
+    let mut reading =
+        unsafe { pty_process::blocking::Pty::from_fd(pty.as_fd().try_clone_to_owned().unwrap()) };
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 1024];
+        while let Ok(read @ 1..) = reading.read(&mut buf) {
+            if seen_tx.send(buf[..read].to_vec()).is_err() {
+                return;
+            }
+        }
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut seen = String::new();
+    while !seen.contains("HELLO") {
+        if let Ok(chunk) = seen_rx.recv_timeout(Duration::from_millis(200)) {
+            seen.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the session never reached the terminal; saw: {seen:?}"
+        );
+    }
+
+    // Everything from here is the answer to the resize alone.
+    seen.clear();
+    pty.resize(pty_process::Size::new(40, 100)).unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !seen.contains("HELLO") {
+        if let Ok(chunk) = seen_rx.recv_timeout(Duration::from_millis(200)) {
+            seen.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the resize never repainted the session; saw: {seen:?}"
+        );
+    }
+    // Painted onto a screen wiped first, or the mark drawn on what used to be
+    // the bottom row is still sitting there.
+    let painted = seen.find("HELLO").unwrap();
+    assert!(
+        seen[..painted].contains("\x1b[2J"),
+        "the repaint did not erase what the old size left behind: {seen:?}"
+    );
+    // And the session is fenced into the rows above the mark at the new height.
+    assert!(
+        seen.contains("\x1b[1;39r"),
+        "the scrolling region was not re-fenced: {seen:?}"
+    );
+
+    let _ = client.kill();
+    let _ = client.wait();
+}
