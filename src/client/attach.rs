@@ -663,9 +663,10 @@ mod terminal {
     /// arriving at never asked for, and its screen is still up.
     ///
     /// What to do about that screen is the mode's, since only one of the two
-    /// owns it.
-    pub(super) fn takeover(mode: &dyn ScreenMode) -> String {
-        format!("{}{}", undone(), mode.takeover())
+    /// owns it. `on_alternate` is whether the session being left has the
+    /// terminal on a full-screen program's own screen.
+    pub(super) fn takeover(mode: &dyn ScreenMode, on_alternate: bool) -> String {
+        format!("{}{}", undone(), mode.takeover(on_alternate))
     }
 
     /// Written before a screen the node sent in answer to a resize.
@@ -800,10 +801,12 @@ mod terminal {
         let screen = held.screen;
         let on_alternate = Arc::clone(&held.on_alternate);
         // One write, so there is never a frame showing an erased screen with no
-        // mark on it.
+        // mark on it. The screen the session before this one was in is left
+        // here, so the flag is spent: what follows starts wherever this
+        // session's own repaint puts the terminal.
         write_now(&format!(
             "{}{}",
-            takeover(screen.mode()),
+            takeover(screen.mode(), on_alternate.swap(false, Ordering::Relaxed)),
             status.setup(terminal_size())
         ));
         pump(
@@ -1374,7 +1377,7 @@ mod tests {
     #[cfg(feature = "desktop")]
     #[test]
     fn a_hop_erases_the_session_before_it() {
-        let takeover = terminal::takeover(Screen::Alternate.mode());
+        let takeover = terminal::takeover(Screen::Alternate.mode(), false);
         let erase = takeover.find("\x1b[2J").expect("a hop erases nothing");
         assert!(
             takeover[..erase].contains("\x1b[H"),
@@ -1391,7 +1394,7 @@ mod tests {
     #[cfg(feature = "desktop")]
     #[test]
     fn a_hop_undoes_every_mode_the_session_before_it_switched_on() {
-        let takeover = terminal::takeover(Screen::Alternate.mode());
+        let takeover = terminal::takeover(Screen::Alternate.mode(), false);
         for mode in crate::node::events::REPLAYED_MODES {
             assert!(
                 takeover.contains(&format!("\x1b[?{mode}l")),
@@ -1413,7 +1416,7 @@ mod tests {
     #[cfg(feature = "desktop")]
     #[test]
     fn a_hop_stays_on_the_alternate_screen() {
-        let takeover = terminal::takeover(Screen::Alternate.mode());
+        let takeover = terminal::takeover(Screen::Alternate.mode(), false);
         for sequence in ["\x1b[?1049l", "\x1b[?1047l", "\x1b[23;2t"] {
             assert!(
                 !takeover.contains(sequence),

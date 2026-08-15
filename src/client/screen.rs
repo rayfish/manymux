@@ -39,7 +39,11 @@ pub trait ScreenMode {
     fn setup(&self) -> String;
 
     /// Sent before every attach, hops included, after the caller's `undone()`.
-    fn takeover(&self) -> String;
+    ///
+    /// `on_alternate` is whether the session being left has the terminal on a
+    /// full-screen program's own screen, which is the hop's to undo for the
+    /// same reason a detach undoes it.
+    fn takeover(&self, on_alternate: bool) -> String;
 
     /// Sent before the screen dump, which paints by absolute coordinates from
     /// the top and so needs the screen underneath it blank.
@@ -86,7 +90,7 @@ impl ScreenMode for Alternate {
         "\x1b[?1049h".to_string()
     }
 
-    fn takeover(&self) -> String {
+    fn takeover(&self, _on_alternate: bool) -> String {
         // The erase is what the screen dump cannot do for itself: it paints
         // from the cursor down to its last line with anything on it and stops,
         // so without this the session before it shows through underneath, below
@@ -124,11 +128,22 @@ impl ScreenMode for Inline {
         String::new()
     }
 
-    fn takeover(&self) -> String {
+    fn takeover(&self, on_alternate: bool) -> String {
         // Nothing is erased: what is on the screen is the terminal's to keep,
         // and rolling it away before the repaint is what moves it into the
         // scrollback instead of throwing it out.
-        String::new()
+        //
+        // The screen a full-screen program in the session you are leaving put
+        // the terminal on is another matter, and hopping has to leave it the
+        // way detaching does. Without this, hopping out of Claude Code lands
+        // the next session on the terminal's alternate screen, where there is
+        // no scrollback to roll into and the wheel goes back to being arrow
+        // keys, which is inline not working at all.
+        if on_alternate {
+            "\x1b[?1047l\x1b[?1049l".to_string()
+        } else {
+            String::new()
+        }
     }
 
     fn before_repaint(&self, size: Size) -> String {
@@ -175,7 +190,10 @@ mod tests {
     fn the_alternate_screen_takes_a_surface_of_its_own_and_erases_it() {
         let mode = Screen::Alternate.mode();
         assert_eq!(mode.setup(), "\x1b[?1049h");
-        assert_eq!(mode.takeover(), "\x1b[H\x1b[2J");
+        assert_eq!(mode.takeover(false), "\x1b[H\x1b[2J");
+        // The session's own switches never reached the terminal, so there is
+        // never a screen of its to leave.
+        assert_eq!(mode.takeover(true), "\x1b[H\x1b[2J");
         // The takeover already erased, so there is nothing to do before the
         // dump.
         assert_eq!(mode.before_repaint(SIZE), "");
@@ -195,9 +213,21 @@ mod tests {
     fn inline_takes_no_screen_and_erases_nothing() {
         let mode = Screen::Inline.mode();
         assert_eq!(mode.setup(), "");
-        assert_eq!(mode.takeover(), "");
+        assert_eq!(mode.takeover(false), "");
         assert!(!mode.owns_the_screen());
         assert_eq!(mode.history(), SEEDED_HISTORY);
+    }
+
+    /// The bug this was written for: hopping out of a session running a
+    /// full-screen program left the terminal on that program's screen, and the
+    /// session hopped to was painted there. That screen has no scrollback, so
+    /// the wheel went back to sending arrow keys and inline stopped working
+    /// until the whole run of attaches ended.
+    #[test]
+    fn hopping_leaves_the_screen_the_session_being_left_put_the_terminal_on() {
+        let left = Screen::Inline.mode().takeover(true);
+        assert!(left.contains("\x1b[?1049l"), "{left:?}");
+        assert!(left.contains("\x1b[?1047l"), "{left:?}");
     }
 
     /// The roll is what puts a screenful into the terminal's scrollback:
