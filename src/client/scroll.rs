@@ -61,8 +61,13 @@ impl Block {
     /// nothing older left to show.
     fn window(&self, offset: u64, rows: u64) -> &[String] {
         // Lines are stored oldest first, and offsets count back from the
-        // newest, so the two run in opposite directions.
-        let end = self.lines.len() as u64 - (offset - self.from);
+        // newest, so the two run in opposite directions. Saturating rather
+        // than trusting the caller: this is the one place in here where two
+        // counts running opposite ways meet, and getting it wrong is a panic
+        // in a debug build and a slice index out of a wrapped subtraction in a
+        // release one, neither of which anybody could read afterwards.
+        let back = offset.saturating_sub(self.from);
+        let end = (self.lines.len() as u64).saturating_sub(back);
         let start = end.saturating_sub(rows);
         &self.lines[start as usize..end as usize]
     }
@@ -371,6 +376,20 @@ mod tests {
         let painted = view.paint();
         assert!(painted.contains("\x1b[22;1H\x1b[0mline 0"), "{painted:?}");
         assert!(painted.contains("\x1b[24;1H\x1b[0mline 2"), "{painted:?}");
+    }
+
+    /// The window is only ever asked for inside the block, but it is asked for
+    /// with two counts that run in opposite directions, so it says what it does
+    /// off the ends rather than leaving a subtraction to wrap.
+    #[test]
+    fn a_window_outside_the_block_is_empty_rather_than_a_panic() {
+        let block = Block {
+            from: 10,
+            lines: vec!["a".to_string(), "b".to_string()],
+        };
+        assert_eq!(block.window(0, 24).len(), 2, "below the block");
+        assert!(block.window(1000, 24).is_empty(), "above it");
+        assert_eq!(block.window(10, 1), ["b"], "the newest line it holds");
     }
 
     /// Until the first block lands there is nothing to draw, and drawing the

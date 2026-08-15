@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 
+use crate::client::scroll;
 use crate::client::{Attached, SessionHalves, Update};
 
 /// The key that goes from focus mode to control mode: Ctrl-] (0x1d).
@@ -244,6 +245,26 @@ pub enum Action {
     /// it. Deciding that is the caller's: this half of the client knows nothing
     /// about clipboards.
     Paste,
+    /// Move the view over the session's history, or open or close it. Where it
+    /// is and what it shows is [`super::scroll`]'s; this only says which way.
+    Scroll(Scroll),
+}
+
+/// A move through the history. Opening the view is not one of these: any of
+/// them arriving while the live screen is showing opens it and then moves it,
+/// so a wheel notch does the obvious thing without a mode to learn first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scroll {
+    /// Back through the history, in lines.
+    Up(u64),
+    Down(u64),
+    PageUp,
+    PageDown,
+    /// The oldest line the host still has, and the live screen.
+    Top,
+    Bottom,
+    /// Back to the live screen, and out of the view.
+    Leave,
 }
 
 /// How the attach ended.
@@ -272,6 +293,10 @@ pub enum Mode {
     Focus,
     /// The keys drive the client: switch sessions, detach, back to focus.
     Control,
+    /// The screen is showing the session's history rather than the session, and
+    /// the keys move it. Only on a screen the client owns, where the terminal
+    /// has no scrollback of its own to offer.
+    Scroll,
 }
 
 impl Mode {
@@ -280,9 +305,77 @@ impl Mode {
         match self {
             Mode::Focus => "focus",
             Mode::Control => "control",
+            Mode::Scroll => "scroll",
         }
     }
 }
+
+/// One mouse report, in the SGR spelling (`CSI < button ; col ; row M`).
+///
+/// Only that spelling, because it is the one the client asks for when it turns
+/// tracking on for itself (`?1006h` beside `?1000h`). The older spellings are a
+/// session's own doing, and a session's reports are never read here: while it
+/// has the mouse, the client's tracking is off and every report belongs to it.
+#[derive(Debug, PartialEq, Eq)]
+struct Report {
+    len: usize,
+    button: u8,
+    /// A press. Releases end in `m` and are dropped: the wheel has no release,
+    /// and a click's two halves would move the view twice.
+    press: bool,
+}
+
+/// Buttons 64 and 65, once the modifier bits (shift 4, meta 8, ctrl 16) are
+/// taken off. 66 and 67 are the horizontal wheel, which has nowhere to go here.
+const WHEEL_UP: u8 = 64;
+const WHEEL_DOWN: u8 = 65;
+const MODIFIERS: u8 = 4 | 8 | 16;
+
+impl Report {
+    fn parse(input: &[u8]) -> Option<Self> {
+        let rest = input.strip_prefix(b"\x1b[<")?;
+        let end = rest.iter().position(|b| matches!(b, b'M' | b'm'))?;
+        let button = std::str::from_utf8(&rest[..end])
+            .ok()?
+            .split(';')
+            .next()?
+            .parse::<u16>()
+            .ok()?;
+        Some(Self {
+            len: 3 + end + 1,
+            button: u8::try_from(button).ok()? & !MODIFIERS,
+            press: rest[end] == b'M',
+        })
+    }
+
+    /// Which way this turns the view, if it turns it at all.
+    fn scroll(&self) -> Option<Scroll> {
+        match (self.press, self.button) {
+            (true, WHEEL_UP) => Some(Scroll::Up(scroll::WHEEL)),
+            (true, WHEEL_DOWN) => Some(Scroll::Down(scroll::WHEEL)),
+            _ => None,
+        }
+    }
+}
+
+/// The keys that move the view, in the spellings terminals send them in.
+///
+/// Matched before the bytes are looked at one at a time, so that the escape
+/// starting each of them is not mistaken for the bare Esc that leaves.
+const VIEW_KEYS: &[(&[u8], Scroll)] = &[
+    (b"\x1b[5~", Scroll::PageUp),
+    (b"\x1b[6~", Scroll::PageDown),
+    (b"\x1b[A", Scroll::Up(1)),
+    (b"\x1b[B", Scroll::Down(1)),
+    (b"\x1bOA", Scroll::Up(1)), // the application-keypad spellings, which a
+    (b"\x1bOB", Scroll::Down(1)), // program may have left the terminal in
+    (b"\x1b[H", Scroll::Top),
+    (b"\x1b[1~", Scroll::Top),
+    (b"\x1b[7~", Scroll::Top),
+    (b"\x1b[F", Scroll::Bottom),
+    (b"\x1b[4~", Scroll::Bottom),
+    (b"\x1b[8~", Scroll::Bottom),
+];
 
 /// Watches the keystroke stream for the key that changes mode, and reads the
 /// keys that follow it.
@@ -315,7 +408,21 @@ pub struct KeyFilter {
     /// session's after all has to be what the terminal sent, or a program that
     /// asked for the long spelling gets a byte it no longer reads that way.
     spelling: Vec<u8>,
+    /// Whether there is a history to look at: a screen the client owns, on a
+    /// host new enough to send windows of one. Off, [`SCROLL_KEY`] is a key
+    /// like any other and the session gets it.
+    scroll: bool,
+    /// Whether the wheel is the client's. True only while the client has mouse
+    /// tracking on for itself, which it does only while the session has asked
+    /// for none: a report arriving then is one the client caused, so reading it
+    /// takes nothing from the session, and dropping the ones that are not the
+    /// wheel keeps a stray click from typing into a shell.
+    wheel: bool,
 }
+
+/// Opens the view, from control mode. tmux's copy-mode key, for the hands that
+/// already know it.
+const SCROLL_KEY: u8 = b'[';
 
 /// How long after the mode key a second one still means "send me the byte"
 /// rather than "back to focus". Long enough not to need a fast hand, short
@@ -364,6 +471,8 @@ impl KeyFilter {
             mode: Mode::Focus,
             pressed: None,
             spelling: vec![prefix],
+            scroll: false,
+            wheel: false,
         }
     }
 
@@ -386,6 +495,10 @@ impl KeyFilter {
         match action {
             Action::Detach | Action::Paste => Mode::Focus,
             Action::Switch(_) => Mode::Control,
+            Action::Scroll(Scroll::Leave) => Mode::Focus,
+            // Every other move keeps the view up, wherever it was opened from:
+            // a wheel notch in focus mode opens it and stays.
+            Action::Scroll(_) => Mode::Scroll,
         }
     }
 
@@ -393,6 +506,26 @@ impl KeyFilter {
     /// which is what `MM_PASTE=off` asks for.
     pub fn set_paste(&mut self, on: bool) {
         self.paste = on;
+    }
+
+    /// Whether there is a history to look at. Off on a screen the terminal owns
+    /// (it has the lines itself) and on a host too old to send a window of one.
+    pub fn set_scroll(&mut self, on: bool) {
+        self.scroll = on;
+        if !on {
+            self.wheel = false;
+        }
+    }
+
+    /// Whether the wheel is the client's right now, which it is only while the
+    /// client has tracking on and the session has not asked for any.
+    pub fn set_wheel(&mut self, ours: bool) {
+        self.wheel = ours && self.scroll;
+    }
+
+    /// Whether there is a history to look at at all.
+    pub fn scrolls(&self) -> bool {
+        self.scroll
     }
 
     /// Start in a mode. Attaching after a switch starts in control mode, which
@@ -412,6 +545,58 @@ impl KeyFilter {
         let mut forward = Vec::with_capacity(input.len());
         let mut i = 0;
         while i < input.len() {
+            // The wheel, while it is the client's. Every report is swallowed,
+            // not only the ones that move the view: the client asked the
+            // terminal for them, the session did not, and forwarding a click
+            // it never asked to hear about would type into whatever is
+            // running.
+            if self.wheel
+                && let Some(report) = Report::parse(&input[i..])
+            {
+                // Every report in the chunk, not just this one. A hand moving
+                // the wheel sends several before the client is next read, and
+                // stopping at the first would leave the rest to be read as
+                // keystrokes and the view a notch behind the hand.
+                let mut net = 0i64;
+                let mut report = Some(report);
+                while let Some(this) = report {
+                    i += this.len;
+                    net += match this.scroll() {
+                        Some(Scroll::Up(lines)) => lines as i64,
+                        Some(Scroll::Down(lines)) => -(lines as i64),
+                        _ => 0,
+                    };
+                    report = Report::parse(&input[i..]);
+                }
+                let scroll = match net {
+                    0 => continue,
+                    net if net > 0 => Scroll::Up(net as u64),
+                    net => Scroll::Down(net.unsigned_abs()),
+                };
+                let action = Action::Scroll(scroll);
+                self.mode = Self::after(action);
+                return Keystrokes {
+                    forward,
+                    action: Some(action),
+                    mode: self.mode,
+                };
+            }
+            // The keys that drive the view, which are escape sequences of their
+            // own and have to be read whole before the escape starting them is
+            // taken for the Esc that leaves.
+            if self.mode == Mode::Scroll
+                && let Some((_, scroll)) = VIEW_KEYS
+                    .iter()
+                    .find(|(spelling, _)| input[i..].starts_with(spelling))
+            {
+                let action = Action::Scroll(*scroll);
+                self.mode = Self::after(action);
+                return Keystrokes {
+                    forward,
+                    action: Some(action),
+                    mode: self.mode,
+                };
+            }
             // A terminal that a program has put into an extended-keys mode
             // spells the client's own keys as escape sequences, so they have to
             // be read off before the bytes are looked at or the mode key goes
@@ -431,6 +616,34 @@ impl KeyFilter {
             }
             let b = input[i];
             i += 1;
+            if self.mode == Mode::Scroll {
+                // Nothing typed here reaches the session: the screen is showing
+                // its history, and a key meant for the program would land in a
+                // screen that is not the one being looked at. Unbound keys do
+                // nothing rather than dropping out of the view, so a hand on
+                // the keyboard cannot lose your place in a long build.
+                let scroll = match b {
+                    b'q' | 0x1b | b'\r' | b'\n' => Some(Scroll::Leave),
+                    b if b == self.prefix => Some(Scroll::Leave),
+                    b' ' | b'f' => Some(Scroll::PageDown),
+                    b'b' => Some(Scroll::PageUp),
+                    b'k' => Some(Scroll::Up(1)),
+                    b'j' => Some(Scroll::Down(1)),
+                    b'g' => Some(Scroll::Top),
+                    b'G' => Some(Scroll::Bottom),
+                    _ => None,
+                };
+                let Some(scroll) = scroll else {
+                    continue;
+                };
+                let action = Action::Scroll(scroll);
+                self.mode = Self::after(action);
+                return Keystrokes {
+                    forward,
+                    action: Some(action),
+                    mode: self.mode,
+                };
+            }
             if self.mode == Mode::Focus {
                 if b == self.prefix {
                     self.spell(&[b]);
@@ -473,6 +686,9 @@ impl KeyFilter {
                 // rather than a second letter to remember.
                 b'h' => Some(Action::Switch(Motion::NextHost)),
                 b'H' => Some(Action::Switch(Motion::PreviousHost)),
+                // Only where there is a history to look at. Elsewhere it is an
+                // unbound key, and the session gets it.
+                SCROLL_KEY if self.scroll => Some(Action::Scroll(Scroll::Up(0))),
                 // Shift-Tab, which starts with the same byte as the Esc that
                 // goes back to focus. An Esc with `[Z` behind it in the same
                 // read is the key; one at the end of a read is a real Esc.
@@ -597,8 +813,9 @@ mod terminal {
     use tokio::signal::unix::{SignalKind, signal};
     use tokio::sync::mpsc;
 
-    use super::{Action, KeyFilter, Mode, Outcome};
+    use super::{Action, KeyFilter, Mode, Outcome, Scroll};
     use crate::client::screen::ScreenMode;
+    use crate::client::scroll::Scrollback;
     use crate::client::status::{self, Filter, Status};
     use crate::client::{Attached, SessionHalves, SessionReader, SessionWriter, Update};
     use crate::clipboard;
@@ -825,6 +1042,36 @@ mod terminal {
     /// hints have it back. Long enough to read without looking for it.
     const NOTICE_FOR: Duration = Duration::from_secs(5);
 
+    /// Take the wheel, or give it back.
+    ///
+    /// The client asks the terminal for mouse reports only while the session
+    /// has asked for none, so the two never both read it. Turning it on has a
+    /// second effect worth having: a terminal that is reporting the mouse stops
+    /// turning the wheel into arrow keys, which is what used to send them to
+    /// whatever was reading the session's input.
+    async fn own_the_wheel(
+        stdout: &mut Stdout,
+        keys: &mut KeyFilter,
+        wheel: &mut bool,
+        ours: bool,
+    ) -> Result<()> {
+        if *wheel == ours {
+            return Ok(());
+        }
+        *wheel = ours;
+        keys.set_wheel(ours);
+        let sequence = if ours {
+            "\x1b[?1000h\x1b[?1006h" // report buttons, in the SGR spelling
+        } else {
+            // Off in the other order, so nothing is left reporting in a
+            // spelling that is no longer switched on.
+            "\x1b[?1006l\x1b[?1000l"
+        };
+        stdout.write_all(sequence.as_bytes()).await?;
+        stdout.flush().await?;
+        Ok(())
+    }
+
     /// Chunks of keystrokes, read on a thread of its own.
     ///
     /// `tokio::io::stdin` would do the same reads, but on a blocking pool
@@ -874,6 +1121,7 @@ mod terminal {
         on_alternate: Arc<AtomicBool>,
     ) -> Result<Outcome> {
         let takes_pastes = session.paste;
+        let scrolls = session.scroll;
         let SessionHalves {
             mut reader,
             mut writer,
@@ -882,7 +1130,17 @@ mod terminal {
         let mut winch = signal(SignalKind::window_change())?;
         let mut keys = KeyFilter::default();
         keys.set_mode(mode);
+        // There is a history to look at only on a screen the client owns.
+        // Inline the terminal has the lines in its own buffer, and its own
+        // wheel is better than anything here.
+        keys.set_scroll(screen.mode().owns_the_screen() && scrolls);
         let mut output = Filter::new(screen);
+        // The view over the session's history, while it is up.
+        let mut scrolling: Option<Scrollback> = None;
+        // Whether the client has mouse tracking on for itself, which it does
+        // only while there is a history to look at and the session has asked
+        // for no reports of its own.
+        let mut wheel = false;
         // The row no longer says what the keys are doing. Held until there is a
         // safe moment to draw, the same as a mark the session cleared.
         let mut restate = false;
@@ -925,6 +1183,43 @@ mod terminal {
                         Some(Action::Switch(motion)) => {
                             writer.detach().await?;
                             return Ok(Outcome::Switch(motion));
+                        }
+                        // Back to the live screen, which the view has been
+                        // drawing over: the node's model is the only place it
+                        // still exists, and it is painted onto an erased screen
+                        // the way a resize is.
+                        Some(Action::Scroll(Scroll::Leave)) => {
+                            scrolling = None;
+                            status.set_scrolled(None);
+                            writer.resync().await?;
+                            owed += 1;
+                            restate = true;
+                        }
+                        Some(Action::Scroll(motion)) => {
+                            let view = scrolling
+                                .get_or_insert_with(|| Scrollback::new(terminal_size()));
+                            match motion {
+                                Scroll::Up(lines) => view.up(lines),
+                                Scroll::Down(lines) => view.down(lines),
+                                Scroll::PageUp => view.page_up(),
+                                Scroll::PageDown => view.page_down(),
+                                Scroll::Top => view.top(),
+                                Scroll::Bottom => view.bottom(),
+                                // Handled above, where the view can be dropped
+                                // without holding a borrow of it.
+                                Scroll::Leave => {}
+                            }
+                            let wanted = view.wanted();
+                            let painted = view.paint();
+                            status.set_scrolled(Some(view.offset()));
+                            if let Some(request) = wanted {
+                                writer.view(&request).await?;
+                            }
+                            stdout.write_all(painted.as_bytes()).await?;
+                            stdout
+                                .write_all(status.repaint(terminal_size()).as_bytes())
+                                .await?;
+                            stdout.flush().await?;
                         }
                         Some(Action::Paste) => {
                             // The key as the terminal spelled it, since it goes
@@ -975,8 +1270,22 @@ mod terminal {
                             let before = screen.mode().before_repaint(terminal_size());
                             stdout.write_all(before.as_bytes()).await?;
                         }
-                        stdout.write_all(&output.feed(&bytes)).await?;
+                        let bytes = output.feed(&bytes);
+                        // Fed to the filter either way, so its parser stays in
+                        // step with the byte stream, but not written while the
+                        // view is up: the screen is showing the history, and
+                        // the session painting over it is what leaving the view
+                        // asks the node to undo.
+                        if scrolling.is_none() {
+                            stdout.write_all(&bytes).await?;
+                        }
                         on_alternate.store(output.on_alternate(), Ordering::Relaxed);
+                        // The session may have just asked for the mouse, or
+                        // given it back. Only between sequences, like the mark.
+                        if output.at_boundary() {
+                            let ours = keys.scrolls() && !output.session_mouse();
+                            own_the_wheel(&mut stdout, &mut keys, &mut wheel, ours).await?;
+                        }
                         // A screen switch went no further than this client, so
                         // the terminal is still showing the screen the session
                         // has just left. Ask for the other one, which exists
@@ -1022,8 +1331,21 @@ mod terminal {
                     Update::History(bytes) => {
                         stdout.write_all(&bytes).await?;
                     }
-                    // The view is wired to this a step from here.
-                    Update::View(_) => {}
+                    // A block of the history. Dropped if the view has been
+                    // closed since it was asked for: what is on the screen is
+                    // the session again, and painting lines over it would be a
+                    // window nobody is looking at.
+                    Update::View(window) => {
+                        if let Some(view) = scrolling.as_mut() {
+                            view.take(window);
+                            status.set_scrolled(Some(view.offset()));
+                            stdout.write_all(view.paint().as_bytes()).await?;
+                            stdout
+                                .write_all(status.repaint(terminal_size()).as_bytes())
+                                .await?;
+                            stdout.flush().await?;
+                        }
+                    }
                     // A bell in one of this machine's other sessions. The
                     // terminal is asked to raise it, and the row says which
                     // session it was, for a terminal that raises nothing.
@@ -1052,6 +1374,22 @@ mod terminal {
                     // the old fence.
                     stdout.write_all(status.repaint(size).as_bytes()).await?;
                     stdout.flush().await?;
+                    // The view is showing lines rather than the session, so it
+                    // repaints itself at the new size. A screen asked for here
+                    // would be painted over it and then be gone when the view
+                    // closes onto an erased screen anyway.
+                    if let Some(view) = scrolling.as_mut() {
+                        view.resize(size);
+                        let wanted = view.wanted();
+                        let painted = view.paint();
+                        if let Some(request) = wanted {
+                            writer.view(&request).await?;
+                        }
+                        stdout.write_all(painted.as_bytes()).await?;
+                        stdout.write_all(status.repaint(size).as_bytes()).await?;
+                        stdout.flush().await?;
+                        continue;
+                    }
                     writer.resync().await?;
                     owed += 1;
                 }
@@ -1427,6 +1765,192 @@ mod tests {
                 !takeover.contains(sequence),
                 "hopping sends {sequence:?}, which gives the terminal back mid-attach"
             );
+        }
+    }
+
+    /// A wheel notch opens the view and moves it in one go: there is no mode to
+    /// learn first, which is the whole point of taking the wheel at all.
+    #[test]
+    fn the_wheel_opens_the_view_and_moves_it() {
+        let mut f = KeyFilter::new(KEY);
+        f.set_scroll(true);
+        f.set_wheel(true);
+        assert_eq!(
+            f.filter(b"\x1b[<64;10;5M"),
+            Keystrokes {
+                forward: Vec::new(),
+                action: Some(Action::Scroll(Scroll::Up(scroll::WHEEL))),
+                mode: Mode::Scroll,
+            }
+        );
+    }
+
+    /// A hand on the wheel sends several reports before the client is next
+    /// read. Answering only the first would leave the rest to be read as
+    /// keystrokes, and the view one notch behind the hand.
+    #[test]
+    fn a_chunk_of_wheel_reports_moves_the_view_once_for_all_of_them() {
+        let mut f = KeyFilter::new(KEY);
+        f.set_scroll(true);
+        f.set_wheel(true);
+        let three = b"\x1b[<64;1;1M\x1b[<64;1;1M\x1b[<64;1;1M";
+        assert_eq!(
+            f.filter(three),
+            Keystrokes {
+                forward: Vec::new(),
+                action: Some(Action::Scroll(Scroll::Up(3 * scroll::WHEEL))),
+                mode: Mode::Scroll,
+            }
+        );
+
+        // And a hand that changed its mind mid-chunk moves by the difference.
+        let mut f = KeyFilter::new(KEY);
+        f.set_scroll(true);
+        f.set_wheel(true);
+        assert_eq!(
+            f.filter(b"\x1b[<64;1;1M\x1b[<65;1;1M"),
+            forwarded(b"")
+        );
+    }
+
+    /// The client asked the terminal for these reports; the session did not.
+    /// Forwarding a click it never asked to hear about would type into it.
+    #[test]
+    fn a_click_the_client_asked_for_is_swallowed_rather_than_forwarded() {
+        let mut f = KeyFilter::new(KEY);
+        f.set_scroll(true);
+        f.set_wheel(true);
+        assert_eq!(f.filter(b"\x1b[<0;10;5M\x1b[<0;10;5m"), forwarded(b""));
+    }
+
+    /// While the session has the mouse, every report is its own and the client
+    /// reads none of them: two programs reading one wheel is one of them
+    /// reading input meant for the other.
+    #[test]
+    fn a_session_that_asked_for_the_mouse_keeps_its_reports() {
+        let mut f = KeyFilter::new(KEY);
+        f.set_scroll(true);
+        f.set_wheel(false);
+        let report = b"\x1b[<64;10;5M";
+        assert_eq!(f.filter(report), forwarded(report));
+    }
+
+    #[test]
+    fn the_scroll_key_opens_the_view_and_the_keys_move_it() {
+        let mut f = KeyFilter::new(KEY);
+        f.set_scroll(true);
+        assert_eq!(
+            f.filter(&[KEY, SCROLL_KEY]),
+            asked(Action::Scroll(Scroll::Up(0)), Mode::Scroll)
+        );
+        for (keys, scroll) in [
+            (&b"\x1b[5~"[..], Scroll::PageUp),
+            (&b"\x1b[6~"[..], Scroll::PageDown),
+            (&b"\x1b[A"[..], Scroll::Up(1)),
+            (&b"g"[..], Scroll::Top),
+            (&b"G"[..], Scroll::Bottom),
+            (&b" "[..], Scroll::PageDown),
+        ] {
+            assert_eq!(
+                f.filter(keys),
+                asked(Action::Scroll(scroll), Mode::Scroll),
+                "{keys:?}"
+            );
+        }
+        assert_eq!(
+            f.filter(b"\x1b"),
+            asked(Action::Scroll(Scroll::Leave), Mode::Focus)
+        );
+    }
+
+    /// Nothing typed at the view reaches the session: the screen is showing the
+    /// history, and a key meant for the program would land somewhere nobody is
+    /// looking. An unbound one does nothing rather than dropping out of the
+    /// view, so a hand on the keyboard cannot lose your place in a long build.
+    #[test]
+    fn keys_the_view_does_not_use_go_nowhere() {
+        let mut f = KeyFilter::new(KEY);
+        f.set_scroll(true);
+        f.filter(&[KEY, SCROLL_KEY]);
+        assert_eq!(
+            f.filter(b"xyz"),
+            Keystrokes {
+                forward: Vec::new(),
+                action: None,
+                mode: Mode::Scroll,
+            }
+        );
+    }
+
+    /// On a screen the terminal owns there is nothing here to look at, and on a
+    /// host too old to send a window there is nothing to look at with. Either
+    /// way the key is the session's, which is where an unbound one goes.
+    #[test]
+    fn the_scroll_key_is_the_sessions_where_there_is_no_history_to_look_at() {
+        let mut f = KeyFilter::new(KEY);
+        f.set_scroll(false);
+        assert_eq!(f.filter(&[KEY, SCROLL_KEY]), forwarded(&[KEY, SCROLL_KEY]));
+    }
+
+    /// Every sequence the filter reads is looked for at an offset into the
+    /// chunk it arrived in, and a chunk can end anywhere: mid-escape, mid
+    /// parameter, between the two bytes of a UTF-8 character. None of that may
+    /// read past the end of the chunk.
+    #[test]
+    fn a_sequence_cut_off_by_the_end_of_a_chunk_is_not_read_past() {
+        let cut = [
+            &b"\x1b"[..],
+            b"\x1b[",
+            b"\x1b[<",
+            b"\x1b[<64",
+            b"\x1b[<64;10;5",
+            b"\x1b[5",
+            b"\x1bO",
+            b"\x1b[27;5",
+            b"\x1b[Z"[..1].as_ref(),
+            "é".as_bytes()[..1].as_ref(),
+        ];
+        for tail in cut {
+            for mode in [Mode::Focus, Mode::Control, Mode::Scroll] {
+                let mut f = KeyFilter::new(KEY);
+                f.set_scroll(true);
+                f.set_wheel(true);
+                f.set_mode(mode);
+                // Reaching the end of this is the assertion.
+                f.filter(tail);
+            }
+        }
+    }
+
+    /// The same, over anything at all: bytes arrive from a terminal, and what a
+    /// terminal sends is only ever mostly what its documentation says.
+    #[test]
+    fn no_chunk_of_bytes_reads_past_the_end_of_itself() {
+        // A generator rather than a crate, so the sweep is the same every run
+        // and a failure can be reproduced from the seed alone.
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut byte = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            // Weighted towards the bytes sequences are made of, so the sweep
+            // spends its time on shapes that nearly parse.
+            const LIKELY: &[u8] = b"\x1b[<;OM~muZAB0123456789";
+            if seed % 3 == 0 {
+                (seed >> 33) as u8
+            } else {
+                LIKELY[(seed >> 33) as usize % LIKELY.len()]
+            }
+        };
+        for mode in [Mode::Focus, Mode::Control, Mode::Scroll] {
+            let mut f = KeyFilter::new(KEY);
+            f.set_scroll(true);
+            f.set_wheel(true);
+            f.set_mode(mode);
+            for _ in 0..2000 {
+                let chunk: Vec<u8> = (0..16).map(|_| byte()).collect();
+                f.filter(&chunk);
+            }
         }
     }
 

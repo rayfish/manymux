@@ -25,6 +25,11 @@ const GUTTER: u16 = 2;
 /// terminal that has stopped taking what you type for no visible reason.
 const HINT: &str = "tab next  p prev  h host  l last  d detach  esc focus";
 
+/// The same, for the view over the session's history, where the keys are
+/// different again and the screen is showing something the session did not
+/// print just now.
+const SCROLL_HINT: &str = "pgup/pgdn page  g/G ends  esc live";
+
 /// Columns kept for the mode's name, which is the width of the longer of the
 /// two. Fixed, so the mark does not jump sideways when the mode changes.
 const MODE: usize = "control".len();
@@ -59,6 +64,10 @@ pub struct Status {
     /// far, and it says it here because a full-screen program owns every other
     /// row on the screen.
     notice: Option<String>,
+    /// How far back the view over the session's history is, while it is up.
+    /// A place of its own rather than a notice, because a notice goes away
+    /// after a few seconds and this is true for as long as the view is.
+    scrolled: Option<u64>,
 }
 
 impl Status {
@@ -67,7 +76,13 @@ impl Status {
             target: target.to_string(),
             mode: Mode::default(),
             notice: None,
+            scrolled: None,
         }
+    }
+
+    /// Say how far back the view is, or that it has gone. The caller repaints.
+    pub fn set_scrolled(&mut self, lines: Option<u64>) {
+        self.scrolled = lines;
     }
 
     /// Put a message on the row. The caller repaints, and takes it off again
@@ -125,11 +140,12 @@ impl Status {
             return String::new();
         }
         let column = size.cols - width + 1 - GUTTER;
-        // Amber in control mode, so a mode that takes your keystrokes for
-        // itself is never on without you seeing it.
+        // Amber in control mode and in the view, so a mode that takes your
+        // keystrokes for itself, or a screen that is not showing the session as
+        // it stands, is never on without you seeing it.
         let mode = match self.mode {
             Mode::Focus => style::faint(&padded(self.mode)),
-            Mode::Control => style::amber(&padded(self.mode)),
+            Mode::Control | Mode::Scroll => style::amber(&padded(self.mode)),
         };
         let dot = style::green("●");
         let name = style::faint(&self.target);
@@ -144,12 +160,19 @@ impl Status {
     /// say, else the key hints while control mode is on, while there is room
     /// for it beside the mark. The mark wins when there is not.
     fn hint(&self, size: Size, mark: u16) -> String {
-        let (text, styled) = match (&self.notice, self.mode) {
+        let scrolled = self
+            .scrolled
+            .map(|lines| format!("{lines} back  {SCROLL_HINT}"));
+        let (text, styled) = match (&self.notice, &scrolled, self.mode) {
             // A notice outranks the hints: it is the answer to a key that was
             // just pressed, and the hints will be back in a few seconds.
-            (Some(notice), _) => (notice.as_str(), style::amber as fn(&str) -> String),
-            (None, Mode::Control) => (HINT, style::faint as fn(&str) -> String),
-            (None, Mode::Focus) => return String::new(),
+            (Some(notice), _, _) => (notice.as_str(), style::amber as fn(&str) -> String),
+            // Where the view is, which is the one thing the screen itself
+            // cannot say: it is showing lines that look exactly like the ones
+            // the session printed a moment ago.
+            (None, Some(scrolled), _) => (scrolled.as_str(), style::amber as fn(&str) -> String),
+            (None, None, Mode::Control) => (HINT, style::faint as fn(&str) -> String),
+            (None, None, Mode::Focus | Mode::Scroll) => return String::new(),
         };
         // A blank column between the two, so they never run together.
         if columns(text) + 1 + mark + GUTTER > size.cols {
@@ -216,6 +239,10 @@ pub struct Filter {
     /// inline, where the switches reach the terminal, is this the terminal's
     /// state as well as the session's.
     alternate: bool,
+    /// Whether the program in the session has asked to be told about the
+    /// mouse. While it has, the wheel is its business and the client neither
+    /// turns tracking on nor reads a report.
+    mouse: bool,
 }
 
 impl Default for Filter {
@@ -259,7 +286,15 @@ impl Filter {
             dirty: false,
             switched: false,
             alternate: false,
+            mouse: false,
         }
+    }
+
+    /// Whether the session has asked for mouse reports. The client's own
+    /// tracking is the complement of this: two programs reading one wheel is
+    /// one of them reading keystrokes meant for the other.
+    pub fn session_mouse(&self) -> bool {
+        self.mouse
     }
 
     /// Whether the session is sitting in a full-screen program's alternate
@@ -425,6 +460,14 @@ impl Filter {
         let Some(modes) = text.strip_prefix('?') else {
             return true;
         };
+        // Any of the tracking modes: which one the program picked decides what
+        // it is told about, not whether it is told anything.
+        if modes
+            .split(';')
+            .any(|mode| matches!(mode.parse::<u16>(), Ok(9 | 1000 | 1002 | 1003)))
+        {
+            self.mouse = final_byte == b'h';
+        }
         let ours = |mode: &&str| matches!(mode.parse::<u16>(), Ok(47 | 1047 | 1049));
         let kept: Vec<&str> = modes.split(';').filter(|m| !ours(m)).collect();
         if kept.len() == modes.split(';').count() {
