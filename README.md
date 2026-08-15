@@ -263,6 +263,10 @@ of it. `n` walks back through the matches and `N` comes back towards the live
 screen. Lowercase ignores case; a capital means it. Every match comes back in
 one answer, so walking them costs nothing even on a machine two hops away.
 
+None of this exists inline, and none of those keys are taken there: your
+terminal's own scrollbar and find bar are already looking at the same lines,
+and they are better at it.
+
 ## Keeping it running
 
 The node starts on demand, the way tmux starts its server, so nothing has to be

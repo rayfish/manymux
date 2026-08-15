@@ -2095,15 +2095,30 @@ mod tests {
         );
     }
 
-    /// Inline the terminal has the history in its own buffer and its own wheel
-    /// scrolls it, so there is no view to open and the key is the session's,
-    /// which is where an unbound one goes. A host too old to send a window is a
-    /// different case: the key stays the client's there, so that it can say so.
+    /// Inline the terminal has the history in its own buffer, its own wheel
+    /// scrolls it and its own find bar searches it, so neither key is the
+    /// client's and both go to the session the way any unbound key does. A host
+    /// too old to answer is a different case: the keys stay the client's there,
+    /// so that it can say why nothing happened.
     #[test]
-    fn the_scroll_key_is_the_sessions_where_the_terminal_owns_the_history() {
+    fn neither_scrolling_nor_searching_is_taken_where_the_terminal_owns_the_history() {
+        for key in [SCROLL_KEY, FIND_KEY] {
+            let mut f = KeyFilter::new(KEY);
+            f.set_scroll(false);
+            assert_eq!(f.filter(&[KEY, key]), forwarded(&[KEY, key]), "{key}");
+            assert_eq!(f.needle(), None, "no prompt was opened either");
+        }
+    }
+
+    /// And the wheel is left alone there too, so the terminal keeps scrolling
+    /// its own buffer rather than the client reading reports nobody asked for.
+    #[test]
+    fn the_wheel_stays_the_terminals_where_the_terminal_owns_the_history() {
         let mut f = KeyFilter::new(KEY);
         f.set_scroll(false);
-        assert_eq!(f.filter(&[KEY, SCROLL_KEY]), forwarded(&[KEY, SCROLL_KEY]));
+        f.set_wheel(true);
+        let report = b"\x1b[<64;10;5M";
+        assert_eq!(f.filter(report), forwarded(report));
     }
 
     /// The whole gesture: `Ctrl-] /`, type, Enter. The needle stays in the
