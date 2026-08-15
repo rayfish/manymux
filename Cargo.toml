@@ -6,6 +6,7 @@ rust-version = "1.91"
 description = "Persistent terminal sessions on every machine you already ssh into"
 license = "MPL-2.0"
 readme = "README.md"
+repository = "https://github.com/rayfish/manymux"
 keywords = ["terminal", "session", "multiplexer", "ssh", "tmux"]
 categories = ["command-line-utilities"]
 
