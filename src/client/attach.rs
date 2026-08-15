@@ -113,6 +113,9 @@ struct Encoded {
     len: usize,
     /// The key, as the codepoint it types unmodified: `]` for Ctrl-].
     code: u32,
+    /// What the same key types with shift held, when the terminal was asked to
+    /// report alternates. `H` for the `h` key.
+    shifted: Option<u32>,
     /// Which modifiers were down, in the protocol's bits, with the `+1` it
     /// adds to them taken back off.
     mods: u8,
@@ -128,15 +131,20 @@ const LOCKS: u8 = 64 | 128;
 
 const PRESS: u8 = 1;
 
-/// The key codes control mode reads. No letters: one typed without modifiers
-/// still arrives as itself, whatever protocol is on.
+/// The key codes control mode and the prompts read. No letters: one typed
+/// without modifiers still arrives as itself, whatever protocol is on.
 const ESCAPE: u32 = 27;
 const ENTER: u32 = 13;
 const TAB: u32 = 9;
+const BACKSPACE: u32 = 127;
 /// The modifier keys, which report presses and releases of their own once a
 /// program asks for event types. 57441 to 57454 is both shifts, controls,
 /// alts, supers, hypers and metas, and the two ISO level shifts.
 const MODIFIER_KEYS: std::ops::RangeInclusive<u32> = 57441..=57454;
+/// The Unicode private use area, which is where the protocol puts every key
+/// that types nothing at all: the arrows, the function keys, the keypad, the
+/// modifiers above.
+const FUNCTIONAL: std::ops::RangeInclusive<u32> = 57344..=63743;
 
 impl Encoded {
     /// Read one key off the front of `input`, if what is there is one.
@@ -151,9 +159,12 @@ impl Encoded {
         let rest = input.strip_prefix(b"\x1b[")?;
         let end = rest.iter().position(|b| (0x40..=0x7e).contains(b))?;
         let mut fields = std::str::from_utf8(&rest[..end]).ok()?.split(';');
+        let mut shifted = None;
         let (code, mods, event) = match rest[end] {
             b'u' => {
-                let code = number(fields.next()?)?;
+                let field = fields.next()?;
+                let code = number(field)?;
+                shifted = alternate(field);
                 let (mods, event) = modifiers(fields.next());
                 (code, mods, event)
             }
@@ -172,6 +183,7 @@ impl Encoded {
         Some(Self {
             len: 2 + end + 1,
             code,
+            shifted,
             mods,
             event,
         })
@@ -186,6 +198,107 @@ impl Encoded {
     /// Whether it is a modifier pressed on its own, which is not a keystroke.
     fn is_modifier(&self) -> bool {
         MODIFIER_KEYS.contains(&self.code)
+    }
+
+    /// The byte this key stands for at a prompt, if it is one of the few that
+    /// mean anything there.
+    ///
+    /// The editing is written once, against the ordinary bytes, and a terminal
+    /// in an extended-keys mode spells the same keys the long way: reading them
+    /// back to the byte is what keeps the two spellings one prompt. Everything
+    /// else a program's mode brings with it (releases, modifiers, the arrows,
+    /// the mode key itself) is not text and stands for nothing.
+    fn typed(&self) -> Option<u8> {
+        if self.event != PRESS {
+            return None;
+        }
+        match self.code {
+            // Ctrl-U, the one chord the prompt reads.
+            _ if self.is(0x15) => Some(0x15),
+            _ => self.byte(),
+        }
+    }
+
+    /// The byte the ordinary encoding would have sent for this key, where there
+    /// is one.
+    ///
+    /// What the client's modes read is bytes, and this is what lets each of
+    /// them keep one table rather than one per protocol. A key that types text
+    /// only arrives spelt this way at all once a program asks for *report all
+    /// keys as escape codes*; with the flags `pi` sets it still arrives as the
+    /// character it types. Reading both costs a line and means the client's own
+    /// keys keep working whichever of the two a program asks the terminal for.
+    fn byte(&self) -> Option<u8> {
+        match self.code {
+            ENTER => Some(b'\r'),
+            ESCAPE => Some(0x1b),
+            BACKSPACE => Some(0x7f),
+            TAB => Some(b'\t'),
+            // ASCII and no wider: `u8::try_from` would take a character up to
+            // U+00FF and hand back the one byte of it, which is half a
+            // character everywhere it is written.
+            _ => self.text().filter(char::is_ascii).map(|typed| typed as u8),
+        }
+    }
+
+    /// The character this key types, if it types one.
+    ///
+    /// A chord types nothing: ctrl, alt and super are how the client's own keys
+    /// and the session's are spelt, and they are read by the control byte
+    /// behind them rather than by a letter. Shift does type, and what it types
+    /// is the alternate the terminal reports beside the key when it was asked
+    /// for alternates. Without that, an ASCII letter is upper-cased here rather
+    /// than guessed at further: the client's keys read their own case (`h` and
+    /// `H`), and a layout it cannot see is not worth more than that.
+    fn text(&self) -> Option<char> {
+        // Letting go of a key types nothing, and neither does holding it down
+        // long enough to repeat: a mode that reports both would otherwise type
+        // a character two and three times over.
+        if self.event != PRESS || self.mods & !(SHIFT | LOCKS) != 0 {
+            return None;
+        }
+        let shift = self.mods & SHIFT != 0;
+        let code = self.shifted.filter(|_| shift).unwrap_or(self.code);
+        // The codepoints the protocol keeps for keys that type nothing: the
+        // arrows, the function keys, the keypad, the modifiers themselves.
+        if FUNCTIONAL.contains(&code) {
+            return None;
+        }
+        let typed = char::from_u32(code).filter(|c| !c.is_control())?;
+        Some(match self.shifted {
+            None if shift => typed.to_ascii_uppercase(),
+            _ => typed,
+        })
+    }
+}
+
+/// The alternate key in a parameter: what the same press would type with shift
+/// held, which is the first sub-parameter when the terminal was asked to report
+/// alternates. The one behind it is the base layout's key, which is for
+/// matching shortcuts on a layout that is not the one in use, and is not what
+/// anything here is doing.
+fn alternate(field: &str) -> Option<u32> {
+    field.split(':').nth(1)?.parse().ok()
+}
+
+/// How many bytes the escape sequence at the head of `input` takes, if what is
+/// there is a sequence at all rather than the Esc key itself.
+///
+/// A sequence that the chunk ends in the middle of is not one, the same way a
+/// Shift-Tab split down the middle is not one: what is there is an Esc, which
+/// is what it would have been read as before any of this.
+fn sequence(input: &[u8]) -> Option<usize> {
+    let rest = input.strip_prefix(b"\x1b")?;
+    match rest.first()? {
+        // A control sequence, which runs to its final byte.
+        b'[' => {
+            let end = rest[1..].iter().position(|b| (0x40..=0x7e).contains(b))?;
+            Some(3 + end)
+        }
+        // SS3, which is one byte and is how a terminal in application-keypad
+        // mode spells the arrows.
+        b'O' => rest.get(1).map(|_| 3),
+        _ => None,
     }
 }
 
@@ -631,6 +744,83 @@ impl KeyFilter {
         }
     }
 
+    /// What a key means in control mode, by the byte it arrives as.
+    ///
+    /// A table of its own rather than a match at the one place keys are read,
+    /// because the same keys reach the client in more than one spelling: a
+    /// program holding the terminal in an extended-keys mode sends them as
+    /// escape sequences, and keys that worked only in the short spelling would
+    /// be keys that stop working while such a program is running.
+    ///
+    /// The prefix and the keys that go back to focus are not here. What they do
+    /// to the mode, and what the session sees of them, is the caller's, and it
+    /// is the one thing that does differ between the spellings.
+    fn controlling(&self, b: u8) -> Option<Action> {
+        let action = match b {
+            b'd' | b'D' => Action::Detach,
+            b'\t' | b'n' | b'N' => Action::Switch(Motion::Next),
+            b'p' | b'P' => Action::Switch(Motion::Previous),
+            b'l' | b'L' => Action::Switch(Motion::Last),
+            // The one key that reads its own case, because shift already means
+            // backwards here: `H` is to `h` what shift-tab is to tab, rather
+            // than a second letter to remember.
+            b'h' => Action::Switch(Motion::NextHost),
+            b'H' => Action::Switch(Motion::PreviousHost),
+            // Only where there is a history to look at. Elsewhere they are
+            // unbound keys, and the session gets them.
+            SCROLL_KEY if self.scroll => Action::Scroll(Scroll::Up(0)),
+            // Straight from control mode into a search, which is the whole
+            // gesture: `Ctrl-] /`, type, Enter.
+            FIND_KEY if self.scroll => Action::Find(Find::Open),
+            // And the same gesture for the name: `Ctrl-] r`, type, Enter.
+            // Nothing here asks the host first, so it is bound whether or not
+            // the host turns out to take it: an old one is answered with a
+            // sentence on the row, which is more use than a letter that lands
+            // in the shell.
+            b'r' | b'R' => Action::Rename(Rename::Open),
+            _ => return None,
+        };
+        Some(action)
+    }
+
+    /// The same, for the keys that move the view. The search keys come first,
+    /// since they are not moves and one of them opens a prompt that takes every
+    /// key after it.
+    fn scrolling(&self, b: u8) -> Option<Action> {
+        let found = match b {
+            FIND_KEY => Some(Find::Open),
+            b'n' => Some(Find::Next),
+            b'N' => Some(Find::Previous),
+            _ => None,
+        };
+        if let Some(found) = found {
+            return Some(Action::Find(found));
+        }
+        let scroll = match b {
+            b'q' | 0x1b | b'\r' | b'\n' => Scroll::Leave,
+            b if b == self.prefix => Scroll::Leave,
+            b' ' | b'f' => Scroll::PageDown,
+            b'b' => Scroll::PageUp,
+            b'k' => Scroll::Up(1),
+            b'j' => Scroll::Down(1),
+            b'g' => Scroll::Top,
+            b'G' => Scroll::Bottom,
+            _ => return None,
+        };
+        Some(Action::Scroll(scroll))
+    }
+
+    /// Open the prompt an action asks for, if it asks for one. The tables above
+    /// say what a key means and do nothing, so that they can be asked from
+    /// either spelling; this is the one thing that has to happen either way.
+    fn opening(&mut self, action: Action) {
+        match action {
+            Action::Find(Find::Open) => self.open(Prompting::Find),
+            Action::Rename(Rename::Open) => self.open(Prompting::Rename),
+            _ => {}
+        }
+    }
+
     /// Whether the paste key is the client's. Off hands it back to the session,
     /// which is what `MM_PASTE=off` asks for.
     pub fn set_paste(&mut self, on: bool) {
@@ -764,39 +954,10 @@ impl KeyFilter {
                 // screen that is not the one being looked at. Unbound keys do
                 // nothing rather than dropping out of the view, so a hand on
                 // the keyboard cannot lose your place in a long build.
-                // The search keys first, since they are not moves and one of
-                // them opens a prompt that takes every key after it.
-                let found = match b {
-                    FIND_KEY => Some(Find::Open),
-                    b'n' => Some(Find::Next),
-                    b'N' => Some(Find::Previous),
-                    _ => None,
-                };
-                if let Some(found) = found {
-                    if found == Find::Open {
-                        self.open(Prompting::Find);
-                    }
-                    return Keystrokes {
-                        forward,
-                        action: Some(Action::Find(found)),
-                        mode: self.mode,
-                    };
-                }
-                let scroll = match b {
-                    b'q' | 0x1b | b'\r' | b'\n' => Some(Scroll::Leave),
-                    b if b == self.prefix => Some(Scroll::Leave),
-                    b' ' | b'f' => Some(Scroll::PageDown),
-                    b'b' => Some(Scroll::PageUp),
-                    b'k' => Some(Scroll::Up(1)),
-                    b'j' => Some(Scroll::Down(1)),
-                    b'g' => Some(Scroll::Top),
-                    b'G' => Some(Scroll::Bottom),
-                    _ => None,
-                };
-                let Some(scroll) = scroll else {
+                let Some(action) = self.scrolling(b) else {
                     continue;
                 };
-                let action = Action::Scroll(scroll);
+                self.opening(action);
                 self.mode = Self::after(action);
                 return Keystrokes {
                     forward,
@@ -837,33 +998,6 @@ impl KeyFilter {
                     self.mode = Mode::Focus;
                     None
                 }
-                b'd' | b'D' => Some(Action::Detach),
-                b'\t' | b'n' | b'N' => Some(Action::Switch(Motion::Next)),
-                b'p' | b'P' => Some(Action::Switch(Motion::Previous)),
-                b'l' | b'L' => Some(Action::Switch(Motion::Last)),
-                // The one key that reads its own case, because shift already
-                // means backwards here: `H` is to `h` what shift-tab is to tab,
-                // rather than a second letter to remember.
-                b'h' => Some(Action::Switch(Motion::NextHost)),
-                b'H' => Some(Action::Switch(Motion::PreviousHost)),
-                // Only where there is a history to look at. Elsewhere they are
-                // unbound keys, and the session gets them.
-                SCROLL_KEY if self.scroll => Some(Action::Scroll(Scroll::Up(0))),
-                // Straight from control mode into a search, which is the whole
-                // gesture: `Ctrl-] /`, type, Enter.
-                FIND_KEY if self.scroll => {
-                    self.open(Prompting::Find);
-                    Some(Action::Find(Find::Open))
-                }
-                // And the same gesture for the title: `Ctrl-] r`, type, Enter.
-                // Nothing here asks the host first, so it is bound whether or
-                // not the host turns out to take it: an old one is answered
-                // with a sentence on the row, which is more use than a letter
-                // that lands in the shell.
-                b'r' | b'R' => {
-                    self.open(Prompting::Rename);
-                    Some(Action::Rename(Rename::Open))
-                }
                 // Shift-Tab, which starts with the same byte as the Esc that
                 // goes back to focus. An Esc with `[Z` behind it in the same
                 // read is the key; one at the end of a read is a real Esc.
@@ -877,12 +1011,18 @@ impl KeyFilter {
                     self.mode = Mode::Focus;
                     None
                 }
-                other => {
-                    self.mode = Mode::Focus;
-                    forward.extend_from_slice(&self.spelling);
-                    forward.push(other);
-                    None
-                }
+                other => match self.controlling(other) {
+                    Some(action) => {
+                        self.opening(action);
+                        Some(action)
+                    }
+                    None => {
+                        self.mode = Mode::Focus;
+                        forward.extend_from_slice(&self.spelling);
+                        forward.push(other);
+                        None
+                    }
+                },
             };
             // Whatever is left of the chunk is dropped: nobody types through a
             // detach or a switch.
@@ -917,12 +1057,47 @@ impl KeyFilter {
     /// detach. Bytes that are not printable are dropped rather than added to
     /// the line, which keeps an arrow key from becoming three characters of
     /// search text or of title.
+    ///
+    /// An escape sequence is taken off whole before any of that, because the
+    /// Esc it starts with is not the Esc key. A program holding the terminal in
+    /// an extended-keys mode makes this the common case rather than a corner:
+    /// the ctrl let go of a moment after the key that opened the prompt reports
+    /// itself, and read a byte at a time that release closed the prompt before
+    /// anything could be typed into it.
     fn typing(&mut self, input: &[u8]) -> Action {
         let Some(prompt) = self.prompt.as_mut() else {
             return Action::Find(Find::Cancel);
         };
         let what = prompt.what;
-        for &b in input {
+        let mut i = 0;
+        while i < input.len() {
+            let mut b = input[i];
+            i += 1;
+            if b == 0x1b
+                && let Some(len) = sequence(&input[i - 1..])
+            {
+                let key = Encoded::parse(&input[i - 1..]);
+                i += len - 1;
+                let Some(key) = key else {
+                    continue;
+                };
+                match key.typed() {
+                    Some(byte) => b = byte,
+                    // A character with no byte of its own, which is how one
+                    // arrives once a program has asked for every key as an
+                    // escape code. Everything else the mode brings with it
+                    // (releases, chords, the keys that type nothing) is not
+                    // typing and is dropped.
+                    None => {
+                        if let Some(typed) = key.text() {
+                            let mut spelt = [0; 4];
+                            let spelt = typed.encode_utf8(&mut spelt);
+                            prompt.typed.extend_from_slice(spelt.as_bytes());
+                        }
+                        continue;
+                    }
+                }
+            }
             match b {
                 b'\r' | b'\n' => return what.action(Find::Run, Rename::Run),
                 0x1b => {
@@ -991,6 +1166,23 @@ impl KeyFilter {
         if key.event != PRESS || key.is_modifier() {
             return None;
         }
+        // The key as the byte the ordinary encoding would have sent, so that
+        // the tables the short spelling is read with answer for this one too.
+        // The mode key is not among them: it is a chord, and what it means is
+        // read from the chord.
+        let byte = if key.is(self.prefix) {
+            Some(self.prefix)
+        } else {
+            key.byte()
+        };
+        if self.mode == Mode::Scroll {
+            // Every key in the view is the client's, the ones that mean nothing
+            // there included: the view must not drop because a hand landed on
+            // the keyboard, and the session behind it must not be typed into.
+            let action = byte.and_then(|b| self.scrolling(b))?;
+            self.opening(action);
+            return Some(action);
+        }
         let pressed = self.pressed.take();
         if key.is(self.prefix) {
             self.spell(spelling);
@@ -1002,12 +1194,15 @@ impl KeyFilter {
         }
         match key.code {
             TAB if key.mods & SHIFT != 0 => return Some(Action::Switch(Motion::Previous)),
-            TAB => return Some(Action::Switch(Motion::Next)),
             ESCAPE | ENTER => {
                 self.mode = Mode::Focus;
                 return None;
             }
             _ => {}
+        }
+        if let Some(action) = byte.and_then(|b| self.controlling(b)) {
+            self.opening(action);
+            return Some(action);
         }
         // An unbound key, handled the way the plain spelling of one is: back to
         // focus, with what opened the mode and what closed it both passed on.
@@ -2504,6 +2699,220 @@ mod tests {
             asked(Action::Rename(Rename::Cancel), Mode::Focus)
         );
         assert_eq!(f.wanted_name(), None);
+    }
+
+    /// A program that asks the terminal for every key as an escape code takes
+    /// the letters with it, and the client's own keys are letters. Read as
+    /// unbound they dropped back to focus and landed in the session instead of
+    /// doing what they say on the row.
+    #[test]
+    fn control_mode_reads_the_letters_in_the_long_spelling() {
+        let mut f = KeyFilter::new(KEY);
+        assert_eq!(
+            f.filter(b"\x1b[93;5u\x1b[100u"),
+            asked(Action::Detach, Mode::Focus)
+        );
+
+        let mut f = KeyFilter::new(KEY);
+        assert_eq!(
+            f.filter(b"\x1b[93;5u\x1b[114u"),
+            asked(Action::Rename(Rename::Open), Mode::Rename)
+        );
+        assert_eq!(f.wanted_name().as_deref(), Some(""));
+
+        // Shift is the alternate the terminal reports beside the key, since the
+        // client's own keys read their case: `H` is not `h`, and the two go
+        // opposite ways.
+        let mut f = KeyFilter::new(KEY);
+        assert_eq!(
+            f.filter(b"\x1b[93;5u\x1b[104u"),
+            asked(Action::Switch(Motion::NextHost), Mode::Control)
+        );
+        assert_eq!(
+            f.filter(b"\x1b[104:72;2u"),
+            asked(Action::Switch(Motion::PreviousHost), Mode::Control)
+        );
+        // And where no alternate was asked for, the case is worked out here.
+        assert_eq!(
+            f.filter(b"\x1b[104;2u"),
+            asked(Action::Switch(Motion::PreviousHost), Mode::Control)
+        );
+        // A chord is still nobody's key but the session's.
+        assert_eq!(
+            f.filter(b"\x1b[104;5u"),
+            forwarded(b"\x1b[93;5u\x1b[104;5u")
+        );
+    }
+
+    /// The view is left with Esc, and with a program holding the terminal in an
+    /// extended-keys mode the Esc key is `CSI 27 u`. Read as anything else it
+    /// left the mode without leaving the view: the client sat showing history
+    /// while everything typed went to the session behind it.
+    #[test]
+    fn the_view_is_driven_in_the_long_spelling_too() {
+        let mut f = KeyFilter::new(KEY);
+        f.set_scroll(true);
+        assert_eq!(
+            f.filter(&[KEY, SCROLL_KEY]),
+            asked(Action::Scroll(Scroll::Up(0)), Mode::Scroll)
+        );
+        assert_eq!(
+            f.filter(b"\x1b[27u"),
+            asked(Action::Scroll(Scroll::Leave), Mode::Focus)
+        );
+
+        // The moves and the search read the same way, and a key the view does
+        // not bind is swallowed: it neither drops the view nor reaches the
+        // session.
+        f.filter(&[KEY, SCROLL_KEY]);
+        assert_eq!(
+            f.filter(b"\x1b[106u"),
+            asked(Action::Scroll(Scroll::Down(1)), Mode::Scroll)
+        );
+        assert_eq!(
+            f.filter(b"\x1b[122;5u"),
+            Keystrokes {
+                forward: vec![],
+                action: None,
+                mode: Mode::Scroll,
+            }
+        );
+        assert_eq!(
+            f.filter(b"\x1b[47u"),
+            asked(Action::Find(Find::Open), Mode::Scroll)
+        );
+        assert_eq!(f.needle().as_deref(), Some(""));
+
+        // And the mode key leaves the view rather than only the mode.
+        let mut f = KeyFilter::new(KEY);
+        f.set_scroll(true);
+        f.filter(&[KEY, SCROLL_KEY]);
+        assert_eq!(
+            f.filter(b"\x1b[93;5u"),
+            asked(Action::Scroll(Scroll::Leave), Mode::Focus)
+        );
+    }
+
+    /// The bug this was written for: with a program like `pi` holding the
+    /// terminal in an extended-keys mode, letting go of the ctrl that opened
+    /// control mode reports itself as an escape sequence, and it arrives after
+    /// the `r` that opened the prompt. Read as typing, its leading Esc closed
+    /// the prompt again, so a session running one of those programs could not
+    /// be renamed.
+    #[test]
+    fn letting_go_of_the_mode_key_does_not_close_the_prompt_it_opened() {
+        let mut f = KeyFilter::new(KEY);
+        assert_eq!(
+            f.filter(b"\x1b[93;5ur"),
+            asked(Action::Rename(Rename::Open), Mode::Rename)
+        );
+        // The `]` released, then the ctrl that was held with it.
+        assert_eq!(
+            f.filter(b"\x1b[93;5:3u\x1b[57442;5:3u"),
+            asked(Action::Rename(Rename::Typed), Mode::Rename)
+        );
+        assert_eq!(f.wanted_name().as_deref(), Some(""));
+        assert_eq!(
+            f.filter(b"bench"),
+            asked(Action::Rename(Rename::Typed), Mode::Rename)
+        );
+        assert_eq!(f.wanted_name().as_deref(), Some("bench"));
+    }
+
+    /// The same race at the other prompt, which is typed the same way and so
+    /// had the same hole in it.
+    #[test]
+    fn letting_go_of_the_mode_key_does_not_close_the_search_either() {
+        let mut f = KeyFilter::new(KEY);
+        f.set_scroll(true);
+        assert_eq!(
+            f.filter(b"\x1b[93;5u/"),
+            asked(Action::Find(Find::Open), Mode::Scroll)
+        );
+        f.filter(b"\x1b[57442;5:3u");
+        assert_eq!(f.needle().as_deref(), Some(""), "the prompt is still open");
+        f.filter(b"error");
+        assert_eq!(f.needle().as_deref(), Some("error"));
+    }
+
+    /// Nothing the terminal sends of its own accord is typing: a mouse report
+    /// from a session that asked for tracking, or a focus event, arrives at
+    /// whatever prompt happens to be open and must leave it as it was.
+    #[test]
+    fn a_report_arriving_at_a_prompt_is_not_typed_into_it() {
+        let mut f = KeyFilter::new(KEY);
+        f.filter(&[KEY, b'r']);
+        f.filter(b"bui\x1b[<0;12;7Mld");
+        assert_eq!(f.wanted_name().as_deref(), Some("build"));
+        // An arrow in the application-keypad spelling, and the terminal saying
+        // the window lost the focus and got it back.
+        assert_eq!(f.filter(b"\x1bOA\x1b[O\x1b[I"), {
+            asked(Action::Rename(Rename::Typed), Mode::Rename)
+        });
+        assert_eq!(f.wanted_name().as_deref(), Some("build"));
+    }
+
+    /// And the keys that do end the typing still end it in the long spelling,
+    /// which is the one they arrive in once a program has asked for it: an Esc
+    /// that only arrived as `CSI 27 u` would leave a prompt with no way out but
+    /// rubbing it empty.
+    #[test]
+    fn the_prompt_reads_the_long_spelling_of_the_keys_that_end_it() {
+        let mut f = KeyFilter::new(KEY);
+        f.filter(&[KEY, b'r']);
+        f.filter(b"bench");
+        // Backspace and Ctrl-U, spelt the long way.
+        f.filter(b"\x1b[127u");
+        assert_eq!(f.wanted_name().as_deref(), Some("benc"));
+        f.filter(b"\x1b[117;5u");
+        assert_eq!(f.wanted_name().as_deref(), Some(""));
+
+        f.filter(b"nightly");
+        assert_eq!(
+            f.filter(b"\x1b[13u"),
+            asked(Action::Rename(Rename::Run), Mode::Focus)
+        );
+        assert_eq!(f.wanted_name().as_deref(), Some("nightly"));
+
+        f.stop_typing();
+        f.filter(&[KEY, b'r']);
+        assert_eq!(
+            f.filter(b"\x1b[27u"),
+            asked(Action::Rename(Rename::Cancel), Mode::Focus)
+        );
+        assert_eq!(f.wanted_name(), None);
+    }
+
+    /// And a name can be typed at it entirely in the long spelling, which is
+    /// what arrives from a program that asked for every key as an escape code.
+    /// The release each press brings with it types nothing, or every letter
+    /// would land twice.
+    #[test]
+    fn a_name_can_be_typed_in_the_long_spelling() {
+        let mut f = KeyFilter::new(KEY);
+        f.filter(&[KEY, b'r']);
+        // `p`, `í` and shift-`A`, each with its release behind it.
+        f.filter(b"\x1b[112u\x1b[112;1:3u");
+        f.filter(b"\x1b[237u\x1b[237;1:3u");
+        f.filter(b"\x1b[97:65;2u\x1b[97:65;2:3u");
+        assert_eq!(f.wanted_name().as_deref(), Some("píA"));
+    }
+
+    /// An Esc that is not the start of anything is still the Esc key, whether
+    /// it is the last byte of a chunk or has an alt-chord behind it.
+    #[test]
+    fn a_bare_escape_at_a_prompt_still_closes_it() {
+        let mut f = KeyFilter::new(KEY);
+        f.filter(&[KEY, b'r']);
+        assert_eq!(
+            f.filter(b"na\x1b"),
+            asked(Action::Rename(Rename::Cancel), Mode::Focus)
+        );
+        f.filter(&[KEY, b'r']);
+        assert_eq!(
+            f.filter(b"na\x1bb"),
+            asked(Action::Rename(Rename::Cancel), Mode::Focus)
+        );
     }
 
     /// Two prompts, one buffer. What is typed at one must never turn up at the

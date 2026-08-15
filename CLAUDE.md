@@ -219,6 +219,18 @@ Three consequences run through the whole codebase and are worth keeping intact:
   left. `attach::Encoded` reads all three, and drops the repeats, releases and
   bare modifier keys that the same protocols add, since in control mode letting
   go of ctrl would otherwise read as a keystroke.
+- **And so does every other key the client reads.** Each mode has one table
+  (`KeyFilter::controlling`, `KeyFilter::scrolling`) taking the byte the
+  ordinary encoding would have sent, and `Encoded::byte` reads a key back to
+  that byte, so the long spelling and the short one cannot answer differently.
+  A key read in only one of them is a key that stops working while a program
+  like `pi` is running, and the ways that shows up are not obvious: an Esc
+  spelt `CSI 27 u` left the mode without leaving the view, so the client sat
+  painting history while everything typed went to the session behind it. Under
+  *report all keys as escape codes* even the letters arrive that way, and the
+  shifted ones arrive as the alternate the terminal reports beside the key,
+  which is why `Encoded::text` reads case out of the alternate rather than the
+  code.
 - **What an attached client asks for goes on the attach stream, never down a
   second connection.** An `Attached` holds neither the socket nor the host it
   arrived by, on purpose: that is the one thing this half of the client is kept
@@ -233,7 +245,14 @@ Three consequences run through the whole codebase and are worth keeping intact:
   handed back says which one is open. A prompt swallows the whole chunk, because
   typing arrives in chunks and one action per byte would drop the rest of each;
   and a rub takes a whole character, not a byte, or one press of an accented key
-  leaves half of it behind.
+  leaves half of it behind. What it swallows is text, so an escape sequence is
+  taken off whole before any of it is read: the Esc a sequence starts with is
+  not the Esc key, and with a program holding the terminal in an extended-keys
+  mode that is the common case, since letting go of the ctrl that opened the
+  prompt reports itself a keystroke later and used to close the prompt again.
+  The other half of that is `Encoded::typed`: the same mode spells Esc, Enter
+  and Backspace the long way, and they are read back to the byte the editing is
+  written against rather than handled twice.
 - **A rename moves the name, and the title stays the program's.** The name says
   which session this is and goes in `host/name`, so it is sanitised in
   `node::registry` and refused when another session already holds it: a spawn
