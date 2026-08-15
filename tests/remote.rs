@@ -1209,3 +1209,84 @@ fn a_resize_repaints_the_screen_at_the_size_it_now_has() {
     let _ = client.kill();
     let _ = client.wait();
 }
+
+/// `mm a devbox` reads as "put me on devbox", and there is usually one thing
+/// running there. Naming the session as well repeats a lookup you have just
+/// done with `mm ls`.
+#[test]
+fn a_machine_on_its_own_attaches_to_the_first_session_on_it() {
+    let world = World::new("attach-machine");
+
+    world.ok(
+        "laptop",
+        &["new", "-d", "-n", "first", "gpu-box", "sleep", "60"],
+    );
+    world.ok(
+        "laptop",
+        &["new", "-d", "-n", "second", "gpu-box", "sleep", "60"],
+    );
+    // A session here too, to be sure the machine is what chose between them.
+    world.ok("laptop", &["new", "-d", "-n", "here", "sleep", "60"]);
+
+    // Ctrl-] d leaves again, so the client exits on its own and says where it
+    // had been.
+    let (left, seen) = world.on_a_terminal("laptop", &["attach", "gpu-box"], "\x1dd");
+    assert!(left, "attaching to gpu-box by name failed: {seen}");
+    assert!(
+        seen.contains("detached from gpu-box/first"),
+        "should have taken the first session on gpu-box: {seen}"
+    );
+}
+
+/// The machine has to be one that is already watched. Anything else is a
+/// session name that is not running, and going out to ssh for a typo would
+/// hang on a name that resolves to nothing.
+#[test]
+fn a_word_that_names_no_machine_is_still_a_missing_session() {
+    let world = World::new("attach-typo");
+
+    world.ok("laptop", &["new", "-d", "-n", "here", "sleep", "60"]);
+
+    let out = world.run("laptop", &["attach", "not-a-machine"]);
+    assert!(!out.status.success());
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert!(said.contains("no session named"), "{said}");
+}
+
+/// A machine being watched but holding nothing says so, rather than reporting
+/// a session name that was never the point.
+#[test]
+fn a_machine_with_nothing_on_it_says_so() {
+    let world = World::new("attach-empty");
+
+    world.ok("laptop", &["add", "gpu-box"]);
+
+    let out = world.run("laptop", &["attach", "gpu-box"]);
+    assert!(!out.status.success());
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert!(said.contains("nothing is running on gpu-box"), "{said}");
+}
+
+/// Attaching to whatever is first is fine, because you can leave again. Killing
+/// or renaming whatever is first is not, so only attach reads a bare machine
+/// name that way.
+#[test]
+fn only_attach_takes_a_machine_where_a_session_is_expected() {
+    let world = World::new("attach-only");
+
+    world.ok(
+        "laptop",
+        &["new", "-d", "-n", "only", "gpu-box", "sleep", "60"],
+    );
+
+    for command in ["kill", "rename"] {
+        let mut args = vec![command, "gpu-box"];
+        if command == "rename" {
+            args.push("whatever");
+        }
+        let out = world.run("laptop", &args);
+        assert!(!out.status.success(), "{command} took a machine name");
+        let said = String::from_utf8_lossy(&out.stderr);
+        assert!(said.contains("no session named"), "{command}: {said}");
+    }
+}

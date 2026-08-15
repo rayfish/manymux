@@ -77,6 +77,10 @@ enum Command {
         args: Vec<String>,
     },
     /// Attach to a session, as `name` or `host/name`.
+    ///
+    /// A machine's name on its own takes the first session on it, so `mm a
+    /// gpu-box` is "put me on gpu-box" without looking up what is running
+    /// there first.
     #[command(visible_alias = "a")]
     Attach {
         #[arg(add = complete::targets())]
@@ -302,12 +306,12 @@ async fn run(cli: Cli) -> Result<u8> {
         }
 
         Command::Attach { target } => {
-            let target = locate(&socket, &target).await?;
+            let target = locate(&socket, &target, Bare::OrMachine).await?;
             do_attach(&socket, &target.host, &target.session).await
         }
 
         Command::Kill { target } => {
-            let target = locate(&socket, &target).await?;
+            let target = locate(&socket, &target, Bare::Session).await?;
             let mut stream = open(&socket, &target.host).await?;
             stream
                 .call(&Request::Kill {
@@ -318,7 +322,7 @@ async fn run(cli: Cli) -> Result<u8> {
         }
 
         Command::Rename { target, title } => {
-            let target = locate(&socket, &target).await?;
+            let target = locate(&socket, &target, Bare::Session).await?;
             let mut stream = open(&socket, &target.host).await?;
             stream
                 .call(&Request::Rename {
@@ -905,12 +909,24 @@ async fn take_listing(pending: &mut Option<JoinHandle<Vec<Located>>>, cycle: &mu
     }
 }
 
+/// What a bare word is allowed to mean besides a session name.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Bare {
+    /// A session and nothing else. A word that happens to name a machine is a
+    /// session name that is not running.
+    Session,
+    /// A machine too, standing for whatever is running on it. Only for going
+    /// somewhere: picking a session out of a list is fine to attach to and not
+    /// fine to kill or rename, where the wrong guess is not undoable.
+    OrMachine,
+}
+
 /// Work out which machine a target is on.
 ///
 /// `host/session` says so outright. A bare name is looked for here first, and
 /// then across every watched machine, so `mm attach api` finds the session
 /// wherever you left it without having to remember which machine that was.
-async fn locate(socket: &Path, target: &str) -> Result<Located> {
+async fn locate(socket: &Path, target: &str, bare: Bare) -> Result<Located> {
     let target = Target::parse(target)?;
     if let Some(host) = target.host {
         return Ok(Located {
@@ -931,9 +947,9 @@ async fn locate(socket: &Path, target: &str) -> Result<Located> {
     let listing = everywhere(socket).await?;
     let mut hosts: Vec<String> = listing
         .sessions
-        .into_iter()
+        .iter()
         .filter(|hosted| hosted.session.name == target.session)
-        .map(|hosted| hosted.host)
+        .map(|hosted| hosted.host.clone())
         .collect();
     hosts.dedup();
 
@@ -942,6 +958,9 @@ async fn locate(socket: &Path, target: &str) -> Result<Located> {
             host: hosts.remove(0),
             session: target.session,
         }),
+        0 if bare == Bare::OrMachine && names_a_machine(&target.session) => {
+            on_that_machine(&listing, &target.session)
+        }
         0 => bail!("no session named {}; see `mm ls`", target.session),
         // Two machines can each have a `build`. Say which, rather than guessing.
         _ => bail!(
@@ -952,6 +971,40 @@ async fn locate(socket: &Path, target: &str) -> Result<Located> {
             target.session
         ),
     }
+}
+
+/// Whether a word names a machine rather than a session.
+///
+/// Only this machine and one already being watched count. A word nobody has
+/// added is a mistyped session name, and treating it as a machine would turn
+/// every typo into an ssh connection to a host that does not exist.
+fn names_a_machine(word: &str) -> bool {
+    is_this_machine(word) || Hosts::load().is_ok_and(|hosts| hosts.has(word))
+}
+
+/// The first session on a machine named on its own.
+///
+/// `mm a devbox` reads as "put me on devbox", and on a machine with one session
+/// naming it as well is repeating a lookup you have just done. First is first as
+/// `mm ls` prints it, so what you get is the row you were looking at.
+fn on_that_machine(listing: &Listing, machine: &str) -> Result<Located> {
+    let here = is_this_machine(machine);
+    let found = listing
+        .sessions
+        .iter()
+        .find(|hosted| hosted.host == machine || (here && is_this_machine(&hosted.host)));
+    if let Some(hosted) = found {
+        return Ok(Located {
+            host: hosted.host.clone(),
+            session: hosted.session.name.clone(),
+        });
+    }
+    // A machine that could not be asked has not said it is empty, and saying it
+    // is would send someone looking for sessions that are still there.
+    if let Some(down) = listing.unreachable.iter().find(|had| had.host == machine) {
+        bail!("{}: {}", down.host, down.error);
+    }
+    bail!("nothing is running on {machine}; `mm n {machine} <command>` starts something there")
 }
 
 fn qualified(host: &str, name: &str) -> String {
