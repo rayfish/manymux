@@ -154,6 +154,79 @@ async fn spawn_session(node: &Arc<Node>, command: &[&str]) -> Spawned {
     Spawned { name, pid }
 }
 
+/// What puts a session's past in the scrollback of the terminal you just walked
+/// up to. It has to arrive before the screen: the client scrolls it away to
+/// make room for the repaint, and a line painted over is a line lost.
+#[tokio::test]
+async fn history_reaches_a_client_that_asks_before_the_screen_does() {
+    let node = test_node().await;
+    let Spawned { name, .. } = spawn_session(
+        &node,
+        &[
+            "/bin/sh",
+            "-c",
+            "i=1; while [ $i -le 60 ]; do echo line $i; i=$((i+1)); done; sleep 300",
+        ],
+    )
+    .await;
+
+    // Attach once to let the session paint, and to know it has finished.
+    let mut watcher = Client::connect(&node);
+    watcher
+        .send(&Request::Attach {
+            name: name.clone(),
+            size: Size::new(80, 24),
+            history: 0,
+        })
+        .await
+        .unwrap();
+    watcher.read_until("line 60").await;
+
+    let mut client = Client::connect(&node);
+    client
+        .send(&Request::Attach {
+            name: name.clone(),
+            size: Size::new(80, 24),
+            history: 100,
+        })
+        .await
+        .unwrap();
+
+    let mut history = String::new();
+    loop {
+        let frame = client.next_frame().await.expect("a frame");
+        if frame.tag == tag::DATA {
+            break;
+        }
+        if frame.tag == tag::HISTORY {
+            history.push_str(&String::from_utf8_lossy(&frame.body));
+        }
+    }
+    assert!(history.contains("line 1\r\n"), "{history:?}");
+    // The screen is the dump's to paint, so its lines are not in here twice.
+    assert!(!history.contains("line 60"), "{history:?}");
+}
+
+/// And a client that asks for none gets the frames it always got.
+#[tokio::test]
+async fn a_client_that_asks_for_no_history_is_sent_none() {
+    let node = test_node().await;
+    let Spawned { name, .. } =
+        spawn_session(&node, &["/bin/sh", "-c", "echo hello; sleep 300"]).await;
+
+    let mut client = Client::connect(&node);
+    client
+        .send(&Request::Attach {
+            name: name.clone(),
+            size: Size::new(80, 24),
+            history: 0,
+        })
+        .await
+        .unwrap();
+    let frame = client.next_frame().await.expect("a frame");
+    assert_eq!(frame.tag, tag::DATA, "the screen, with nothing before it");
+}
+
 /// The case this closes: a laptop whose lid shuts mid-attach. Its connection is
 /// dead but nothing closes it, so without a probe the phantom keeps its say in
 /// the session's size and keeps counting as attached for as long as the node

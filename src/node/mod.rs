@@ -219,13 +219,13 @@ impl Node {
             Request::Attach {
                 name,
                 size,
-                history: _,
+                history,
             } => {
                 let Some(session) = self.registry.get(&name) else {
                     return reply(&mut write, Err(anyhow::anyhow!("no session named {name}")))
                         .await;
                 };
-                let attached = session.attach(size);
+                let attached = session.attach(size, history);
                 let response = Response::Attached {
                     size: attached.size,
                     paste: true,
@@ -338,10 +338,17 @@ where
 {
     let session::Attached {
         attachment,
+        history,
         repaint,
         mut output,
         size: _,
     } = attached;
+    // Before the screen: the client scrolls these into its terminal's own
+    // scrollback and paints the screen over the blank they leave behind.
+    // Chunked because a thousand lines is bigger than a frame.
+    for chunk in history.as_bytes().chunks(proto::PASTE_CHUNK) {
+        send(&mut write, tag::HISTORY, chunk).await?;
+    }
     // Paint the screen as it stands before streaming anything live.
     send(&mut write, tag::DATA, repaint.as_bytes()).await?;
 

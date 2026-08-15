@@ -106,6 +106,11 @@ impl State {
 pub struct Attached {
     /// Dropping this detaches.
     pub attachment: Attachment,
+    /// The lines behind the screen, rendered as text, or empty when the client
+    /// asked for none. Written before [`Self::repaint`] and never after: the
+    /// client scrolls these into its terminal's own scrollback and paints the
+    /// screen over what is left.
+    pub history: String,
     /// Escape sequence that repaints the screen exactly as it is. Paint it
     /// before streaming anything live.
     pub repaint: String,
@@ -328,7 +333,9 @@ impl Session {
     }
 
     /// Attach a client.
-    pub fn attach(self: &Arc<Self>, size: Size) -> Attached {
+    /// `history` is how many lines from behind the screen the client wants,
+    /// which is zero for one painting on a screen of its own.
+    pub fn attach(self: &Arc<Self>, size: Size, history: u32) -> Attached {
         let id = self.next_client.fetch_add(1, Ordering::Relaxed);
         self.host_clients.fetch_add(1, Ordering::Relaxed);
         let mut state = self.state.lock().unwrap();
@@ -340,6 +347,7 @@ impl Session {
         self.apply_size(&mut state, effective);
         state.bells = 0;
         let repaint = state.repaint();
+        let history = super::history::render(&state.vt, history as usize);
         drop(state);
 
         Attached {
@@ -347,6 +355,7 @@ impl Session {
                 session: Arc::clone(self),
                 id,
             },
+            history,
             repaint,
             output,
             size: effective,
