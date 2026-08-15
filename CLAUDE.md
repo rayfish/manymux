@@ -162,6 +162,14 @@ Three consequences run through the whole codebase and are worth keeping intact:
   just walked up to has something to scroll. The order per attach is history,
   roll, repaint, and getting it wrong paints over the lines it was meant to
   save.
+- **The alternate screen has a view of its own instead** (`src/client/scroll.rs`,
+  `tag::VIEW`, `tag::FIND`). It is not tmux's copy mode and must not become one:
+  no selection and no yank, because the terminal's own selection still works on
+  what the view is showing. Lines come a few screenfuls at a time and matches
+  all at once, both for the same reason: a wheel notch or an `n` on a machine
+  two hops away must not be a round trip. Whether the host can do either rides
+  on `Response::Attached { scroll }`, and a host that cannot says so on the mark
+  row rather than leaving a key that does nothing.
 - **The wheel is the terminal's to route, not ours.** A program that asked for
   mouse tracking gets SGR reports, one on its own alternate screen without
   tracking gets the terminal's alternate-scroll arrows, and ordinary output

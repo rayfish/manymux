@@ -248,6 +248,26 @@ pub enum Action {
     /// Move the view over the session's history, or open or close it. Where it
     /// is and what it shows is [`super::scroll`]'s; this only says which way.
     Scroll(Scroll),
+    /// Something happened to the search. The text being typed lives in the key
+    /// filter, since that is what a keyboard mode is; everything done with it
+    /// is the caller's.
+    Find(Find),
+}
+
+/// What a key did to the search.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Find {
+    /// The prompt is open and empty. Draw it.
+    Open,
+    /// The needle changed. Draw it again.
+    Typed,
+    /// Enter: go and look for what has been typed.
+    Run,
+    /// Esc with a prompt open: the view stays, the prompt goes.
+    Cancel,
+    /// The next match further back, and the one back towards the live screen.
+    Next,
+    Previous,
 }
 
 /// A move through the history. Opening the view is not one of these: any of
@@ -418,11 +438,22 @@ pub struct KeyFilter {
     /// takes nothing from the session, and dropping the ones that are not the
     /// wheel keeps a stray click from typing into a shell.
     wheel: bool,
+    /// What is being typed at the search prompt, while one is open.
+    ///
+    /// Kept here rather than by the caller because it is keyboard state, and
+    /// because a chunk holding several typed bytes has to become one needle
+    /// rather than one action per byte, which is a shape this returns nothing
+    /// for.
+    needle: Option<Vec<u8>>,
 }
 
 /// Opens the view, from control mode. tmux's copy-mode key, for the hands that
 /// already know it.
 const SCROLL_KEY: u8 = b'[';
+
+/// Opens a search, from control mode or from inside the view. What every pager
+/// and editor uses, for the same reason.
+const FIND_KEY: u8 = b'/';
 
 /// How long after the mode key a second one still means "send me the byte"
 /// rather than "back to focus". Long enough not to need a fast hand, short
@@ -473,7 +504,20 @@ impl KeyFilter {
             spelling: vec![prefix],
             scroll: false,
             wheel: false,
+            needle: None,
         }
+    }
+
+    /// What is being typed at the search prompt, if one is open.
+    pub fn needle(&self) -> Option<String> {
+        self.needle
+            .as_ref()
+            .map(|typed| String::from_utf8_lossy(typed).into_owned())
+    }
+
+    /// Close the prompt, keeping whatever was typed out of the next search.
+    pub fn stop_typing(&mut self) {
+        self.needle = None;
     }
 
     /// How the terminal spelled the last key the client took for itself, for a
@@ -499,6 +543,10 @@ impl KeyFilter {
             // Every other move keeps the view up, wherever it was opened from:
             // a wheel notch in focus mode opens it and stays.
             Action::Scroll(_) => Mode::Scroll,
+            // A search is something you do to the view, so it puts you in it
+            // and leaves you there. Cancelling the prompt is cancelling the
+            // prompt, not leaving.
+            Action::Find(_) => Mode::Scroll,
         }
     }
 
@@ -545,6 +593,18 @@ impl KeyFilter {
         let mut forward = Vec::with_capacity(input.len());
         let mut i = 0;
         while i < input.len() {
+            // A prompt open takes everything, so that a search for `d` is a
+            // search and not a detach. The whole chunk at once, because typing
+            // arrives in chunks and one action per byte would drop the rest of
+            // each of them.
+            if self.needle.is_some() {
+                let action = self.typing(&input[i..]);
+                return Keystrokes {
+                    forward,
+                    action: Some(action),
+                    mode: self.mode,
+                };
+            }
             // The wheel, while it is the client's. Every report is swallowed,
             // not only the ones that move the view: the client asked the
             // terminal for them, the session did not, and forwarding a click
@@ -622,6 +682,24 @@ impl KeyFilter {
                 // screen that is not the one being looked at. Unbound keys do
                 // nothing rather than dropping out of the view, so a hand on
                 // the keyboard cannot lose your place in a long build.
+                // The search keys first, since they are not moves and one of
+                // them opens a prompt that takes every key after it.
+                let found = match b {
+                    FIND_KEY => Some(Find::Open),
+                    b'n' => Some(Find::Next),
+                    b'N' => Some(Find::Previous),
+                    _ => None,
+                };
+                if let Some(found) = found {
+                    if found == Find::Open {
+                        self.needle = Some(Vec::new());
+                    }
+                    return Keystrokes {
+                        forward,
+                        action: Some(Action::Find(found)),
+                        mode: self.mode,
+                    };
+                }
                 let scroll = match b {
                     b'q' | 0x1b | b'\r' | b'\n' => Some(Scroll::Leave),
                     b if b == self.prefix => Some(Scroll::Leave),
@@ -686,9 +764,15 @@ impl KeyFilter {
                 // rather than a second letter to remember.
                 b'h' => Some(Action::Switch(Motion::NextHost)),
                 b'H' => Some(Action::Switch(Motion::PreviousHost)),
-                // Only where there is a history to look at. Elsewhere it is an
-                // unbound key, and the session gets it.
+                // Only where there is a history to look at. Elsewhere they are
+                // unbound keys, and the session gets them.
                 SCROLL_KEY if self.scroll => Some(Action::Scroll(Scroll::Up(0))),
+                // Straight from control mode into a search, which is the whole
+                // gesture: `Ctrl-] /`, type, Enter.
+                FIND_KEY if self.scroll => {
+                    self.needle = Some(Vec::new());
+                    Some(Action::Find(Find::Open))
+                }
                 // Shift-Tab, which starts with the same byte as the Esc that
                 // goes back to focus. An Esc with `[Z` behind it in the same
                 // read is the key; one at the end of a read is a real Esc.
@@ -725,6 +809,44 @@ impl KeyFilter {
             action: None,
             mode: self.mode,
         }
+    }
+
+    /// Everything typed at an open search prompt, in one go.
+    ///
+    /// Stops at the first key that ends the typing, and drops whatever followed
+    /// it: nobody types through an Enter, the same way nobody types through a
+    /// detach. Bytes that are not printable are dropped rather than added to
+    /// the needle, which keeps an arrow key from becoming three characters of
+    /// search text.
+    fn typing(&mut self, input: &[u8]) -> Action {
+        let Some(needle) = self.needle.as_mut() else {
+            return Action::Find(Find::Cancel);
+        };
+        for &b in input {
+            match b {
+                b'\r' | b'\n' => return Action::Find(Find::Run),
+                0x1b => {
+                    self.needle = None;
+                    return Action::Find(Find::Cancel);
+                }
+                // Backspace, in both spellings terminals send.
+                0x08 | 0x7f => {
+                    // A rub with nothing left to rub out closes the prompt,
+                    // which is where a hand that changed its mind ends up.
+                    if needle.pop().is_none() {
+                        self.needle = None;
+                        return Action::Find(Find::Cancel);
+                    }
+                }
+                // Ctrl-U, which is what a shell means by "start again".
+                0x15 => needle.clear(),
+                // Printable, and the bytes of a multi-byte character, which
+                // are all above 0x7f and go in as they come.
+                0x20..=0x7e | 0x80.. => needle.push(b),
+                _ => {}
+            }
+        }
+        Action::Find(Find::Typed)
     }
 
     /// One key in the terminal's own spelling. Returns what it asked for, if it
@@ -813,7 +935,7 @@ mod terminal {
     use tokio::signal::unix::{SignalKind, signal};
     use tokio::sync::mpsc;
 
-    use super::{Action, KeyFilter, Mode, Outcome, Scroll};
+    use super::{Action, Find, KeyFilter, Mode, Outcome, Scroll};
     use crate::client::screen::ScreenMode;
     use crate::client::scroll::Scrollback;
     use crate::client::status::{self, Filter, Status};
@@ -1216,6 +1338,55 @@ mod terminal {
                             owed += 1;
                             restate = true;
                         }
+                        // Typing, and what typing turns into. The needle lives
+                        // in the key filter until Enter, so all of this does is
+                        // keep the row saying what is in it.
+                        Some(Action::Find(found)) if !scrolls => {
+                            keys.stop_typing();
+                            keys.set_mode(Mode::Focus);
+                            status.set_mode(Mode::Focus);
+                            let _ = found;
+                            status.set_notice(
+                                "this host is too old to search; `mm restart` there",
+                            );
+                            notice_until = Some(tokio::time::Instant::now() + NOTICE_FOR);
+                            restate = true;
+                            settle(&mut stdout, &output, &status, &mut pending, &mut restate)
+                                .await?;
+                        }
+                        Some(Action::Find(found)) => {
+                            let view = scrolling
+                                .get_or_insert_with(|| Scrollback::new(terminal_size()));
+                            match found {
+                                Find::Open | Find::Typed => {
+                                    status.set_prompt(keys.needle());
+                                }
+                                Find::Cancel => status.set_prompt(None),
+                                Find::Run => {
+                                    let needle = keys.needle().unwrap_or_default();
+                                    keys.stop_typing();
+                                    status.set_prompt(None);
+                                    writer.find(&needle).await?;
+                                }
+                                // Walking the matches is local: every one of
+                                // them came back with the search.
+                                Find::Next | Find::Previous => {
+                                    view.step(found == Find::Next);
+                                    status.set_scrolled(Some(view.offset()));
+                                    status.set_searching(view.searching());
+                                    let wanted = view.wanted();
+                                    let painted = view.paint();
+                                    if let Some(request) = wanted {
+                                        writer.view(&request).await?;
+                                    }
+                                    stdout.write_all(painted.as_bytes()).await?;
+                                }
+                            }
+                            stdout
+                                .write_all(status.repaint(terminal_size()).as_bytes())
+                                .await?;
+                            stdout.flush().await?;
+                        }
                         Some(Action::Scroll(motion)) => {
                             let view = scrolling
                                 .get_or_insert_with(|| Scrollback::new(terminal_size()));
@@ -1351,6 +1522,26 @@ mod terminal {
                     // there is no title to prefix and no mark to put back.
                     Update::History(bytes) => {
                         stdout.write_all(&bytes).await?;
+                    }
+                    // Where the search found what it was looking for. The view
+                    // jumps to the first match above where it is sitting, and
+                    // asks for the block around it.
+                    Update::Found(found) => {
+                        if let Some(view) = scrolling.as_mut() {
+                            view.found(found);
+                            status.set_scrolled(Some(view.offset()));
+                            status.set_searching(view.searching());
+                            let wanted = view.wanted();
+                            let painted = view.paint();
+                            if let Some(request) = wanted {
+                                writer.view(&request).await?;
+                            }
+                            stdout.write_all(painted.as_bytes()).await?;
+                            stdout
+                                .write_all(status.repaint(terminal_size()).as_bytes())
+                                .await?;
+                            stdout.flush().await?;
+                        }
                     }
                     // A block of the history. Dropped if the view has been
                     // closed since it was asked for: what is on the screen is
@@ -1591,9 +1782,9 @@ mod terminal {
                     // only worth anything while it is news.
                     Update::Event(_) => {}
                     // Unreachable: history comes at the start of an attach,
-                    // before there has been a key to press, and the view is
-                    // never open while a paste is running.
-                    Update::History(_) | Update::View(_) => {}
+                    // before there has been a key to press, and neither the
+                    // view nor a search is open while a paste is running.
+                    Update::History(_) | Update::View(_) | Update::Found(_) => {}
                     Update::Exited(code) => return Ok(Pasted::Ended(Outcome::Exited(code))),
                     Update::Disconnected => return Ok(Pasted::Ended(Outcome::Disconnected)),
                 },
@@ -1637,8 +1828,9 @@ pub async fn collect_until(
             // For a caller with no terminal to raise one on. A client that
             // renders sessions itself reads these from its own subscription.
             Update::Event(_) => continue,
-            // Nothing here scrolls, so nothing here asked for a window.
-            Update::View(_) => continue,
+            // Nothing here scrolls, so nothing here asked for a window or went
+            // looking through one.
+            Update::View(_) | Update::Found(_) => continue,
             Update::Exited(code) => Outcome::Exited(code),
             Update::Disconnected => Outcome::Disconnected,
         };
@@ -1912,6 +2104,97 @@ mod tests {
         let mut f = KeyFilter::new(KEY);
         f.set_scroll(false);
         assert_eq!(f.filter(&[KEY, SCROLL_KEY]), forwarded(&[KEY, SCROLL_KEY]));
+    }
+
+    /// The whole gesture: `Ctrl-] /`, type, Enter. The needle stays in the
+    /// filter until it is run, because a chunk holding several typed bytes has
+    /// to become one needle rather than an action per byte.
+    #[test]
+    fn a_search_is_typed_at_the_prompt_and_run_with_enter() {
+        let mut f = KeyFilter::new(KEY);
+        f.set_scroll(true);
+        assert_eq!(
+            f.filter(&[KEY, FIND_KEY]),
+            asked(Action::Find(Find::Open), Mode::Scroll)
+        );
+        assert_eq!(f.needle().as_deref(), Some(""));
+
+        assert_eq!(
+            f.filter(b"error"),
+            asked(Action::Find(Find::Typed), Mode::Scroll)
+        );
+        assert_eq!(f.needle().as_deref(), Some("error"));
+
+        assert_eq!(
+            f.filter(b"\r"),
+            asked(Action::Find(Find::Run), Mode::Scroll)
+        );
+    }
+
+    /// The reason the prompt takes every key while it is open. `d` detaches
+    /// everywhere else, and a search for `docker` starts with one.
+    #[test]
+    fn keys_that_do_things_elsewhere_are_just_letters_at_the_prompt() {
+        let mut f = KeyFilter::new(KEY);
+        f.set_scroll(true);
+        f.filter(&[KEY, FIND_KEY]);
+        assert_eq!(
+            f.filter(b"docker qng"),
+            asked(Action::Find(Find::Typed), Mode::Scroll)
+        );
+        assert_eq!(f.needle().as_deref(), Some("docker qng"));
+    }
+
+    #[test]
+    fn a_prompt_can_be_rubbed_out_and_backed_out_of() {
+        let mut f = KeyFilter::new(KEY);
+        f.set_scroll(true);
+        f.filter(&[KEY, FIND_KEY]);
+        f.filter(b"abc");
+        f.filter(&[0x7f]);
+        assert_eq!(f.needle().as_deref(), Some("ab"));
+        f.filter(&[0x15]); // Ctrl-U, start again
+        assert_eq!(f.needle().as_deref(), Some(""));
+
+        // Rubbing out the last of nothing closes the prompt, which is where a
+        // hand that changed its mind ends up.
+        assert_eq!(
+            f.filter(&[0x7f]),
+            asked(Action::Find(Find::Cancel), Mode::Scroll)
+        );
+        assert_eq!(f.needle(), None);
+
+        f.filter(&[FIND_KEY]);
+        assert_eq!(
+            f.filter(&[0x1b]),
+            asked(Action::Find(Find::Cancel), Mode::Scroll)
+        );
+        assert_eq!(f.needle(), None);
+    }
+
+    /// A needle typed in a language the terminal sends as several bytes each.
+    #[test]
+    fn a_needle_can_hold_more_than_ascii() {
+        let mut f = KeyFilter::new(KEY);
+        f.set_scroll(true);
+        f.filter(&[KEY, FIND_KEY]);
+        f.filter("Ubicación".as_bytes());
+        assert_eq!(f.needle().as_deref(), Some("Ubicación"));
+    }
+
+    #[test]
+    fn the_matches_are_walked_with_n_and_shift_n() {
+        let mut f = KeyFilter::new(KEY);
+        f.set_scroll(true);
+        f.filter(&[KEY, SCROLL_KEY]);
+        assert_eq!(
+            f.filter(b"n"),
+            asked(Action::Find(Find::Next), Mode::Scroll)
+        );
+        assert_eq!(
+            f.filter(b"N"),
+            asked(Action::Find(Find::Previous), Mode::Scroll)
+        );
     }
 
     /// Every sequence the filter reads is looked for at an offset into the

@@ -68,6 +68,13 @@ pub struct Status {
     /// A place of its own rather than a notice, because a notice goes away
     /// after a few seconds and this is true for as long as the view is.
     scrolled: Option<u64>,
+    /// What is being typed at the search prompt, while one is open. Outranks
+    /// everything else on the row: it is the only thing there that is being
+    /// changed a keystroke at a time, and a row that does not show what you are
+    /// typing is a row you cannot type into.
+    prompt: Option<String>,
+    /// What the last search found, once it has been run.
+    searching: Option<String>,
 }
 
 impl Status {
@@ -77,12 +84,30 @@ impl Status {
             mode: Mode::default(),
             notice: None,
             scrolled: None,
+            prompt: None,
+            searching: None,
         }
     }
 
     /// Say how far back the view is, or that it has gone. The caller repaints.
     pub fn set_scrolled(&mut self, lines: Option<u64>) {
         self.scrolled = lines;
+        if lines.is_none() {
+            // The view has closed, and what a search found went with it.
+            self.searching = None;
+            self.prompt = None;
+        }
+    }
+
+    /// Show what is being typed at the search prompt, or take the prompt away.
+    pub fn set_prompt(&mut self, needle: Option<String>) {
+        self.prompt = needle;
+    }
+
+    /// Show what the last search found: the needle, and which match of how
+    /// many the view is on.
+    pub fn set_searching(&mut self, searching: Option<String>) {
+        self.searching = searching;
     }
 
     /// Put a message on the row. The caller repaints, and takes it off again
@@ -160,9 +185,22 @@ impl Status {
     /// say, else the key hints while control mode is on, while there is room
     /// for it beside the mark. The mark wins when there is not.
     fn hint(&self, size: Size, mark: u16) -> String {
-        let scrolled = self
-            .scrolled
-            .map(|lines| format!("{lines} back  {SCROLL_HINT}"));
+        // A prompt being typed into outranks the lot: it is the only thing on
+        // this row that changes a keystroke at a time.
+        if let Some(prompt) = &self.prompt {
+            let typed = format!("/{prompt}");
+            return if columns(&typed) + 1 + mark + GUTTER > size.cols {
+                String::new()
+            } else {
+                style::amber(&typed)
+            };
+        }
+        let scrolled = self.scrolled.map(|lines| match &self.searching {
+            // What a search found says where you are better than a line count
+            // does, and both will not fit.
+            Some(searching) => format!("{searching}  n next  esc live"),
+            None => format!("{lines} back  {SCROLL_HINT}"),
+        });
         let (text, styled) = match (&self.notice, &scrolled, self.mode) {
             // A notice outranks the hints: it is the answer to a key that was
             // just pressed, and the hints will be back in a few seconds.

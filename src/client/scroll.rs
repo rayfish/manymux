@@ -16,7 +16,7 @@
 //! over ssh per wheel notch, on machines that are usually two hops away.
 
 use crate::client::status::session_size;
-use crate::proto::{Size, View as Window, ViewRequest};
+use crate::proto::{Found, Size, View as Window, ViewRequest};
 
 /// Screenfuls fetched at a time. Enough that a page up or down lands inside
 /// what is already here, so the common gesture never waits on the network.
@@ -41,6 +41,18 @@ pub struct Scrollback {
     asked: Option<ViewRequest>,
     /// Rows the session's part of the screen has, which is what a page is.
     rows: u16,
+    /// The last search: what was looked for, where it was found, and which of
+    /// those the view is sitting on.
+    search: Option<Search>,
+}
+
+struct Search {
+    needle: String,
+    /// Offsets of the matching lines, nearest the bottom first, as the host
+    /// found them.
+    lines: Vec<u64>,
+    /// Which of them the view is on, once it has landed on one.
+    at: Option<usize>,
 }
 
 struct Block {
@@ -82,7 +94,79 @@ impl Scrollback {
             block: None,
             asked: None,
             rows: session_size(size).rows,
+            search: None,
         }
+    }
+
+    /// Take what a search found, and go to the first match above where the view
+    /// is sitting. Returns whether there was one to go to.
+    ///
+    /// "Above" because a search back through a history is the only direction
+    /// there is anything to find in: everything below the view is on the screen
+    /// already.
+    pub fn found(&mut self, found: Found) -> bool {
+        let mut search = Search {
+            needle: found.needle,
+            lines: found.lines,
+            at: None,
+        };
+        let first = search.lines.iter().position(|line| *line > self.offset);
+        search.at = first;
+        self.search = Some(search);
+        match first {
+            Some(at) => {
+                self.jump(at);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The next match further back, or the previous one on the way down.
+    /// Returns whether there was one; at either end the view stays put, which
+    /// is what says there is nothing more that way.
+    pub fn step(&mut self, back: bool) -> bool {
+        let Some(search) = &self.search else {
+            return false;
+        };
+        let next = match (search.at, back) {
+            (Some(at), true) => at + 1,
+            (Some(0), false) => return false,
+            (Some(at), false) => at - 1,
+            // A search that found nothing to land on, stepped through anyway.
+            (None, _) => return false,
+        };
+        if next >= search.lines.len() {
+            return false;
+        }
+        self.jump(next);
+        true
+    }
+
+    /// Put the match in the middle of the screen, where the lines either side
+    /// of it are the reason you were looking for it.
+    fn jump(&mut self, at: usize) {
+        let Some(search) = &mut self.search else {
+            return;
+        };
+        let Some(line) = search.lines.get(at).copied() else {
+            return;
+        };
+        search.at = Some(at);
+        let middle = self.page() / 2;
+        let furthest = self.total.saturating_sub(self.page());
+        self.offset = line.saturating_sub(middle).min(furthest);
+    }
+
+    /// What the row says about the search: the needle, and which match of how
+    /// many the view is on.
+    pub fn searching(&self) -> Option<String> {
+        let search = self.search.as_ref()?;
+        let count = search.lines.len();
+        Some(match search.at {
+            Some(at) => format!("/{}  {}/{count}", search.needle, at + 1),
+            None => format!("/{}  no matches", search.needle),
+        })
     }
 
     pub fn resize(&mut self, size: Size) {
@@ -390,6 +474,64 @@ mod tests {
         assert_eq!(block.window(0, 24).len(), 2, "below the block");
         assert!(block.window(1000, 24).is_empty(), "above it");
         assert_eq!(block.window(10, 1), ["b"], "the newest line it holds");
+    }
+
+    fn found(lines: Vec<u64>) -> Found {
+        Found {
+            needle: "boom".to_string(),
+            lines,
+        }
+    }
+
+    /// A search goes back through the history, because everything below the
+    /// view is on the screen already, and lands with the match in the middle so
+    /// the lines either side of it are there too.
+    #[test]
+    fn a_search_lands_on_the_first_match_above_the_view() {
+        let mut view = view(1000);
+        assert!(view.found(found(vec![100, 400, 900])));
+        assert_eq!(view.offset(), 100 - 12, "the match, half a screen up");
+        assert_eq!(view.searching().as_deref(), Some("/boom  1/3"));
+    }
+
+    #[test]
+    fn n_walks_back_through_the_matches_and_shift_n_comes_back() {
+        let mut view = view(1000);
+        view.found(found(vec![100, 400, 900]));
+
+        assert!(view.step(true));
+        assert_eq!(view.offset(), 400 - 12);
+        assert_eq!(view.searching().as_deref(), Some("/boom  2/3"));
+
+        assert!(view.step(true));
+        assert_eq!(view.offset(), 900 - 12);
+        assert!(!view.step(true), "there is no fourth match");
+        assert_eq!(view.offset(), 900 - 12, "and the view stays where it was");
+
+        assert!(view.step(false));
+        assert_eq!(view.offset(), 400 - 12);
+        assert!(view.step(false));
+        assert!(!view.step(false), "nor a match below the first");
+    }
+
+    /// A match near the top cannot be centred: there is nothing older to put
+    /// above it, and the view stops where the history does.
+    #[test]
+    fn a_match_at_the_top_is_shown_against_the_top() {
+        let mut view = view(100);
+        view.found(found(vec![99]));
+        assert_eq!(view.offset(), 100 - 24);
+    }
+
+    #[test]
+    fn a_search_that_finds_nothing_says_so_and_stays_put() {
+        let mut view = view(1000);
+        view.page_up();
+        let before = view.offset();
+        assert!(!view.found(found(Vec::new())));
+        assert_eq!(view.offset(), before);
+        assert_eq!(view.searching().as_deref(), Some("/boom  no matches"));
+        assert!(!view.step(true));
     }
 
     /// Until the first block lands there is nothing to draw, and drawing the

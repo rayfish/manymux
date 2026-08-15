@@ -11,7 +11,7 @@
 
 use avt::{Color, Line, Pen, Vt};
 
-use crate::proto::{View, ViewRequest};
+use crate::proto::{Found, View, ViewRequest};
 
 /// The last `lines` lines of history, rendered with the pen sequences that
 /// coloured them, each ending in a carriage return and a newline.
@@ -56,6 +56,50 @@ pub fn window(vt: &Vt, request: &ViewRequest) -> View {
         })
         .collect();
     View { from, total, lines }
+}
+
+/// Every line of the buffer holding `needle`, as offsets back from the newest
+/// line, nearest the bottom first.
+///
+/// All of them, not a page of them: ten thousand lines is nothing to walk here,
+/// and sending the lot is what lets a client step through the matches without
+/// asking again. An empty needle finds nothing rather than everything, since
+/// what it means is that nobody has typed anything yet.
+///
+/// Smartcase, the way `less` and vim do it: an all-lowercase needle ignores
+/// case, and one with a capital in it means the capital.
+pub fn find(vt: &Vt, needle: &str) -> Found {
+    let mut lines = Vec::new();
+    if needle.is_empty() {
+        return Found {
+            needle: needle.to_string(),
+            lines,
+        };
+    }
+    let folded = needle.to_lowercase();
+    let cased = needle != folded;
+    let all: Vec<&Line> = vt.lines().collect();
+    let total = all.len() as u64;
+    for (i, line) in all.iter().enumerate() {
+        let text = line.text();
+        let found = if cased {
+            text.contains(needle)
+        } else {
+            text.to_lowercase().contains(&folded)
+        };
+        if found {
+            // The offset that puts this line at the bottom of a window, which
+            // is the same count `window` takes.
+            lines.push(total - 1 - i as u64);
+        }
+    }
+    // Nearest the bottom first, which is the order a search back through the
+    // history walks them in.
+    lines.reverse();
+    Found {
+        needle: needle.to_string(),
+        lines,
+    }
 }
 
 fn write_line(line: &Line, out: &mut String) {
@@ -232,6 +276,46 @@ mod tests {
 
         let view = window(&vt, &ViewRequest { from: 0, lines: 99 });
         assert_eq!(view.lines.len(), 5, "everything there is");
+    }
+
+    /// Offsets rather than lines, in the same count a window takes, so that
+    /// jumping to a match is the ordinary fetch with a number from here.
+    #[test]
+    fn a_search_answers_with_where_the_matches_are() {
+        let mut vt = vt(20, 3);
+        for i in 1..=6 {
+            vt.feed_str(&format!("line {i}\r\n"));
+        }
+        // Seven lines, the last being the one the cursor sits on. `line 6` is
+        // index 5 of 7, so it is one back from the newest.
+        let found = find(&vt, "line 6");
+        assert_eq!(found.lines, vec![1]);
+        assert_eq!(found.needle, "line 6");
+
+        // Nearest the bottom first: that is the order a search back through
+        // the history walks them in.
+        let found = find(&vt, "line");
+        assert_eq!(found.lines, vec![1, 2, 3, 4, 5, 6]);
+
+        assert!(find(&vt, "nothing here").lines.is_empty());
+        assert!(
+            find(&vt, "").lines.is_empty(),
+            "an empty needle is nobody having typed yet, not everything"
+        );
+    }
+
+    /// Smartcase, the way `less` and vim do it, because a search you type in a
+    /// hurry is lowercase and a search you meant is not.
+    #[test]
+    fn a_lowercase_search_ignores_case_and_a_capital_means_it() {
+        let mut vt = vt(20, 3);
+        vt.feed_str("Warning: no\r\n");
+        for i in 1..=4 {
+            vt.feed_str(&format!("line {i}\r\n"));
+        }
+        assert_eq!(find(&vt, "warning").lines.len(), 1);
+        assert_eq!(find(&vt, "Warning").lines.len(), 1);
+        assert!(find(&vt, "WARNING").lines.is_empty());
     }
 
     #[test]

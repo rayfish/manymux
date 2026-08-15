@@ -92,6 +92,15 @@ pub mod tag {
     /// What a client scrolling back through a session reads, on a screen of
     /// its own where the terminal has no scrollback of its own to offer.
     pub const VIEW: u8 = 0x1b;
+
+    /// A search through everything a session has printed, asked for and
+    /// answered on the same tag: the request is a [`super::FindRequest`], the
+    /// answer a [`super::Found`].
+    ///
+    /// Every hit comes back at once rather than one at a time, because the
+    /// lines are already in memory on the node and walking the matches is then
+    /// local: `n` on a machine two hops away should not be a round trip.
+    pub const FIND: u8 = 0x1c;
 }
 
 /// The largest file a paste may carry. A screenshot is a couple of megabytes;
@@ -274,6 +283,23 @@ pub struct View {
     /// ends are without asking.
     pub total: u64,
     pub lines: Vec<String>,
+}
+
+/// What to look for in everything a session has printed.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct FindRequest {
+    pub needle: String,
+}
+
+/// Where it was found: one offset per matching line, counted back from the
+/// newest the way [`ViewRequest::from`] is, nearest the bottom first.
+///
+/// The needle comes back with them so a client can tell this answer from the
+/// one to a search it has since retyped.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct Found {
+    pub needle: String,
+    pub lines: Vec<u64>,
 }
 
 /// Something that happened in a session, as it goes over the wire.

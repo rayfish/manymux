@@ -252,6 +252,17 @@ The catch is that the mark on the bottom row is fenced off with a scrolling
 region, and a terminal that throws away what scrolls out of one keeps nothing.
 iTerm2 keeps it. If yours does not, `--screen alternate` is the way back.
 
+On the alternate screen the terminal has no scrollback to offer, so manymux
+shows you its own. The wheel opens it, or `Ctrl-] [`; `pgup`/`pgdn`, `g` and
+`G` move it, `esc` goes back to the live session. The wheel is only taken while
+the program in the session has asked for no mouse reports of its own, so
+scrolling still reaches Claude Code, vim and htop.
+
+`Ctrl-] /` searches everything the session has printed, all ten thousand lines
+of it. `n` walks back through the matches and `N` comes back towards the live
+screen. Lowercase ignores case; a capital means it. Every match comes back in
+one answer, so walking them costs nothing even on a machine two hops away.
+
 ## Keeping it running
 
 The node starts on demand, the way tmux starts its server, so nothing has to be

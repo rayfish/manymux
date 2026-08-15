@@ -31,7 +31,9 @@ use tracing::{debug, info, warn};
 use crate::client::Stream;
 use crate::hosts::{Hosts, this_machine};
 use crate::notify::Notifier;
-use crate::proto::{self, FrameReader, HostedEvent, Request, Response, ViewRequest, tag};
+use crate::proto::{
+    self, FindRequest, FrameReader, HostedEvent, Request, Response, ViewRequest, tag,
+};
 use peers::Peers;
 use registry::Registry;
 
@@ -391,6 +393,15 @@ where
                         let request: ViewRequest = proto::decode(&frame.body)?;
                         let view = attachment.window(&request);
                         proto::write_msg(&mut write, tag::VIEW, &view).await?;
+                    }
+                    // A search through the same lines. Every hit at once: they
+                    // are already in memory here, and walking them one round
+                    // trip at a time is what makes a search on a machine two
+                    // hops away feel like a search on a bad website.
+                    tag::FIND => {
+                        let request: FindRequest = proto::decode(&frame.body)?;
+                        let found = attachment.find(&request.needle);
+                        proto::write_msg(&mut write, tag::FIND, &found).await?;
                     }
                     tag::PASTE => incoming.take(frame.body),
                     tag::PASTE_END => {

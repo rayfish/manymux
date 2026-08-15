@@ -23,7 +23,8 @@ use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
 use crate::proto::{
-    self, FrameReader, HostedEvent, PasteInfo, Request, Response, Size, ViewRequest, tag,
+    self, FindRequest, FrameReader, HostedEvent, PasteInfo, Request, Response, Size, ViewRequest,
+    tag,
 };
 
 type Reader = FrameReader<Box<dyn AsyncRead + Unpin + Send>>;
@@ -460,6 +461,9 @@ pub enum Update {
     /// A window of the session's history, in answer to
     /// [`SessionWriter::view`]. What a client scrolling back paints.
     View(proto::View),
+    /// Where a search found what it was looking for, in answer to
+    /// [`SessionWriter::find`].
+    Found(proto::Found),
     /// The host is checking this client is still there. Answer it with
     /// [`SessionWriter::pong`], or the host will eventually conclude the client
     /// went away and detach it. Answering once is what opts a client in: one
@@ -491,6 +495,7 @@ impl SessionReader {
                 tag::RESYNC => Update::Screen(frame.body),
                 tag::HISTORY => Update::History(frame.body),
                 tag::VIEW => Update::View(proto::decode(&frame.body)?),
+                tag::FIND => Update::Found(proto::decode(&frame.body)?),
                 tag::PING => Update::Ping,
                 tag::EVENT => Update::Event(proto::decode(&frame.body)?),
                 tag::EXIT => Update::Exited(proto::decode(&frame.body)?),
@@ -554,6 +559,15 @@ impl SessionWriter {
     /// trip over ssh per wheel notch.
     pub async fn view(&mut self, request: &ViewRequest) -> Result<()> {
         proto::write_msg(&mut self.write, tag::VIEW, request).await
+    }
+
+    /// Search everything the session has printed, answered with an
+    /// [`Update::Found`] naming every line that matches.
+    pub async fn find(&mut self, needle: &str) -> Result<()> {
+        let request = FindRequest {
+            needle: needle.to_string(),
+        };
+        proto::write_msg(&mut self.write, tag::FIND, &request).await
     }
 
     /// Answer an [`Update::Ping`], which is how the host tells a client that is

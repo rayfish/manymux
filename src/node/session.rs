@@ -18,7 +18,9 @@ use tokio::sync::{broadcast, mpsc, watch};
 use tracing::{debug, warn};
 
 use super::events::{Event, Scanner, Utf8Decoder};
-use crate::proto::{EventKind, SessionEvent, SessionInfo, Size, SpawnSpec, View, ViewRequest};
+use crate::proto::{
+    EventKind, Found, SessionEvent, SessionInfo, Size, SpawnSpec, View, ViewRequest,
+};
 use crate::user;
 
 /// Lines of scrollback kept per session. Enough to scroll back through a long
@@ -158,6 +160,12 @@ impl Attachment {
     pub fn window(&self, request: &ViewRequest) -> View {
         let state = self.session.state.lock().unwrap();
         super::history::window(&state.vt, request)
+    }
+
+    /// Every line of that history holding `needle`.
+    pub fn find(&self, needle: &str) -> Found {
+        let state = self.session.state.lock().unwrap();
+        super::history::find(&state.vt, needle)
     }
 
     pub fn exit_rx(&self) -> watch::Receiver<Option<i32>> {

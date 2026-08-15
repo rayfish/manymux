@@ -10,7 +10,8 @@ use std::time::Duration;
 use anyhow::Result;
 use manymux::node::{Config, Node};
 use manymux::proto::{
-    self, EventKind, FrameReader, HostedEvent, Request, Response, Size, SpawnSpec, ViewRequest, tag,
+    self, EventKind, FindRequest, FrameReader, HostedEvent, Request, Response, Size, SpawnSpec,
+    ViewRequest, tag,
 };
 use tokio::io::{AsyncRead, DuplexStream, WriteHalf, split};
 
@@ -111,6 +112,30 @@ impl Client {
                 }
                 Some(_) => {}
                 None => panic!("the stream closed before the window arrived"),
+            }
+        }
+    }
+
+    /// Search everything the session has printed, and read past whatever else
+    /// is on the stream until the answer comes back.
+    async fn search(&mut self, needle: &str) -> proto::Found {
+        let request = FindRequest {
+            needle: needle.to_string(),
+        };
+        proto::write_frame(
+            &mut self.write,
+            tag::FIND,
+            &proto::encode(&request).expect("a request"),
+        )
+        .await
+        .expect("asking");
+        loop {
+            match self.next_frame().await {
+                Some(frame) if frame.tag == tag::FIND => {
+                    return proto::decode(&frame.body).expect("what was found");
+                }
+                Some(_) => {}
+                None => panic!("the stream closed before the search came back"),
             }
         }
     }
@@ -278,6 +303,57 @@ async fn a_client_can_scroll_back_through_what_a_session_printed() {
         })
         .await;
     assert_eq!(top.lines.len(), 1, "one line left above the top");
+}
+
+/// Searching the same buffer, which is what makes ten thousand lines worth
+/// keeping: every match comes back at once, as offsets a window can be asked
+/// for, so walking them costs no more round trips.
+#[tokio::test]
+async fn a_client_can_search_everything_a_session_printed() {
+    let node = test_node().await;
+    let Spawned { name, .. } = spawn_session(
+        &node,
+        &[
+            "/bin/sh",
+            "-c",
+            "i=1; while [ $i -le 60 ]; do echo line $i; i=$((i+1)); done; echo Boom; sleep 300",
+        ],
+    )
+    .await;
+
+    let mut client = Client::connect(&node);
+    client
+        .send(&Request::Attach {
+            name: name.clone(),
+            size: Size::new(80, 24),
+            history: 0,
+        })
+        .await
+        .unwrap();
+    client.read_until("Boom").await;
+
+    let found = client.search("line 4").await;
+    assert_eq!(found.needle, "line 4");
+    // `line 4`, `line 40` through `line 49`: eleven lines, newest first.
+    assert_eq!(found.lines.len(), 11);
+    assert!(
+        found.lines.windows(2).all(|pair| pair[0] < pair[1]),
+        "nearest the bottom first: {:?}",
+        found.lines
+    );
+
+    // The offsets are the ones a window takes, so a match can be looked at.
+    let view = client
+        .ask_for_view(&ViewRequest {
+            from: found.lines[0],
+            lines: 1,
+        })
+        .await;
+    assert_eq!(view.lines, vec!["line 49"]);
+
+    // Smartcase, as `less` and vim do it.
+    assert_eq!(client.search("boom").await.lines.len(), 1);
+    assert!(client.search("BOOM").await.lines.is_empty());
 }
 
 /// And a client that asks for none gets the frames it always got.
