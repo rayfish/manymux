@@ -250,8 +250,9 @@ node already running. `MM_NOTIFY=off` does the same for one command, and
 ## Scrollback
 
 Attaching takes a screen of its own, the way tmux does, so your terminal's
-scrollbar still shows the shell you attached from and the wheel does nothing
-useful. If you would rather your terminal kept the session's history:
+scrollbar still shows the shell you attached from and the wheel has nothing of
+the session's to move. If you would rather your terminal kept the session's
+history:
 
 ```bash
 mm attach --screen inline web01     # this attach only
@@ -270,10 +271,18 @@ region, and a terminal that throws away what scrolls out of one keeps nothing.
 iTerm2 keeps it. If yours does not, `--screen alternate` is the way back.
 
 On the alternate screen the terminal has no scrollback to offer, so manymux
-shows you its own. The wheel opens it, or `Ctrl-] [`; `pgup`/`pgdn`, `g` and
-`G` move it, `esc` goes back to the live session. The wheel is only taken while
-the program in the session has asked for no mouse reports of its own, so
-scrolling still reaches Claude Code, vim and htop.
+shows you its own. `Ctrl-] [` opens it; the wheel, `pgup`/`pgdn`, `g` and `G`
+move it, `esc` goes back to the live session.
+
+The mouse is your terminal's the rest of the time, so dragging selects and
+copies exactly as it does anywhere else, with no modifier held. That is why the
+wheel does not open the view: reporting the wheel to manymux is the same thing
+as taking the drag away from the terminal, and copying a line off the screen is
+worth more than one gesture fewer. It also means the wheel does nothing while
+the view is closed, since a terminal on its alternate screen would otherwise
+turn a notch into arrow keys aimed at whatever the session is running. Nothing
+here is taken from a program that asked for the mouse itself: Claude Code, vim
+and htop keep every report, wheel and drag alike.
 
 `Ctrl-] /` searches everything the session has printed, all ten thousand lines
 of it. `n` walks back through the matches and `N` comes back towards the live

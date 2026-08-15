@@ -32,6 +32,10 @@ const GUTTER: u16 = 2;
 const HINTS: &[&str] = &[
     "tab next",
     "p prev",
+    // Early, because it is the only way into the view: the wheel is left to
+    // the terminal so that a drag selects, and a key nobody can find is a
+    // feature nobody has.
+    "[ scroll",
     "r rename",
     "d detach",
     "esc focus",
@@ -993,6 +997,17 @@ mod tests {
         assert!(painted.contains("d detach"), "{painted:?}");
         // And the mark keeps its place beside them.
         assert!(painted.contains("\x1b[24;62H"), "{painted:?}");
+    }
+
+    /// The wheel no longer opens the view, because the mouse is the terminal's
+    /// while the session is live so that a drag can select. That leaves the key
+    /// as the only way in, and a way in nobody can see is no way in.
+    #[test]
+    fn the_hints_offer_the_key_that_opens_the_view() {
+        let mut status = Status::new("srv/zsh");
+        status.set_mode(Mode::Control);
+        let painted = status.repaint(Size::new(80, 24));
+        assert!(painted.contains("[ scroll"), "{painted:?}");
     }
 
     /// A row with room for some of them shows some of them, in order, rather

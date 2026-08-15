@@ -2,9 +2,12 @@
 //!
 //! `alternate` takes the terminal's second screen buffer and paints the session
 //! there. It behaves the same everywhere and gives your shell's screen back
-//! untouched, and it is the reason the wheel is useless while attached: that
-//! buffer has no scrollback, so terminals turn the wheel into arrow keys and
-//! they land in whatever is reading the session's input.
+//! untouched, and it is the reason the wheel has nothing to do while attached:
+//! that buffer has no scrollback, so terminals turn the wheel into arrow keys
+//! that land in whatever is reading the session's input. Which is why this mode
+//! switches alternate scroll off for the run of attaches: with the mouse left
+//! to the terminal so that a drag selects, nobody is left to swallow those
+//! arrows. [`super::scroll`] is what the mode has instead of a wheel.
 //!
 //! `inline` leaves the terminal on its own screen. What the session prints
 //! scrolls into the terminal's scrollback, which means the wheel, the find bar
@@ -87,7 +90,17 @@ impl ScreenMode for Alternate {
         // the cursor at the session's row 1 rather than where its prompt
         // appears to be. On a surface of its own the coordinates mean what they
         // say.
-        "\x1b[?1049h".to_string()
+        //
+        // Alternate scroll goes with it. The wheel is read here only while the
+        // view is up, so that the mouse is the terminal's the rest of the time
+        // and a drag selects; but a terminal on its alternate screen with
+        // nobody reporting turns a notch into arrow keys, and those land in
+        // whatever is reading the session's input. Scrolling up at a shell
+        // would walk its history. Saved first, so what the terminal had is what
+        // it gets back: one that does not know how to save it keeps the setting
+        // off afterwards, which costs `less` its wheel and is the cheaper half
+        // of the trade.
+        "\x1b[?1007s\x1b[?1007l\x1b[?1049h".to_string()
     }
 
     fn takeover(&self, _on_alternate: bool) -> String {
@@ -111,7 +124,7 @@ impl ScreenMode for Alternate {
         // the cursor back where the shell left it, on the line after the
         // command you typed. A newline here would print the detach message one
         // blank line further down for no reason.
-        "\x1b[?1047l\x1b[?1049l\r".to_string()
+        "\x1b[?1047l\x1b[?1049l\x1b[?1007r\r".to_string()
     }
 
     fn history(&self) -> u32 {
@@ -189,7 +202,7 @@ mod tests {
     #[test]
     fn the_alternate_screen_takes_a_surface_of_its_own_and_erases_it() {
         let mode = Screen::Alternate.mode();
-        assert_eq!(mode.setup(), "\x1b[?1049h");
+        assert!(mode.setup().ends_with("\x1b[?1049h"), "{:?}", mode.setup());
         assert_eq!(mode.takeover(false), "\x1b[H\x1b[2J");
         // The session's own switches never reached the terminal, so there is
         // never a screen of its to leave.
@@ -199,6 +212,38 @@ mod tests {
         assert_eq!(mode.before_repaint(SIZE), "");
         assert!(mode.owns_the_screen());
         assert_eq!(mode.history(), 0, "there is nowhere to put it");
+    }
+
+    /// The client reads the wheel only while its view is up, so the rest of
+    /// the time the terminal has the mouse back and a drag selects the way it
+    /// does anywhere else. What that leaves behind is the wheel itself: on the
+    /// terminal's alternate screen a notch becomes arrow keys, and they land in
+    /// whatever is reading the session's input, so a shell walks its history
+    /// every time you scroll. Off it goes, saved first so detaching gives the
+    /// terminal back the setting it arrived with.
+    #[test]
+    fn the_alternate_screen_makes_the_wheel_inert_rather_than_arrow_keys() {
+        let mode = Screen::Alternate.mode();
+        let setup = mode.setup();
+        assert!(setup.contains("\x1b[?1007s"), "{setup:?}");
+        assert!(setup.contains("\x1b[?1007l"), "{setup:?}");
+        assert!(
+            setup.find("\x1b[?1007s") < setup.find("\x1b[?1007l"),
+            "saved before it is changed: {setup:?}"
+        );
+        assert!(mode.reset(SIZE, false).contains("\x1b[?1007r"));
+    }
+
+    /// Inline is on the terminal's own screen, where the wheel scrolls the
+    /// terminal's own scrollback and alternate scroll never applies. Touching
+    /// it there would take the wheel away from the mode whose whole point is
+    /// having it.
+    #[test]
+    fn inline_leaves_alternate_scroll_alone() {
+        let mode = Screen::Inline.mode();
+        assert!(!mode.setup().contains("1007"));
+        assert!(!mode.reset(SIZE, false).contains("1007"));
+        assert!(!mode.reset(SIZE, true).contains("1007"));
     }
 
     #[test]

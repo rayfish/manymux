@@ -188,12 +188,27 @@ Three consequences run through the whole codebase and are worth keeping intact:
   save.
 - **The alternate screen has a view of its own instead** (`src/client/scroll.rs`,
   `tag::VIEW`, `tag::FIND`). It is not tmux's copy mode and must not become one:
-  no selection and no yank, because the terminal's own selection still works on
-  what the view is showing. Lines come a few screenfuls at a time and matches
+  no selection and no yank, because the terminal's own selection works on what
+  the view is showing, on the modifier every terminal keeps for it while the
+  wheel is being reported. Lines come a few screenfuls at a time and matches
   all at once, both for the same reason: a wheel notch or an `n` on a machine
   two hops away must not be a round trip. Whether the host can do either rides
   on `Response::Attached { scroll }`, and a host that cannot says so on the mark
   row rather than leaving a key that does nothing.
+- **The mouse is the terminal's except while that view is up**
+  (`attach::wheel_is_ours`). A terminal reporting the mouse to us is a terminal
+  not selecting with it, so a client that held tracking for the whole attach was
+  a client you could not copy a line out of without a modifier held down. The
+  reports are worth that only where the wheel is the gesture, which is the view,
+  and the view is where the key opens it: the wheel cannot open what it is not
+  being reported for. Two things follow. `Alternate::setup` switches alternate
+  scroll off (`?1007s` then `?1007l`, restored with `?1007r`), because with
+  nobody reporting, a notch on the terminal's alternate screen becomes arrow
+  keys and they land in whatever is reading the session's input. And the key has
+  to be on the hints row, since the gesture that used to find it is gone. A
+  session that asked for the mouse itself keeps every report as before: taking
+  it would leave two readers on one wheel, and giving it back on the way out of
+  the view would switch off tracking the client never switched on.
 - **The wheel is the terminal's to route, not ours.** A program that asked for
   mouse tracking gets SGR reports, one on its own alternate screen without
   tracking gets the terminal's alternate-scroll arrows, and ordinary output

@@ -515,6 +515,28 @@ impl Report {
     }
 }
 
+/// Whether the wheel is the client's to read, or the terminal's to do what it
+/// likes with.
+///
+/// Only while the view is up. Reporting the mouse is what stops a drag from
+/// selecting, so a client that holds it for the whole attach is one you cannot
+/// copy a line out of without a modifier held down; and with the view closed
+/// there is nothing here for a notch to move anyway. What the view is open on
+/// has already been decided by then: it opens only on a screen the client owns
+/// and a host new enough to answer for a window.
+///
+/// Never while the session has asked for reports of its own, which is both
+/// halves of the same rule: two readers on one wheel, and a client that turned
+/// tracking on would turn it off again on the way out of the view, leaving a
+/// program that asked for the mouse without one.
+///
+/// Desktop-only, like the terminal it is a rule about: a mobile app has no
+/// wheel to route and its own idea of what a drag is.
+#[cfg(feature = "desktop")]
+fn wheel_is_ours(view_open: bool, session_mouse: bool) -> bool {
+    view_open && !session_mouse
+}
+
 /// The keys that move the view, in the spellings terminals send them in.
 ///
 /// Matched before the bytes are looked at one at a time, so that the escape
@@ -840,11 +862,6 @@ impl KeyFilter {
     /// client has tracking on and the session has not asked for any.
     pub fn set_wheel(&mut self, ours: bool) {
         self.wheel = ours && self.scroll;
-    }
-
-    /// Whether there is a history to look at at all.
-    pub fn scrolls(&self) -> bool {
-        self.scroll
     }
 
     /// Start in a mode. Attaching after a switch starts in control mode, which
@@ -1230,7 +1247,7 @@ mod terminal {
     use tokio::signal::unix::{SignalKind, signal};
     use tokio::sync::mpsc;
 
-    use super::{Action, Find, KeyFilter, Mode, Outcome, Rename, Scroll};
+    use super::{Action, Find, KeyFilter, Mode, Outcome, Rename, Scroll, wheel_is_ours};
     use crate::client::screen::ScreenMode;
     use crate::client::scroll::Scrollback;
     use crate::client::status::{self, Filter, Status};
@@ -1498,11 +1515,10 @@ mod terminal {
 
     /// Take the wheel, or give it back.
     ///
-    /// The client asks the terminal for mouse reports only while the session
-    /// has asked for none, so the two never both read it. Turning it on has a
-    /// second effect worth having: a terminal that is reporting the mouse stops
-    /// turning the wheel into arrow keys, which is what used to send them to
-    /// whatever was reading the session's input.
+    /// When that is, and why it is so rarely, is [`wheel_is_ours`]. The arrow
+    /// keys a terminal would make of a notch with nobody reporting are not this
+    /// function's problem: alternate scroll is off for the whole run of
+    /// attaches, in [`crate::client::screen`].
     async fn own_the_wheel(
         stdout: &mut Stdout,
         keys: &mut KeyFilter,
@@ -1825,6 +1841,11 @@ mod terminal {
                         }
                         None => {}
                     }
+                    // The view has just opened or just closed, and the wheel
+                    // goes with it: the terminal has the mouse back the moment
+                    // there is a live session to select on.
+                    let ours = wheel_is_ours(scrolling.is_some(), output.session_mouse());
+                    own_the_wheel(&mut stdout, &mut keys, &mut wheel, ours).await?;
                 }
                 update = reader.next() => match update? {
                     Update::Output(bytes) => {
@@ -1851,7 +1872,7 @@ mod terminal {
                         // The session may have just asked for the mouse, or
                         // given it back. Only between sequences, like the mark.
                         if output.at_boundary() {
-                            let ours = keys.scrolls() && scrolls && !output.session_mouse();
+                            let ours = wheel_is_ours(scrolling.is_some(), output.session_mouse());
                             own_the_wheel(&mut stdout, &mut keys, &mut wheel, ours).await?;
                         }
                         // A screen switch went no further than this client, so
@@ -2380,12 +2401,14 @@ mod tests {
         }
     }
 
-    /// A wheel notch opens the view and moves it in one go: there is no mode to
-    /// learn first, which is the whole point of taking the wheel at all.
+    /// The key opens the view and the wheel moves it from there: the client
+    /// asks the terminal for reports only once there is a window for them to
+    /// move, so that the rest of the time a drag is a selection.
     #[test]
-    fn the_wheel_opens_the_view_and_moves_it() {
+    fn the_wheel_moves_the_view_the_key_opened() {
         let mut f = KeyFilter::new(KEY);
         f.set_scroll(true);
+        f.filter(&[KEY, SCROLL_KEY]);
         f.set_wheel(true);
         assert_eq!(
             f.filter(b"\x1b[<64;10;5M"),
@@ -2430,6 +2453,28 @@ mod tests {
         f.set_scroll(true);
         f.set_wheel(true);
         assert_eq!(f.filter(b"\x1b[<0;10;5M\x1b[<0;10;5m"), forwarded(b""));
+    }
+
+    /// The mouse is the terminal's while you are looking at the live session,
+    /// so a drag selects and a double click takes a word, the way they do in
+    /// any other program. A client holding mouse reports for the whole attach
+    /// is a client you cannot copy a line out of without a modifier held, and
+    /// the wheel it holds them for has nothing to scroll until the view is up.
+    #[cfg(feature = "desktop")]
+    #[test]
+    fn the_wheel_is_the_clients_only_while_the_view_is_up() {
+        assert!(wheel_is_ours(true, false));
+        assert!(!wheel_is_ours(false, false), "nothing to scroll yet");
+    }
+
+    /// A program that asked for the mouse keeps it, view or no view. Taking it
+    /// would leave two readers on one wheel, and giving it back on the way out
+    /// of the view would switch off tracking the client never switched on.
+    #[cfg(feature = "desktop")]
+    #[test]
+    fn the_wheel_is_never_taken_from_a_session_that_asked_for_it() {
+        assert!(!wheel_is_ours(true, true));
+        assert!(!wheel_is_ours(false, true));
     }
 
     /// While the session has the mouse, every report is its own and the client

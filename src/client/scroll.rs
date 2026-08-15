@@ -6,10 +6,17 @@
 //! here; this is what the other mode has instead.
 //!
 //! Deliberately not tmux's copy mode. There is no selection and no yank: the
-//! terminal's own selection still works on whatever the view is showing, which
-//! is what copying a line you scrolled to actually needs. What is left is
-//! moving a window over the node's ten thousand lines, which is arithmetic and
-//! string building, and is all here so it can be tested without a terminal.
+//! terminal's own selection works on whatever the view is showing, which is
+//! what copying a line you scrolled to actually needs. What is left is moving a
+//! window over the node's ten thousand lines, which is arithmetic and string
+//! building, and is all here so it can be tested without a terminal.
+//!
+//! The one thing that gets in the way of that selection is the wheel, since a
+//! terminal reporting the mouse to us is a terminal not selecting with it. So
+//! the reports are asked for only while this view is up (`attach::wheel_is_ours`),
+//! which is where the wheel is the gesture and elsewhere the drag is; and inside
+//! the view a drag needs the modifier terminals give for exactly this, shift
+//! almost everywhere and option in iTerm2.
 //!
 //! The window moves locally inside a block that has already arrived, and a
 //! block is a few screenfuls. A request per wheel notch would be a round trip
