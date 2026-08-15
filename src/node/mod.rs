@@ -10,6 +10,7 @@
 //! deploy's node, because the socket lives under deploy's runtime directory.
 
 pub mod events;
+mod history;
 pub mod paste;
 pub mod peers;
 pub mod registry;
