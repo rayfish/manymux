@@ -193,6 +193,12 @@ impl Status {
         self.prompt = name.map(|text| ("rename ", text));
     }
 
+    /// And for the prompt that names a group to put the highlighted session
+    /// in, which is the same editing again and a different question.
+    pub fn set_grouping(&mut self, name: Option<String>) {
+        self.prompt = name.map(|text| ("group ", text));
+    }
+
     /// Show what the last search found: the needle, and which match of how
     /// many the view is on.
     pub fn set_searching(&mut self, searching: Option<String>) {

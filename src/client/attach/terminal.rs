@@ -775,13 +775,13 @@ async fn pump(
                     Some(Action::GroupName(step)) => {
                         match step {
                             Rename::Open | Rename::Typed => {
-                                status.set_renaming(keys.wanted_group());
+                                status.set_grouping(keys.wanted_group());
                             }
-                            Rename::Cancel => status.set_renaming(None),
+                            Rename::Cancel => status.set_grouping(None),
                             Rename::Run => {
                                 let name = keys.wanted_group().unwrap_or_default();
                                 keys.stop_typing();
-                                status.set_renaming(None);
+                                status.set_grouping(None);
                                 let session = popup.as_ref().and_then(Popup::subject);
                                 if let Some(session) = session
                                     && !name.trim().is_empty()
@@ -1015,7 +1015,16 @@ async fn pump(
                 // so the node's model is the only place it still exists and it
                 // is painted back the way a resize is, which is the same trip
                 // leaving the view already makes.
-                if popup.is_some() && !matches!(status.mode(), Mode::Control | Mode::Picking) {
+                // `Mode::Rename` keeps it: both prompts opened from the popup
+                // are a step of a gesture that started there, and the row being
+                // named or grouped is the highlighted one. Taking the box away
+                // under the prompt would leave nothing saying which.
+                if popup.is_some()
+                    && !matches!(
+                        status.mode(),
+                        Mode::Control | Mode::Picking | Mode::Rename
+                    )
+                {
                     popup = None;
                     status.set_popped(false);
                     writer.resync().await?;

@@ -563,6 +563,10 @@ const SHIFT_TAB: &[u8] = b"\x1b[Z";
 const PICK_KEYS: &[(&[u8], Pick)] = &[
     (b"\x1b[A", Pick::Up),
     (b"\x1b[B", Pick::Down),
+    // Shift-Tab, which is spelt like a report and pressed like a key. Here
+    // rather than only in the control-mode match, so it moves the group list
+    // too: read a byte at a time there, its Esc is the Esc that closes.
+    (SHIFT_TAB, Pick::Up),
     // The application-keypad spellings, which a program may have left the
     // terminal in.
     (b"\x1bOA", Pick::Up),
@@ -808,7 +812,12 @@ impl KeyFilter {
 
     /// Where an action leaves the keyboard. A switch stays in control mode, so
     /// the next key carries on walking without a mode key of its own.
-    fn after(action: Action) -> Mode {
+    /// `now` is the mode the key arrived in, because one action's answer
+    /// depends on it: moving a highlight stays in whichever list is showing.
+    /// Reading it as control mode meant the key after a move in the group list
+    /// was read with the session list's table, where `m` moves and `d`
+    /// detaches, which is the whole reason that mode is separate.
+    fn after(action: Action, now: Mode) -> Mode {
         match action {
             // A new session is a fresh shell waiting to be typed into, which
             // is why it is the one key here that does not leave the mode on:
@@ -820,7 +829,7 @@ impl KeyFilter {
             // out of it go back to the session.
             Action::Pick(Pick::Go | Pick::Cancel) => Mode::Focus,
             Action::Pick(Pick::Move | Pick::Groups) => Mode::Picking,
-            Action::Pick(_) => Mode::Control,
+            Action::Pick(_) => now,
             // Back to the group list rather than to the session: naming a group
             // was one step of choosing one, and the list it was chosen from is
             // still what you are looking at.
@@ -905,6 +914,10 @@ impl KeyFilter {
     /// landing on the keyboard must not close a gesture halfway through.
     fn picking(&self, b: u8) -> Option<Action> {
         let pick = match b {
+            // The same gesture as in the session list: one key with a
+            // direction, rather than a second pair of keys to learn for a list
+            // that behaves identically.
+            b'\t' => Pick::Down,
             b'j' | b'J' => Pick::Down,
             b'k' | b'K' => Pick::Up,
             b'\r' | b'\n' => Pick::Go,
@@ -1003,7 +1016,7 @@ impl KeyFilter {
             // each of them.
             if self.prompt.is_some() {
                 let action = self.typing(&input[i..]);
-                self.mode = Self::after(action);
+                self.mode = Self::after(action, self.mode);
                 return Keystrokes {
                     forward,
                     action: Some(action),
@@ -1040,7 +1053,7 @@ impl KeyFilter {
                     net => Scroll::Down(net.unsigned_abs()),
                 };
                 let action = Action::Scroll(scroll);
-                self.mode = Self::after(action);
+                self.mode = Self::after(action, self.mode);
                 return Keystrokes {
                     forward,
                     action: Some(action),
@@ -1057,7 +1070,7 @@ impl KeyFilter {
                     .find(|(spelling, _)| input[i..].starts_with(spelling))
             {
                 let action = Action::Scroll(*scroll);
-                self.mode = Self::after(action);
+                self.mode = Self::after(action, self.mode);
                 return Keystrokes {
                     forward,
                     action: Some(action),
@@ -1075,7 +1088,7 @@ impl KeyFilter {
                 self.pressed = None;
                 i += spelling.len();
                 let action = Action::Pick(*pick);
-                self.mode = Self::after(action);
+                self.mode = Self::after(action, self.mode);
                 return Keystrokes {
                     forward,
                     action: Some(action),
@@ -1091,7 +1104,7 @@ impl KeyFilter {
                 let spelling = &input[i..i + key.len];
                 i += key.len;
                 if let Some(action) = self.encoded(&key, spelling, now, &mut forward) {
-                    self.mode = Self::after(action);
+                    self.mode = Self::after(action, self.mode);
                     return Keystrokes {
                         forward,
                         action: Some(action),
@@ -1126,7 +1139,7 @@ impl KeyFilter {
                     continue;
                 };
                 self.opening(action);
-                self.mode = Self::after(action);
+                self.mode = Self::after(action, self.mode);
                 return Keystrokes {
                     forward,
                     action: Some(action),
@@ -1144,7 +1157,7 @@ impl KeyFilter {
                     continue;
                 };
                 self.opening(action);
-                self.mode = Self::after(action);
+                self.mode = Self::after(action, self.mode);
                 return Keystrokes {
                     forward,
                     action: Some(action),
@@ -1220,7 +1233,7 @@ impl KeyFilter {
             // detach or a switch. A popup move is the exception, and hands the
             // rest back; see `rest_after`.
             if let Some(action) = action {
-                self.mode = Self::after(action);
+                self.mode = Self::after(action, self.mode);
                 return Keystrokes {
                     forward,
                     action: Some(action),
@@ -2564,6 +2577,108 @@ mod tests {
             f.filter(&[KEY, b'v', b'i', b'm']),
             forwarded(&[KEY, b'v', b'i', b'm'])
         );
+    }
+
+    /// A filter already showing the group list, which is where `m` and `g`
+    /// leave it.
+    fn picking() -> KeyFilter {
+        let mut f = KeyFilter::default();
+        assert_eq!(
+            f.filter(&[KEY, b'm']),
+            asked(Action::Pick(Pick::Move), Mode::Picking)
+        );
+        f
+    }
+
+    /// The same gesture as in the session list. Bound in only one of them, the
+    /// group list was a list you could open and not move in, so every Enter
+    /// took the first row.
+    #[test]
+    fn the_group_list_moves_with_the_same_keys_the_session_list_does() {
+        for key in [&b"\t"[..], &b"j"[..]] {
+            let mut f = picking();
+            assert_eq!(
+                f.filter(key),
+                asked(Action::Pick(Pick::Down), Mode::Picking),
+                "{key:?}"
+            );
+        }
+        for key in [SHIFT_TAB, &b"k"[..], &b"\x1b[A"[..]] {
+            let mut f = picking();
+            assert_eq!(
+                f.filter(key),
+                asked(Action::Pick(Pick::Up), Mode::Picking),
+                "{key:?}"
+            );
+        }
+    }
+
+    /// Shift-Tab is spelt like a report and pressed like a key, and read a byte
+    /// at a time the Esc it starts with is the Esc that closes the list.
+    #[test]
+    fn shift_tab_does_not_close_the_group_list() {
+        let mut f = picking();
+        assert_ne!(
+            f.filter(SHIFT_TAB),
+            asked(Action::Pick(Pick::Cancel), Mode::Focus)
+        );
+    }
+
+    /// The keys that act on a session mean nothing while a group is being
+    /// chosen: `m` here would be moving a move, and `d` would detach out of a
+    /// gesture halfway through.
+    #[test]
+    fn the_session_keys_are_unbound_while_a_group_is_being_chosen() {
+        for key in [&b"m"[..], &b"d"[..], &b"["[..], &b"h"[..], &b"l"[..]] {
+            let mut f = picking();
+            let out = f.filter(key);
+            assert_eq!(out.action, None, "{key:?}");
+            assert!(out.forward.is_empty(), "nothing reaches the session");
+            assert_eq!(out.mode, Mode::Picking);
+        }
+    }
+
+    /// Naming a new group is the same editing as the rename and the search, so
+    /// the same prompt answers for it, and it comes back to the list it was
+    /// opened from rather than to the session.
+    #[test]
+    fn naming_a_new_group_types_at_the_shared_prompt() {
+        let mut f = picking();
+        assert_eq!(
+            f.filter(b"n"),
+            asked(Action::GroupName(Rename::Open), Mode::Rename)
+        );
+        assert_eq!(
+            f.filter(b"pi"),
+            asked(Action::GroupName(Rename::Typed), Mode::Rename)
+        );
+        assert_eq!(f.wanted_group().as_deref(), Some("pi"));
+        assert_eq!(
+            f.filter(b"\r"),
+            asked(Action::GroupName(Rename::Run), Mode::Picking)
+        );
+    }
+
+    /// Two writes a moment apart arrive as one read, so `tab` then `Enter` is
+    /// a single chunk. Every other action ends the chunk it was found in; a
+    /// popup move must not, or the key that commits is thrown away.
+    #[test]
+    fn a_move_and_the_key_that_commits_it_survive_arriving_together() {
+        let mut f = KeyFilter::default();
+        let out = f.filter(&[KEY, b'\t', b'\r']);
+        assert_eq!(out.action, Some(Action::Pick(Pick::Down)));
+        assert_eq!(out.rest, b"\r".to_vec(), "the commit is handed back");
+        let out = f.filter(&out.rest);
+        assert_eq!(out.action, Some(Action::Pick(Pick::Go)));
+    }
+
+    /// And nothing else hands anything back: nobody types through a detach.
+    #[test]
+    fn every_other_action_still_ends_the_chunk_it_was_found_in() {
+        let mut f = KeyFilter::default();
+        let out = f.filter(&[KEY, b'd', b'x', b'y']);
+        assert_eq!(out.action, Some(Action::Detach));
+        assert!(out.rest.is_empty());
     }
 
     #[test]
