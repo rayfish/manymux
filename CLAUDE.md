@@ -194,6 +194,25 @@ Three consequences run through the whole codebase and are worth keeping intact:
   under the switch keys and the one case that forgets the entry and undoes the
   hop. Reading every failure the second way, as this once did, meant a closed
   lid mid-hop dropped a live session from the cycle and ended the attach.
+- **A session that ends hands back the one you came from, and only the session
+  you named ends the attach.** `Cycle::fall_back` is the whole decision: a run
+  that has hopped has somewhere to go back to and goes there, while a run that
+  has not is `mm attach host/name` doing what it was asked, so it prints the
+  line and leaves with the status. Which is why the status is worth keeping:
+  `mm attach box/build; echo $?` is a thing people write, and a client that
+  landed them in whatever else was running would have thrown it away. The exit
+  is *carried* while the fall-back is attempted (`ended` in `do_attach`),
+  because that attach can fail too: the session you came from may have exited
+  in the background while you were away from it, and answering that with the
+  wait a dropped connection gets would sit forever on a session nobody is
+  running. So a `Missed::Gone` while one is carried reports the exit instead of
+  waiting, which also makes the fall-back safe to attempt without asking the
+  listing first, where a stale answer would be wrong in both directions. What
+  is left behind is left behind in `Motion::Last` as much as in the listing, or
+  the key for the session you came from would reach one that has ended. And the
+  row says what ended, because the line that says it on the way out belongs to
+  a run that is over, and a screen that changes under somebody with nothing
+  said about it reads as a client that lost its place.
 - **The daemon gives up on a machine it cannot reach, and a client is what
   starts it again.** `peers::retry_after` is three growing delays and then
   nothing: a retry is an ssh process, a name to resolve and a connect to wait

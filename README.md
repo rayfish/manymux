@@ -178,6 +178,12 @@ you in it in focus mode: it is the one control key that does not leave the mode
 on, because what follows a new session is typing rather than another hop. The
 node picks the name, and `mm ls` has it from then on.
 
+Ending a session you moved to puts you back in the one you came from, rather
+than back at your shell: type `exit` in the session `n` just started and you are
+where you pressed it, with the row saying what ended and with what status. Only
+the session you named on the command line ends the attach when it exits, so
+`mm attach gpu-box/build; echo $?` still tells you what the build did.
+
 `r` opens a prompt on the mark row: type a name, `enter` renames the session,
 `esc` leaves it alone. It is the same rename `mm rename` does, so the mark and
 `mm ls` say the new name from then on, and the row says so if the host refused

@@ -10,6 +10,10 @@
 //! on another one without asking, and left no way to say "the next machine"
 //! outright. Machines are their own motion now.
 //!
+//! The one move here that no key makes is falling back: a session that ends
+//! hands you the one you came from, which is the trail `Motion::Last` walks and
+//! so belongs beside it rather than in the caller.
+//!
 //! The order is the one the listing arrives in, which is by machine and then by
 //! when each session was opened, oldest first. It used to be by name, and a
 //! name is the one thing about a session that moves: renaming one shuffled the
@@ -157,6 +161,20 @@ impl Cycle {
                 session.session = name.to_string();
             }
         }
+    }
+
+    /// The session you are in has ended: go back to the one you came from, and
+    /// answer with it. `None` when this run has not hopped at all, which is a
+    /// session somebody named on the command line and nowhere to fall back to.
+    ///
+    /// What is left behind is left behind for good, in the cycle and in
+    /// `Motion::Last` both: the way back leads to a session that has exited,
+    /// and there is nothing there to come back to.
+    pub fn fall_back(&mut self) -> Option<Located> {
+        let back = self.previous.take()?;
+        let ended = std::mem::replace(&mut self.current, back);
+        self.forget(&ended);
+        Some(self.current.clone())
     }
 
     /// Take back the last hop, leaving no trail: for one that could not be
@@ -358,6 +376,34 @@ mod tests {
         // Neither the way back nor the way on goes to the session that is gone.
         assert_eq!(step(&cycle, Motion::Last), None);
         assert_eq!(step(&cycle, Motion::Next).as_deref(), Some("web"));
+    }
+
+    #[test]
+    fn a_session_that_ends_falls_back_to_the_one_you_came_from() {
+        let mut cycle = cycle(&["api", "build", "web"], "api");
+        cycle.moved_to(Located::new("here", "build"));
+        assert_eq!(cycle.fall_back(), Some(Located::new("here", "api")));
+        assert_eq!(cycle.current().session, "api");
+    }
+
+    /// A run that only ever attached to what the command line named: the
+    /// session ending there ends the command, so there is nothing to say.
+    #[test]
+    fn a_run_that_has_not_hopped_has_nowhere_to_fall_back_to() {
+        let mut cycle = cycle(&["api", "build"], "api");
+        assert_eq!(cycle.fall_back(), None);
+        assert_eq!(cycle.current().session, "api");
+    }
+
+    /// The session that ended is gone, so it is neither in the cycle nor the
+    /// place `Motion::Last` goes: coming back to it is coming back to nothing.
+    #[test]
+    fn the_session_that_ended_is_neither_in_the_cycle_nor_where_last_goes() {
+        let mut cycle = cycle(&["api", "build", "web"], "api");
+        cycle.moved_to(Located::new("here", "build"));
+        cycle.fall_back();
+        assert_eq!(step(&cycle, Motion::Next).as_deref(), Some("web"));
+        assert_eq!(step(&cycle, Motion::Last), None);
     }
 
     #[test]

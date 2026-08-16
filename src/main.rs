@@ -801,8 +801,8 @@ fn chosen(screen: Option<Screen>) -> Screen {
     screen.unwrap_or_else(|| Settings::or_default().screen)
 }
 
-/// Attach, and keep attaching for as long as the switch keys ask for another
-/// session.
+/// Attach, and keep attaching: for as long as the switch keys ask for another
+/// session, and for as long as one that ends has another to hand back to.
 ///
 /// The terminal is held across the whole run rather than per session, so a hop
 /// is a repaint and not a trip through the whole setup and back.
@@ -836,6 +836,10 @@ async fn do_attach(
     // attach that follows it. Nothing else here has anywhere to say it: the
     // terminal between two attaches is showing a session.
     let mut notice: Option<String> = None;
+    // The exit this run is carrying while it goes back to the session it came
+    // from, kept because that fall-back can fail: a session that ended is the
+    // end of the run after all if there is no longer anywhere to land.
+    let mut ended: Option<(Outcome, String)> = None;
     let (outcome, where_) = loop {
         let target = cycle.current().clone();
         let mut where_ = qualified(&target.host, &target.session);
@@ -846,6 +850,14 @@ async fn do_attach(
         };
         let session = match attach_to(socket, &target, history, watching).await {
             Ok(session) => session,
+            // The way back out of a session that ended is gone too, and there
+            // is nothing further back than the one you came from. So the run
+            // is over after all, and what it has to report is the exit it was
+            // carrying rather than this.
+            Err(Missed::Gone(e)) if ended.is_some() => {
+                debug!("could not fall back to {where_}: {e:#}");
+                break ended.take().expect("carrying an exit, by the guard");
+            }
             // A hop onto a session that has gone since the listing was taken:
             // the machine answered and has no such session. Stay where you
             // were and put the dead entry out of the cycle, rather than
@@ -879,6 +891,9 @@ async fn do_attach(
         };
         lost = 0;
         attached = true;
+        // Landed, so the exit that sent us here is somebody else's news now:
+        // the next one to report is whatever this session does.
+        ended = None;
 
         let (outcome, renamed) =
             attach::run(&mut held, session, &where_, mode, notice.take().as_deref()).await?;
@@ -925,6 +940,32 @@ async fn do_attach(
                     mode = Mode::Focus;
                 }
             },
+            // A session this run put you in has ended, so the run has not:
+            // back to the one you came from, the way a hop goes. What ended
+            // is said on the row you land on, because the line that says it
+            // on the way out is only printed by a run that is over, and a
+            // screen that changes under somebody with nothing said about it
+            // reads as a client that lost its place.
+            Outcome::Exited(code) => {
+                // The name and not the whole target, because the row it goes
+                // on is narrow and drops a notice that does not fit outright,
+                // and because the machine is the one named two columns to its
+                // right in all but the rarest fall-back.
+                let name = cycle.current().session.clone();
+                match cycle.fall_back() {
+                    Some(_) => {
+                        hopped = false;
+                        listing = Some(spawn_listing(socket));
+                        notice = Some(format!("{name} exited with status {code}"));
+                        ended = Some((Outcome::Exited(code), where_));
+                        mode = Mode::Focus;
+                    }
+                    // Nowhere to fall back to, so this is the session somebody
+                    // named on the command line: the command is over and the
+                    // status it ended with is the answer.
+                    None => break (Outcome::Exited(code), where_),
+                }
+            }
             // The whole point of the project is that the session is still
             // running on a machine that never noticed you left, so a wifi hop
             // or a closed lid is not a reason to put somebody back at their

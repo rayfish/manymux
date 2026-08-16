@@ -1593,6 +1593,179 @@ fn an_attach_whose_connection_drops_comes_back_by_itself() {
     let _ = client.wait();
 }
 
+/// The other half of falling back: a run that has not hopped has nowhere to
+/// fall back to, so the session named on the command line ending is the command
+/// ending, status and all.
+#[test]
+fn a_session_named_on_the_command_line_ends_the_attach_when_it_exits() {
+    use std::io::{Read, Write};
+    use std::os::fd::AsFd;
+    use std::sync::mpsc;
+
+    let world = World::new("ends-the-attach");
+    world.ok("laptop", &["add", "gpu-box"]);
+    world.ok("gpu-box", &["new", "-d", "-n", "quick", "sh"]);
+    world.wait_for_node("gpu-box");
+
+    let (pty, pts) = pty_process::blocking::open().unwrap();
+    pty.resize(pty_process::Size::new(24, 80)).unwrap();
+    let mut client = pty_process::blocking::Command::new(MM)
+        .arg("--socket")
+        .arg(world.socket("laptop"))
+        .args(["attach", "gpu-box/quick"])
+        .env("MM_CONFIG_DIR", world.dir.join("laptop"))
+        .env("MM_SSH", world.ssh_stub())
+        .env("MM_LOG", "manymux=warn")
+        .env("TERM", "xterm-256color")
+        .spawn(pts)
+        .expect("attaching on a terminal");
+
+    let (seen_tx, seen_rx) = mpsc::channel();
+    let mut reading =
+        unsafe { pty_process::blocking::Pty::from_fd(pty.as_fd().try_clone_to_owned().unwrap()) };
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 1024];
+        while let Ok(read @ 1..) = reading.read(&mut buf) {
+            if seen_tx.send(buf[..read].to_vec()).is_err() {
+                return;
+            }
+        }
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut seen = String::new();
+    let mut typed = false;
+    let status = loop {
+        if let Ok(chunk) = seen_rx.recv_timeout(Duration::from_millis(200)) {
+            seen.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if !typed && seen.contains("gpu-box/quick") {
+            typed = true;
+            (&pty).write_all(b"exit 3\n").unwrap();
+        }
+        if let Some(status) = client.try_wait().expect("checking the client") {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "typed={typed}; the terminal saw: {seen:?}"
+        );
+    };
+
+    assert_eq!(status.code(), Some(3), "the session's status is the answer");
+    assert!(
+        seen.contains("exited with status 3"),
+        "the terminal saw: {seen:?}"
+    );
+}
+
+/// A session started from inside a run ends inside it too: typing `exit` in it
+/// puts you back in the session you were in when you pressed the key, rather
+/// than ending the whole attach and handing back a shell.
+#[test]
+fn a_session_that_ends_puts_you_back_in_the_one_you_came_from() {
+    use std::io::{Read, Write};
+    use std::os::fd::AsFd;
+    use std::sync::mpsc;
+
+    let world = World::new("fall-back");
+    world.ok("laptop", &["add", "gpu-box"]);
+    world.ok("gpu-box", &["new", "-d", "-n", "long", "sleep", "300"]);
+    world.wait_for_node("gpu-box");
+
+    let (pty, pts) = pty_process::blocking::open().unwrap();
+    pty.resize(pty_process::Size::new(24, 80)).unwrap();
+    let mut client = pty_process::blocking::Command::new(MM)
+        .arg("--socket")
+        .arg(world.socket("laptop"))
+        .args(["attach", "gpu-box/long"])
+        .env("MM_CONFIG_DIR", world.dir.join("laptop"))
+        .env("MM_SSH", world.ssh_stub())
+        .env("MM_LOG", "manymux=warn")
+        .env("TERM", "xterm-256color")
+        .spawn(pts)
+        .expect("attaching on a terminal");
+
+    let (seen_tx, seen_rx) = mpsc::channel();
+    let mut reading =
+        unsafe { pty_process::blocking::Pty::from_fd(pty.as_fd().try_clone_to_owned().unwrap()) };
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 1024];
+        while let Ok(read @ 1..) = reading.read(&mut buf) {
+            if seen_tx.send(buf[..read].to_vec()).is_err() {
+                return;
+            }
+        }
+    });
+
+    let mut seen = String::new();
+    let catch_up = |seen: &mut String| {
+        if let Ok(chunk) = seen_rx.recv_timeout(Duration::from_millis(200)) {
+            seen.push_str(&String::from_utf8_lossy(&chunk));
+        }
+    };
+
+    // Ctrl-] n once the client is on the screen, then wait to land in whatever
+    // the node called the session it started.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut pressed = false;
+    let started = loop {
+        catch_up(&mut seen);
+        if !pressed && seen.contains("gpu-box/long") {
+            pressed = true;
+            (&pty).write_all(b"\x1dn").unwrap();
+            seen.clear();
+        }
+        if pressed {
+            let listing = world.ok("gpu-box", &["ls", "local"]);
+            let started: Vec<&str> = listing
+                .lines()
+                .skip(1)
+                .filter_map(|line| line.split_whitespace().next())
+                .filter(|name| *name != "long")
+                .collect();
+            if let [name] = started[..]
+                && seen.contains(&format!("gpu-box/{name}"))
+            {
+                break name.to_string();
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "pressed={pressed}; the terminal saw: {seen:?}"
+        );
+    };
+
+    // End it the way anybody ends a shell.
+    seen.clear();
+    (&pty).write_all(b"exit\n").unwrap();
+
+    // Back where it came from, and saying what happened: a screen that changes
+    // under somebody with nothing said about it reads as a client that lost its
+    // place.
+    let said = format!("{started} exited with status 0");
+    let back = Instant::now() + Duration::from_secs(30);
+    while !(seen.contains("gpu-box/long") && seen.contains(&said)) {
+        catch_up(&mut seen);
+        assert!(
+            Instant::now() < back,
+            "{started} ended but the client did not come back saying so; the terminal saw: {seen:?}"
+        );
+    }
+
+    assert!(
+        client.try_wait().expect("checking the client").is_none(),
+        "the client should be back in gpu-box/long, not at the shell"
+    );
+    assert!(
+        !world.ok("gpu-box", &["ls", "local"]).contains(&started),
+        "{started} should be gone rather than left running"
+    );
+
+    let _ = client.kill();
+    let _ = client.wait();
+}
+
 /// The control key that starts a session starts it on the machine the client
 /// is on, not the one it was typed from, and lands you in it. Two hops away
 /// here: the key is pressed on the laptop and the session appears on gpu-box.
