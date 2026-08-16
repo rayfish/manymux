@@ -277,11 +277,12 @@ pub enum Response {
         /// how a bell in the session next door reaches the terminal in front of
         /// you. False on a host from before it did.
         ///
-        /// This one has no key behind it, which is what makes saying so matter
-        /// more rather than less: the others go quiet on a keystroke somebody
-        /// chose to press, and this one goes quiet on a bell nobody was waiting
-        /// at the screen for. Without the flag an old host is indistinguishable
-        /// from a quiet machine.
+        /// The one flag no client says anything about. It has no key behind it,
+        /// so the only thing to say was a sentence on every attach to a host
+        /// that could not ring, which is a line of chrome about something that
+        /// has not happened. Still answered, because a client from the build
+        /// that did say so reads it, and a node that went quiet here would have
+        /// it call every new host old.
         #[serde(default)]
         events: bool,
     },

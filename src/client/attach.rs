@@ -398,7 +398,7 @@ pub enum Rename {
     /// Enter: ask the host for the name that has been typed. It answers with
     /// the name that stuck, or with why it refused.
     Run,
-    /// Esc, or a rub with nothing left to rub out: the name stays as it was.
+    /// Esc: the name stays as it was.
     Cancel,
 }
 
@@ -525,6 +525,12 @@ fn wheel_is_ours(view_open: bool, session_mouse: bool) -> bool {
     view_open && !session_mouse
 }
 
+/// Shift-Tab, spelt the way a terminal sends it when nothing has asked for a
+/// longer encoding. Named because it is the one control sequence reaching a
+/// mode the client is holding that a hand pressed, rather than one the terminal
+/// sent of its own accord.
+const SHIFT_TAB: &[u8] = b"\x1b[Z";
+
 /// The keys that move the view, in the spellings terminals send them in.
 ///
 /// Matched before the bytes are looked at one at a time, so that the escape
@@ -625,16 +631,15 @@ impl Prompting {
     }
 }
 
-/// Take the last character off a line being typed, and say whether there was
-/// one to take.
+/// Take the last character off a line being typed, if there is one.
 ///
 /// A character rather than a byte, because one press of a key that put three
 /// bytes in has to take all three out again. UTF-8 continuation bytes are
 /// `0b10xxxxxx`, so the character starts at the last byte that is not one.
-fn pop_char(typed: &mut Vec<u8>) -> Option<()> {
-    let start = typed.iter().rposition(|b| b & 0xc0 != 0x80)?;
-    typed.truncate(start);
-    Some(())
+fn pop_char(typed: &mut Vec<u8>) {
+    if let Some(start) = typed.iter().rposition(|b| b & 0xc0 != 0x80) {
+        typed.truncate(start);
+    }
 }
 
 /// Opens the view, from control mode. tmux's copy-mode key, for the hands that
@@ -951,6 +956,22 @@ impl KeyFilter {
                 }
                 continue;
             }
+            // A sequence the terminal sent of its own accord rather than one a
+            // hand pressed: a mouse report from a session that asked for
+            // tracking, a focus event as the window is tabbed away from and
+            // back. Read a byte at a time the Esc in front of it is the Esc key,
+            // so moving the mouse dropped control mode and the rest of the
+            // report was typed into the session behind it. A mode the client is
+            // holding is left only by something the user typed; in focus mode
+            // these are the session's and go straight through, which is why
+            // that mode is not here.
+            if self.mode != Mode::Focus
+                && !input[i..].starts_with(SHIFT_TAB)
+                && let Some(len) = sequence(&input[i..])
+            {
+                i += len;
+                continue;
+            }
             let b = input[i];
             i += 1;
             if self.mode == Mode::Scroll {
@@ -1008,7 +1029,7 @@ impl KeyFilter {
                 // read is the key; one at the end of a read is a real Esc.
                 // Split across two reads it reads as an Esc, which costs a trip
                 // back to focus and nothing else.
-                0x1b if input[i..].starts_with(b"[Z") => {
+                0x1b if input[i..].starts_with(&SHIFT_TAB[1..]) => {
                     i += 2;
                     Some(Action::Switch(Motion::Previous))
                 }
@@ -1109,15 +1130,12 @@ impl KeyFilter {
                     self.prompt = None;
                     return what.action(Find::Cancel, Rename::Cancel);
                 }
-                // Backspace, in both spellings terminals send.
-                0x08 | 0x7f => {
-                    // A rub with nothing left to rub out closes the prompt,
-                    // which is where a hand that changed its mind ends up.
-                    if pop_char(&mut prompt.typed).is_none() {
-                        self.prompt = None;
-                        return what.action(Find::Cancel, Rename::Cancel);
-                    }
-                }
+                // Backspace, in both spellings terminals send. A rub with
+                // nothing left to rub out does nothing: rubbing a line out to
+                // start it again is how a name gets retyped, and closing the
+                // prompt on the last one threw away the gesture halfway
+                // through. Esc is the way out, and it is the only one.
+                0x08 | 0x7f => pop_char(&mut prompt.typed),
                 // Ctrl-U, which is what a shell means by "start again".
                 0x15 => prompt.typed.clear(),
                 // Printable, and the bytes of a multi-byte character, which
@@ -1583,7 +1601,6 @@ mod terminal {
         let takes_pastes = session.paste;
         let scrolls = session.scroll;
         let renames = session.rename;
-        let carries_events = session.events;
         let SessionHalves {
             mut reader,
             mut writer,
@@ -1622,19 +1639,6 @@ mod terminal {
         // written, and the rule for which of them get one.
         let mut pending = String::new();
         let bells = Bells::new(naming.host);
-
-        // A host from before the attach stream carried events will never send
-        // one, and there is no key here to find that out with: the other
-        // capabilities go quiet under a keystroke somebody chose to press,
-        // while this one goes quiet under a bell nobody was watching for. Said
-        // once, on the row, and only to someone who has bells switched on,
-        // since silence is what the rest asked for. The first repaint paints
-        // it, which is why nothing is written here.
-        if !carries_events && notify::to_terminal() {
-            status.set_notice("this host is too old to relay bells; `mm restart` there");
-            notice_until = Some(tokio::time::Instant::now() + NOTICE_FOR);
-            restate = true;
-        }
 
         loop {
             tokio::select! {
@@ -2614,15 +2618,14 @@ mod tests {
         f.filter(&[0x15]); // Ctrl-U, start again
         assert_eq!(f.needle().as_deref(), Some(""));
 
-        // Rubbing out the last of nothing closes the prompt, which is where a
-        // hand that changed its mind ends up.
+        // Rubbing out the last of nothing does nothing: a line rubbed out to
+        // be typed again is a line still being typed.
         assert_eq!(
             f.filter(&[0x7f]),
-            asked(Action::Find(Find::Cancel), Mode::Scroll)
+            asked(Action::Find(Find::Typed), Mode::Scroll)
         );
-        assert_eq!(f.needle(), None);
+        assert_eq!(f.needle().as_deref(), Some(""));
 
-        f.filter(&[FIND_KEY]);
         assert_eq!(
             f.filter(&[0x1b]),
             asked(Action::Find(Find::Cancel), Mode::Scroll)
@@ -2738,14 +2741,18 @@ mod tests {
         );
         assert_eq!(f.wanted_name(), None);
 
-        // And the rub with nothing left to rub out, which is the other way a
-        // hand that changed its mind gets out.
+        // And a rub with nothing left to rub out keeps the prompt, so a name
+        // rubbed out to be typed again can be typed again.
         f.filter(&[KEY, b'r']);
+        f.filter(b"bench");
+        f.filter(&[0x15]);
         assert_eq!(
             f.filter(&[0x7f]),
-            asked(Action::Rename(Rename::Cancel), Mode::Focus)
+            asked(Action::Rename(Rename::Typed), Mode::Rename)
         );
-        assert_eq!(f.wanted_name(), None);
+        assert_eq!(f.wanted_name().as_deref(), Some(""));
+        f.filter(b"nightly");
+        assert_eq!(f.wanted_name().as_deref(), Some("nightly"));
     }
 
     /// A program that asks the terminal for every key as an escape code takes
@@ -2882,6 +2889,51 @@ mod tests {
         assert_eq!(f.needle().as_deref(), Some("error"));
     }
 
+    /// The same rule one mode along: a report is not a keystroke, so control
+    /// mode outlives one. A session running something that asked for mouse
+    /// tracking or focus reporting has the terminal sending these whenever the
+    /// hand or the window moves, and read a byte at a time the Esc in front of
+    /// one dropped the mode and typed the rest of the report into the session.
+    #[test]
+    fn a_report_arriving_in_control_mode_leaves_the_mode_as_it_was() {
+        let mut f = KeyFilter::new(KEY);
+        assert_eq!(f.filter(&[KEY]), held());
+        // A drag, and the window losing the focus and getting it back.
+        assert_eq!(f.filter(b"\x1b[<35;12;7M\x1b[O\x1b[I"), held());
+        // Still control mode, so the next key is still the client's.
+        assert_eq!(f.filter(b"d"), asked(Action::Detach, Mode::Focus));
+    }
+
+    /// And Shift-Tab is spelt the same way and is not one of them: it is a key
+    /// somebody pressed, and it walks the sessions backwards.
+    #[test]
+    fn shift_tab_is_not_taken_for_a_report() {
+        let mut f = KeyFilter::new(KEY);
+        f.filter(&[KEY]);
+        assert_eq!(
+            f.filter(SHIFT_TAB),
+            asked(Action::Switch(Motion::Previous), Mode::Control)
+        );
+    }
+
+    /// The view is held the same way. A report reaching it while the session
+    /// has the mouse read as the Esc that leaves, so a hand moving over the
+    /// terminal closed the window you were reading.
+    #[test]
+    fn a_report_arriving_in_the_view_leaves_it_open() {
+        let mut f = KeyFilter::new(KEY);
+        f.set_scroll(true);
+        f.filter(&[KEY, SCROLL_KEY]);
+        assert_eq!(
+            f.filter(b"\x1b[<35;12;7M"),
+            Keystrokes {
+                forward: vec![],
+                action: None,
+                mode: Mode::Scroll,
+            }
+        );
+    }
+
     /// Nothing the terminal sends of its own accord is typing: a mouse report
     /// from a session that asked for tracking, or a focus event, arrives at
     /// whatever prompt happens to be open and must leave it as it was.
@@ -2901,8 +2953,8 @@ mod tests {
 
     /// And the keys that do end the typing still end it in the long spelling,
     /// which is the one they arrive in once a program has asked for it: an Esc
-    /// that only arrived as `CSI 27 u` would leave a prompt with no way out but
-    /// rubbing it empty.
+    /// that only arrived as `CSI 27 u` would leave a prompt with no way out of
+    /// it at all.
     #[test]
     fn the_prompt_reads_the_long_spelling_of_the_keys_that_end_it() {
         let mut f = KeyFilter::new(KEY);

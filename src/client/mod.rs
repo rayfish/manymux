@@ -439,9 +439,11 @@ pub struct Attached {
     /// broken client rather than an old host.
     pub rename: bool,
     /// Whether this host puts its other sessions' events on this stream, which
-    /// is what rings the terminal for a bell in the session next door. False on
-    /// a host from before it did, where silence is otherwise the same shape as
-    /// nothing having happened.
+    /// is what rings the terminal for a bell in the session next door. Nothing
+    /// here reads it: a host that cannot ring is quiet, and a sentence about it
+    /// on every attach is noisier than the bells it is about. Kept because a
+    /// client from the build that did say so is still out there reading it, and
+    /// a node that stopped answering would have it call every new host old.
     pub events: bool,
 }
 

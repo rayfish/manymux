@@ -254,6 +254,17 @@ Three consequences run through the whole codebase and are worth keeping intact:
   shifted ones arrive as the alternate the terminal reports beside the key,
   which is why `Encoded::text` reads case out of the alternate rather than the
   code.
+- **A mode the client is holding is left by a keystroke and by nothing else.**
+  A session that asked for mouse tracking or focus reporting has the terminal
+  sending reports whenever the hand or the window moves, and those arrive on the
+  same stdin the keys do. Read a byte at a time the Esc in front of one is the
+  Esc key: moving the mouse dropped control mode, closed the view, and the rest
+  of the report was typed into the session behind it. So control and scroll take
+  an escape sequence off whole before any byte of it is read and drop the ones
+  that are not keys, the same as a prompt does. `attach::SHIFT_TAB` is the one
+  exception, being spelt like a report and pressed like a key. Focus mode is not
+  in this at all: there the reports are the session's, and they go through
+  untouched.
 - **What an attached client asks for goes on the attach stream, never down a
   second connection.** An `Attached` holds neither the socket nor the host it
   arrived by, on purpose: that is the one thing this half of the client is kept
@@ -263,14 +274,16 @@ Three consequences run through the whole codebase and are worth keeping intact:
   node too old to know the tag skips it in silence, so `Response::Attached`
   carries a flag per capability (`paste`, `scroll`, `rename`, `events`) and the
   client says "this host is too old" rather than leaving a key that does
-  nothing. `events` is the odd one and the reason the rule is worth stating
-  twice: it has no key behind it, so an old node is not a key that does nothing
-  but a machine that never rings, which is the same shape as a quiet one and was
-  undiagnosable from the client. It is said once on attach rather than on a
-  press, and only to somebody who has bells switched on. Note also that
-  replacing the binary is not enough for any of these: the node keeps running
-  the build it started from until `mm restart`, which `update::is_stale` says
-  for this machine and nothing says for a host you reach over ssh.
+  nothing. `events` is the odd one out and the exception that shapes the rule:
+  it has no key behind it, so the only place to say it was the mark row on every
+  attach to such a host, which is a sentence about a bell that has not rung and
+  may never ring. Nothing reads it now, and it is still answered because a
+  client from the build that did read it is still out there: a node that stopped
+  saying so would have it call every new host old. A sentence is worth writing
+  only where a key was pressed. Note also that replacing the binary is not
+  enough for any of these: the node keeps running the build it started from
+  until `mm restart`, which `update::is_stale` says for this machine and nothing
+  says for a host you reach over ssh.
 - **Both prompts are one prompt** (`attach::Prompt`). The search and the rename
   are typed the same way, so the editing lives in one place and only the action
   handed back says which one is open. A prompt swallows the whole chunk, because
@@ -283,7 +296,10 @@ Three consequences run through the whole codebase and are worth keeping intact:
   prompt reports itself a keystroke later and used to close the prompt again.
   The other half of that is `Encoded::typed`: the same mode spells Esc, Enter
   and Backspace the long way, and they are read back to the byte the editing is
-  written against rather than handled twice.
+  written against rather than handled twice. Esc is the only way out: a rub with
+  nothing left to rub out does nothing, because rubbing a line out to start it
+  again is how a name gets retyped and closing the prompt on the last backspace
+  threw the gesture away halfway through.
 - **A rename moves the name, and the title stays the program's.** The name says
   which session this is and goes in `host/name`, so it is sanitised in
   `node::registry` and refused when another session already holds it: a spawn
