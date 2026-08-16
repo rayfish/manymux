@@ -18,6 +18,7 @@ use tokio::sync::{broadcast, mpsc, watch};
 use tracing::{debug, warn};
 
 use super::events::{Event, Scanner, Utf8Decoder};
+use crate::lock::held;
 use crate::proto::{
     EventKind, Found, SessionEvent, SessionInfo, Size, SpawnSpec, View, ViewRequest,
 };
@@ -146,7 +147,7 @@ impl Attachment {
 
     /// Update this client's requested size and renegotiate the effective size.
     pub fn resize(&self, size: Size) {
-        let mut state = self.session.state.lock().unwrap();
+        let mut state = held(&self.session.state);
         state.clients.insert(self.id, size.sane());
         let effective = state.effective_size();
         self.session.apply_size(&mut state, effective);
@@ -155,25 +156,25 @@ impl Attachment {
     /// Whether the program is expecting pastes to be bracketed, which decides
     /// how a pasted file's path is handed to it.
     pub fn bracketed_paste(&self) -> bool {
-        self.session.state.lock().unwrap().scanner.bracketed_paste()
+        held(&self.session.state).scanner.bracketed_paste()
     }
 
     /// Re-read the screen after a lag, so the client can repaint instead of
     /// rendering a hole.
     pub fn resync(&self) -> String {
-        self.session.state.lock().unwrap().repaint()
+        held(&self.session.state).repaint()
     }
 
     /// A window of the session's history, for a client scrolling back through
     /// it on a screen the terminal keeps no scrollback for.
     pub fn window(&self, request: &ViewRequest) -> View {
-        let state = self.session.state.lock().unwrap();
+        let state = held(&self.session.state);
         super::history::window(&state.vt, request)
     }
 
     /// Every line of that history holding `needle`.
     pub fn find(&self, needle: &str) -> Found {
-        let state = self.session.state.lock().unwrap();
+        let state = held(&self.session.state);
         super::history::find(&state.vt, needle)
     }
 
@@ -192,7 +193,7 @@ impl Attachment {
 impl Drop for Attachment {
     fn drop(&mut self) {
         self.session.host_clients.fetch_sub(1, Ordering::Relaxed);
-        let mut state = self.session.state.lock().unwrap();
+        let mut state = held(&self.session.state);
         state.clients.remove(&self.id);
         let effective = state.effective_size();
         self.session.apply_size(&mut state, effective);
@@ -326,7 +327,7 @@ impl Session {
     /// stream, never both and never neither.
     fn ingest(&self, chunk: &[u8]) {
         let mut events = Vec::new();
-        let mut state = self.state.lock().unwrap();
+        let mut state = held(&self.state);
 
         state.scanner.feed(chunk, |e| events.push(e));
         let text = state.decoder.decode(chunk);
@@ -351,7 +352,7 @@ impl Session {
     /// listener never has to ask a follow-up question to render a notification.
     pub fn publish(&self, kind: EventKind) {
         let (title, attached) = {
-            let state = self.state.lock().unwrap();
+            let state = held(&self.state);
             (state.title(&self.command), state.clients.len())
         };
         let _ = self.events.send(SessionEvent {
@@ -369,7 +370,7 @@ impl Session {
     pub fn attach(self: &Arc<Self>, size: Size, history: u32) -> Attached {
         let id = self.next_client.fetch_add(1, Ordering::Relaxed);
         self.host_clients.fetch_add(1, Ordering::Relaxed);
-        let mut state = self.state.lock().unwrap();
+        let mut state = held(&self.state);
 
         // Subscribe under the lock so the repaint and the stream meet exactly.
         let output = self.output_tx.subscribe();
@@ -404,14 +405,14 @@ impl Session {
     }
 
     pub fn name(&self) -> String {
-        self.name.lock().unwrap().clone()
+        held(&self.name).clone()
     }
 
     /// Answer to a different name from now on. The registry does the deciding,
     /// since it owns the names and is the only place a clash can be seen; this
     /// is the session's half of what it decided.
     pub fn set_name(&self, name: &str) {
-        *self.name.lock().unwrap() = name.to_string();
+        *held(&self.name) = name.to_string();
     }
 
     /// Ask the child to go away. SIGHUP to the whole process group, the way a
@@ -468,7 +469,7 @@ impl Session {
     }
 
     pub fn info(&self) -> SessionInfo {
-        let state = self.state.lock().unwrap();
+        let state = held(&self.state);
         SessionInfo {
             name: self.name(),
             title: state.title(&self.command),

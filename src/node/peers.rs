@@ -13,6 +13,8 @@ use std::time::Duration;
 use tokio::task::JoinHandle;
 use tracing::info;
 
+use crate::lock::held;
+
 /// How long to wait before re-subscribing to a machine's events after the
 /// subscription ends. Guards against a tight loop when a host is down, or
 /// answers and hangs up.
@@ -31,7 +33,7 @@ impl Peers {
     /// Machines already watched are left alone: pairing with one must not
     /// interrupt the subscription to another.
     pub fn sync(&self, wanted: &[String]) -> Vec<String> {
-        let mut watchers = self.watchers.lock().unwrap();
+        let mut watchers = held(&self.watchers);
 
         let gone: Vec<String> = watchers
             .keys()
@@ -54,17 +56,17 @@ impl Peers {
 
     /// Record the task watching `host`, so dropping the host stops it.
     pub fn watching(&self, host: String, task: JoinHandle<()>) {
-        self.watchers.lock().unwrap().insert(host, task);
+        held(&self.watchers).insert(host, task);
     }
 
     pub fn names(&self) -> Vec<String> {
-        let mut names: Vec<String> = self.watchers.lock().unwrap().keys().cloned().collect();
+        let mut names: Vec<String> = held(&self.watchers).keys().cloned().collect();
         names.sort();
         names
     }
 
     pub fn len(&self) -> usize {
-        self.watchers.lock().unwrap().len()
+        held(&self.watchers).len()
     }
 
     pub fn is_empty(&self) -> bool {

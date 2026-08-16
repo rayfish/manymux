@@ -32,6 +32,14 @@ desktop = [
     "dep:tracing-appender",
 ]
 
+[lints.clippy]
+# Every mutex in the tree is a `std` one guarding a short synchronous critical
+# section, which is only correct while none of them is held across an await.
+# See src/lock.rs. Denied here rather than in CI so a local `cargo clippy` says
+# so too.
+await_holding_lock = "deny"
+await_holding_invalid_type = "deny"
+
 [dependencies]
 anyhow = "1.0.104"
 avt = "0.18.0"

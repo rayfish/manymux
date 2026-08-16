@@ -124,6 +124,16 @@ Three consequences run through the whole codebase and are worth keeping intact:
   and `nohup` has to keep meaning what it means. `GRACE` also has to stay inside
   the window `node::stop` gives the socket to go quiet, or `mm stop` reports a
   node still listening when it is only still saying goodbye.
+- **Every lock is a `std` one, taken through `lock::held`, and never held across
+  an await.** The three go together. `std` is right because every critical
+  section here is short and synchronous, and because `Attachment::drop` takes
+  one, where a `tokio` mutex could not: `Drop` cannot await. What makes that
+  safe is the second half, which is not a matter of care but of
+  `clippy::await_holding_lock`, denied in `Cargo.toml` so a local run says so
+  and not only CI. `held` is the third, and it drops poisoning: a panic under a
+  lock is one operation going wrong, while poisoning makes every later one panic
+  too, so a node whose bookkeeping panicked once would answer nothing about that
+  session until somebody restarted it and took the other sessions with it.
 - **A tab completion never starts a node, never installs anything, and never
   waits on ssh unless the word already names a machine** (`src/complete.rs`).
   All three are tested.

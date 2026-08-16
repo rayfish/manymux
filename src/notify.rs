@@ -27,6 +27,7 @@ use std::time::{Duration, Instant};
 use tokio::process::Command;
 use tracing::{debug, info};
 
+use crate::lock::held;
 use crate::proto::{EventKind, SessionEvent};
 use crate::settings;
 
@@ -57,7 +58,7 @@ impl Cooldown {
     /// Whether this session may notify again yet, counting the answer as one
     /// if it is yes.
     pub fn allow(&self, key: &str) -> bool {
-        let mut last = self.last.lock().unwrap();
+        let mut last = held(&self.last);
         let now = Instant::now();
         match last.get(key) {
             Some(previous) if now.duration_since(*previous) < COOLDOWN => false,
@@ -250,6 +251,30 @@ async fn run(command: &mut Command) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A panic anywhere under a lock must cost that one operation and nothing
+    /// else. `std`'s poisoning turns it into every later call panicking too,
+    /// which in a node is a session that answers nothing until it is restarted.
+    #[test]
+    fn a_panic_under_the_lock_does_not_take_the_cooldown_with_it() {
+        let cooldown = Cooldown::default();
+
+        // Quiet, or the deliberate panic below prints a backtrace over the
+        // test output.
+        let hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _held = held(&cooldown.last);
+            panic!("something went wrong under the lock");
+        }));
+        std::panic::set_hook(hook);
+        assert!(panicked.is_err(), "the test needs the panic to happen");
+
+        assert!(
+            cooldown.allow("gpu-box/build"),
+            "the cooldown still answers after a panic under its lock"
+        );
+    }
 
     fn event(kind: EventKind, attached: usize) -> SessionEvent {
         SessionEvent {

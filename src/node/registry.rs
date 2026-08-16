@@ -9,6 +9,7 @@ use tokio::sync::broadcast;
 use tracing::info;
 
 use super::session::{Session, default_name};
+use crate::lock::held;
 use crate::proto::{EventKind, SessionEvent, SessionInfo, SpawnSpec};
 
 /// Events buffered per subscriber. A subscriber that falls this far behind is
@@ -41,7 +42,7 @@ impl Registry {
     }
 
     pub fn spawn(self: &Arc<Self>, spec: &SpawnSpec) -> Result<Arc<Session>> {
-        let mut sessions = self.sessions.lock().unwrap();
+        let mut sessions = held(&self.sessions);
         prune(&mut sessions);
 
         let name = match &spec.name {
@@ -68,7 +69,7 @@ impl Registry {
         let mut exit_rx = session.exit_rx();
         tokio::spawn(async move {
             let _ = exit_rx.wait_for(|code| code.is_some()).await;
-            prune(&mut registry.sessions.lock().unwrap());
+            prune(&mut held(&registry.sessions));
             info!(session = %exited.name(), "exited");
         });
 
@@ -76,7 +77,7 @@ impl Registry {
     }
 
     pub fn get(&self, name: &str) -> Option<Arc<Session>> {
-        let mut sessions = self.sessions.lock().unwrap();
+        let mut sessions = held(&self.sessions);
         prune(&mut sessions);
         sessions.get(name).cloned()
     }
@@ -84,13 +85,13 @@ impl Registry {
     /// Every live session, for the one caller that acts on all of them at once
     /// rather than reporting them: the shutdown.
     pub fn all(&self) -> Vec<Arc<Session>> {
-        let mut sessions = self.sessions.lock().unwrap();
+        let mut sessions = held(&self.sessions);
         prune(&mut sessions);
         sessions.values().map(Arc::clone).collect()
     }
 
     pub fn list(&self) -> Vec<SessionInfo> {
-        let mut sessions = self.sessions.lock().unwrap();
+        let mut sessions = held(&self.sessions);
         prune(&mut sessions);
         let mut out: Vec<_> = sessions.values().map(|s| s.info()).collect();
         // Oldest first, and by name only to break a tie: two sessions opened in
@@ -116,7 +117,7 @@ impl Registry {
     /// was typed at a prompt with somebody sitting in front of it, and quietly
     /// landing them on `build-2` is worse than saying the name is taken.
     pub fn rename(&self, name: &str, to: &str) -> Result<String> {
-        let mut sessions = self.sessions.lock().unwrap();
+        let mut sessions = held(&self.sessions);
         prune(&mut sessions);
         if !sessions.contains_key(name) {
             return Err(no_such(name));
