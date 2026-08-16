@@ -675,6 +675,19 @@ fn ssh_is_invoked_with_the_destination_and_nothing_surprising() {
         args.iter().any(|a| a.starts_with("ControlMaster")),
         "connections should be shared: {args:?}"
     );
+    // Without these, a connection that dies without closing is one ssh never
+    // notices: it holds the pipes open and silent for as long as the process
+    // lives. Worse with a shared connection than without, because the master
+    // outlives the command that made it and every later command multiplexes
+    // onto the corpse, where no `ConnectTimeout` applies.
+    assert!(
+        args.iter().any(|a| a.starts_with("ServerAliveInterval")),
+        "a dead connection should be noticed: {args:?}"
+    );
+    assert!(
+        args.iter().any(|a| a.starts_with("ServerAliveCountMax")),
+        "a dead connection should be given up on: {args:?}"
+    );
 }
 
 /// Sanity check that the stub really is a stand-in and not the thing under

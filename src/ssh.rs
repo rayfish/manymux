@@ -24,6 +24,30 @@ use tokio::process::{Child, Command};
 /// master open.
 const PERSIST: &str = "5m";
 
+/// How ssh is made to notice a connection that died without closing.
+///
+/// A lid closed on a wifi hop kills the connection and closes nothing. Without
+/// these, ssh sits on a socket to nowhere for as long as the process lives:
+/// the kernel's own TCP keepalive is two hours away, and `ConnectTimeout` is
+/// about reaching a machine rather than staying reached. That leaves the pipes
+/// carrying the protocol open and silent, which is the one thing a reader
+/// cannot tell from a session that has nothing to say.
+///
+/// Sharing connections makes it worse rather than better, and is why this is
+/// not left to the protocol's own deadline. A master outlives the command that
+/// made it, so a master whose network went takes every later command down with
+/// it: `ControlMaster=auto` multiplexes onto it, and connecting to a control
+/// socket has no timeout to give up on. One dead master is `mm ls`, `mm new`
+/// and tab completion all hanging until somebody works out what a control
+/// socket is.
+///
+/// Three tries at fifteen seconds is the same three-quarters of a minute the
+/// protocol gives a silent peer ([`crate::proto::SILENT_FOR`]), so a client
+/// that ssh has not yet given up on reaches the same conclusion at about the
+/// same time by itself.
+const ALIVE_EVERY: &str = "15";
+const ALIVE_TRIES: &str = "3";
+
 /// A running `ssh <host> mm agent`, and its pipes.
 pub struct Agent {
     pub child: Child,
@@ -190,7 +214,14 @@ fn base(tty: Tty) -> Command {
         .arg("-o")
         .arg(format!("ControlPath={}", control_path().display()))
         .arg("-o")
-        .arg(format!("ControlPersist={PERSIST}"));
+        .arg(format!("ControlPersist={PERSIST}"))
+        // Notice a connection that went, rather than holding its pipes open
+        // and silent forever. On the master this is what keeps one dead
+        // connection from hanging every command that follows it.
+        .arg("-o")
+        .arg(format!("ServerAliveInterval={ALIVE_EVERY}"))
+        .arg("-o")
+        .arg(format!("ServerAliveCountMax={ALIVE_TRIES}"));
     command
 }
 
