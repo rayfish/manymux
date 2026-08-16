@@ -200,6 +200,17 @@ fn target_candidates(current: &OsStr) -> Vec<CompletionCandidate> {
     let Some(current) = current.to_str() else {
         return Vec::new();
     };
+    // `@`: a group, which is a local file read. Offered only behind the sigil,
+    // so an ordinary session completion is exactly what it always was, and
+    // answered without asking any machine anything.
+    if current.starts_with('@') {
+        return described(
+            groups()
+                .into_iter()
+                .map(|name| (format!("@{name}"), String::new()))
+                .filter(|(target, _)| target.starts_with(current)),
+        );
+    }
     let socket = socket();
 
     // `host/`: they have said which machine, so go and ask it, and only it.

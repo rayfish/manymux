@@ -2166,3 +2166,26 @@ fn the_listing_shows_a_group_column_only_once_something_is_in_one() {
     let grouped = world.ok("laptop", &["ls"]);
     assert!(grouped.contains("pi"), "{grouped}");
 }
+
+/// Group names are a local file read, so a tab reaches no machine at all, which
+/// is what every completer here is held to. Offered only behind the sigil: an
+/// ordinary session completion is exactly what it always was.
+#[test]
+fn an_at_sign_completes_group_names_without_asking_any_machine() {
+    let world = World::new("complete-groups");
+
+    world.ok("laptop", &["new", "-d", "-n", "build", "sleep", "60"]);
+    world.ok("laptop", &["group", "build", "pi"]);
+
+    assert_eq!(world.complete("laptop", &["a", "@"]), vec!["@pi"]);
+    assert_eq!(world.complete("laptop", &["a", "@p"]), vec!["@pi"]);
+    assert!(world.complete("laptop", &["a", "@z"]).is_empty());
+
+    // And a word with no sigil offers sessions, with no group among them.
+    let plain = world.complete("laptop", &["a", ""]);
+    assert!(plain.contains(&"build".to_string()), "{plain:?}");
+    assert!(
+        plain.iter().all(|offered| !offered.starts_with('@')),
+        "{plain:?}"
+    );
+}
