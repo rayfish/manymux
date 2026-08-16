@@ -28,12 +28,14 @@ mod keys;
 mod terminal;
 
 pub use keys::{
-    Action, DEFAULT_PREFIX, Find, KeyFilter, Keystrokes, Mode, Motion, PASTE_KEY, Rename, Scroll,
-    prefix,
+    Action, DEFAULT_PREFIX, Find, KeyFilter, Keystrokes, Mode, Motion, PASTE_KEY, Pick, Rename,
+    Scroll, prefix,
 };
 
+use super::picker;
+
 #[cfg(feature = "desktop")]
-pub use terminal::{Held, Wait, hold, run, session_size, terminal_size, waiting};
+pub use terminal::{Held, PopupFeed, Wait, hold, run, session_size, terminal_size, waiting};
 
 /// How long to wait before trying to reach a lost session again, by how many
 /// tries have failed.
@@ -63,6 +65,10 @@ const SLOWEST: u64 = 10;
 #[derive(Debug, PartialEq, Eq)]
 pub enum Outcome {
     Detached,
+    /// A popup was closed with something chosen. What each row means is the
+    /// caller's: it handed the rows in and gets their ids back, so this half of
+    /// the client never learns what a host, a group or a pid is.
+    Chose(Chose),
     /// A switch key was pressed. Which session it lands on is the caller's to
     /// work out: this half of the client knows nothing about hosts.
     Switch(Motion),
@@ -73,6 +79,42 @@ pub enum Outcome {
     Exited(i32),
     /// The host went away.
     Disconnected,
+}
+
+/// What a popup was closed with, in the caller's own row ids.
+///
+/// Every one of these needs something this half of the client is kept from
+/// knowing: assigning needs a config file and a session's pid, renaming a
+/// session that is not the one attached needs a connection to its machine, and
+/// narrowing needs the listing. So they are handed back the way a switch is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Chose {
+    /// Attach to the session on this row.
+    Go(usize),
+    /// Move the session on `session` into the group on `group`.
+    Move { session: usize, group: usize },
+    /// Narrow to the group on this row.
+    Focus(usize),
+    /// Rename the session on `session`.
+    Named { session: usize, to: String },
+    /// Make a group and put the session on `session` in it. One act rather than
+    /// two, because a group is a set of live sessions and an empty one cannot
+    /// exist.
+    NewGroup { session: usize, name: String },
+}
+
+/// The rows a popup is drawn from, handed in per attach.
+///
+/// Both lists at once because `m` swaps from one to the other without a round
+/// trip, and asking for the groups at that moment would put an ssh in the
+/// middle of a keystroke.
+#[derive(Debug, Default, Clone)]
+pub struct Rows {
+    pub sessions: Vec<picker::Row>,
+    pub groups: Vec<picker::Row>,
+    /// Which session row is the one being attached to, so the popup opens with
+    /// the highlight already on it.
+    pub at: usize,
 }
 
 /// Everything an attached session produced before it stopped.

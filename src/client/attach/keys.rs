@@ -346,11 +346,40 @@ pub enum Motion {
     PreviousHost,
 }
 
+/// What a key did to a popup.
+///
+/// Where the highlight is and what it lands on is [`super::super::picker`]'s;
+/// this only says which way, the same split [`Scroll`] uses for the view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pick {
+    Up,
+    Down,
+    /// The next machine in the list, and the one before: a bigger step of the
+    /// same gesture, now that there is a list to see it in.
+    NextGroup,
+    PreviousGroup,
+    /// Enter: go to the highlighted session, or take the highlighted group.
+    Go,
+    /// `m`: move the highlighted session into a group, which opens the group
+    /// list over this one.
+    Move,
+    /// `g`: narrow to a group, which opens the same list for the other verb.
+    Groups,
+    /// Esc: close, changing nothing.
+    Cancel,
+}
+
 /// What a key pressed in switch mode asks for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
     Detach,
     Switch(Motion),
+    /// Something happened to the popup control mode puts on the screen.
+    Pick(Pick),
+    /// The same four states as a rename, for the prompt that names a new group.
+    /// A third prompt rather than a third editor: the typing is identical and
+    /// only the action carrying it says which prompt it happened at.
+    GroupName(Rename),
     /// Start a session on the machine this one is on, and go and sit in it.
     /// Where that is and what it gets called is the caller's, for the same
     /// reason a switch is: this half of the client knows nothing about hosts.
@@ -441,6 +470,12 @@ pub enum Mode {
     /// keyboard here is neither the session's nor doing control keys: every
     /// letter is text, and the row is the only place it shows.
     Rename,
+    /// A group is being chosen, from the list drawn over the session list.
+    ///
+    /// Its own mode because the keys that act on a session mean nothing here:
+    /// `m` from inside this would be moving a move, and `d` would detach out
+    /// of a gesture halfway through.
+    Picking,
 }
 
 /// One mouse report, in the SGR spelling (`CSI < button ; col ; row M`).
@@ -518,6 +553,21 @@ pub(super) fn wheel_is_ours(view_open: bool, session_mouse: bool) -> bool {
 /// mode the client is holding that a hand pressed, rather than one the terminal
 /// sent of its own accord.
 const SHIFT_TAB: &[u8] = b"\x1b[Z";
+
+/// The keys that move a popup's highlight, in the spellings terminals send
+/// them in.
+///
+/// Matched before the bytes are looked at one at a time, for the same reason
+/// [`VIEW_KEYS`] is: read a byte at a time the Esc starting `\x1b[A` is the Esc
+/// that closes the popup, so reaching for a cursor key would shut the list.
+const PICK_KEYS: &[(&[u8], Pick)] = &[
+    (b"\x1b[A", Pick::Up),
+    (b"\x1b[B", Pick::Down),
+    // The application-keypad spellings, which a program may have left the
+    // terminal in.
+    (b"\x1bOA", Pick::Up),
+    (b"\x1bOB", Pick::Down),
+];
 
 /// The keys that move the view, in the spellings terminals send them in.
 ///
@@ -607,16 +657,31 @@ enum Prompting {
     Find,
     /// The session's title.
     Rename,
+    /// A group to put the highlighted session in.
+    Group,
 }
 
 impl Prompting {
-    /// The same four things happen at either prompt; which action carries them
-    /// is all that differs, so the pair is named at the one place it matters.
+    /// The same four things happen at every prompt; which action carries them
+    /// is all that differs, so the set is named at the one place it matters.
     fn action(self, find: Find, rename: Rename) -> Action {
         match self {
             Prompting::Find => Action::Find(find),
             Prompting::Rename => Action::Rename(rename),
+            Prompting::Group => Action::GroupName(rename),
         }
+    }
+}
+
+/// What is left of a chunk once an action has been taken out of it.
+///
+/// Only a popup move gives any of it back. See [`Keystrokes::rest`].
+fn rest_after(action: Action, left: &[u8]) -> Vec<u8> {
+    match action {
+        Action::Pick(Pick::Up | Pick::Down | Pick::NextGroup | Pick::PreviousGroup) => {
+            left.to_vec()
+        }
+        _ => Vec::new(),
     }
 }
 
@@ -676,6 +741,15 @@ pub struct Keystrokes {
     pub action: Option<Action>,
     /// The mode the client is in now, for the row at the bottom of the screen.
     pub mode: Mode,
+    /// What was left of the chunk, for the one action you do type through:
+    /// moving a popup's highlight.
+    ///
+    /// Everything else ends the chunk it was found in, because nobody types
+    /// through a detach or a switch. A highlight move is not like those: two
+    /// writes a moment apart arrive as one read, so `tab` then `Enter` is one
+    /// chunk, and dropping the rest there loses the keystroke that commits.
+    /// Empty for every other action, which keeps that rule where it was.
+    pub rest: Vec<u8>,
 }
 
 impl KeyFilter {
@@ -700,6 +774,11 @@ impl KeyFilter {
     /// What is being typed at the rename prompt, if that is the one open.
     pub fn wanted_name(&self) -> Option<String> {
         self.typed(Prompting::Rename)
+    }
+
+    /// What is being typed at the new-group prompt, if that is the one open.
+    pub fn wanted_group(&self) -> Option<String> {
+        self.typed(Prompting::Group)
     }
 
     fn typed(&self, what: Prompting) -> Option<String> {
@@ -737,6 +816,16 @@ impl KeyFilter {
             // a command.
             Action::Detach | Action::Paste | Action::New => Mode::Focus,
             Action::Switch(_) => Mode::Control,
+            // The popup stays up while the highlight is moving, and both ways
+            // out of it go back to the session.
+            Action::Pick(Pick::Go | Pick::Cancel) => Mode::Focus,
+            Action::Pick(Pick::Move | Pick::Groups) => Mode::Picking,
+            Action::Pick(_) => Mode::Control,
+            // Back to the group list rather than to the session: naming a group
+            // was one step of choosing one, and the list it was chosen from is
+            // still what you are looking at.
+            Action::GroupName(Rename::Run | Rename::Cancel) => Mode::Picking,
+            Action::GroupName(_) => Mode::Rename,
             Action::Scroll(Scroll::Leave) => Mode::Focus,
             // Every other move keeps the view up, wherever it was opened from:
             // a wheel notch in focus mode opens it and stays.
@@ -770,14 +859,26 @@ impl KeyFilter {
             // than a letter each beside them: one gesture with a direction is
             // less to remember than two keys, and it leaves the letters for
             // the things done to a session rather than the moves between them.
-            b'\t' => Action::Switch(Motion::Next),
+            //
+            // They move the highlight rather than hopping outright, now that
+            // there is a list to move it in. Walking three sessions used to be
+            // three detaches and three reattaches, over ssh, to see what each
+            // one was; it is now one, on the Enter that commits.
+            b'\t' | b'j' | b'J' => Action::Pick(Pick::Down),
+            b'k' | b'K' => Action::Pick(Pick::Up),
+            b'\r' | b'\n' => Action::Pick(Pick::Go),
+            // Move the highlighted session into a group, and narrow to one.
+            // Two verbs, and which list you came from is what says which:
+            // no row in either means two things.
+            b'm' | b'M' => Action::Pick(Pick::Move),
+            b'g' => Action::Pick(Pick::Groups),
             b'l' | b'L' => Action::Switch(Motion::Last),
             b'n' | b'N' => Action::New,
             // The one key that reads its own case, because shift already means
             // backwards here: `H` is to `h` what shift-tab is to tab, rather
             // than a second letter to remember.
-            b'h' => Action::Switch(Motion::NextHost),
-            b'H' => Action::Switch(Motion::PreviousHost),
+            b'h' => Action::Pick(Pick::NextGroup),
+            b'H' => Action::Pick(Pick::PreviousGroup),
             // Only where there is a history to look at. Elsewhere they are
             // unbound keys, and the session gets them.
             SCROLL_KEY if self.scroll => Action::Scroll(Scroll::Up(0)),
@@ -793,6 +894,30 @@ impl KeyFilter {
             _ => return None,
         };
         Some(action)
+    }
+
+    /// The same, for the group list drawn over the session list.
+    ///
+    /// A table of its own rather than a subset of [`Self::controlling`]: the
+    /// keys that act on a session have nothing to act on here, and letting one
+    /// through would run it against whatever was highlighted behind this list.
+    /// Everything not here does nothing, the same as in the view: a hand
+    /// landing on the keyboard must not close a gesture halfway through.
+    fn picking(&self, b: u8) -> Option<Action> {
+        let pick = match b {
+            b'j' | b'J' => Pick::Down,
+            b'k' | b'K' => Pick::Up,
+            b'\r' | b'\n' => Pick::Go,
+            b'q' | 0x1b => Pick::Cancel,
+            b if b == self.prefix => Pick::Cancel,
+            // A group that does not exist yet, named at the prompt. It assigns
+            // as well as creates, necessarily: a group is a set of live
+            // sessions, so an empty one cannot exist and creating one is the
+            // same act as putting the first session in it.
+            b'n' | b'N' => return Some(Action::GroupName(Rename::Open)),
+            _ => return None,
+        };
+        Some(Action::Pick(pick))
     }
 
     /// The same, for the keys that move the view. The search keys come first,
@@ -829,6 +954,7 @@ impl KeyFilter {
         match action {
             Action::Find(Find::Open) => self.open(Prompting::Find),
             Action::Rename(Rename::Open) => self.open(Prompting::Rename),
+            Action::GroupName(Rename::Open) => self.open(Prompting::Group),
             _ => {}
         }
     }
@@ -882,6 +1008,7 @@ impl KeyFilter {
                     forward,
                     action: Some(action),
                     mode: self.mode,
+                    rest: Vec::new(),
                 };
             }
             // The wheel, while it is the client's. Every report is swallowed,
@@ -918,6 +1045,7 @@ impl KeyFilter {
                     forward,
                     action: Some(action),
                     mode: self.mode,
+                    rest: Vec::new(),
                 };
             }
             // The keys that drive the view, which are escape sequences of their
@@ -934,6 +1062,25 @@ impl KeyFilter {
                     forward,
                     action: Some(action),
                     mode: self.mode,
+                    rest: Vec::new(),
+                };
+            }
+            // The same, for the arrows that move a popup's highlight.
+            if matches!(self.mode, Mode::Control | Mode::Picking)
+                && let Some((spelling, pick)) = PICK_KEYS
+                    .iter()
+                    .find(|(spelling, _)| input[i..].starts_with(spelling))
+            {
+                self.spell(spelling);
+                self.pressed = None;
+                i += spelling.len();
+                let action = Action::Pick(*pick);
+                self.mode = Self::after(action);
+                return Keystrokes {
+                    forward,
+                    action: Some(action),
+                    mode: self.mode,
+                    rest: rest_after(action, &input[i..]),
                 };
             }
             // A terminal that a program has put into an extended-keys mode
@@ -949,6 +1096,7 @@ impl KeyFilter {
                         forward,
                         action: Some(action),
                         mode: self.mode,
+                        rest: rest_after(action, &input[i..]),
                     };
                 }
                 continue;
@@ -971,6 +1119,21 @@ impl KeyFilter {
             }
             let b = input[i];
             i += 1;
+            if self.mode == Mode::Picking {
+                // Same rule as the view: nothing here reaches the session, and
+                // an unbound key does nothing rather than closing the list.
+                let Some(action) = self.picking(b) else {
+                    continue;
+                };
+                self.opening(action);
+                self.mode = Self::after(action);
+                return Keystrokes {
+                    forward,
+                    action: Some(action),
+                    mode: self.mode,
+                    rest: rest_after(action, &input[i..]),
+                };
+            }
             if self.mode == Mode::Scroll {
                 // Nothing typed here reaches the session: the screen is showing
                 // its history, and a key meant for the program would land in a
@@ -986,6 +1149,7 @@ impl KeyFilter {
                     forward,
                     action: Some(action),
                     mode: self.mode,
+                    rest: Vec::new(),
                 };
             }
             if self.mode == Mode::Focus {
@@ -1003,6 +1167,7 @@ impl KeyFilter {
                         forward,
                         action: Some(Action::Paste),
                         mode: self.mode,
+                        rest: Vec::new(),
                     };
                 } else {
                     forward.push(b);
@@ -1013,6 +1178,10 @@ impl KeyFilter {
             let action = match b {
                 // First, so that a mode key which is itself one of the keys
                 // below can still be sent through by pressing it twice.
+                // Closes the popup, and sends the byte on when it was pressed
+                // twice quickly. An action rather than a bare mode change,
+                // because the popup has to be taken off the screen and only
+                // the caller can repaint what was under it.
                 b if b == self.prefix => {
                     self.spell(&[b]);
                     if pressed.is_some_and(|at| now.duration_since(at) < LITERAL) {
@@ -1022,15 +1191,15 @@ impl KeyFilter {
                     None
                 }
                 // Shift-Tab, which starts with the same byte as the Esc that
-                // goes back to focus. An Esc with `[Z` behind it in the same
+                // closes the popup. An Esc with `[Z` behind it in the same
                 // read is the key; one at the end of a read is a real Esc.
                 // Split across two reads it reads as an Esc, which costs a trip
                 // back to focus and nothing else.
                 0x1b if input[i..].starts_with(&SHIFT_TAB[1..]) => {
                     i += 2;
-                    Some(Action::Switch(Motion::Previous))
+                    Some(Action::Pick(Pick::Up))
                 }
-                0x1b | b'\r' | b'\n' => {
+                0x1b | b'\n' => {
                     self.mode = Mode::Focus;
                     None
                 }
@@ -1048,13 +1217,15 @@ impl KeyFilter {
                 },
             };
             // Whatever is left of the chunk is dropped: nobody types through a
-            // detach or a switch.
+            // detach or a switch. A popup move is the exception, and hands the
+            // rest back; see `rest_after`.
             if let Some(action) = action {
                 self.mode = Self::after(action);
                 return Keystrokes {
                     forward,
                     action: Some(action),
                     mode: self.mode,
+                    rest: rest_after(action, &input[i..]),
                 };
             }
         }
@@ -1062,6 +1233,7 @@ impl KeyFilter {
             forward,
             action: None,
             mode: self.mode,
+            rest: Vec::new(),
         }
     }
 
@@ -1203,6 +1375,12 @@ impl KeyFilter {
             self.opening(action);
             return Some(action);
         }
+        if self.mode == Mode::Picking {
+            // The same, for the group list.
+            let action = byte.and_then(|b| self.picking(b))?;
+            self.opening(action);
+            return Some(action);
+        }
         let pressed = self.pressed.take();
         if key.is(self.prefix) {
             self.spell(spelling);
@@ -1213,8 +1391,8 @@ impl KeyFilter {
             return None;
         }
         match key.code {
-            TAB if key.mods & SHIFT != 0 => return Some(Action::Switch(Motion::Previous)),
-            ESCAPE | ENTER => {
+            TAB if key.mods & SHIFT != 0 => return Some(Action::Pick(Pick::Up)),
+            ESCAPE => {
                 self.mode = Mode::Focus;
                 return None;
             }
@@ -1243,6 +1421,7 @@ mod tests {
             forward: bytes.to_vec(),
             action: None,
             mode: Mode::Focus,
+            rest: Vec::new(),
         }
     }
 
@@ -1253,6 +1432,7 @@ mod tests {
             forward: vec![],
             action: None,
             mode: Mode::Control,
+            rest: Vec::new(),
         }
     }
 
@@ -1262,6 +1442,7 @@ mod tests {
             forward: vec![],
             action: Some(action),
             mode,
+            rest: Vec::new(),
         }
     }
 
@@ -1283,6 +1464,7 @@ mod tests {
                 forward: Vec::new(),
                 action: Some(Action::Scroll(Scroll::Up(scroll::WHEEL))),
                 mode: Mode::Scroll,
+                rest: Vec::new(),
             }
         );
     }
@@ -1302,6 +1484,7 @@ mod tests {
                 forward: Vec::new(),
                 action: Some(Action::Scroll(Scroll::Up(3 * scroll::WHEEL))),
                 mode: Mode::Scroll,
+                rest: Vec::new(),
             }
         );
 
@@ -1399,6 +1582,7 @@ mod tests {
                 forward: Vec::new(),
                 action: None,
                 mode: Mode::Scroll,
+                rest: Vec::new(),
             }
         );
     }
@@ -1647,16 +1831,16 @@ mod tests {
         let mut f = KeyFilter::new(KEY);
         assert_eq!(
             f.filter(b"\x1b[93;5u\x1b[104u"),
-            asked(Action::Switch(Motion::NextHost), Mode::Control)
+            asked(Action::Pick(Pick::NextGroup), Mode::Control)
         );
         assert_eq!(
             f.filter(b"\x1b[104:72;2u"),
-            asked(Action::Switch(Motion::PreviousHost), Mode::Control)
+            asked(Action::Pick(Pick::PreviousGroup), Mode::Control)
         );
         // And where no alternate was asked for, the case is worked out here.
         assert_eq!(
             f.filter(b"\x1b[104;2u"),
-            asked(Action::Switch(Motion::PreviousHost), Mode::Control)
+            asked(Action::Pick(Pick::PreviousGroup), Mode::Control)
         );
         // A chord is still nobody's key but the session's.
         assert_eq!(
@@ -1696,6 +1880,7 @@ mod tests {
                 forward: vec![],
                 action: None,
                 mode: Mode::Scroll,
+                rest: Vec::new(),
             }
         );
         assert_eq!(
@@ -1772,14 +1957,14 @@ mod tests {
     }
 
     /// And Shift-Tab is spelt the same way and is not one of them: it is a key
-    /// somebody pressed, and it walks the sessions backwards.
+    /// somebody pressed, and it walks the list backwards.
     #[test]
     fn shift_tab_is_not_taken_for_a_report() {
         let mut f = KeyFilter::new(KEY);
         f.filter(&[KEY]);
         assert_eq!(
             f.filter(SHIFT_TAB),
-            asked(Action::Switch(Motion::Previous), Mode::Control)
+            asked(Action::Pick(Pick::Up), Mode::Control)
         );
     }
 
@@ -1797,6 +1982,7 @@ mod tests {
                 forward: vec![],
                 action: None,
                 mode: Mode::Scroll,
+                rest: Vec::new(),
             }
         );
     }
@@ -1990,6 +2176,7 @@ mod tests {
                 forward: b"ls".to_vec(),
                 action: Some(Action::Detach),
                 mode: Mode::Focus,
+                rest: Vec::new(),
             }
         );
     }
@@ -2065,7 +2252,7 @@ mod tests {
     fn control_mode_reads_escape_and_shift_tab_in_the_long_spelling() {
         let mut f = KeyFilter::default();
         assert_eq!(f.filter(b"\x1b[93;5u\x1b[9;2u"), {
-            asked(Action::Switch(Motion::Previous), Mode::Control)
+            asked(Action::Pick(Pick::Up), Mode::Control)
         });
         assert_eq!(f.filter(b"\x1b[27u"), forwarded(b""));
         assert_eq!(f.filter(b"ls"), forwarded(b"ls"));
@@ -2089,6 +2276,7 @@ mod tests {
                 forward: b"ls".to_vec(),
                 action: Some(Action::Paste),
                 mode: Mode::Focus,
+                rest: Vec::new(),
             }
         );
         // And what goes back to the session, when the clipboard turns out to
@@ -2177,6 +2365,7 @@ mod tests {
                 forward: b"ls".to_vec(),
                 action: Some(Action::Detach),
                 mode: Mode::Focus,
+                rest: Vec::new(),
             }
         );
         // And the default key is then just an ordinary keystroke again.
@@ -2196,6 +2385,7 @@ mod tests {
                 forward: b"ls".to_vec(),
                 action: Some(Action::Paste),
                 mode: Mode::Focus,
+                rest: Vec::new(),
             }
         );
         // And the keyboard is still in focus afterwards: pasting is not a mode.
@@ -2234,26 +2424,31 @@ mod tests {
                 forward: b"abc".to_vec(),
                 action: Some(Action::Detach),
                 mode: Mode::Focus,
+                rest: Vec::new(),
             }
         );
     }
 
     #[test]
     fn control_mode_stays_on_so_tab_walks_the_list() {
-        // The point of the mode: one key, then as many hops as you like.
+        // The point of the mode: one key, then as many moves as you like. What
+        // moves now is the highlight in the popup rather than the client, so
+        // walking three sessions is one reattach on the Enter instead of three.
         let mut f = KeyFilter::default();
         assert_eq!(
             f.filter(&[KEY, b'\t']),
-            asked(Action::Switch(Motion::Next), Mode::Control)
+            asked(Action::Pick(Pick::Down), Mode::Control)
         );
         assert_eq!(
             f.filter(b"\t"),
-            asked(Action::Switch(Motion::Next), Mode::Control)
+            asked(Action::Pick(Pick::Down), Mode::Control)
         );
         assert_eq!(
             f.filter(SHIFT_TAB),
-            asked(Action::Switch(Motion::Previous), Mode::Control)
+            asked(Action::Pick(Pick::Up), Mode::Control)
         );
+        // `l` is not a move through the list but a jump out of it, so it still
+        // commits: the session you came from may not even be on screen.
         assert_eq!(
             f.filter(b"l"),
             asked(Action::Switch(Motion::Last), Mode::Control)
@@ -2287,19 +2482,23 @@ mod tests {
     fn the_host_keys_move_machine_and_leave_control_mode_on() {
         // The one binding that reads its own case, so both spellings are keys
         // rather than `H` dropping back to focus as an unbound one would.
+        //
+        // A bigger step of the same gesture now that the machines are drawn as
+        // headings in the popup: they move the highlight to the next machine's
+        // first session and commit nothing, which Enter is for.
         let mut f = KeyFilter::default();
         assert_eq!(
             f.filter(&[KEY, b'h']),
-            asked(Action::Switch(Motion::NextHost), Mode::Control)
+            asked(Action::Pick(Pick::NextGroup), Mode::Control)
         );
         assert_eq!(
             f.filter(b"H"),
-            asked(Action::Switch(Motion::PreviousHost), Mode::Control)
+            asked(Action::Pick(Pick::PreviousGroup), Mode::Control)
         );
         // And walking the machine you land on carries on from there.
         assert_eq!(
             f.filter(b"\t"),
-            asked(Action::Switch(Motion::Next), Mode::Control)
+            asked(Action::Pick(Pick::Down), Mode::Control)
         );
     }
 
@@ -2311,7 +2510,7 @@ mod tests {
         let mut f = KeyFilter::default();
         assert_eq!(
             f.filter(&[KEY, b'\t']),
-            asked(Action::Switch(Motion::Next), Mode::Control)
+            asked(Action::Pick(Pick::Down), Mode::Control)
         );
         assert_eq!(f.filter(&[KEY]), forwarded(b""));
         assert_eq!(f.filter(b"ls"), forwarded(b"ls"));
@@ -2322,33 +2521,37 @@ mod tests {
         let mut f = KeyFilter::default();
         assert_eq!(
             f.filter(&[KEY, b'\t']),
-            asked(Action::Switch(Motion::Next), Mode::Control)
+            asked(Action::Pick(Pick::Down), Mode::Control)
         );
-        // The first goes back to focus, the second starts a fresh mode key, and
+        // The first closes the popup, the second starts a fresh mode key, and
         // the third is the one that goes through.
         assert_eq!(f.filter(&[KEY, KEY, KEY]), forwarded(&[KEY]));
         assert_eq!(f.filter(b"x"), forwarded(b"x"));
     }
 
     #[test]
-    fn shift_tab_goes_back_and_a_bare_escape_returns_to_focus() {
+    fn shift_tab_goes_back_and_a_bare_escape_closes_the_popup() {
         let mut f = KeyFilter::default();
         assert_eq!(
             f.filter(&[KEY, 0x1b, b'[', b'Z']),
-            asked(Action::Switch(Motion::Previous), Mode::Control)
+            asked(Action::Pick(Pick::Up), Mode::Control)
         );
-        // An Esc with nothing behind it in the same read is a real Esc, and
-        // typing carries on into the session.
+        // An Esc with nothing behind it in the same read is a real Esc: back to
+        // focus, which is also what takes the popup off the screen, and typing
+        // carries on into the session.
         assert_eq!(f.filter(b"\x1b"), forwarded(b""));
         assert_eq!(f.filter(b"ls"), forwarded(b"ls"));
     }
 
     #[test]
-    fn enter_returns_to_focus_without_reaching_the_session() {
-        // Swallowed rather than forwarded: coming back to focus must not also
-        // submit whatever is sitting at the prompt.
+    fn enter_takes_the_highlighted_row_without_reaching_the_session() {
+        // Swallowed rather than forwarded: choosing a row must not also submit
+        // whatever is sitting at the prompt behind the popup.
         let mut f = KeyFilter::default();
-        assert_eq!(f.filter(&[KEY, b'\r']), forwarded(b""));
+        assert_eq!(
+            f.filter(&[KEY, b'\r']),
+            asked(Action::Pick(Pick::Go), Mode::Focus)
+        );
         assert_eq!(f.filter(b"x"), forwarded(b"x"));
     }
 
@@ -2358,8 +2561,8 @@ mod tests {
         // silently eaten while the mode sat there unnoticed.
         let mut f = KeyFilter::default();
         assert_eq!(
-            f.filter(&[KEY, b'g', b'i', b't']),
-            forwarded(&[KEY, b'g', b'i', b't'])
+            f.filter(&[KEY, b'v', b'i', b'm']),
+            forwarded(&[KEY, b'v', b'i', b'm'])
         );
     }
 
@@ -2383,6 +2586,7 @@ mod tests {
                 forward: vec![],
                 action: None,
                 mode: Mode::Control,
+                rest: Vec::new(),
             }
         );
         assert_eq!(f.filter_at(&[KEY], at + LITERAL), forwarded(b""));
@@ -2401,6 +2605,7 @@ mod tests {
                 forward: vec![],
                 action: None,
                 mode: Mode::Control,
+                rest: Vec::new(),
             }
         );
         assert_eq!(
@@ -2425,6 +2630,7 @@ mod tests {
                 forward: vec![],
                 action: None,
                 mode: Mode::Control,
+                rest: Vec::new(),
             }
         );
         assert_eq!(f.filter(b"d"), asked(Action::Detach, Mode::Focus));

@@ -164,6 +164,42 @@ impl Picker {
         self.rows.iter().position(|row| !row.heading)
     }
 
+    /// The first row under the next heading, or the previous one.
+    ///
+    /// A bigger step of the same gesture: with the machines drawn as headings,
+    /// `h` jumping between them is what it obviously means, and it commits
+    /// nothing, which Enter is for.
+    pub fn next_heading(&mut self, forwards: bool) {
+        let len = self.rows.len();
+        if len == 0 {
+            return;
+        }
+        let mut seen_heading = false;
+        let mut next = self.at;
+        for _ in 0..len {
+            next = if forwards {
+                (next + 1) % len
+            } else {
+                (next + len - 1) % len
+            };
+            if self.rows[next].heading {
+                seen_heading = true;
+                continue;
+            }
+            // Going back, the row wanted is the first under the heading rather
+            // than the last one above it, so keep walking to the top of the run.
+            if seen_heading && (forwards || self.starts_a_run(next)) {
+                self.at = next;
+                return;
+            }
+        }
+    }
+
+    /// Whether this row is the first under its heading.
+    fn starts_a_run(&self, index: usize) -> bool {
+        index == 0 || self.rows[index - 1].heading
+    }
+
     /// One row on, skipping headings and wrapping at both ends.
     ///
     /// Bounded by the row count rather than looping until it finds one: a list

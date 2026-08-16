@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::fmt::{self, Display, Formatter};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow, bail};
@@ -12,11 +12,13 @@ use tokio::signal::unix::{SignalKind, signal};
 use tokio::task::JoinHandle;
 use tracing::debug;
 
-use manymux::client::attach::{self, Mode, Outcome, Wait};
+use manymux::client::attach::{self, Chose, Mode, Motion, Outcome, Rows, Wait};
 use manymux::client::groups::Groups;
+use manymux::client::picker::Row;
 use manymux::client::switch::{Cycle, Located};
 use manymux::client::{Attached, Stream};
 use manymux::hosts::{Hosts, is_this_machine, this_machine};
+use manymux::lock::held as held_lock;
 use manymux::node::{Config, Node};
 use manymux::proto::{Request, Response, SpawnSpec};
 use manymux::settings::{Screen, Settings};
@@ -892,6 +894,9 @@ async fn do_attach(
     // from the current session, because widening out of a group you are still
     // sitting in has to be possible.
     let mut settled = false;
+    // Where the listing task leaves its answer, so the ids the popup hands back
+    // are looked up in the rows it was actually showing.
+    let latest: Arc<Mutex<Option<Listed>>> = Arc::new(Mutex::new(None));
 
     let mut held = attach::hold(screen)?;
     let mut mode = Mode::Focus;
@@ -970,8 +975,74 @@ async fn do_attach(
         // the next one to report is whatever this session does.
         ended = None;
 
-        let (outcome, renamed) =
-            attach::run(&mut held, session, &where_, mode, notice.take().as_deref()).await?;
+        // Before the rows are built, because the popup is drawn from them and
+        // it opens on a keystroke inside the attach, where there is no asking
+        // anything. The wait is the same half second the switch keys allow and
+        // for the same reason: what is already known stands rather than being
+        // waited on, since a machine that is asleep must not hold up a screen.
+        take_listing(&mut listing, &mut cycle, &mut snapshot, &mut groups).await;
+        if !settled && !snapshot.is_empty() {
+            settled = true;
+            if let Some(info) = snapshot.info(cycle.current()) {
+                let group = groups
+                    .group_of(&cycle.current().host, info)
+                    .map(str::to_string);
+                cycle.focus(group);
+            }
+        }
+        let listed = Listed::new(&snapshot, &groups, &cycle);
+        // The popup's way of asking what the machines are running, since the
+        // attach owns this task for as long as it lasts and cannot go and look
+        // itself. Groups and the narrowing cannot change under it: every way of
+        // changing either ends the attach, which is what makes a snapshot of
+        // them safe to hand over.
+        let (asks, mut wanted) = tokio::sync::mpsc::channel::<()>(1);
+        let (answered, fresh) = tokio::sync::watch::channel(listed.rows.clone());
+        let lister = {
+            let socket = socket.to_path_buf();
+            let groups = groups.clone();
+            let focus = cycle.focused().map(str::to_string);
+            let current = cycle.current().clone();
+            let latest = Arc::clone(&latest);
+            tokio::spawn(async move {
+                while wanted.recv().await.is_some() {
+                    let Ok(listing) = everywhere(&socket).await else {
+                        continue;
+                    };
+                    let snapshot = Snapshot {
+                        reached: listing.reached(),
+                        sessions: listing.sessions,
+                    };
+                    let listed = Listed::of(&snapshot, &groups, focus.as_deref(), &current);
+                    // Kept where the caller can read it once the attach ends:
+                    // the ids the popup hands back are this listing's, and
+                    // looking them up in the one it opened with would name the
+                    // wrong session.
+                    *held_lock(&latest) = Some(listed.clone());
+                    if answered.send(listed.rows).is_err() {
+                        return;
+                    }
+                }
+            })
+        };
+        let (outcome, renamed) = attach::run(
+            &mut held,
+            session,
+            &where_,
+            mode,
+            notice.take().as_deref(),
+            attach::PopupFeed {
+                rows: listed.rows.clone(),
+                group: cycle.focused(),
+                asks,
+                fresh,
+            },
+        )
+        .await?;
+        lister.abort();
+        // The rows the ids in `outcome` belong to: the last answer if one
+        // landed while the popup was up, else the ones it opened with.
+        let listed = held_lock(&latest).take().unwrap_or(listed);
         // Renamed from inside, so the name this run has been using is nobody's
         // now: the cycle would hop to a session that is not there, and the line
         // printed on the way out would name it too.
@@ -980,21 +1051,81 @@ async fn do_attach(
             cycle.renamed(&name);
         }
         match outcome {
-            Outcome::Switch(motion) => {
-                take_listing(&mut listing, &mut cycle, &mut snapshot, &mut groups).await;
-                // The first listing to land is the first chance to know what
-                // group this run started in, and it lands before the key that
-                // asked for it is acted on. Done once: after this the focus is
-                // the popup's to move, and re-reading it would undo a widening.
-                if !settled && !snapshot.is_empty() {
-                    settled = true;
-                    if let Some(info) = snapshot.info(cycle.current()) {
-                        let group = groups
-                            .group_of(&cycle.current().host, info)
-                            .map(str::to_string);
+            // Everything the popup chose, in its own row ids. The lookups are
+            // here because this is the half that knows what a row means: the
+            // popup is handed rows and hands back ids, and never learns what a
+            // host, a group or a pid is.
+            Outcome::Chose(chose) => {
+                hopped = false;
+                match chose {
+                    // A hop like any other, so the way back is recorded the
+                    // same way and `Motion::Last` reaches it.
+                    Chose::Go(row) => {
+                        if let Some(there) = listed.at.get(row)
+                            && *there != target
+                        {
+                            cycle.moved_to(there.clone());
+                            hopped = true;
+                        }
+                    }
+                    // Narrowing. You move only when the session you are in is
+                    // not in the group you just chose, since widening or
+                    // choosing the group you are already in should leave you
+                    // where you are.
+                    Chose::Focus(row) => {
+                        let group = listed.groups.get(row).cloned().flatten();
                         cycle.focus(group);
+                        if let Some(next) = cycle.step(Motion::Next)
+                            && !cycle.holds(&target)
+                        {
+                            cycle.moved_to(next);
+                            hopped = true;
+                        }
+                    }
+                    // A local file write and a redraw: nothing detaches for
+                    // this, which is why `m` acts on the highlighted row rather
+                    // than the session you are attached to.
+                    Chose::Move { session, group } => {
+                        let group = listed.groups.get(group).cloned().flatten();
+                        notice = regroup(socket, &listed, session, group, &mut groups)
+                            .await
+                            .err()
+                            .map(|e| format!("{e:#}"));
+                        cycle.refresh(entries(&snapshot, &groups));
+                    }
+                    Chose::NewGroup { session, name } => {
+                        notice = regroup(socket, &listed, session, Some(name), &mut groups)
+                            .await
+                            .err()
+                            .map(|e| format!("{e:#}"));
+                        cycle.refresh(entries(&snapshot, &groups));
+                    }
+                    // The row may not be the session at the other end of the
+                    // attach stream, and `tag::RENAME` renames that one by
+                    // design, so this goes over a connection to its machine.
+                    Chose::Named { session, to } => {
+                        let at = listed.at.get(session);
+                        let pid = at.and_then(|at| snapshot.info(at)).map(|i| i.pid);
+                        match rename_at(socket, at, pid.unwrap_or_default(), &to).await {
+                            Ok(name) => {
+                                if let Some(at) = at
+                                    && *at == target
+                                {
+                                    where_ = qualified(&at.host, &name);
+                                    cycle.renamed(&name);
+                                }
+                            }
+                            Err(e) => notice = Some(format!("{e:#}")),
+                        }
                     }
                 }
+                // Whatever it was, what the machines are running may have moved
+                // under it, and a press is the only thing that ever asks.
+                listing = Some(spawn_listing(socket));
+                mode = Mode::Focus;
+            }
+            Outcome::Switch(motion) => {
+                take_listing(&mut listing, &mut cycle, &mut snapshot, &mut groups).await;
                 hopped = false;
                 if let Some(next) = cycle.step(motion) {
                     cycle.moved_to(next);
@@ -1095,7 +1226,7 @@ async fn do_attach(
             println!("[disconnected from {where_}]");
             Ok(FAILED)
         }
-        Outcome::Switch(_) | Outcome::New => {
+        Outcome::Switch(_) | Outcome::New | Outcome::Chose(_) => {
             unreachable!("switches never leave the loop above")
         }
     }
@@ -1248,6 +1379,159 @@ impl Snapshot {
     fn is_empty(&self) -> bool {
         self.sessions.is_empty()
     }
+}
+
+/// The popup's rows, and what each row id means.
+///
+/// The ids are indices into the two `Vec`s beside the rows, so the half of the
+/// client that draws the popup never learns what a host, a group or a pid is:
+/// it hands back an id and this looks it up. Built together and replaced
+/// together, or an id would index the wrong session.
+#[derive(Clone, Default)]
+struct Listed {
+    rows: Rows,
+    /// One per session row, in the same order.
+    at: Vec<Located>,
+    /// One per group row. The first is `None`, which is "everything" when you
+    /// are narrowing and "no group" when you are moving a session.
+    groups: Vec<Option<String>>,
+}
+
+impl Listed {
+    /// A heading per machine, then its sessions, in the order the listing
+    /// arrived: by machine, then oldest first. The same order the switch keys
+    /// walk, so the popup and the keys never disagree about what is next.
+    ///
+    /// Narrowed to the focused group when there is one, because that is what
+    /// every other way of moving around is narrowed to.
+    fn new(snapshot: &Snapshot, groups: &Groups, cycle: &Cycle) -> Self {
+        Self::of(snapshot, groups, cycle.focused(), cycle.current())
+    }
+
+    /// The same, from the two things about the cycle that matter, so a task
+    /// with no cycle of its own can build these while an attach is up.
+    fn of(snapshot: &Snapshot, groups: &Groups, focus: Option<&str>, current: &Located) -> Self {
+        let mut rows = Vec::new();
+        let mut at = Vec::new();
+        let mut machine: Option<&str> = None;
+        for hosted in &snapshot.sessions {
+            let group = groups.group_of(&hosted.host, &hosted.session);
+            if let Some(focus) = focus
+                && group != Some(focus)
+            {
+                continue;
+            }
+            if machine != Some(hosted.host.as_str()) {
+                machine = Some(&hosted.host);
+                rows.push(Row::heading(&hosted.host));
+            }
+            let here = *current == Located::new(&hosted.host, &hosted.session.name);
+            let mut note = term::duration(hosted.session.idle);
+            if hosted.session.bells > 0 {
+                note = format!("{note} *");
+            }
+            if here {
+                note = "●".to_string();
+            }
+            rows.push(
+                Row::new(at.len(), &hosted.session.name)
+                    .detail(&hosted.session.title)
+                    .note(note),
+            );
+            at.push(Located::new(&hosted.host, &hosted.session.name));
+        }
+        let landed = current.clone();
+        let on = at.iter().position(|there| *there == landed).unwrap_or(0);
+        let highlight = rows
+            .iter()
+            .position(|row| !row.heading && row.id == on)
+            .unwrap_or(0);
+
+        // The first row is "everything" or "no group" depending on which verb
+        // opened the list, which is why it carries no name.
+        let mut group_rows = vec![Row::new(0, "(none)")];
+        let mut names: Vec<Option<String>> = vec![None];
+        let held = groups.tally(&snapshot.sessions);
+        for (name, count) in held {
+            let mark = if focus == Some(name.as_str()) {
+                "●"
+            } else {
+                ""
+            };
+            group_rows.push(
+                Row::new(names.len(), &name)
+                    .detail(count.to_string())
+                    .note(mark),
+            );
+            names.push(Some(name));
+        }
+
+        Self {
+            rows: Rows {
+                sessions: rows,
+                groups: group_rows,
+                at: highlight,
+            },
+            at,
+            groups: names,
+        }
+    }
+}
+
+/// Put the session on `row` in a group, or take it out of one.
+///
+/// The pid and the start time membership is keyed on come from the snapshot the
+/// popup was drawn from, and that snapshot can be a few seconds old. One
+/// `sessions_on` to the machine holding it refreshes them first, because a
+/// stale pid puts the wrong session in a group, which is worse than a round
+/// trip on a key nobody presses in a hurry.
+async fn regroup(
+    socket: &Path,
+    listed: &Listed,
+    row: usize,
+    group: Option<String>,
+    groups: &mut Groups,
+) -> Result<()> {
+    let at = listed
+        .at
+        .get(row)
+        .ok_or_else(|| anyhow!("that session is no longer listed"))?;
+    let sessions = sessions_on(socket, &at.host).await?;
+    let session = sessions
+        .iter()
+        .find(|s| s.name == at.session)
+        .ok_or_else(|| anyhow!("{} is no longer running", at.session))?;
+    match &group {
+        Some(name) => groups.assign(name, &at.host, session),
+        None => groups.clear(&at.host, session),
+    }
+    groups.save()
+}
+
+/// Rename the session on a popup row, wherever it is running, and answer with
+/// the name that stuck.
+///
+/// `Request::Rename` answers `Ok` and throws that name away, and it cannot be
+/// made to say more without a node old enough to be out there failing to
+/// decode it. So the session is looked up again afterwards by the one thing a
+/// rename does not move: its pid. What was typed and what it ended up called
+/// are not always the same string, since the node sanitises it, and the mark
+/// row is about to draw one of them.
+async fn rename_at(socket: &Path, at: Option<&Located>, pid: u32, to: &str) -> Result<String> {
+    let at = at.ok_or_else(|| anyhow!("that session is no longer listed"))?;
+    open(socket, &at.host)
+        .await?
+        .call(&Request::Rename {
+            name: at.session.clone(),
+            to: to.to_string(),
+        })
+        .await?;
+    let sessions = sessions_on(socket, &at.host).await?;
+    Ok(sessions
+        .iter()
+        .find(|s| s.pid == pid)
+        .map(|s| s.name.clone())
+        .unwrap_or_else(|| to.to_string()))
 }
 
 /// The listing as the cycle wants it: an address, and the group it is in.

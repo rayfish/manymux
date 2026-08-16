@@ -23,8 +23,10 @@ const RESERVED: u16 = 1;
 /// puts between its columns.
 const GUTTER: u16 = 2;
 
-/// What the keys do, shown while control mode is on. Without it the mode is a
-/// terminal that has stopped taking what you type for no visible reason.
+/// What the keys do, shown while control mode is on and there is no popup to
+/// say it: a window too small to hold a box, which is the only time this row is
+/// all there is. Without it the mode is a terminal that has stopped taking what
+/// you type for no visible reason.
 ///
 /// Cut from the end when the row cannot hold all of it, rather than dropped
 /// whole: the mark takes what it takes, a long target name leaves little
@@ -34,6 +36,7 @@ const GUTTER: u16 = 2;
 const HINTS: &[&str] = &[
     "tab next",
     "s-tab prev",
+    "⏎ go",
     // Early, because it is the only way into the view: the wheel is left to
     // the terminal so that a drag selects, and a key nobody can find is a
     // feature nobody has.
@@ -79,6 +82,14 @@ pub struct Status {
     target: String,
     /// The mode the row says the keyboard is in.
     mode: Mode,
+    /// Whether a popup is on the screen carrying its own key hints, in which
+    /// case this row leaves them to it.
+    popped: bool,
+    /// The group the run is narrowed to, if any. Drawn in front of the target,
+    /// because the row already answers "which session" and this answers "which
+    /// work", and a narrowing you cannot see is a set of switch keys that
+    /// quietly stopped reaching half your sessions.
+    group: Option<String>,
     /// Something the client has to say for itself, which takes the hints' place
     /// while it is up. A paste is the only thing that has anything to say so
     /// far, and it says it here because a full-screen program owns every other
@@ -111,6 +122,8 @@ impl Status {
         Self {
             target: target.to_string(),
             mode: Mode::default(),
+            popped: false,
+            group: None,
             notice: None,
             scrolled: None,
             prompt: None,
@@ -118,6 +131,16 @@ impl Status {
             watching: false,
             lost: false,
         }
+    }
+
+    /// Whether a popup is up and carrying the key hints.
+    pub fn set_popped(&mut self, popped: bool) {
+        self.popped = popped;
+    }
+
+    /// Which group the run is narrowed to, or none.
+    pub fn set_group(&mut self, group: Option<&str>) {
+        self.group = group.map(str::to_string);
     }
 
     /// Say that this client cannot type into the session, for as long as it is
@@ -230,7 +253,18 @@ impl Status {
     /// The mark itself, drawn a gutter in from the right end of the reserved
     /// row, with the key hints beside it while control mode is on.
     fn mark(&self, size: Size) -> String {
-        let width = columns(&format!("● {}", self.target));
+        // The group drops first when the row runs out of room: which session
+        // you are in is the thing this row exists to say, and the narrowing is
+        // worth knowing but not worth losing the target over.
+        let mut prefix = match &self.group {
+            Some(group) if !group.is_empty() => format!("{group} · "),
+            _ => String::new(),
+        };
+        let mut width = columns(&format!("● {prefix}{}", self.target));
+        if width + GUTTER > size.cols {
+            prefix.clear();
+            width = columns(&format!("● {}", self.target));
+        }
         // Right-aligned, and dropped rather than wrapped on a terminal too
         // narrow to hold it and its gutter: a wrapped mark would scroll the
         // screen.
@@ -255,9 +289,11 @@ impl Status {
             (true, _, _) => style::amber("○"),
             (false, true, _) => style::faint("◦"),
             (false, false, Mode::Focus) => style::green("●"),
-            (false, false, Mode::Control | Mode::Scroll | Mode::Rename) => style::amber("○"),
+            (false, false, Mode::Control | Mode::Picking | Mode::Scroll | Mode::Rename) => {
+                style::amber("○")
+            }
         };
-        let name = style::faint(&self.target);
+        let name = style::faint(&format!("{prefix}{}", self.target));
         format!(
             "\x1b[{row};1H\x1b[2K{hint}\x1b[{row};{column}H{dot} {name}",
             row = size.rows,
@@ -298,7 +334,12 @@ impl Status {
             // the session printed a moment ago.
             (None, Some(scrolled), _) => (scrolled.as_str(), style::amber as fn(&str) -> String),
             // The one thing on this row that can be shortened to fit, and is.
-            (None, None, Mode::Control) => {
+            // Only where there is no popup to carry them: control mode draws
+            // its own hints inside the box, and two hint lines at once is one
+            // too many. This is the fallback for a terminal too small to hold
+            // a box, which is the only time control mode has nothing on screen
+            // but this row.
+            (None, None, Mode::Control) if !self.popped => {
                 let hints = hints(size.cols.saturating_sub(1 + mark + GUTTER));
                 return if hints.is_empty() {
                     String::new()
@@ -308,7 +349,11 @@ impl Status {
             }
             // Rename is here for the sake of the match: that mode is never on
             // without a prompt, which was answered above.
-            (None, None, Mode::Focus | Mode::Scroll | Mode::Rename) => return String::new(),
+            (
+                None,
+                None,
+                Mode::Control | Mode::Picking | Mode::Focus | Mode::Scroll | Mode::Rename,
+            ) => return String::new(),
         };
         // A blank column between the two, so they never run together.
         if columns(text) + 1 + mark + GUTTER > size.cols {

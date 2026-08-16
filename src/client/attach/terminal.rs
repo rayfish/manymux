@@ -18,7 +18,8 @@ use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::mpsc;
 
 use super::keys::wheel_is_ours;
-use super::{Action, Find, KeyFilter, Mode, Outcome, Rename, Scroll};
+use super::{Action, Chose, Find, KeyFilter, Mode, Outcome, Pick, Rename, Rows, Scroll};
+use crate::client::picker::Picker;
 use crate::client::screen::ScreenMode;
 use crate::client::scroll::Scrollback;
 use crate::client::status::{self, Filter, Status};
@@ -308,13 +309,21 @@ pub async fn run(
     target: &str,
     mode: Mode,
     notice: Option<&str>,
+    popup: PopupFeed<'_>,
 ) -> Result<(Outcome, Option<String>)> {
+    let PopupFeed {
+        rows,
+        group,
+        asks,
+        fresh,
+    } = popup;
     let watching = session.read_only;
     let mut status = Status::new(target);
     if watching {
         status = status.watching();
     }
     status.set_mode(mode);
+    status.set_group(group);
     if let Some(notice) = notice {
         status.set_notice(notice);
     }
@@ -339,8 +348,13 @@ pub async fn run(
             host: host_of(target),
             called: &mut called,
         },
-        screen,
-        on_alternate,
+        Painting {
+            screen,
+            on_alternate,
+            rows,
+            asks,
+            fresh,
+        },
     )
     .await?;
     let renamed = called != session_of(target);
@@ -447,6 +461,105 @@ fn keyboard() -> mpsc::Receiver<Vec<u8>> {
     keys
 }
 
+/// Put the popup on the screen, or take the mark row back to saying what it
+/// says without one.
+///
+/// One write, so there is never a frame with half a box on it, and the mark row
+/// last: it is the thing that says the client has the keyboard, and it must not
+/// be painted over by the box it is telling you about.
+async fn draw_popup(
+    stdout: &mut tokio::io::Stdout,
+    popup: &Option<Popup>,
+    status: &mut Status,
+    restate: &mut bool,
+) -> Result<()> {
+    let Some(popup) = popup else {
+        return Ok(());
+    };
+    let size = terminal_size();
+    status.set_popped(true);
+    let drawn = format!("{}{}", popup.picker.draw(size), status.repaint(size));
+    stdout.write_all(drawn.as_bytes()).await?;
+    stdout.flush().await?;
+    *restate = false;
+    Ok(())
+}
+
+/// Everything the popup needs, which the caller owns and this half does not:
+/// the rows, the narrowing they were built under, and the two ends of asking
+/// for them again.
+pub struct PopupFeed<'a> {
+    pub rows: Rows,
+    pub group: Option<&'a str>,
+    pub asks: mpsc::Sender<()>,
+    pub fresh: tokio::sync::watch::Receiver<Rows>,
+}
+
+/// What the pump paints on and what it paints there, which travel together
+/// because the screen mode decides how all three are used.
+struct Painting {
+    screen: Screen,
+    /// Whether the session has the terminal on a full-screen program's own
+    /// screen, shared with the teardown and the panic hook.
+    on_alternate: Arc<AtomicBool>,
+    /// The rows the popup opens with.
+    rows: Rows,
+    /// Say the word and the caller goes and asks the machines what they are
+    /// running again, answering on `fresh`.
+    ///
+    /// A press is the only thing that ever asks, here as everywhere else: the
+    /// popup opens on whatever was true a moment ago and is corrected when the
+    /// answer lands, rather than sitting on a machine that is asleep. The one
+    /// that found nowhere to go asks too, or the first fruitless press would be
+    /// the last one that ever asked.
+    asks: mpsc::Sender<()>,
+    /// Rows as of the last answer. Swapped in under the highlight by id, so a
+    /// listing landing under an open popup does not slide it onto a different
+    /// session.
+    fresh: tokio::sync::watch::Receiver<Rows>,
+}
+
+/// The popup on the screen, and what the list in it is for.
+///
+/// Two verbs over one widget, and which list you entered from is what says
+/// which: no row in either means two things, which is what an earlier shape of
+/// this got wrong.
+struct Popup {
+    picker: Picker,
+    what: Showing,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Showing {
+    /// The sessions you can reach. Enter attaches.
+    Sessions,
+    /// Groups, to put the session on `row` into. Enter assigns.
+    Moving { row: usize },
+    /// Groups, to narrow to. Enter narrows.
+    Narrowing,
+}
+
+const SESSION_HINTS: &str = "⏎ go  r name  m group  g show  n new  d detach";
+const MOVE_HINTS: &str = "⏎ move   n new group   esc";
+const NARROW_HINTS: &str = "⏎ show   esc";
+
+impl Popup {
+    fn sessions(rows: &Rows) -> Self {
+        Self {
+            picker: Picker::new("sessions", SESSION_HINTS, rows.sessions.clone(), rows.at),
+            what: Showing::Sessions,
+        }
+    }
+
+    /// The session row the popup is acting on, whichever list is showing.
+    fn subject(&self) -> Option<usize> {
+        match self.what {
+            Showing::Moving { row } => Some(row),
+            _ => self.picker.chosen().map(|row| row.id),
+        }
+    }
+}
+
 /// The name in `naming` is written back when a rename lands: the mark row
 /// is not the only thing that has to follow it.
 async fn pump(
@@ -455,9 +568,15 @@ async fn pump(
     mut status: Status,
     mode: Mode,
     naming: Naming<'_>,
-    screen: Screen,
-    on_alternate: Arc<AtomicBool>,
+    painting: Painting,
 ) -> Result<Outcome> {
+    let Painting {
+        screen,
+        on_alternate,
+        mut rows,
+        asks,
+        mut fresh,
+    } = painting;
     let watching = session.read_only;
     let takes_pastes = session.paste;
     let scrolls = session.scroll;
@@ -480,6 +599,9 @@ async fn pump(
     let mut output = Filter::new(screen);
     // The view over the session's history, while it is up.
     let mut scrolling: Option<Scrollback> = None;
+    // The popup control mode puts on the screen, while it is up, and which of
+    // the two lists it is showing.
+    let mut popup: Option<Popup> = None;
     // Whether the client has mouse tracking on for itself, which it does
     // only while there is a history to look at and the session has asked
     // for no reports of its own.
@@ -511,7 +633,15 @@ async fn pump(
                 let Some(typed) = typed else {
                     return Ok(Outcome::Detached);
                 };
-                let keystrokes = keys.filter(&typed);
+                // Round the chunk until it is used up. Only a popup move hands
+                // any of it back (see `Keystrokes::rest`), and it has to:
+                // two writes a moment apart arrive as one read, so `tab` then
+                // `Enter` is a single chunk and stopping at the move would
+                // throw away the key that commits.
+                let mut chunk = typed;
+                'chunk: loop {
+                let keystrokes = keys.filter(&chunk);
+                chunk = keystrokes.rest.clone();
                 // A viewer's keystrokes go nowhere. The node drops them anyway,
                 // which is what makes the promise worth anything; not sending
                 // them keeps a held key off the wire and out of the session's
@@ -519,9 +649,20 @@ async fn pump(
                 if !keystrokes.forward.is_empty() && !watching {
                     writer.send_input(&keystrokes.forward).await?;
                 }
-                if keystrokes.mode != status.mode() {
+                let was = status.mode();
+                if keystrokes.mode != was {
                     status.set_mode(keystrokes.mode);
                     restate = true;
+                }
+                // The mode key on its own, which is what control mode looks
+                // like: the popup is the mode rather than something the mode
+                // can show, so it goes up on the way in and not on the first
+                // key after it. Asked for again in the same breath, because a
+                // press is the only thing that ever asks.
+                if keystrokes.mode == Mode::Control && was != Mode::Control && popup.is_none() {
+                    let _ = asks.try_send(());
+                    popup = Some(Popup::sessions(&rows));
+                    draw_popup(&mut stdout, &popup, &mut status, &mut restate).await?;
                 }
                 settle(&mut stdout, &output, &status, &mut pending, &mut restate).await?;
                 match keystrokes.action {
@@ -549,6 +690,113 @@ async fn pump(
                     Some(Action::New) => {
                         writer.detach().await?;
                         return Ok(Outcome::New);
+                    }
+                    // The popup, which is what control mode looks like. Moving
+                    // the highlight is local: walking three sessions used to be
+                    // three detaches and three reattaches over ssh just to see
+                    // what each one was, and is now one, on the Enter.
+                    // Closing is the teardown below, which every other way out
+                    // of the mode goes through too. Nothing to do here but stay
+                    // out of its way: opening a popup to close it would put the
+                    // box back on the screen.
+                    Some(Action::Pick(Pick::Cancel)) => {}
+                    Some(Action::Pick(pick)) => {
+                        // Every press asks, whether or not it moved anywhere.
+                        // Asking only after a landing meant the first press
+                        // that found nothing was the last one that ever asked,
+                        // so a machine with one session on it when the run
+                        // started stayed that way as far as this was concerned.
+                        let _ = asks.try_send(());
+                        let up = popup.get_or_insert_with(|| Popup::sessions(&rows));
+                        match pick {
+                            Pick::Up => up.picker.up(),
+                            Pick::Down => up.picker.down(),
+                            Pick::NextGroup => up.picker.next_heading(true),
+                            Pick::PreviousGroup => up.picker.next_heading(false),
+                            // Off to the group list, over the session list
+                            // rather than instead of it: Esc there comes back
+                            // to where the gesture started.
+                            Pick::Move | Pick::Groups => {
+                                let Some(row) = up.picker.chosen().map(|row| row.id) else {
+                                    continue;
+                                };
+                                let (title, hints, what) = if pick == Pick::Move {
+                                    let name = up
+                                        .picker
+                                        .chosen()
+                                        .map(|row| row.label.clone())
+                                        .unwrap_or_default();
+                                    (
+                                        format!("move \"{name}\" to"),
+                                        MOVE_HINTS,
+                                        Showing::Moving { row },
+                                    )
+                                } else {
+                                    ("groups".to_string(), NARROW_HINTS, Showing::Narrowing)
+                                };
+                                *up = Popup {
+                                    picker: Picker::new(title, hints, rows.groups.clone(), 0),
+                                    what,
+                                };
+                                keys.set_mode(Mode::Picking);
+                                status.set_mode(Mode::Picking);
+                            }
+                            Pick::Go => {
+                                let chosen = up.picker.chosen().map(|row| row.id);
+                                let what = up.what;
+                                let subject = up.subject();
+                                let Some(chosen) = chosen else { continue };
+                                status.set_popped(false);
+                                writer.detach().await?;
+                                return Ok(match (what, subject) {
+                                    (Showing::Sessions, _) => {
+                                        Outcome::Chose(Chose::Go(chosen))
+                                    }
+                                    (Showing::Moving { .. }, Some(session)) => {
+                                        Outcome::Chose(Chose::Move { session, group: chosen })
+                                    }
+                                    (Showing::Moving { .. }, None) => Outcome::Detached,
+                                    (Showing::Narrowing, _) => {
+                                        Outcome::Chose(Chose::Focus(chosen))
+                                    }
+                                });
+                            }
+                            // Taken off the screen by the teardown below,
+                            // which every other way out of the mode goes
+                            // through too. Unreachable: matched above.
+                            Pick::Cancel => {}
+                        }
+                        draw_popup(&mut stdout, &popup, &mut status, &mut restate).await?;
+                    }
+                    // Naming a group, at the prompt the rename and the search
+                    // already share. Enter creates it and puts the session in
+                    // it, necessarily: a group is a set of live sessions, so an
+                    // empty one cannot exist.
+                    Some(Action::GroupName(step)) => {
+                        match step {
+                            Rename::Open | Rename::Typed => {
+                                status.set_renaming(keys.wanted_group());
+                            }
+                            Rename::Cancel => status.set_renaming(None),
+                            Rename::Run => {
+                                let name = keys.wanted_group().unwrap_or_default();
+                                keys.stop_typing();
+                                status.set_renaming(None);
+                                let session = popup.as_ref().and_then(Popup::subject);
+                                if let Some(session) = session
+                                    && !name.trim().is_empty()
+                                {
+                                    status.set_popped(false);
+                                    writer.detach().await?;
+                                    return Ok(Outcome::Chose(Chose::NewGroup {
+                                        session,
+                                        name,
+                                    }));
+                                }
+                            }
+                        }
+                        restate = true;
+                        draw_popup(&mut stdout, &popup, &mut status, &mut restate).await?;
                     }
                     // A host from before the view existed answers for no
                     // window, so there is nothing to open. Said on the row
@@ -683,10 +931,29 @@ async fn pump(
                                 let wanted = keys.wanted_name().unwrap_or_default();
                                 keys.stop_typing();
                                 status.set_renaming(None);
-                                // Nothing is said here: the row keeps
-                                // naming the session what it is still
-                                // called until the host says otherwise.
-                                writer.rename(&wanted).await?;
+                                // The row the popup is on, which may not be the
+                                // session at the other end of this stream, and
+                                // `tag::RENAME` renames that one by design. So
+                                // it goes back to the caller, which can reach
+                                // the machine holding it.
+                                let session = popup.as_ref().and_then(Popup::subject);
+                                match session {
+                                    Some(session) if !wanted.trim().is_empty() => {
+                                        status.set_popped(false);
+                                        writer.detach().await?;
+                                        return Ok(Outcome::Chose(Chose::Named {
+                                            session,
+                                            to: wanted,
+                                        }));
+                                    }
+                                    // No popup, so this is a client driving the
+                                    // prompt without one: the session at the
+                                    // other end of the stream is the only one
+                                    // it could mean. Nothing is said here, the
+                                    // row keeps the old name until the host
+                                    // answers.
+                                    _ => writer.rename(&wanted).await?,
+                                }
                             }
                         }
                         // Through `settle` rather than written on the spot,
@@ -740,11 +1007,48 @@ async fn pump(
                     }
                     None => {}
                 }
+                // A mode that is no longer one of the popup's is a popup that
+                // has to come off the screen, whichever key did it. Keyed off
+                // the mode rather than off an action, because most of the ways
+                // out are not actions at all: an unbound key, a mistyped mode
+                // key, an Esc. The client has no copy of what the box covered,
+                // so the node's model is the only place it still exists and it
+                // is painted back the way a resize is, which is the same trip
+                // leaving the view already makes.
+                if popup.is_some() && !matches!(status.mode(), Mode::Control | Mode::Picking) {
+                    popup = None;
+                    status.set_popped(false);
+                    writer.resync().await?;
+                    owed += 1;
+                    restate = true;
+                    settle(&mut stdout, &output, &status, &mut pending, &mut restate).await?;
+                }
                 // The view has just opened or just closed, and the wheel
                 // goes with it: the terminal has the mouse back the moment
                 // there is a live session to select on.
                 let ours = wheel_is_ours(scrolling.is_some(), output.session_mouse());
                 own_the_wheel(&mut stdout, &mut keys, &mut wheel, ours).await?;
+                if chunk.is_empty() {
+                    break 'chunk;
+                }
+                }
+            }
+            // A listing has landed. Swapped in under the highlight rather than
+            // reopening the popup, so a session ending three rows up does not
+            // move what Enter would take.
+            landed = fresh.changed() => {
+                if landed.is_err() {
+                    continue;
+                }
+                rows = fresh.borrow_and_update().clone();
+                if let Some(up) = popup.as_mut() {
+                    if up.what == Showing::Sessions {
+                        up.picker.replace(rows.sessions.clone());
+                    } else {
+                        up.picker.replace(rows.groups.clone());
+                    }
+                    draw_popup(&mut stdout, &popup, &mut status, &mut restate).await?;
+                }
             }
             update = reader.next() => match update? {
                 Update::Output(bytes) => {

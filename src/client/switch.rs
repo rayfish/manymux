@@ -123,6 +123,13 @@ impl Cycle {
         self.focus.as_deref()
     }
 
+    /// Whether a session is inside the current narrowing. Asked after a focus
+    /// changes, to tell "you are already in this group" from "you have to be
+    /// moved into it".
+    pub fn holds(&self, at: &Located) -> bool {
+        self.visible().iter().any(|entry| &entry.at == at)
+    }
+
     /// The sessions a motion may land on: the group's when one is active, all
     /// of them otherwise.
     fn visible(&self) -> Vec<&Entry> {

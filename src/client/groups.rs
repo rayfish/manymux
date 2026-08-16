@@ -59,13 +59,13 @@ impl Member {
     }
 }
 
-#[derive(Serialize, Deserialize, Default, Debug)]
+#[derive(Serialize, Deserialize, Default, Debug, Clone)]
 struct Members {
     #[serde(default)]
     members: BTreeSet<Member>,
 }
 
-#[derive(Serialize, Deserialize, Default, Debug)]
+#[derive(Serialize, Deserialize, Default, Debug, Clone)]
 pub struct Groups {
     /// A `BTreeMap` so the file keeps a stable order and does not churn in a
     /// diff, the same reason [`crate::hosts::Hosts`] uses a `BTreeSet`.

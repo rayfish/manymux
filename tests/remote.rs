@@ -1664,6 +1664,7 @@ fn a_switch_key_that_lands_nowhere_asks_where_to_go_again() {
     let deadline = Instant::now() + Duration::from_secs(60);
     let mut alone = false;
     let mut again = false;
+    let mut taken = false;
     loop {
         if let Ok(chunk) = seen_rx.recv_timeout(Duration::from_millis(200)) {
             seen.push_str(&String::from_utf8_lossy(&chunk));
@@ -1678,12 +1679,22 @@ fn a_switch_key_that_lands_nowhere_asks_where_to_go_again() {
             (&pty).write_all(b"\x1d\t").unwrap();
             seen.clear();
         }
-        // A press that landed nowhere leaves control mode on, which the hints
-        // row is how you see: the next key is still the client's, so it is the
-        // same key on its own.
-        if alone && !again && seen.contains("tab next") {
+        // The popup is up and control mode is still on, so the next key is
+        // still the client's. The second press is what asks again, and the
+        // answer is what puts `second` in the list; then Enter takes it.
+        // The popup is up and control mode is still on, so the next key is
+        // still the client's. The second press is what asks again, and the
+        // answer is what puts `second` in the list.
+        if alone && !again && seen.contains("second") {
             again = true;
             (&pty).write_all(b"\t").unwrap();
+        }
+        // Then Enter takes the row the second press moved onto. A read of its
+        // own, the way a hand sends it: an action ends the chunk it was found
+        // in, here as everywhere else in this client.
+        if again && !taken && seen.contains("second") {
+            taken = true;
+            (&pty).write_all(b"\r").unwrap();
         }
         if again && watched(&world.ok("gpu-box", &["ls", "local"])) == ["second"] {
             break;
@@ -1750,29 +1761,30 @@ fn a_reconnect_hands_the_keyboard_back_to_the_session() {
     // What has happened so far, in the order it has to happen in. Everything
     // waits on the terminal saying so, because the whole test is about which
     // session the client is in when a key is pressed.
+    let mut opened = false;
     let mut hopped = false;
-    let mut nudged = Instant::now();
     let mut cut = false;
     let mut noticed = false;
     let mut back = false;
+    let mut again = false;
     loop {
         if let Ok(chunk) = seen_rx.recv_timeout(Duration::from_millis(200)) {
             seen.push_str(&String::from_utf8_lossy(&chunk));
         }
-        // Hop to the session next door, which is what turns control mode on.
-        if !hopped && seen.contains("gpu-box/one") {
-            hopped = true;
-            nudged = Instant::now();
-            (&pty).write_all(b"\x1d\t").unwrap();
-            seen.clear();
+        // Open the popup, which is what control mode looks like and what
+        // turns it on. The listing it asks for is still out at the other
+        // machine, so the session next door appears in the box a moment later.
+        if !opened && seen.contains("gpu-box/one") {
+            opened = true;
+            (&pty).write_all(b"\x1d").unwrap();
         }
-        // A hop lands nowhere while the listing behind the switch keys is
-        // still out at the other machine, and the client stays in control
-        // mode when it does. A bare tab is the same key again, and is a tab
-        // into the session if the hop has in fact landed.
-        if hopped && !cut && nudged.elapsed() > Duration::from_secs(3) {
-            nudged = Instant::now();
+        // There it is: move onto it and take it. Two reads, because an action
+        // ends the chunk it was found in.
+        if opened && !hopped && seen.contains("two") {
+            hopped = true;
             (&pty).write_all(b"\t").unwrap();
+            (&pty).write_all(b"\r").unwrap();
+            seen.clear();
         }
         // Landed. Now kill the agent bridging the client to gpu-box, the way
         // a closed lid kills the ssh under it. Not the node: the sessions
@@ -1791,17 +1803,26 @@ fn a_reconnect_hands_the_keyboard_back_to_the_session() {
             seen.clear();
         }
         // Back on the session, which is the mark row naming it again. The
-        // same two keys as the first hop, and they have to do the same thing.
+        // same keys as the first hop, and they have to do the same thing: a
+        // wait hands the keyboard back to the session, so `Ctrl-]` has to
+        // reach the client again rather than being typed into the shell.
         if noticed && !back && seen.contains("gpu-box/two") {
             back = true;
-            (&pty).write_all(b"\x1d\t").unwrap();
+            (&pty).write_all(b"\x1d").unwrap();
+            seen.clear();
         }
-        if back && watched(&world.ok("gpu-box", &["ls", "local"])) == ["one"] {
+        if back && !again && seen.contains("one") {
+            again = true;
+            (&pty).write_all(b"\t").unwrap();
+            (&pty).write_all(b"\r").unwrap();
+        }
+        if again && watched(&world.ok("gpu-box", &["ls", "local"])) == ["one"] {
             break;
         }
         assert!(
             Instant::now() < deadline,
-            "hopped={hopped} cut={cut} noticed={noticed} back={back}; \
+            "opened={opened} hopped={hopped} cut={cut} noticed={noticed} \
+             back={back} again={again}; \
              gpu-box says {:?} is attached; the terminal saw: {seen:?}",
             watched(&world.ok("gpu-box", &["ls", "local"])),
         );
