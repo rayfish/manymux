@@ -84,8 +84,11 @@ Three consequences run through the whole codebase and are worth keeping intact:
   of tests are there; `terminal.rs` is raw mode, escape sequences and the pump
   loop, and is desktop-only; `mod.rs` is the vocabulary they share plus
   `collect_until`, the way in for a caller with no terminal.
-  `src/client/status.rs` and `src/client/switch.rs` are terminal-free for the
-  same reason.
+  `src/client/status.rs`, `src/client/switch.rs`, `src/client/picker.rs` and
+  `src/client/groups.rs` are terminal-free for the same reason.
+- `src/client/groups.rs` is `groups.toml`, beside the host list: which sessions
+  you are treating as one piece of work, spanning machines. `src/client/picker.rs`
+  is the list control mode draws, filled with sessions or with groups.
 - `src/main.rs` is the CLI, and the only place that decides local versus remote:
   `open()` picks socket or ssh, `open_or_start()` is for commands that ask a
   machine to hold something new. Beside it and belonging to the binary rather
@@ -262,6 +265,62 @@ Three consequences run through the whole codebase and are worth keeping intact:
   lock is one operation going wrong, while poisoning makes every later one panic
   too, so a node whose bookkeeping panicked once would answer nothing about that
   session until somebody restarted it and took the other sessions with it.
+- **A group lives in the client, and is keyed on the pid and the start time.**
+  A node runs the build it started from until `mm restart`, and for a host
+  reached over ssh nothing says it is stale, so a group defined at the node
+  would work on some machines and silently not on others with no way to see
+  which. Defined in `groups.toml` it works the moment one binary is replaced,
+  against a node of any age: nothing about this touches the wire, which is the
+  acceptance test. What it costs is that a group made at your desk is not one
+  your phone sees, and that is the trade rather than an oversight. Membership is
+  `(host, pid, started)` and never the name, because a name is the one thing
+  about a session that moves: keyed by name, a rename would drop a session out
+  of its group, and one typed on another machine would not even be seen.
+  `started` is there for the one case the pid cannot answer, a machine that
+  rebooted and reused the number. Pruning considers only the hosts that
+  *answered* (`Listing::reached`), or a machine that is asleep loses its
+  sessions out of their groups while you are away from it. A group is a set of
+  live sessions and nothing else, so the last one ending takes the group with
+  it and `Cycle::refresh` clears a focus that has emptied: left narrowed to
+  nothing, every switch key would do nothing with no way to find out why.
+- **The popup is what control mode looks like, and the two verbs are told apart
+  by which list you came from.** `Ctrl-]` draws the sessions rather than
+  changing a mode nothing shows. Keys about a session act on the highlighted
+  row (Enter, `r`, `m`), keys about you act on the client (`d`, `n`, `[`, `/`,
+  `p`). Enter on a group narrows, `m` then Enter assigns, and no row in either
+  list means two things. `m` acting on the highlighted row rather than on the
+  session you are attached to is what makes grouping possible without hopping:
+  the picker already holds every session's `SessionInfo`, so assigning is a
+  local write and a redraw. `r` is the exception that proves the stream rule:
+  it may name a row that is *not* the session at the other end of the attach
+  stream, and `tag::RENAME` renames that one by design, so it goes back to
+  `main` as a `Request::Rename` to that row's machine.
+- **`Mode::Picking` is a mode because the session keys must not reach it**, and
+  `KeyFilter::after` takes the mode the key arrived in for the same reason: a
+  move that answered `Mode::Control` meant the key after one in the group list
+  was read with the session table, where `m` moves and `d` detaches. Both lists
+  read every key through `Encoded::byte`, and the arrows and Shift-Tab go in
+  `PICK_KEYS` and are matched whole, or the Esc each of them starts with is the
+  Esc that closes the box.
+- **A popup move is the one action you type through.** Everything else ends the
+  chunk it was found in, because nobody types through a detach or a switch. Two
+  writes a moment apart arrive as one read, so `tab` then `Enter` is a single
+  chunk and stopping at the move throws away the key that commits;
+  `Keystrokes::rest` hands the remainder back for moves alone and `pump` rounds
+  the chunk until it is used up.
+- **The popup asks the machines on every press and never waits on them.** It
+  opens on the snapshot the switch keys already keep and is corrected when the
+  answer lands, swapped in by `Picker::replace`, which holds the highlight on
+  the same `Row::id` rather than the same index: a session ending three rows up
+  would otherwise move what Enter takes. The row ids are the caller's, which is
+  what keeps hosts, groups and pids out of this half of the client, and the ids
+  the outcome carries belong to whichever listing was last drawn.
+- **A group is spelled `@name`, and no bare word is ever guessed at.**
+  `gpu-box/pi` cannot say whether `pi` is a session or a group, and trying one
+  then the other means making a group named after a session silently changes
+  where a command you have typed for weeks goes. `target.rs` has ruled against
+  that twice already, and `mm kill @pi` is refused for the same reason a bare
+  machine name is only accepted for going somewhere.
 - **A tab completion never starts a node, never installs anything, and never
   waits on ssh unless the word already names a machine** (`src/complete.rs`).
   All three are tested.
