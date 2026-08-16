@@ -22,7 +22,7 @@
 
 use anyhow::{Result, bail};
 use bytes::BytesMut;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -32,6 +32,26 @@ use tokio_util::codec::{Decoder, FramedRead};
 
 /// Frames larger than this are a protocol error, not an allocation.
 pub const MAX_FRAME: usize = 1 << 20;
+
+/// How often the host asks an attached client whether it is still there, and
+/// how long either half may go unheard before the other treats the connection
+/// as gone.
+///
+/// Nothing underneath notices a connection that died without closing. A lid
+/// closed on a wifi hop leaves sshd holding the session and ssh holding a
+/// socket to nowhere; sshd's own `ClientAlive` probing is off by default, and
+/// the kernel's TCP keepalive is two hours away. So the two halves say so to
+/// each other, and the pair of numbers lives here rather than beside either of
+/// them: a host pinging less often than the client's patience would have every
+/// idle session look like a dead one, which is a way for two builds to disagree
+/// that no amount of care at one end can catch.
+///
+/// The probe goes one way and the deadline goes both. The host learns a client
+/// vanished because the answers stop, and the client learns the host went
+/// because the questions do, which is the only thing that ever arrives on a
+/// session that has been quietly sitting at a prompt for an hour.
+pub const PING_EVERY: Duration = Duration::from_secs(15);
+pub const SILENT_FOR: Duration = Duration::from_secs(45);
 
 pub mod tag {
     pub const REQUEST: u8 = 0x01;

@@ -21,6 +21,7 @@ use tokio::net::UnixStream;
 use tokio::process::{Child, ChildStderr};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
+use tokio::time::Instant;
 
 use crate::proto::{
     self, FindRequest, FrameReader, HostedEvent, PasteInfo, Request, Response, Size, ViewRequest,
@@ -488,6 +489,7 @@ impl Attached {
             reader: SessionReader {
                 read: self.read,
                 _carrier: carrier.clone(),
+                deadline: None,
             },
             writer: SessionWriter {
                 write: self.write,
@@ -540,14 +542,43 @@ pub enum Update {
 pub struct SessionReader {
     read: Reader,
     _carrier: Option<Arc<Carrier>>,
+    /// When to stop believing the host is there, or `None` until it has pinged.
+    deadline: Option<Instant>,
 }
 
 impl SessionReader {
+    /// The next thing the host had to say, or that it has stopped saying
+    /// anything.
+    ///
+    /// The deadline is the client's half of the ping contract, and it is what
+    /// makes a dropped connection something the client finds out about. A
+    /// connection that closes is the easy case and arrives here as the end of
+    /// the stream; one that dies without closing sends nothing and stays open,
+    /// and there is no layer below this that will ever say so.
+    ///
+    /// It is a moment rather than a stretch of patience per call, because this
+    /// is polled from a `select!` that wakes on every keystroke: a deadline
+    /// starting again with each call would be pushed back for as long as
+    /// somebody keeps typing, which is exactly what a person does to a session
+    /// that has stopped answering. Cancelling the read is otherwise free, since
+    /// the frames are decoded through a reader that keeps what it had.
     pub async fn next(&mut self) -> Result<Update> {
         loop {
-            let Some(frame) = self.read.next().await? else {
+            let frame = match self.deadline {
+                Some(at) => match tokio::time::timeout_at(at, self.read.next()).await {
+                    Ok(frame) => frame?,
+                    Err(_) => return Ok(Update::Disconnected),
+                },
+                None => self.read.next().await?,
+            };
+            let Some(frame) = frame else {
                 return Ok(Update::Disconnected);
             };
+            // Anything at all counts as the host being there, so a session
+            // printing steadily is never given up on between two pings.
+            if self.deadline.is_some() {
+                self.deadline = Some(Instant::now() + proto::SILENT_FOR);
+            }
             return Ok(match frame.tag {
                 tag::DATA => Update::Output(frame.body),
                 tag::RESYNC => Update::Screen(frame.body),
@@ -555,7 +586,16 @@ impl SessionReader {
                 tag::VIEW => Update::View(proto::decode(&frame.body)?),
                 tag::FIND => Update::Found(proto::decode(&frame.body)?),
                 tag::RENAME => Update::Renamed(proto::decode(&frame.body)?),
-                tag::PING => Update::Ping,
+                // The first ping is what opts this connection into the deadline
+                // above, the mirror of the host holding only a client that has
+                // answered one. A node too old to ping says nothing for hours
+                // at a time quite legitimately, and giving up on it would make
+                // every idle session on an older machine look like a dead
+                // connection.
+                tag::PING => {
+                    self.deadline = Some(Instant::now() + proto::SILENT_FOR);
+                    Update::Ping
+                }
                 tag::EVENT => Update::Event(proto::decode(&frame.body)?),
                 tag::EXIT => Update::Exited(proto::decode(&frame.body)?),
                 // Unknown tags are skipped rather than fatal, so a newer host
@@ -644,5 +684,96 @@ impl SessionWriter {
     /// still there from one whose connection died without closing.
     pub async fn pong(&mut self) -> Result<()> {
         proto::write_frame(&mut self.write, tag::PONG, &[]).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+
+    /// Longer than any deadline here, so a reader that is waiting for the right
+    /// reason still finishes the test rather than hanging it.
+    const LONGER_THAN_ANY_WAIT: Duration = Duration::from_secs(600);
+
+    fn reading(stream: impl AsyncRead + Unpin + Send + 'static) -> SessionReader {
+        let read: Box<dyn AsyncRead + Unpin + Send> = Box::new(stream);
+        SessionReader {
+            read: FrameReader::new(read),
+            _carrier: None,
+            deadline: None,
+        }
+    }
+
+    /// The reason the client cannot simply wait for the stream to end. A lid
+    /// closed on a wifi hop kills the connection without closing it: ssh does
+    /// not notice, so the pipe stays open and silent, and a reader with no
+    /// deadline of its own sits there believing it is still attached while the
+    /// node has long since given up its half.
+    #[tokio::test(start_paused = true)]
+    async fn a_host_that_stops_answering_is_a_connection_that_went() {
+        let (mut host, client) = tokio::io::duplex(4096);
+        let mut reader = reading(client);
+
+        proto::write_frame(&mut host, tag::PING, &[]).await.unwrap();
+        assert!(matches!(reader.next().await.unwrap(), Update::Ping));
+
+        // Silence, with the stream still open: `host` is deliberately never
+        // dropped, because a connection that closed is the easy case.
+        let update = tokio::time::timeout(LONGER_THAN_ANY_WAIT, reader.next())
+            .await
+            .expect("a host that went quiet should be given up on, not waited on forever")
+            .unwrap();
+        assert!(matches!(update, Update::Disconnected), "got {update:?}");
+    }
+
+    /// The other half of the ping contract, and the reason the deadline is not
+    /// simply always on. A node too old to ping says nothing for hours at a
+    /// time quite legitimately, and dropping it would make every idle session
+    /// on an older machine look like a dead connection.
+    #[tokio::test(start_paused = true)]
+    async fn a_host_too_old_to_ask_is_never_given_up_on() {
+        let (mut host, client) = tokio::io::duplex(4096);
+        let mut reader = reading(client);
+
+        proto::write_frame(&mut host, tag::DATA, b"hello")
+            .await
+            .unwrap();
+        assert!(matches!(reader.next().await.unwrap(), Update::Output(_)));
+
+        let waited = tokio::time::timeout(LONGER_THAN_ANY_WAIT, reader.next()).await;
+        assert!(
+            waited.is_err(),
+            "a host that has never pinged is an older build, not a connection that went"
+        );
+    }
+
+    /// The deadline is a moment, not a stretch of patience per call. `next` is
+    /// polled from a `select!` that wakes on every keystroke, so a deadline
+    /// starting again with each call would be pushed back for as long as
+    /// somebody keeps typing, which is exactly what a person does to a session
+    /// that has stopped answering.
+    #[tokio::test(start_paused = true)]
+    async fn typing_at_a_host_that_went_does_not_put_off_giving_up() {
+        let (mut host, client) = tokio::io::duplex(4096);
+        let mut reader = reading(client);
+
+        proto::write_frame(&mut host, tag::PING, &[]).await.unwrap();
+        assert!(matches!(reader.next().await.unwrap(), Update::Ping));
+
+        // A keystroke every few seconds, each one cancelling the read the way
+        // the other arms of the pump's `select!` do.
+        for _ in 0..30 {
+            let cancelled = tokio::time::timeout(Duration::from_secs(3), reader.next()).await;
+            if let Ok(update) = cancelled {
+                assert!(
+                    matches!(update.unwrap(), Update::Disconnected),
+                    "the only thing this stream can produce is the giving up"
+                );
+                return;
+            }
+        }
+        panic!("a silent host outlasted 90 seconds of keystrokes");
     }
 }

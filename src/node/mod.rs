@@ -33,7 +33,8 @@ use crate::client::Stream;
 use crate::hosts::{Hosts, this_machine};
 use crate::notify::Notifier;
 use crate::proto::{
-    self, FindRequest, FrameReader, HostedEvent, Renamed, Request, Response, ViewRequest, tag,
+    self, FindRequest, FrameReader, HostedEvent, PING_EVERY, Renamed, Request, Response,
+    SILENT_FOR, ViewRequest, tag,
 };
 use peers::Peers;
 use registry::Registry;
@@ -44,16 +45,13 @@ const HOSTS_POLL: Duration = Duration::from_secs(2);
 /// Events buffered per subscriber before it is considered too far behind.
 const EVENT_BACKLOG: usize = 256;
 
-/// How often an attached client is asked whether it is still there, and how
-/// long it may go without answering before it is treated as gone.
-///
-/// Nothing underneath notices a client that vanished without detaching. A
-/// closed laptop leaves sshd holding the session, sshd's own `ClientAlive`
-/// probing is off by default, and the kernel's TCP keepalive is two hours away.
-/// Until something says otherwise the phantom keeps its say in the session's
-/// size and keeps counting as attached in `mm ls`.
-const PING_EVERY: Duration = Duration::from_secs(15);
-const SILENT_FOR: Duration = Duration::from_secs(45);
+// `PING_EVERY` and `SILENT_FOR` are imported rather than written here because
+// both halves of the stream work to the same pair. A client gives up on a host
+// that stops asking, so a node asking less often than the client's patience
+// would have every idle session look like a dead connection. What the deadline
+// buys on this side: until something says otherwise, a client that vanished
+// without detaching keeps its say in the session's size and keeps counting as
+// attached in `mm ls`.
 
 /// How long a session's process group gets between the hangup and being killed
 /// outright, on the way out.
