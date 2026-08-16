@@ -124,6 +124,22 @@ Three consequences run through the whole codebase and are worth keeping intact:
   and `nohup` has to keep meaning what it means. `GRACE` also has to stay inside
   the window `node::stop` gives the socket to go quiet, or `mm stop` reports a
   node still listening when it is only still saying goodbye.
+- **The daemon gives up on a machine it cannot reach, and a client is what
+  starts it again.** `peers::retry_after` is three growing delays and then
+  nothing: a retry is an ssh process, a name to resolve and a connect to wait
+  out, per watched machine, and a laptop that is asleep or on another network
+  stays that way for hours rather than seconds. What replaces the timer is
+  `Request::Reached`, sent by any client command that got an answer out of a
+  machine (`note_reached`, from `everywhere` and from a remote `mm new`), which
+  is the only way the node here can learn the network is different: a client
+  reaches another machine over its own ssh and the node never sees it. Two
+  things this rests on. A watcher that gave up is a *finished task still in the
+  map*, because a task cannot tidy its own entry away without racing whoever is
+  replacing it, so `Peers::watched` and `sync` both read `is_finished` and
+  nothing anywhere may go back to `contains_key`. And the attempt count resets
+  only for a subscription that lasted `peers::STEADY`, or a host that accepts
+  ssh and hangs up immediately would be retried every five seconds forever,
+  which is the thing this was written to stop.
 - **Every lock is a `std` one, taken through `lock::held`, and never held across
   an await.** The three go together. `std` is right because every critical
   section here is short and synchronous, and because `Attachment::drop` takes

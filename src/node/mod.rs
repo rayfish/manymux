@@ -123,10 +123,7 @@ impl Node {
     /// Watch exactly these machines, dropping any others.
     fn watch_peers(self: &Arc<Self>, wanted: &[String]) {
         for host in self.peers.sync(wanted) {
-            let node = Arc::clone(self);
-            let watching = host.clone();
-            let task = tokio::spawn(async move { node.watch(watching).await });
-            self.peers.watching(host, task);
+            self.watch_host(host);
         }
     }
 
@@ -152,14 +149,64 @@ impl Node {
         }
     }
 
-    /// Subscribe to one machine's events for as long as it is watched.
+    /// Subscribe to one machine's events until it stops being reachable.
+    ///
+    /// Returning is giving up, and nothing on a timer undoes it: a machine that
+    /// has been unreachable for a minute is usually one that will be
+    /// unreachable for the afternoon, and the daemon has no way to tell the
+    /// difference between a laptop lid and a dead host. What does know is the
+    /// person: reaching the machine from a client resubscribes it
+    /// ([`Node::reached`]).
     async fn watch(&self, host: String) {
+        let mut failed = 0;
         loop {
+            let since = Instant::now();
             if let Err(e) = self.subscribe_once(&host).await {
                 debug!(host = %host, "event subscription ended: {e:#}");
             }
-            tokio::time::sleep(peers::RESUBSCRIBE_DELAY).await;
+            // A subscription that stood up for a while is the machine having
+            // been reachable, whatever ended it, so the count starts over. One
+            // that took the connection and dropped it is not, or a host that
+            // accepts ssh and hangs up would be retried every five seconds for
+            // as long as it kept doing it.
+            if since.elapsed() >= peers::STEADY {
+                failed = 0;
+            }
+            failed += 1;
+            let Some(delay) = peers::retry_after(failed) else {
+                info!(host = %host, "unreachable, so no longer watching it: `mm ls` picks it back up");
+                return;
+            };
+            tokio::time::sleep(delay).await;
         }
+    }
+
+    /// Start watching a machine a client just reached, if it is one we watch
+    /// and gave up on.
+    ///
+    /// This is the other half of [`Node::watch`] giving up. The node cannot see
+    /// the client's ssh at all, since a client talks to a remote machine
+    /// itself rather than through the node here, so being told is the only way
+    /// it finds out that the network is worth trying again.
+    pub fn rewatch(self: &Arc<Self>, answered: &[String], watched: &[String]) {
+        for host in answered {
+            // Only machines on the list. A client reaches plenty of machines
+            // nobody asked to hear a bell from, and an ssh destination typed
+            // once is not `mm add`.
+            if !watched.contains(host) || self.peers.watched(host) {
+                continue;
+            }
+            info!(host = %host, "reachable again, subscribing to its events");
+            self.watch_host(host.clone());
+        }
+    }
+
+    /// Spawn the task that keeps one machine's subscription up.
+    fn watch_host(self: &Arc<Self>, host: String) {
+        let node = Arc::clone(self);
+        let watching = host.clone();
+        let task = tokio::spawn(async move { node.watch(watching).await });
+        self.peers.watching(host, task);
     }
 
     async fn subscribe_once(&self, host: &str) -> Result<()> {
@@ -240,7 +287,7 @@ impl Node {
 
     /// Serve one stream: a single request, then either a response or, for
     /// `Attach` and `Events`, something lasting until the client goes away.
-    pub async fn handle<R, W>(&self, read: R, mut write: W) -> Result<()>
+    pub async fn handle<R, W>(self: &Arc<Self>, read: R, mut write: W) -> Result<()>
     where
         R: AsyncRead + Unpin + Send,
         W: AsyncWrite + Unpin + Send,
@@ -318,6 +365,14 @@ impl Node {
                 std::process::exit(0);
             }
 
+            // Answered rather than acted on and forgotten, so a client can tell
+            // an old node (which refuses the request) from a new one.
+            Request::Reached { hosts } => {
+                let watched = Hosts::load().map(|hosts| hosts.names()).unwrap_or_default();
+                self.rewatch(&hosts, &watched);
+                reply(&mut write, Ok(Response::Ok)).await
+            }
+
             request => reply(&mut write, self.answer(request)).await,
         }
     }
@@ -335,7 +390,7 @@ impl Node {
                 version: crate::VERSION.to_string(),
                 build: self.build.clone(),
             }),
-            Request::Attach { .. } | Request::Events | Request::Stop => {
+            Request::Attach { .. } | Request::Events | Request::Stop | Request::Reached { .. } => {
                 unreachable!("handled before the single-response path")
             }
         }
@@ -820,6 +875,62 @@ pub async fn note_a_node_left_behind(socket: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn watching_nothing() -> Arc<Node> {
+        Node::start(Config {
+            peers: Vec::new(),
+            hosts_file: None,
+            notifications: false,
+        })
+        .await
+    }
+
+    /// `.invalid` can never resolve (RFC 2606), so the watcher this starts
+    /// fails at once and never touches the network.
+    const NOWHERE: &str = "nowhere.invalid";
+
+    /// The other half of a watcher giving up: without this, a machine that came
+    /// back would stay unwatched until the node was restarted, and its bells
+    /// would go nowhere while `mm ls` was plainly reaching it.
+    #[tokio::test]
+    async fn a_machine_a_client_reached_is_watched_again() {
+        let node = watching_nothing().await;
+        assert!(!node.peers.watched(NOWHERE));
+
+        node.rewatch(&[NOWHERE.to_string()], &[NOWHERE.to_string()]);
+
+        assert!(
+            node.peers.watched(NOWHERE),
+            "a watched machine that answered a client is subscribed to again"
+        );
+    }
+
+    /// A client reaches machines nobody asked to be notified about: an ssh
+    /// destination typed once is not `mm add`.
+    #[tokio::test]
+    async fn a_machine_that_is_not_watched_is_not_watched_now_either() {
+        let node = watching_nothing().await;
+
+        node.rewatch(&[NOWHERE.to_string()], &[]);
+
+        assert!(!node.peers.watched(NOWHERE));
+        assert!(node.peers.is_empty(), "and nothing was started for it");
+    }
+
+    /// Re-arming has to leave a live subscription alone, or every `mm ls` would
+    /// drop the events feed on the floor and build a new one.
+    #[tokio::test]
+    async fn a_machine_already_watched_is_left_alone() {
+        let node = watching_nothing().await;
+        let watched = [NOWHERE.to_string()];
+        node.rewatch(&watched, &watched);
+        let first = node.peers.names();
+
+        node.rewatch(&watched, &watched);
+
+        assert_eq!(node.peers.names(), first);
+        assert_eq!(node.peers.len(), 1, "one watcher, not two");
+    }
 
     #[test]
     fn a_paste_is_only_written_once_it_is_whole() {

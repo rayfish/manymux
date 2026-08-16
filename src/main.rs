@@ -327,6 +327,11 @@ async fn run(cli: Cli) -> Result<u8> {
             if remember(&host)? {
                 eprintln!("mm: now watching {host}; `mm rm {host}` to stop");
             }
+            // A session started somewhere is proof that machine is up, and this
+            // is the one path to it that never lists anything.
+            if !is_this_machine(&host) {
+                note_reached(&socket, vec![host.clone()]).await;
+            }
             if detached {
                 println!("{}", qualified(&host, &name));
                 return Ok(OK);
@@ -712,6 +717,10 @@ async fn open_or_start(socket: &Path, host: &str) -> Result<Stream> {
 struct Listing {
     sessions: Vec<HostedSession>,
     unreachable: Vec<Unreachable>,
+    /// Every machine that answered, whether or not it had anything to say. Kept
+    /// separately because a machine with no sessions on it puts nothing in
+    /// `sessions` and is every bit as reached as a busy one.
+    answered: Vec<String>,
 }
 
 /// A machine that could not be reached, and why.
@@ -724,6 +733,7 @@ impl Listing {
     fn add(&mut self, host: &str, found: Result<Vec<SessionInfo>>) {
         match found {
             Ok(sessions) => {
+                self.answered.push(host.to_string());
                 self.sessions
                     .extend(sessions.into_iter().map(|session| HostedSession {
                         host: host.to_string(),
@@ -735,6 +745,44 @@ impl Listing {
                 error: format!("{e:#}"),
             }),
         }
+    }
+
+    /// The machines worth telling this machine's node about, so it can
+    /// resubscribe to any it had given up on. This machine is not one of them:
+    /// it is never watched, being where the watching happens.
+    fn reached(&self) -> Vec<String> {
+        let mut hosts: Vec<String> = self
+            .answered
+            .iter()
+            .filter(|host| !is_this_machine(host))
+            .cloned()
+            .collect();
+        hosts.sort();
+        hosts.dedup();
+        hosts
+    }
+}
+
+/// Tell this machine's node which machines just answered, so it can subscribe
+/// again to any it had given up on.
+///
+/// Nothing here is worth failing a command over, so every way it can go wrong
+/// is the same as it going right: no node running here (the common case on a
+/// machine used only to reach others), a node too old to know the request, or a
+/// socket that has gone. There is nothing to do about any of them, and nothing
+/// the person who typed `mm ls` would want said about it.
+async fn note_reached(socket: &Path, hosts: Vec<String>) {
+    if hosts.is_empty() {
+        return;
+    }
+    let told = async {
+        Stream::local(socket)
+            .await?
+            .call(&Request::Reached { hosts })
+            .await
+    };
+    if let Err(e) = told.await {
+        debug!("could not tell the node what answered: {e:#}");
     }
 }
 
@@ -752,8 +800,11 @@ async fn list(socket: &Path, host: Option<String>) -> Result<u8> {
                 &name
             };
             listing.add(label, sessions_on(socket, &name).await);
+            note_reached(socket, listing.reached()).await;
             listing
         }
+        // Reports for itself, since it is also what an attach and a bare
+        // target go through.
         None => everywhere(socket).await?,
     };
 
@@ -828,6 +879,7 @@ async fn everywhere(socket: &Path) -> Result<Listing> {
             Err(e) => debug!("a host query did not finish: {e}"),
         }
     }
+    note_reached(socket, listing.reached()).await;
 
     // By machine first, which is what makes each one's sessions a run in the
     // table and in the switch keys' cycle, then oldest first within it.
@@ -1425,6 +1477,36 @@ fn names_the_directory(rc: &str, dir: &Path, home: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn session(name: &str) -> SessionInfo {
+        SessionInfo {
+            name: name.to_string(),
+            title: name.to_string(),
+            command: "zsh".into(),
+            pid: 1,
+            size: manymux::proto::Size::new(80, 24),
+            attached: 0,
+            idle: 0,
+            bells: 0,
+            started: std::time::SystemTime::UNIX_EPOCH,
+        }
+    }
+
+    /// What the node is told answered, so it can resubscribe to a machine it
+    /// gave up on. A machine that did not answer must not be in it, or giving
+    /// up would be undone by the very listing that proved the host is still
+    /// unreachable.
+    #[test]
+    fn only_the_machines_that_answered_count_as_reached() {
+        let mut listing = Listing::default();
+        listing.add(this_machine(), Ok(vec![session("here")]));
+        listing.add("gpu-box", Ok(vec![session("build")]));
+        // Reachable and idle. Nothing in the table, and still reached.
+        listing.add("api", Ok(Vec::new()));
+        listing.add("asleep", Err(anyhow!("no answer in 5s")));
+
+        assert_eq!(listing.reached(), vec!["api", "gpu-box"]);
+    }
 
     fn xdg(shell: Shell) -> Location {
         completion_path_in(

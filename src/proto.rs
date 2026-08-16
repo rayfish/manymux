@@ -230,6 +230,18 @@ pub enum Request {
     /// sessions. What lets a bell reach you when nothing is attached to see it.
     Events,
 
+    /// These machines answered a client just now, so a node that gave up
+    /// watching them can start again.
+    ///
+    /// The node cannot work this out for itself: a client reaches another
+    /// machine over its own ssh, and the node here never sees it. Being told is
+    /// what replaces retrying on a timer. A node too old to decode this answers
+    /// with an error, and the client throws it away, having nothing to do with
+    /// the answer either way.
+    Reached {
+        hosts: Vec<String>,
+    },
+
     /// Stop the node. Every session it owns dies with it, so this is for
     /// picking up a new binary, and the caller is expected to have asked.
     Stop,
@@ -840,6 +852,27 @@ mod tests {
             panic!("an attach should decode as one");
         };
         assert_eq!(history, 0, "a client that cannot ask for history gets none");
+    }
+
+    /// Why a new request can go anywhere in the enum, which is the whole of
+    /// "adding a `Request` variant is safe". Encoded by index instead, adding
+    /// one in the middle would renumber every variant after it, and a fleet
+    /// updated one machine at a time would have old clients asking for
+    /// something else entirely by the same number.
+    #[test]
+    fn a_request_is_encoded_by_the_name_of_its_variant() {
+        let encoded = encode(&Request::Version).unwrap();
+        let text = String::from_utf8_lossy(&encoded);
+        assert!(text.contains("Version"), "encoded as {text:?}");
+
+        let added_later = encode(&Request::Reached {
+            hosts: vec!["gpu-box".into()],
+        })
+        .unwrap();
+        let Request::Reached { hosts } = decode(&added_later).unwrap() else {
+            panic!("a reached should decode as one");
+        };
+        assert_eq!(hosts, ["gpu-box"]);
     }
 
     #[test]
