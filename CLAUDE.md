@@ -78,12 +78,20 @@ Three consequences run through the whole codebase and are worth keeping intact:
   out: the desktop tools above, and `escape()`, the OSC 9 an attached client
   hands to the terminal it is sitting in. `src/settings.rs` is `settings.toml`
   beside the host list, which so far holds only `notify`.
-- `src/client/attach.rs` drives a real terminal (raw mode, focus/control modes,
-  the `Ctrl-]` prefix). `src/client/status.rs` and `src/client/switch.rs` are
-  deliberately terminal-free so they can be tested as string and list handling.
+- `src/client/attach/` is the attached client, in three parts split by what
+  needs a terminal. `keys.rs` turns bytes off stdin into what the client was
+  asked for and touches no terminal at all, which is why most of its 1100 lines
+  of tests are there; `terminal.rs` is raw mode, escape sequences and the pump
+  loop, and is desktop-only; `mod.rs` is the vocabulary they share plus
+  `collect_until`, the way in for a caller with no terminal.
+  `src/client/status.rs` and `src/client/switch.rs` are terminal-free for the
+  same reason.
 - `src/main.rs` is the CLI, and the only place that decides local versus remote:
   `open()` picks socket or ssh, `open_or_start()` is for commands that ask a
-  machine to hold something new.
+  machine to hold something new. Beside it and belonging to the binary rather
+  than the library: `src/target.rs` turns a typed word into a machine and a
+  session, `src/complete.rs` answers a tab, `src/completions.rs` works out
+  where a shell reads its completion script from.
 
 ### Rules that are easy to break
 
