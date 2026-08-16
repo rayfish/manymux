@@ -260,6 +260,7 @@ async fn history_reaches_a_client_that_asks_before_the_screen_does() {
             name: name.clone(),
             size: Size::new(80, 24),
             history: 0,
+            read_only: false,
         })
         .await
         .unwrap();
@@ -271,6 +272,7 @@ async fn history_reaches_a_client_that_asks_before_the_screen_does() {
             name: name.clone(),
             size: Size::new(80, 24),
             history: 100,
+            read_only: false,
         })
         .await
         .unwrap();
@@ -312,6 +314,7 @@ async fn a_client_can_scroll_back_through_what_a_session_printed() {
             name: name.clone(),
             size: Size::new(80, 24),
             history: 0,
+            read_only: false,
         })
         .await
         .unwrap();
@@ -364,6 +367,7 @@ async fn a_client_can_search_everything_a_session_printed() {
             name: name.clone(),
             size: Size::new(80, 24),
             history: 0,
+            read_only: false,
         })
         .await
         .unwrap();
@@ -406,6 +410,7 @@ async fn a_client_that_asks_for_no_history_is_sent_none() {
             name: name.clone(),
             size: Size::new(80, 24),
             history: 0,
+            read_only: false,
         })
         .await
         .unwrap();
@@ -428,6 +433,7 @@ async fn a_client_that_stops_answering_is_detached() {
         name: name.clone(),
         size: Size::new(80, 24),
         history: 0,
+        read_only: false,
     };
     assert!(matches!(
         client.send(&attach).await.unwrap(),
@@ -475,6 +481,7 @@ async fn a_client_that_never_answers_is_left_alone() {
         name: name.clone(),
         size: Size::new(80, 24),
         history: 0,
+        read_only: false,
     };
     assert!(matches!(
         client.send(&attach).await.unwrap(),
@@ -507,6 +514,7 @@ async fn detaching_leaves_the_child_running_and_reattach_repaints() {
         name: name.clone(),
         size: Size::new(80, 24),
         history: 0,
+        read_only: false,
     };
     assert!(matches!(
         client.send(&attach).await.unwrap(),
@@ -564,6 +572,7 @@ async fn a_client_watching_a_session_end_is_told_what_it_ended_with() {
                 name: name.clone(),
                 size: Size::new(80, 24),
                 history: 0,
+                read_only: false,
             })
             .await
             .unwrap(),
@@ -604,6 +613,7 @@ async fn asking_for_the_screen_again_gets_the_screen_again() {
                 name: name.clone(),
                 size: Size::new(80, 24),
                 history: 0,
+                read_only: false,
             })
             .await
             .unwrap(),
@@ -652,6 +662,7 @@ async fn output_produced_while_detached_is_on_the_screen_when_you_return() {
         name: name.clone(),
         size: Size::new(80, 24),
         history: 0,
+        read_only: false,
     };
     assert!(matches!(
         client.send(&attach).await.unwrap(),
@@ -674,6 +685,7 @@ async fn resizing_a_client_resizes_the_child_terminal() {
         name: name.clone(),
         size: Size::new(80, 24),
         history: 0,
+        read_only: false,
     };
     assert!(matches!(
         client.send(&attach).await.unwrap(),
@@ -805,6 +817,7 @@ async fn two_clients_share_one_session_at_the_smaller_size() {
             name: name.clone(),
             size: Size::new(120, 40),
             history: 0,
+            read_only: false,
         })
         .await
         .unwrap()
@@ -819,6 +832,7 @@ async fn two_clients_share_one_session_at_the_smaller_size() {
             name: name.clone(),
             size: Size::new(80, 50),
             history: 0,
+            read_only: false,
         })
         .await
         .unwrap()
@@ -865,6 +879,7 @@ async fn reattaching_restores_mouse_reporting_and_the_title() {
         name: name.clone(),
         size: Size::new(80, 24),
         history: 0,
+        read_only: false,
     };
     assert!(matches!(
         client.send(&attach).await.unwrap(),
@@ -912,6 +927,7 @@ async fn a_pasted_image_is_written_on_the_host_and_its_path_typed_into_the_sessi
         name: name.clone(),
         size: Size::new(200, 24),
         history: 0,
+        read_only: false,
     };
     let Response::Attached { paste, .. } = client.send(&attach).await.unwrap() else {
         panic!("attach failed");
@@ -977,6 +993,7 @@ async fn a_bell_next_door_reaches_an_attached_client_and_this_ones_does_not() {
         name: name.clone(),
         size: Size::new(80, 24),
         history: 0,
+        read_only: false,
     };
     assert!(matches!(
         client.send(&attach).await.unwrap(),
@@ -1022,6 +1039,7 @@ async fn a_name_typed_at_an_attached_client_renames_the_session() {
             name: name.clone(),
             size: Size::new(80, 24),
             history: 0,
+            read_only: false,
         })
         .await
         .unwrap();
@@ -1075,6 +1093,7 @@ async fn a_rename_that_cannot_be_done_is_refused_with_a_reason() {
             name: name.clone(),
             size: Size::new(80, 24),
             history: 0,
+            read_only: false,
         })
         .await
         .unwrap();
@@ -1094,4 +1113,98 @@ async fn a_rename_that_cannot_be_done_is_refused_with_a_reason() {
 
     node.registry.kill(&name).unwrap();
     node.registry.kill(&next_door.name()).unwrap();
+}
+
+/// What makes `mm view` worth having: the node drops a watching client's input
+/// rather than trusting the client not to send any. A promise enforced at the
+/// far end is one you can point at a session somebody else is working in.
+#[tokio::test]
+async fn a_watching_client_cannot_type_into_the_session() {
+    let node = test_node().await;
+    let Spawned { name, .. } = spawn_session(&node, &["/bin/cat"]).await;
+
+    let mut watcher = Client::connect(&node);
+    let Response::Attached { read_only, .. } = watcher
+        .send(&Request::Attach {
+            name: name.clone(),
+            size: Size::new(80, 24),
+            history: 0,
+            read_only: true,
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("watching should attach");
+    };
+    assert!(read_only, "the host says it understood the request");
+
+    // `cat` echoes whatever reaches it, so anything coming back is input that
+    // got through.
+    watcher.type_line("typed by a watcher").await.unwrap();
+
+    let mut seen = String::new();
+    let echoed = tokio::time::timeout(Duration::from_millis(500), async {
+        loop {
+            let frame = watcher.next_frame().await.expect("a frame");
+            if frame.tag == tag::DATA {
+                seen.push_str(&String::from_utf8_lossy(&frame.body));
+                if seen.contains("typed by a watcher") {
+                    return;
+                }
+            }
+        }
+    })
+    .await;
+    assert!(
+        echoed.is_err(),
+        "a watcher's keystrokes reached the session: {seen:?}"
+    );
+}
+
+/// The other half of watching: a viewer's window is nothing to do with the
+/// session's geometry, or looking in from a phone would reflow the screen of
+/// whoever is working in it.
+#[tokio::test]
+async fn a_watching_client_does_not_shrink_the_session() {
+    let node = test_node().await;
+    let Spawned { name, .. } = spawn_session(&node, &["/bin/cat"]).await;
+
+    let mut working = Client::connect(&node);
+    let Response::Attached { size, .. } = working
+        .send(&Request::Attach {
+            name: name.clone(),
+            size: Size::new(120, 40),
+            history: 0,
+            read_only: false,
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("attaching should attach");
+    };
+    assert_eq!(size, Size::new(120, 40));
+
+    let mut watcher = Client::connect(&node);
+    let Response::Attached { size, .. } = watcher
+        .send(&Request::Attach {
+            name: name.clone(),
+            size: Size::new(40, 10),
+            history: 0,
+            read_only: true,
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("watching should attach");
+    };
+    assert_eq!(
+        size,
+        Size::new(120, 40),
+        "the viewer is shown the size the session is at, not the one it asked for"
+    );
+    assert_eq!(
+        node.registry.get(&name).expect("the session").info().size,
+        Size::new(120, 40),
+        "and the session keeps the geometry the working client gave it"
+    );
 }

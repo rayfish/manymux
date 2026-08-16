@@ -390,11 +390,22 @@ impl Stream {
     ///
     /// `history` is how many lines of the session's scrollback to ask for,
     /// which arrive as [`Update::History`] before the repaint.
-    pub async fn attach(mut self, name: &str, size: Size, history: u32) -> Result<Attached> {
+    /// `read_only` watches without typing. A host that does not answer that it
+    /// understood the request is refused rather than attached to: the whole
+    /// point is the promise, and an older node would hand back an ordinary
+    /// session with a live keyboard.
+    pub async fn attach(
+        mut self,
+        name: &str,
+        size: Size,
+        history: u32,
+        read_only: bool,
+    ) -> Result<Attached> {
         let request = Request::Attach {
             name: name.to_string(),
             size,
             history,
+            read_only,
         };
         match self.request(&request).await? {
             Response::Attached {
@@ -403,16 +414,26 @@ impl Stream {
                 scroll,
                 rename,
                 events,
-            } => Ok(Attached {
-                read: self.read,
-                write: self.write,
-                carrier: self.carrier,
-                size,
-                paste,
-                scroll,
-                rename,
-                events,
-            }),
+                read_only: watching,
+            } => {
+                if read_only && !watching {
+                    bail!(
+                        "that machine runs a manymux too old to watch a session without \
+                         typing into it; `mm update` there, or attach instead"
+                    );
+                }
+                Ok(Attached {
+                    read: self.read,
+                    write: self.write,
+                    carrier: self.carrier,
+                    size,
+                    paste,
+                    scroll,
+                    rename,
+                    events,
+                    read_only,
+                })
+            }
             Response::Error(message) => bail!(message),
             other => bail!("unexpected response to attach: {other:?}"),
         }
@@ -445,6 +466,10 @@ pub struct Attached {
     /// client from the build that did say so is still out there reading it, and
     /// a node that stopped answering would have it call every new host old.
     pub events: bool,
+    /// Whether this client only watches. The node enforces it, so this is what
+    /// the client draws and which keys it bothers offering, not what makes it
+    /// safe.
+    pub read_only: bool,
 }
 
 /// The two halves of an attached session, so output can be read while input is

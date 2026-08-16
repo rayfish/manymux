@@ -132,6 +132,22 @@ Three consequences run through the whole codebase and are worth keeping intact:
   and `nohup` has to keep meaning what it means. `GRACE` also has to stay inside
   the window `node::stop` gives the socket to go quiet, or `mm stop` reports a
   node still listening when it is only still saying goodbye.
+- **Watching is enforced at the node, and answered for.** `mm view` is an
+  attach with `read_only`, and what makes it worth pointing at a session
+  somebody else is working in is that `Attachment::send_input` drops the bytes
+  rather than the client agreeing not to send them. Two consequences that are
+  choices rather than accidents. A viewer is left out of `State::clients`, so
+  somebody looking on from a phone cannot reflow the screen of whoever is
+  typing, and it is shown the geometry the session is already at. But it does
+  count in `host_clients`, the opposite way, because a person watching is a
+  person present and a bell should reach the terminal they are sitting at.
+  The answering half is the rule that shapes it: `read_only` is a defaulted
+  field, so a node too old to know it decodes the request without it and hands
+  back an ordinary attach with a live keyboard. That is why
+  `Response::Attached` carries a `read_only` flag and why the client refuses a
+  host that does not set it, rather than treating it as a key that does nothing
+  the way `paste`, `scroll` and `rename` are treated. A promise nobody made
+  must not be assumed.
 - **A connection that drops is waited out, not reported.** The session is still
   running on a machine that never noticed the client left, so putting somebody
   back at their shell over a wifi hop throws away the one thing the project is

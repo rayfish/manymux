@@ -277,7 +277,11 @@ pub async fn run(
     target: &str,
     mode: Mode,
 ) -> Result<(Outcome, Option<String>)> {
+    let watching = session.read_only;
     let mut status = Status::new(target);
+    if watching {
+        status = status.watching();
+    }
     status.set_mode(mode);
     let screen = held.screen;
     let on_alternate = Arc::clone(&held.on_alternate);
@@ -419,6 +423,7 @@ async fn pump(
     screen: Screen,
     on_alternate: Arc<AtomicBool>,
 ) -> Result<Outcome> {
+    let watching = session.read_only;
     let takes_pastes = session.paste;
     let scrolls = session.scroll;
     let renames = session.rename;
@@ -468,7 +473,11 @@ async fn pump(
                     return Ok(Outcome::Detached);
                 };
                 let keystrokes = keys.filter(&typed);
-                if !keystrokes.forward.is_empty() {
+                // A viewer's keystrokes go nowhere. The node drops them anyway,
+                // which is what makes the promise worth anything; not sending
+                // them keeps a held key off the wire and out of the session's
+                // idle time, which is drawn in every listing.
+                if !keystrokes.forward.is_empty() && !watching {
                     writer.send_input(&keystrokes.forward).await?;
                 }
                 if keystrokes.mode != status.mode() {
@@ -595,14 +604,16 @@ async fn pump(
                     // it: the name lives in the key filter until Enter, so
                     // all there is to do until then is keep the row saying
                     // what is in it.
-                    Some(Action::Rename(_)) if !renames => {
+                    Some(Action::Rename(_)) if watching || !renames => {
                         keys.stop_typing();
                         keys.set_mode(Mode::Focus);
                         status.set_mode(Mode::Focus);
                         status.set_renaming(None);
-                        status.set_notice(
-                            "this host is too old to rename from here; `mm rename` instead",
-                        );
+                        status.set_notice(if watching {
+                            "watching, so nothing here can be renamed"
+                        } else {
+                            "this host is too old to rename from here; `mm rename` instead"
+                        });
                         notice_until = Some(tokio::time::Instant::now() + NOTICE_FOR);
                         restate = true;
                         settle(&mut stdout, &output, &status, &mut pending, &mut restate)
@@ -631,6 +642,13 @@ async fn pump(
                         restate = true;
                         settle(&mut stdout, &output, &status, &mut pending, &mut restate)
                             .await?;
+                    }
+                    // Nothing to hand a session this client cannot type into,
+                    // and the clipboard is not worth reading to find that out.
+                    Some(Action::Paste) if watching => {
+                        status.set_notice("watching, so there is nothing to paste into");
+                        notice_until = Some(tokio::time::Instant::now() + NOTICE_FOR);
+                        restate = true;
                     }
                     Some(Action::Paste) => {
                         // The key as the terminal spelled it, since it goes

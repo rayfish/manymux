@@ -114,6 +114,21 @@ enum Command {
         #[arg(long, value_enum)]
         screen: Option<Screen>,
     },
+    /// Watch a session without being able to type into it.
+    ///
+    /// The same screen an attach gives you, scrolling and search included, with
+    /// the keyboard going nowhere: the node drops this client's input rather
+    /// than trusting it, so this is safe to point at a session somebody else is
+    /// working in. It stays out of the size negotiation too, so watching from a
+    /// narrow window cannot shrink the screen they are looking at.
+    #[command(visible_alias = "v")]
+    View {
+        #[arg(add = complete::targets())]
+        target: String,
+        /// Whose screen to paint on, as for `attach`.
+        #[arg(long, value_enum)]
+        screen: Option<Screen>,
+    },
     /// Send SIGHUP to a session's process group.
     #[command(visible_alias = "k")]
     Kill {
@@ -342,12 +357,24 @@ async fn run(cli: Cli) -> Result<u8> {
                 println!("{}", qualified(&host, &name));
                 return Ok(OK);
             }
-            do_attach(&socket, &host, &name, chosen(screen)).await
+            do_attach(&socket, &host, &name, chosen(screen), false).await
         }
 
         Command::Attach { target, screen } => {
             let target = locate(&socket, &target, Bare::OrMachine).await?;
-            do_attach(&socket, &target.host, &target.session, chosen(screen)).await
+            do_attach(
+                &socket,
+                &target.host,
+                &target.session,
+                chosen(screen),
+                false,
+            )
+            .await
+        }
+
+        Command::View { target, screen } => {
+            let target = locate(&socket, &target, Bare::OrMachine).await?;
+            do_attach(&socket, &target.host, &target.session, chosen(screen), true).await
         }
 
         Command::Kill { target } => {
@@ -778,7 +805,13 @@ fn chosen(screen: Option<Screen>) -> Screen {
 ///
 /// The terminal is held across the whole run rather than per session, so a hop
 /// is a repaint and not a trip through the whole setup and back.
-async fn do_attach(socket: &Path, host: &str, name: &str, screen: Screen) -> Result<u8> {
+async fn do_attach(
+    socket: &Path,
+    host: &str,
+    name: &str,
+    screen: Screen,
+    watching: bool,
+) -> Result<u8> {
     let mut cycle = Cycle::new(Located::new(host, name));
     // Asked for before the first attach, so the first switch key has something
     // to go on.
@@ -803,7 +836,7 @@ async fn do_attach(socket: &Path, host: &str, name: &str, screen: Screen) -> Res
         } else {
             0
         };
-        let session = match attach_to(socket, &target, history).await {
+        let session = match attach_to(socket, &target, history, watching).await {
             Ok(session) => session,
             // A hop onto a session that has gone since the listing. Stay where
             // you were and put the dead entry out of the cycle, rather than
@@ -899,10 +932,15 @@ async fn wait_to_reconnect(held: &mut attach::Held, where_: &str, lost: &mut u32
 }
 
 /// Open a stream to wherever a session is, and attach to it.
-async fn attach_to(socket: &Path, target: &Located, history: u32) -> Result<Attached> {
+async fn attach_to(
+    socket: &Path,
+    target: &Located,
+    history: u32,
+    watching: bool,
+) -> Result<Attached> {
     let stream = open(socket, &target.host).await?;
     stream
-        .attach(&target.session, attach::session_size(), history)
+        .attach(&target.session, attach::session_size(), history, watching)
         .await
 }
 

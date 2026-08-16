@@ -321,18 +321,20 @@ impl Node {
                 name,
                 size,
                 history,
+                read_only,
             } => {
                 let Some(session) = self.registry.get(&name) else {
                     return reply(&mut write, Err(anyhow::anyhow!("no session named {name}")))
                         .await;
                 };
-                let attached = session.attach(size, history);
+                let attached = session.attach(size, history, read_only);
                 let response = Response::Attached {
                     size: attached.size,
                     paste: true,
                     scroll: true,
                     rename: true,
                     events: true,
+                    read_only: true,
                 };
                 proto::write_msg(&mut write, tag::RESPONSE, &response).await?;
                 pump_attachment(
@@ -523,11 +525,18 @@ where
                     // client is showing the old name until it hears otherwise.
                     tag::RENAME => {
                         let wanted: String = proto::decode(&frame.body)?;
-                        let answer = match registry.rename(&attachment.name(), &wanted) {
-                            Ok(name) => Renamed::Name(name),
-                            Err(e) => {
-                                debug!("refusing a rename from an attached client: {e:#}");
-                                Renamed::Refused(format!("{e:#}"))
+                        // A viewer is refused with a reason rather than
+                        // ignored, this being the one thing it can ask for that
+                        // has an answer to give back.
+                        let answer = if attachment.read_only() {
+                            Renamed::Refused("watching, so nothing here can be changed".into())
+                        } else {
+                            match registry.rename(&attachment.name(), &wanted) {
+                                Ok(name) => Renamed::Name(name),
+                                Err(e) => {
+                                    debug!("refusing a rename from an attached client: {e:#}");
+                                    Renamed::Refused(format!("{e:#}"))
+                                }
                             }
                         };
                         proto::write_msg(&mut write, tag::RENAME, &answer).await?;

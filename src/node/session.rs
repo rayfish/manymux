@@ -138,15 +138,34 @@ pub struct Attached {
 pub struct Attachment {
     session: Arc<Session>,
     id: u64,
+    /// A client watching rather than working. Enforced here rather than trusted
+    /// to the client: the promise is what makes `mm view` safe to point at a
+    /// session somebody else is working in.
+    read_only: bool,
 }
 
 impl Attachment {
     pub fn send_input(&self, bytes: Vec<u8>) {
+        if self.read_only {
+            return;
+        }
         let _ = self.session.input_tx.send(Input::Bytes(bytes));
     }
 
+    /// Whether this client only watches, for the paths that answer rather than
+    /// ignore: a rename is refused with a reason.
+    pub fn read_only(&self) -> bool {
+        self.read_only
+    }
+
     /// Update this client's requested size and renegotiate the effective size.
+    ///
+    /// A viewer never joins that negotiation, so its window changing size is
+    /// nothing to do with the session's geometry.
     pub fn resize(&self, size: Size) {
+        if self.read_only {
+            return;
+        }
         let mut state = held(&self.session.state);
         state.clients.insert(self.id, size.sane());
         let effective = state.effective_size();
@@ -365,16 +384,27 @@ impl Session {
     }
 
     /// Attach a client.
+    ///
     /// `history` is how many lines from behind the screen the client wants,
     /// which is zero for one painting on a screen of its own.
-    pub fn attach(self: &Arc<Self>, size: Size, history: u32) -> Attached {
+    ///
+    /// `read_only` is a client watching rather than working. It stays out of
+    /// the size negotiation below, because somebody looking on from a phone
+    /// must not shrink the screen of whoever is typing, and it takes whatever
+    /// geometry the session is already at. It still counts in `host_clients`,
+    /// which is deliberate and the other way round: a person watching a session
+    /// is a person present, and a bell should reach the terminal they are
+    /// sitting at rather than a desktop notifier somewhere else.
+    pub fn attach(self: &Arc<Self>, size: Size, history: u32, read_only: bool) -> Attached {
         let id = self.next_client.fetch_add(1, Ordering::Relaxed);
         self.host_clients.fetch_add(1, Ordering::Relaxed);
         let mut state = held(&self.state);
 
         // Subscribe under the lock so the repaint and the stream meet exactly.
         let output = self.output_tx.subscribe();
-        state.clients.insert(id, size.sane());
+        if !read_only {
+            state.clients.insert(id, size.sane());
+        }
         let effective = state.effective_size();
         self.apply_size(&mut state, effective);
         state.bells = 0;
@@ -386,6 +416,7 @@ impl Session {
             attachment: Attachment {
                 session: Arc::clone(self),
                 id,
+                read_only,
             },
             history,
             repaint,

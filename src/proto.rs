@@ -225,6 +225,17 @@ pub enum Request {
         /// decodes and attaches with no history at all.
         #[serde(default)]
         history: u32,
+        /// Watch without typing: the node drops this client's input rather than
+        /// trusting it not to send any, and leaves it out of the size
+        /// negotiation so somebody looking on from a phone cannot shrink the
+        /// screen of whoever is working.
+        ///
+        /// Defaulted like the rest, which is exactly why the answer carries a
+        /// flag of its own: a node too old to know this field decodes the
+        /// request without it and hands back a session that can be typed into.
+        /// Silently. See `Response::Attached { read_only }`.
+        #[serde(default)]
+        read_only: bool,
     },
     /// Turn this stream into a feed of everything happening in this machine's
     /// sessions. What lets a bell reach you when nothing is attached to see it.
@@ -297,6 +308,17 @@ pub enum Response {
         /// it call every new host old.
         #[serde(default)]
         events: bool,
+        /// Whether this host understood the request to watch without typing.
+        ///
+        /// The one flag a client must not ignore. The others answer for a key
+        /// that would otherwise do nothing, which is a nuisance; this one
+        /// answers for a promise. A node too old to know `read_only` decodes
+        /// the request without it and attaches an ordinary client, so a viewer
+        /// that assumed it worked would be sitting at a live keyboard believing
+        /// it could not type. `false` here means the host cannot do it, and
+        /// `mm view` refuses rather than pretending.
+        #[serde(default)]
+        read_only: bool,
     },
     /// What the node is running. `build` is the SHA-256 of the binary it
     /// started from, taken at startup: the version alone cannot answer the
@@ -629,10 +651,15 @@ mod tests {
             scroll,
             rename,
             events,
+            read_only,
         } = decoded
         else {
             panic!("an old answer should still be an attach");
         };
+        assert!(
+            !read_only,
+            "nor promise to drop the input of a client that only watches"
+        );
         assert_eq!(size, Size::new(80, 24));
         assert!(!paste, "a host that never heard of pasting cannot take one");
         assert!(
@@ -653,6 +680,7 @@ mod tests {
             scroll: true,
             rename: true,
             events: true,
+            read_only: true,
         })
         .unwrap();
         assert!(matches!(decode::<Old>(&new).unwrap(), Old::Attached { .. }));
@@ -835,6 +863,7 @@ mod tests {
             name: "api".into(),
             size: Size::new(80, 24),
             history: 1000,
+            read_only: false,
         })
         .unwrap();
         let Old::Attach { name, size } = decode(&asked).unwrap();

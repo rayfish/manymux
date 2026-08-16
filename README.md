@@ -93,6 +93,23 @@ gpu-box/long is not answering, reconnecting in 4s
 It keeps trying for about two minutes. `Ctrl-]` then `d` gives up early, and so
 does `Ctrl-C`.
 
+## Watching without typing
+
+```bash
+mm view gpu-box/claude
+```
+
+The same screen an attach gives you, scrolling and search included, with the
+keyboard going nowhere. The mark is a hollow grey `◦` rather than a green dot,
+so a window you cannot type into never looks like one you can.
+
+The node is what enforces it, not the client, so this is safe to point at a
+session somebody else is working in: their keystrokes are theirs, and yours
+are dropped at the far end rather than on trust. A viewer also stays out of the
+size negotiation, so watching from a phone or a narrow split cannot reflow the
+screen of whoever is working. `mm view` on a machine running a manymux too old
+to promise any of that says so instead of attaching.
+
 Copying out of a session is your terminal's job, over OSC 52, which manymux
 passes through untouched. Most terminals refuse clipboard writes until you say
 otherwise (iTerm2: Settings > General > Selection; Terminal.app has no OSC 52 at
@@ -374,6 +391,7 @@ actually running the same thing.
 mm ls [host]                         list sessions, everywhere or on one machine
 mm new [host] [-n name] [-d] [cmd]   start a session (default: your login shell)
 mm attach <target> [--screen ...]    attach; Ctrl-] then tab switches, d detaches
+mm view <target> [--screen ...]      watch a session without typing into it
 mm kill <target>                     SIGHUP a session's process group
 mm rename <target> <name>            give a session a different name
 mm add <host> | hosts | rm <host>    which machines to list and watch
@@ -384,7 +402,8 @@ mm service install|uninstall         run the node at boot
 mm completions [shell] [--install]   tab completion, with your session names in it
 ```
 
-The ones you type often have a short form: `l`, `n`, `a`, `k`, `r`, `h`, `up`.
+The ones you type often have a short form: `l`, `n`, `a`, `v`, `k`, `r`, `h`,
+`up`.
 
 Two more exist and are hidden from `mm --help`, because nothing types them:
 `mm daemon` is the node itself, run by the service unit or by a client that

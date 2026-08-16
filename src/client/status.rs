@@ -93,6 +93,10 @@ pub struct Status {
     prompt: Option<(&'static str, String)>,
     /// What the last search found, once it has been run.
     searching: Option<String>,
+    /// Whether this client is only watching. True for the whole attach rather
+    /// than a mode that comes and goes, which is why it is a field here and not
+    /// one of [`Mode`]: nothing you press changes it.
+    watching: bool,
 }
 
 impl Status {
@@ -104,7 +108,15 @@ impl Status {
             scrolled: None,
             prompt: None,
             searching: None,
+            watching: false,
         }
+    }
+
+    /// Say that this client cannot type into the session, for as long as it is
+    /// attached.
+    pub fn watching(mut self) -> Self {
+        self.watching = true;
+        self
     }
 
     /// Show a different session name, for the one thing that changes it while
@@ -210,9 +222,14 @@ impl Status {
         // showing the session as it stands, is never on without you seeing it.
         // Which mode is beside it already: control puts the hints there, the
         // view how far back it is, a rename what is being typed.
-        let dot = match self.mode {
-            Mode::Focus => style::green("●"),
-            Mode::Control | Mode::Scroll | Mode::Rename => style::amber("○"),
+        // Watching outranks the mode, because it is the one thing on this row
+        // that no keystroke changes: the keyboard reaches nothing whatever mode
+        // it is in, and a green dot promising otherwise would be a lie for the
+        // whole attach rather than for a moment.
+        let dot = match (self.watching, self.mode) {
+            (true, _) => style::faint("◦"),
+            (false, Mode::Focus) => style::green("●"),
+            (false, Mode::Control | Mode::Scroll | Mode::Rename) => style::amber("○"),
         };
         let name = style::faint(&self.target);
         format!(
