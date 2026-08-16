@@ -8,6 +8,7 @@
 
 pub mod attach;
 pub mod groups;
+pub mod picker;
 pub mod screen;
 pub mod scroll;
 pub mod status;
