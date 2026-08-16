@@ -223,29 +223,48 @@ pub enum Wait {
 /// terminal where it left it, and one that does not at least says why nothing
 /// is happening. Nothing is written to the session, there being none.
 ///
+/// The row is counted down rather than written once and left, and it says so
+/// again when the delay is up and the attempt is out there
+/// ([`status::waiting_notice`]). Both are for the same reason: this is the
+/// only part of the screen that can move while a connection is gone, so a row
+/// that does not is a client that has died as far as anybody can tell. And the
+/// attempt is the half worth saying out loud, since reaching a machine that is
+/// off takes as long as ssh takes to give up on it, which is most of the time
+/// spent here on the wait that matters.
+///
+/// `lost_for` is how long ago the connection went, which the caller keeps
+/// because it outlives one delay.
+///
 /// The keyboard is still read, because a wait nobody can leave is worse than
 /// no wait at all. The mode key's detach is one way out, so that leaving a
 /// session that is gone is the same gesture as leaving one that is there. The
 /// other is Ctrl-C, which has nowhere else to go while there is no session to
 /// send it to, and which is what a hand reaches for anyway.
-pub async fn waiting(held: &mut Held, target: &str, delay: Duration) -> Wait {
-    let mut status = Status::new(target);
+pub async fn waiting(held: &mut Held, target: &str, delay: Duration, lost_for: Duration) -> Wait {
+    let mut status = Status::new(target).lost();
+    let began = tokio::time::Instant::now();
+    let until = began + delay;
     // Which session this is about is already on the mark two columns to the
-    // right, so the room goes on the way out instead: the waiting no longer
-    // ends by itself, and a row that does not say how to leave is a row that
-    // has to. A notice too long for the terminal is not shown at all.
-    status.set_notice(&format!(
-        "not answering, retrying in {}s  ctrl-c to stop",
-        delay.as_secs().max(1)
-    ));
-    write_now(&status.repaint(terminal_size()));
+    // right, so the room goes to the wait itself: it no longer ends by
+    // itself, and a row that does not say how to leave is a row that has to.
+    // A notice too long for the terminal is not shown at all.
+    let mut say = |left: Option<Duration>| {
+        status.set_notice(&status::waiting_notice(lost_for + began.elapsed(), left));
+        write_now(&status.repaint(terminal_size()));
+    };
 
     let mut keys = KeyFilter::new(crate::client::attach::prefix());
-    let until = tokio::time::sleep(delay);
-    tokio::pin!(until);
+    // The first tick is now, which is what paints the row on the way in.
+    let mut tick = tokio::time::interval(TICK);
+    let sleep = tokio::time::sleep_until(until);
+    tokio::pin!(sleep);
     loop {
         tokio::select! {
-            () = &mut until => return Wait::Retry,
+            () = &mut sleep => {
+                say(None);
+                return Wait::Retry;
+            }
+            _ = tick.tick() => say(Some(until.saturating_duration_since(tokio::time::Instant::now()))),
             typed = held.keys.recv() => match typed {
                 // The keyboard reader is gone, which is stdin at end of file.
                 // Nobody is going to press anything.
@@ -262,6 +281,10 @@ pub async fn waiting(held: &mut Held, target: &str, delay: Duration) -> Wait {
         }
     }
 }
+
+/// How often the row counts down. A second, because that is the unit it is
+/// counting in.
+const TICK: Duration = Duration::from_secs(1);
 
 /// Ctrl-C, which while nothing is attached is a way out rather than a signal
 /// to pass on.

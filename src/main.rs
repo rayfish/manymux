@@ -3,7 +3,7 @@ use std::fmt::{self, Display, Formatter};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand, ValueHint};
@@ -825,10 +825,10 @@ async fn do_attach(
     // scrollback. Without this, walking the list with the switch key would dump
     // a thousand lines on every hop.
     let mut seeded: HashSet<String> = HashSet::new();
-    // Failed attempts to get back to a session the connection dropped under.
-    // Zero whenever the last attach worked, which is what makes a connection
-    // that comes back and goes again start over at the quick delays.
-    let mut lost = 0;
+    // The connection this run is without, while it is without one. Cleared
+    // whenever an attach works, which is what makes one that comes back and
+    // goes again start over at the quick delays and at a fresh clock.
+    let mut lost: Option<Lost> = None;
     // Whether this run has been attached to anything yet, which is what tells
     // a command that did not work from a connection that went.
     let mut attached = false;
@@ -879,7 +879,7 @@ async fn do_attach(
             // to the one the command line named.
             Err(e) if attached => {
                 debug!("could not get back to {where_}: {e:#}");
-                match wait_to_reconnect(&mut held, &where_, &mut lost).await {
+                match wait_to_reconnect(&mut held, &where_, &mut lost, &mut mode).await {
                     Wait::Retry => continue,
                     Wait::GiveUp => break (Outcome::Disconnected, where_),
                 }
@@ -889,7 +889,7 @@ async fn do_attach(
             // session nobody is running says so and gives the shell back.
             Err(e) => return Err(e.into()),
         };
-        lost = 0;
+        lost = None;
         attached = true;
         // Landed, so the exit that sent us here is somebody else's news now:
         // the next one to report is whatever this session does.
@@ -911,9 +911,20 @@ async fn do_attach(
                 if let Some(next) = cycle.step(motion) {
                     cycle.moved_to(next);
                     hopped = true;
-                    if listing.is_none() {
-                        listing = Some(spawn_listing(socket));
-                    }
+                }
+                // Whether or not it landed, and this is the whole reason the
+                // key that goes nowhere is worth anything: a press is the only
+                // thing that ever asks, so one that found nowhere to go and did
+                // not ask again was the last one that ever asked. A machine
+                // with one session on it when the run started stayed a machine
+                // with one session on it as far as these keys were concerned,
+                // however many were started beside it afterwards. Asked rather
+                // than waited on, because the press before it has already
+                // waited: `take_listing` gives a listing half a second and no
+                // more, since a keystroke must not sit on a machine that is
+                // asleep.
+                if listing.is_none() {
+                    listing = Some(spawn_listing(socket));
                 }
                 // Nowhere to go is not a reason to drop back to focus: the next
                 // key carries on from wherever this one left you.
@@ -971,10 +982,12 @@ async fn do_attach(
             // or a closed lid is not a reason to put somebody back at their
             // shell. The screen stays exactly as the session painted it and
             // the mark row says what is happening.
-            Outcome::Disconnected => match wait_to_reconnect(&mut held, &where_, &mut lost).await {
-                Wait::Retry => continue,
-                Wait::GiveUp => break (Outcome::Disconnected, where_),
-            },
+            Outcome::Disconnected => {
+                match wait_to_reconnect(&mut held, &where_, &mut lost, &mut mode).await {
+                    Wait::Retry => continue,
+                    Wait::GiveUp => break (Outcome::Disconnected, where_),
+                }
+            }
             outcome => break (outcome, where_),
         }
     };
@@ -1005,9 +1018,52 @@ async fn do_attach(
 /// There is no attempt that ends the waiting: [`Wait::GiveUp`] comes from
 /// somebody pressing something, which is the only thing that should end it.
 /// The session is still running on a machine that never noticed anybody left.
-async fn wait_to_reconnect(held: &mut attach::Held, where_: &str, lost: &mut u32) -> Wait {
-    *lost = lost.saturating_add(1);
-    attach::waiting(held, where_, attach::reconnect_after(*lost)).await
+///
+/// The keyboard goes back to the session's here, and this is the only place
+/// that does it. Control mode belongs to the hop that turned it on, which is
+/// why it survives a reattach at all: what follows a hop is usually another
+/// one. A wait is not a hop. Nobody pressed anything, the row has been saying
+/// the connection went rather than what the keys do, and somebody coming back
+/// to it presses the mode key meaning to *enter* control mode; pressed while
+/// it is already on, that key leaves it, and the `tab` after it lands in their
+/// shell. Left set, the mode outlived every hop for the rest of the run,
+/// because nothing else here ever turned it off again.
+async fn wait_to_reconnect(
+    held: &mut attach::Held,
+    where_: &str,
+    lost: &mut Option<Lost>,
+    mode: &mut Mode,
+) -> Wait {
+    *mode = Mode::Focus;
+    let lost = lost.get_or_insert_with(Lost::new);
+    lost.attempts = lost.attempts.saturating_add(1);
+    attach::waiting(
+        held,
+        where_,
+        attach::reconnect_after(lost.attempts),
+        lost.since.elapsed(),
+    )
+    .await
+}
+
+/// A connection that has gone, for as long as it is gone.
+struct Lost {
+    /// When it went, which is what the mark row counts from: a screen somebody
+    /// walks up to says how long it has been sitting there, and after the first
+    /// few tries the delay says nothing about that at all.
+    since: Instant,
+    /// Attempts to get back that have failed, which is what the delay grows
+    /// with.
+    attempts: u32,
+}
+
+impl Lost {
+    fn new() -> Self {
+        Self {
+            since: Instant::now(),
+            attempts: 0,
+        }
+    }
 }
 
 /// Why a session could not be attached to.

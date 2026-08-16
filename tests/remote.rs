@@ -311,6 +311,18 @@ fn rows(table: &str) -> Vec<String> {
         .collect()
 }
 
+/// The sessions in a `mm ls` table that have a client attached, by the column
+/// that says so. The dot is the whole of it: it appears nowhere else on the
+/// row, and the hollow one beside it means nobody is there.
+fn watched(table: &str) -> Vec<String> {
+    table
+        .lines()
+        .skip(1)
+        .filter(|line| line.contains('●'))
+        .filter_map(|line| line.split_whitespace().next().map(str::to_string))
+        .collect()
+}
+
 /// Just the session names, with any `host/` prefix taken off.
 fn sessions(table: &str) -> Vec<String> {
     rows(table)
@@ -1588,6 +1600,199 @@ fn an_attach_whose_connection_drops_comes_back_by_itself() {
         world.ok("gpu-box", &["ls", "local"]).contains("long"),
         "the session outlives the connection to it"
     );
+
+    let _ = client.kill();
+    let _ = client.wait();
+}
+
+/// A switch key that finds nowhere to go has to ask where to go next time.
+///
+/// The listing behind the keys is only ever asked for by a press, so a press
+/// that landed nowhere and did not ask was the last one that ever asked: a
+/// machine with one session on it when the run started stayed a machine with
+/// one session on it, however many were started beside it afterwards.
+#[test]
+fn a_switch_key_that_lands_nowhere_asks_where_to_go_again() {
+    use std::io::{Read, Write};
+    use std::os::fd::AsFd;
+    use std::sync::mpsc;
+
+    let world = World::new("switch-asks-again");
+    world.ok("laptop", &["add", "gpu-box"]);
+    world.ok("gpu-box", &["new", "-d", "-n", "only", "sleep", "300"]);
+    world.wait_for_node("gpu-box");
+
+    let (pty, pts) = pty_process::blocking::open().unwrap();
+    pty.resize(pty_process::Size::new(24, 80)).unwrap();
+    let mut client = pty_process::blocking::Command::new(MM)
+        .arg("--socket")
+        .arg(world.socket("laptop"))
+        .args(["attach", "gpu-box/only"])
+        .env("MM_CONFIG_DIR", world.dir.join("laptop"))
+        .env("MM_SSH", world.ssh_stub())
+        .env("MM_LOG", "manymux=warn")
+        .env("TERM", "xterm-256color")
+        .spawn(pts)
+        .expect("attaching on a terminal");
+
+    let (seen_tx, seen_rx) = mpsc::channel();
+    let mut reading =
+        unsafe { pty_process::blocking::Pty::from_fd(pty.as_fd().try_clone_to_owned().unwrap()) };
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 1024];
+        while let Ok(read @ 1..) = reading.read(&mut buf) {
+            if seen_tx.send(buf[..read].to_vec()).is_err() {
+                return;
+            }
+        }
+    });
+
+    let mut seen = String::new();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut alone = false;
+    let mut again = false;
+    loop {
+        if let Ok(chunk) = seen_rx.recv_timeout(Duration::from_millis(200)) {
+            seen.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        // The second session is started before the key is pressed, so that the
+        // listing the press asks for is one that has it. What the press cannot
+        // use is the listing taken when the run started, which is the one with
+        // nowhere to go in it.
+        if !alone && seen.contains("gpu-box/only") {
+            alone = true;
+            world.ok("gpu-box", &["new", "-d", "-n", "second", "sleep", "300"]);
+            (&pty).write_all(b"\x1d\t").unwrap();
+            seen.clear();
+        }
+        // A press that landed nowhere leaves control mode on, which the hints
+        // row is how you see: the next key is still the client's, so it is the
+        // same key on its own.
+        if alone && !again && seen.contains("tab next") {
+            again = true;
+            (&pty).write_all(b"\t").unwrap();
+        }
+        if again && watched(&world.ok("gpu-box", &["ls", "local"])) == ["second"] {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "alone={alone} again={again}; gpu-box says {:?} is attached; the terminal saw: {seen:?}",
+            watched(&world.ok("gpu-box", &["ls", "local"])),
+        );
+    }
+
+    let _ = client.kill();
+    let _ = client.wait();
+}
+
+/// The keyboard a reconnect hands back is the session's, and it is the client
+/// that has to hand it back.
+///
+/// Control mode is turned on by a hop, so the key after one carries on walking
+/// without a mode key of its own, and nothing else here ever turns it off
+/// again. A connection waited out and reattached came back with it still on,
+/// where `Ctrl-]` *leaves* control mode and the `tab` behind it is a tab into
+/// somebody's shell: the session next door had become unreachable by the one
+/// gesture that reaches it, for the rest of the run.
+#[test]
+fn a_reconnect_hands_the_keyboard_back_to_the_session() {
+    use std::io::{Read, Write};
+    use std::os::fd::AsFd;
+    use std::sync::mpsc;
+
+    let world = World::new("reconnect-keys");
+    world.ok("laptop", &["add", "gpu-box"]);
+    world.ok("gpu-box", &["new", "-d", "-n", "one", "sleep", "300"]);
+    world.ok("gpu-box", &["new", "-d", "-n", "two", "sleep", "300"]);
+    world.wait_for_node("gpu-box");
+
+    let (pty, pts) = pty_process::blocking::open().unwrap();
+    pty.resize(pty_process::Size::new(24, 80)).unwrap();
+    let mut client = pty_process::blocking::Command::new(MM)
+        .arg("--socket")
+        .arg(world.socket("laptop"))
+        .args(["attach", "gpu-box/one"])
+        .env("MM_CONFIG_DIR", world.dir.join("laptop"))
+        .env("MM_SSH", world.ssh_stub())
+        .env("MM_LOG", "manymux=warn")
+        .env("TERM", "xterm-256color")
+        .spawn(pts)
+        .expect("attaching on a terminal");
+
+    let (seen_tx, seen_rx) = mpsc::channel();
+    let mut reading =
+        unsafe { pty_process::blocking::Pty::from_fd(pty.as_fd().try_clone_to_owned().unwrap()) };
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 1024];
+        while let Ok(read @ 1..) = reading.read(&mut buf) {
+            if seen_tx.send(buf[..read].to_vec()).is_err() {
+                return;
+            }
+        }
+    });
+
+    let mut seen = String::new();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    // What has happened so far, in the order it has to happen in. Everything
+    // waits on the terminal saying so, because the whole test is about which
+    // session the client is in when a key is pressed.
+    let mut hopped = false;
+    let mut nudged = Instant::now();
+    let mut cut = false;
+    let mut noticed = false;
+    let mut back = false;
+    loop {
+        if let Ok(chunk) = seen_rx.recv_timeout(Duration::from_millis(200)) {
+            seen.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        // Hop to the session next door, which is what turns control mode on.
+        if !hopped && seen.contains("gpu-box/one") {
+            hopped = true;
+            nudged = Instant::now();
+            (&pty).write_all(b"\x1d\t").unwrap();
+            seen.clear();
+        }
+        // A hop lands nowhere while the listing behind the switch keys is
+        // still out at the other machine, and the client stays in control
+        // mode when it does. A bare tab is the same key again, and is a tab
+        // into the session if the hop has in fact landed.
+        if hopped && !cut && nudged.elapsed() > Duration::from_secs(3) {
+            nudged = Instant::now();
+            (&pty).write_all(b"\t").unwrap();
+        }
+        // Landed. Now kill the agent bridging the client to gpu-box, the way
+        // a closed lid kills the ssh under it. Not the node: the sessions
+        // have to outlive it.
+        if hopped && !cut && seen.contains("gpu-box/two") {
+            cut = true;
+            let pattern = format!("{}/gpu-box.sock agent", world.dir.display());
+            Command::new("pkill")
+                .args(["-f", &pattern])
+                .status()
+                .expect("running pkill");
+        }
+        // The row says the connection went, and says it is still trying.
+        if cut && !noticed && seen.contains("reconnecting") {
+            noticed = true;
+            seen.clear();
+        }
+        // Back on the session, which is the mark row naming it again. The
+        // same two keys as the first hop, and they have to do the same thing.
+        if noticed && !back && seen.contains("gpu-box/two") {
+            back = true;
+            (&pty).write_all(b"\x1d\t").unwrap();
+        }
+        if back && watched(&world.ok("gpu-box", &["ls", "local"])) == ["one"] {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "hopped={hopped} cut={cut} noticed={noticed} back={back}; \
+             gpu-box says {:?} is attached; the terminal saw: {seen:?}",
+            watched(&world.ok("gpu-box", &["ls", "local"])),
+        );
+    }
 
     let _ = client.kill();
     let _ = client.wait();

@@ -183,6 +183,29 @@ Three consequences run through the whole codebase and are worth keeping intact:
   run has been attached to anything at all (`attached` in `do_attach`); only
   the first attach can fail outright, because that one is a command that did
   not work rather than a connection that went.
+- **The row is the only thing that moves while a connection is gone, so it has
+  to.** Everything above it is the session as it was painted before the drop,
+  which is the point; a row written once and left there is a client that has
+  died as far as anybody watching can tell. So `terminal::waiting` counts the
+  delay down a second at a time and says `reconnecting` while an attempt is
+  out (`status::waiting_notice`), and the attempt is the half worth naming:
+  reaching a machine that is off takes as long as ssh takes to give up on it,
+  which is most of the time spent here. It says how long ago the connection
+  went as well as how long until the next try, because after the first few
+  tries the delay is flat and says nothing about how long you have been away.
+  `main::Lost` holds both, being older than one delay. And the dot goes hollow,
+  since the one thing it means is who has the keyboard and while this is up
+  nobody does.
+- **A wait hands the keyboard back to the session, and it is the only thing
+  that does.** Control mode survives a reattach on purpose: a hop sets it so
+  the key after one carries on walking (`mode` in `do_attach`). Nothing else
+  turns it off, so a reconnect that kept it came back with the client holding
+  the keyboard, where `Ctrl-]` *leaves* control mode and the `tab` behind it is
+  a tab into somebody's shell: after one hop and one closed lid, the session
+  next door was unreachable by the gesture that reaches it for the rest of the
+  run. `wait_to_reconnect` clears it, which covers both ways in, and the reason
+  is that a wait is not a hop: nobody pressed anything, and the row has been
+  saying the connection went rather than what the keys do.
 - **What a reconnect goes back to is the session you were in, and telling that
   from a stale listing is what `main::Missed` is for.** The loop reattaches to
   `cycle.current()`, which a hop has already moved, so a drop a moment after
@@ -453,6 +476,16 @@ Three consequences run through the whole codebase and are worth keeping intact:
   because `SystemTime` has no `Default`, and a host too old to send it ties all
   of its sessions at the epoch, where the name tiebreak leaves them in the order
   they have always been in.
+- **A press is the only thing that asks the machines what they are running, so
+  every press has to ask.** Nothing refreshes the switch keys' listing on a
+  timer: it is asked for after a key is pressed and read by the next one
+  (`spawn_listing`, `take_listing`), which is what keeps a keystroke off a
+  machine that is asleep, `take_listing` giving one half a second and then
+  going with what it already knows. The trap is the press that lands nowhere.
+  Asking only after a landing meant the first fruitless press was the last one
+  that ever asked, so a machine with one session on it when the run started
+  stayed that way as far as these keys were concerned, whatever was started
+  beside it afterwards. The listing is asked for either way.
 
 ### Tests
 

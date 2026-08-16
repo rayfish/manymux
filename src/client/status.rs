@@ -9,6 +9,8 @@
 //! Everything here is string building and parsing, kept out of
 //! [`super::attach`] so it can be tested without a terminal.
 
+use std::time::Duration;
+
 use crate::client::attach::Mode;
 use crate::proto::Size;
 use crate::settings::Screen;
@@ -98,6 +100,10 @@ pub struct Status {
     /// than a mode that comes and goes, which is why it is a field here and not
     /// one of [`Mode`]: nothing you press changes it.
     watching: bool,
+    /// Whether there is a session at the other end of this at all. False while
+    /// a lost connection is being waited out, which is the one time the screen
+    /// shows a session that nothing is reaching.
+    lost: bool,
 }
 
 impl Status {
@@ -110,6 +116,7 @@ impl Status {
             prompt: None,
             searching: None,
             watching: false,
+            lost: false,
         }
     }
 
@@ -117,6 +124,13 @@ impl Status {
     /// attached.
     pub fn watching(mut self) -> Self {
         self.watching = true;
+        self
+    }
+
+    /// Say that there is no session at the other end: the screen is showing one
+    /// as it was last painted, and the connection to it has gone.
+    pub fn lost(mut self) -> Self {
+        self.lost = true;
         self
     }
 
@@ -234,10 +248,14 @@ impl Status {
         // that no keystroke changes: the keyboard reaches nothing whatever mode
         // it is in, and a green dot promising otherwise would be a lie for the
         // whole attach rather than for a moment.
-        let dot = match (self.watching, self.mode) {
-            (true, _) => style::faint("◦"),
-            (false, Mode::Focus) => style::green("●"),
-            (false, Mode::Control | Mode::Scroll | Mode::Rename) => style::amber("○"),
+        // A lost connection outranks both, for the same reason and more of it:
+        // there is no session at the other end to have the keyboard, and the
+        // screen above the row is showing one that cannot say so itself.
+        let dot = match (self.lost, self.watching, self.mode) {
+            (true, _, _) => style::amber("○"),
+            (false, true, _) => style::faint("◦"),
+            (false, false, Mode::Focus) => style::green("●"),
+            (false, false, Mode::Control | Mode::Scroll | Mode::Rename) => style::amber("○"),
         };
         let name = style::faint(&self.target);
         format!(
@@ -332,6 +350,53 @@ fn hints(room: u16) -> String {
 /// How many columns a piece of unstyled text takes.
 fn columns(text: &str) -> u16 {
     u16::try_from(text.chars().count()).unwrap_or(u16::MAX)
+}
+
+/// What the row says while a lost connection is being waited out.
+///
+/// A screen somebody walks back up to has to answer three things before they
+/// touch anything: how long it has been sitting there, whether anything is
+/// still being tried, and how to stop. Which session it is about is not among
+/// them, being on the mark two columns to the right.
+///
+/// `retry_in` is how long until the next attempt, or `None` while one is out
+/// there. Saying which is the difference between a client that is working and
+/// one that has stopped, and from the screen alone they look identical: the
+/// session is painted exactly as it was either way.
+pub fn waiting_notice(lost_for: Duration, retry_in: Option<Duration>) -> String {
+    let trying = match retry_in {
+        // Never zero: a row that counts down to nothing and sits there reads as
+        // a clock that has stopped rather than one about to tick over.
+        Some(left) => format!("retrying in {}s", ceiling(left).max(1)),
+        None => "reconnecting".to_string(),
+    };
+    format!(
+        "lost {} ago{HINT_GAP}{trying}{HINT_GAP}ctrl-c to stop",
+        roughly(lost_for)
+    )
+}
+
+/// Seconds, rounded up, so a countdown starts at the delay it was given rather
+/// than a second short of it.
+fn ceiling(left: Duration) -> u64 {
+    left.as_secs() + u64::from(left.subsec_nanos() > 0)
+}
+
+/// How long ago something was, in the one unit somebody reads it in.
+///
+/// Coarser as it grows, because that is how the answer is used: seconds tell
+/// you to wait, minutes tell you to go and do something else, and nobody who
+/// has been away for an hour cares which second of it this is.
+fn roughly(elapsed: Duration) -> String {
+    let seconds = elapsed.as_secs();
+    if seconds < 60 {
+        return format!("{seconds}s");
+    }
+    let minutes = seconds / 60;
+    if minutes < 60 {
+        return format!("{minutes}m");
+    }
+    format!("{}h {}m", minutes / 60, minutes % 60)
 }
 
 /// The scrolling region the session lives in: everything above the mark.
@@ -716,6 +781,79 @@ mod tests {
 
     fn through(filter: &mut Filter, input: &str) -> String {
         String::from_utf8(filter.feed(input.as_bytes())).unwrap()
+    }
+
+    /// The row is the only thing on the screen that changes while a connection
+    /// is being waited out: everything above it is the session as it was
+    /// painted before the drop. So it has to say that something is still
+    /// happening, and when the next thing happens.
+    #[test]
+    fn the_row_says_a_connection_is_being_waited_for_and_for_how_long() {
+        let waiting = waiting_notice(Duration::from_secs(4), Some(Duration::from_secs(8)));
+        assert!(waiting.contains("lost 4s ago"), "{waiting}");
+        assert!(waiting.contains("retrying in 8s"), "{waiting}");
+        assert!(waiting.contains("ctrl-c to stop"), "{waiting}");
+    }
+
+    /// An attempt is out there and the screen cannot show it: a client trying
+    /// to reach a machine and one that has given up paint the same nothing.
+    #[test]
+    fn the_row_says_when_an_attempt_is_out_rather_than_counting_down_to_one() {
+        let trying = waiting_notice(Duration::from_secs(90), None);
+        assert!(trying.contains("reconnecting"), "{trying}");
+        assert!(!trying.contains("retrying in"), "{trying}");
+    }
+
+    /// The countdown is what says the client is still working, so it must not
+    /// spend the last second of every delay reading zero.
+    #[test]
+    fn a_countdown_rounds_up_and_never_reaches_zero() {
+        let mid = waiting_notice(Duration::ZERO, Some(Duration::from_millis(7_100)));
+        assert!(mid.contains("retrying in 8s"), "{mid}");
+        let last = waiting_notice(Duration::ZERO, Some(Duration::from_millis(20)));
+        assert!(last.contains("retrying in 1s"), "{last}");
+        let over = waiting_notice(Duration::ZERO, Some(Duration::ZERO));
+        assert!(over.contains("retrying in 1s"), "{over}");
+    }
+
+    /// Coming back to a screen that has been sitting there since lunch, the
+    /// question is how long, not how many seconds.
+    #[test]
+    fn how_long_it_has_been_lost_is_said_in_the_unit_it_is_read_in() {
+        assert_eq!(roughly(Duration::from_secs(0)), "0s");
+        assert_eq!(roughly(Duration::from_secs(59)), "59s");
+        assert_eq!(roughly(Duration::from_secs(60)), "1m");
+        assert_eq!(roughly(Duration::from_secs(59 * 60 + 59)), "59m");
+        assert_eq!(roughly(Duration::from_secs(3 * 3600 + 5 * 60)), "3h 5m");
+    }
+
+    /// The dot says who has the keyboard, and while the connection is gone
+    /// nobody does: the session it would go to is on a machine this client
+    /// cannot reach, and the screen above the row is showing that session
+    /// exactly as it was left.
+    #[test]
+    fn the_dot_does_not_promise_a_session_that_is_not_there() {
+        let live = Status::new("gpu-box/build").repaint(Size::new(80, 24));
+        let lost = Status::new("gpu-box/build")
+            .lost()
+            .repaint(Size::new(80, 24));
+        assert!(live.contains('●'), "{live:?}");
+        assert!(!lost.contains('●'), "{lost:?}");
+        assert!(lost.contains('○'), "{lost:?}");
+    }
+
+    /// It shares the row with the mark, and the mark wins: a notice too long
+    /// for the terminal is not shown at all, which would leave the wait with
+    /// nothing to say for itself on the width people actually use.
+    #[test]
+    fn the_whole_notice_fits_beside_the_mark_on_an_eighty_column_row() {
+        let mut status = Status::new("gpu-box/nightly-build");
+        status.set_notice(&waiting_notice(
+            Duration::from_secs(3 * 3600 + 5 * 60),
+            Some(Duration::from_secs(10)),
+        ));
+        let row = status.repaint(Size::new(80, 24));
+        assert!(row.contains("retrying in 10s"), "{row:?}");
     }
 
     #[test]
