@@ -11,7 +11,7 @@ use tokio::signal::unix::{SignalKind, signal};
 use tokio::task::JoinHandle;
 use tracing::debug;
 
-use manymux::client::attach::{self, Mode, Outcome};
+use manymux::client::attach::{self, Mode, Outcome, Wait};
 use manymux::client::switch::{Cycle, Located};
 use manymux::client::{Attached, Stream};
 use manymux::hosts::{Hosts, is_this_machine, this_machine};
@@ -791,6 +791,10 @@ async fn do_attach(socket: &Path, host: &str, name: &str, screen: Screen) -> Res
     // scrollback. Without this, walking the list with the switch key would dump
     // a thousand lines on every hop.
     let mut seeded: HashSet<String> = HashSet::new();
+    // Failed attempts to get back to a session the connection dropped under.
+    // Zero whenever the last attach worked, which is what makes a connection
+    // that comes back and goes again get the full patience a second time.
+    let mut lost = 0;
     let (outcome, where_) = loop {
         let target = cycle.current().clone();
         let mut where_ = qualified(&target.host, &target.session);
@@ -812,8 +816,20 @@ async fn do_attach(socket: &Path, host: &str, name: &str, screen: Screen) -> Res
                 hopped = false;
                 continue;
             }
+            // Still not back. The machine being unreachable and the session
+            // having gone while it was look the same from here, and both are
+            // worth another try: a node restarting is a session that comes back
+            // under the same name.
+            Err(e) if lost > 0 => {
+                debug!("could not get back to {where_}: {e:#}");
+                match wait_to_reconnect(&mut held, &where_, &mut lost).await {
+                    Wait::Retry => continue,
+                    Wait::GiveUp => break (Outcome::Disconnected, where_),
+                }
+            }
             Err(e) => return Err(e),
         };
+        lost = 0;
 
         let (outcome, renamed) = attach::run(&mut held, session, &where_, mode).await?;
         // Renamed from inside, so the name this run has been using is nobody's
@@ -838,6 +854,15 @@ async fn do_attach(socket: &Path, host: &str, name: &str, screen: Screen) -> Res
                 // key carries on from wherever this one left you.
                 mode = Mode::Control;
             }
+            // The whole point of the project is that the session is still
+            // running on a machine that never noticed you left, so a wifi hop
+            // or a closed lid is not a reason to put somebody back at their
+            // shell. The screen stays exactly as the session painted it and
+            // the mark row says what is happening.
+            Outcome::Disconnected => match wait_to_reconnect(&mut held, &where_, &mut lost).await {
+                Wait::Retry => continue,
+                Wait::GiveUp => break (Outcome::Disconnected, where_),
+            },
             outcome => break (outcome, where_),
         }
     };
@@ -858,6 +883,18 @@ async fn do_attach(socket: &Path, host: &str, name: &str, screen: Screen) -> Res
             Ok(FAILED)
         }
         Outcome::Switch(_) => unreachable!("switches never leave the loop above"),
+    }
+}
+
+/// Count one failed attempt at a lost session and sit out the delay it earns.
+///
+/// Running out of attempts is [`Wait::GiveUp`] without anybody having to press
+/// anything, so the caller has one thing to check rather than two.
+async fn wait_to_reconnect(held: &mut attach::Held, where_: &str, lost: &mut u32) -> Wait {
+    *lost += 1;
+    match attach::reconnect_after(*lost) {
+        Some(delay) => attach::waiting(held, where_, delay).await,
+        None => Wait::GiveUp,
     }
 }
 

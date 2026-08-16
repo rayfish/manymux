@@ -81,6 +81,18 @@ mistaken for a plain shell. The row keeps to itself: the session is told the
 screen is one row shorter, so nothing it draws lands there. Detaching gives the
 row, the title and the terminal back.
 
+If the connection drops rather than you leaving, the client waits instead of
+dropping you back at your shell. The session is still running on a machine that
+never noticed, so a wifi hop or a closed lid just puts a line on that row and
+the screen comes back as it was:
+
+```
+gpu-box/long is not answering, reconnecting in 4s
+```
+
+It keeps trying for about two minutes. `Ctrl-]` then `d` gives up early, and so
+does `Ctrl-C`.
+
 Copying out of a session is your terminal's job, over OSC 52, which manymux
 passes through untouched. Most terminals refuse clipboard writes until you say
 otherwise (iTerm2: Settings > General > Selection; Terminal.app has no OSC 52 at

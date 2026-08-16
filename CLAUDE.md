@@ -132,6 +132,20 @@ Three consequences run through the whole codebase and are worth keeping intact:
   and `nohup` has to keep meaning what it means. `GRACE` also has to stay inside
   the window `node::stop` gives the socket to go quiet, or `mm stop` reports a
   node still listening when it is only still saying goodbye.
+- **A connection that drops is waited out, not reported.** The session is still
+  running on a machine that never noticed the client left, so putting somebody
+  back at their shell over a wifi hop throws away the one thing the project is
+  for. `do_attach` keeps `held`, so the terminal stays in raw mode showing the
+  screen as the session last painted it, and only the mark row changes
+  (`terminal::waiting`). `attach::reconnect_after` is short at first and then
+  flat, for two minutes in total, because the first failures are a lid or a
+  network hop and the rest are somebody who has walked away. Two things this
+  needs. The wait reads the keyboard, or it would be a wait nobody could leave:
+  the mode key's detach gets out, and so does Ctrl-C, which has nowhere else to
+  go while there is no session to send it to. And a failure to reattach is
+  another lost attempt rather than an error, because from here a machine that
+  is unreachable and a session that has gone look the same, and a node
+  restarting is a session that comes back under the same name.
 - **The daemon gives up on a machine it cannot reach, and a client is what
   starts it again.** `peers::retry_after` is three growing delays and then
   nothing: a retry is an ssh process, a name to resolve and a connect to wait

@@ -1507,3 +1507,88 @@ fn only_attach_takes_a_machine_where_a_session_is_expected() {
         assert!(said.contains("no session named"), "{command}: {said}");
     }
 }
+
+/// The whole premise of the project is that the session outlives the
+/// connection, so losing the connection must not put somebody back at their
+/// shell with the session still running two hops away. The ssh dies here, the
+/// way a wifi hop or a closed lid kills it; the node and the session on the
+/// other side never notice.
+#[test]
+fn an_attach_whose_connection_drops_comes_back_by_itself() {
+    use std::io::Read;
+    use std::sync::mpsc;
+
+    let world = World::new("reconnect");
+    world.ok("laptop", &["add", "gpu-box"]);
+    world.ok("gpu-box", &["new", "-d", "-n", "long", "sleep", "300"]);
+    world.wait_for_node("gpu-box");
+
+    let (mut pty, pts) = pty_process::blocking::open().unwrap();
+    pty.resize(pty_process::Size::new(24, 80)).unwrap();
+    let mut client = pty_process::blocking::Command::new(MM)
+        .arg("--socket")
+        .arg(world.socket("laptop"))
+        .args(["attach", "gpu-box/long"])
+        .env("MM_CONFIG_DIR", world.dir.join("laptop"))
+        .env("MM_SSH", world.ssh_stub())
+        .env("MM_LOG", "manymux=warn")
+        .env("TERM", "xterm-256color")
+        .spawn(pts)
+        .expect("attaching on a terminal");
+
+    let (seen_tx, seen_rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 1024];
+        while let Ok(read @ 1..) = pty.read(&mut buf) {
+            if seen_tx.send(buf[..read].to_vec()).is_err() {
+                return;
+            }
+        }
+    });
+
+    let mut seen = String::new();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut cut = false;
+    let mut noticed = false;
+    loop {
+        if let Ok(chunk) = seen_rx.recv_timeout(Duration::from_millis(200)) {
+            seen.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        // Once the client is on the screen, kill the agent bridging it to
+        // gpu-box. Not the node: the session has to survive, which is the
+        // whole point.
+        if !cut && seen.contains("gpu-box/long") {
+            cut = true;
+            let pattern = format!("{}/gpu-box.sock agent", world.dir.display());
+            Command::new("pkill")
+                .args(["-f", &pattern])
+                .status()
+                .expect("running pkill");
+        }
+        if cut && !noticed && seen.contains("reconnecting") {
+            noticed = true;
+            // Everything from here is what happens after it says so.
+            seen.clear();
+        }
+        // Back on the session, which is the mark row naming it again.
+        if noticed && seen.contains("gpu-box/long") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "cut={cut} noticed={noticed}; the terminal saw: {seen:?}"
+        );
+    }
+
+    assert!(
+        client.try_wait().expect("checking the client").is_none(),
+        "the client should still be attached, not back at the shell"
+    );
+    assert!(
+        world.ok("gpu-box", &["ls", "local"]).contains("long"),
+        "the session outlives the connection to it"
+    );
+
+    let _ = client.kill();
+    let _ = client.wait();
+}

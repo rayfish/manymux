@@ -207,6 +207,62 @@ fn write_now(text: &str) {
     let _ = out.flush();
 }
 
+/// What waiting for a lost machine ended in.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Wait {
+    /// The delay is up. Try the session again.
+    Retry,
+    /// Somebody said to stop waiting, or there is no more waiting to do.
+    GiveUp,
+}
+
+/// Sit out one delay between attempts to reach a session again.
+///
+/// The screen is left exactly as the session last painted it, with the mark
+/// row saying what is going on: a connection that comes back finds the
+/// terminal where it left it, and one that does not at least says why nothing
+/// is happening. Nothing is written to the session, there being none.
+///
+/// The keyboard is still read, because a wait nobody can leave is worse than
+/// no wait at all. The mode key's detach is one way out, so that leaving a
+/// session that is gone is the same gesture as leaving one that is there. The
+/// other is Ctrl-C, which has nowhere else to go while there is no session to
+/// send it to, and which is what a hand reaches for anyway.
+pub async fn waiting(held: &mut Held, target: &str, delay: Duration) -> Wait {
+    let mut status = Status::new(target);
+    status.set_notice(&format!(
+        "{target} is not answering, reconnecting in {}s",
+        delay.as_secs().max(1)
+    ));
+    write_now(&status.repaint(terminal_size()));
+
+    let mut keys = KeyFilter::new(crate::client::attach::prefix());
+    let until = tokio::time::sleep(delay);
+    tokio::pin!(until);
+    loop {
+        tokio::select! {
+            () = &mut until => return Wait::Retry,
+            typed = held.keys.recv() => match typed {
+                // The keyboard reader is gone, which is stdin at end of file.
+                // Nobody is going to press anything.
+                None => return Wait::GiveUp,
+                Some(chunk) => {
+                    if chunk.contains(&INTERRUPT) {
+                        return Wait::GiveUp;
+                    }
+                    if matches!(keys.filter(&chunk).action, Some(Action::Detach)) {
+                        return Wait::GiveUp;
+                    }
+                }
+            },
+        }
+    }
+}
+
+/// Ctrl-C, which while nothing is attached is a way out rather than a signal
+/// to pass on.
+const INTERRUPT: u8 = 0x03;
+
 /// Run the attach loop until the client detaches, switches away, or the
 /// session ends.
 ///
