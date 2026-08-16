@@ -110,11 +110,51 @@ impl Hosts {
     }
 }
 
-/// A session address: `name` on this machine, or `host/name` elsewhere.
+/// One half of a target: an ordinary name, or a group marked with `@`.
+///
+/// A sigil rather than trying a name as a session and then as a group.
+/// `gpu-box/pi` cannot say which `pi` is, and resolving it by trying one and
+/// then the other means that making a group named after a session you already
+/// have silently changes where a command you have typed for weeks goes. This
+/// file has ruled against that kind of guess twice already: a bare word is only
+/// a machine if it is one you have added, and a name found on two machines is
+/// an error naming both rather than a pick.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Named {
+    Session(String),
+    Group(String),
+}
+
+impl Named {
+    fn parse(text: &str) -> Result<Self> {
+        match text.strip_prefix('@') {
+            Some("") => bail!("`@` needs a group name after it"),
+            Some(group) => Ok(Named::Group(group.to_string())),
+            None => Ok(Named::Session(text.to_string())),
+        }
+    }
+
+    /// The name, whichever kind it is.
+    pub fn name(&self) -> &str {
+        match self {
+            Named::Session(name) | Named::Group(name) => name,
+        }
+    }
+
+    pub fn group(&self) -> Option<&str> {
+        match self {
+            Named::Group(name) => Some(name),
+            Named::Session(_) => None,
+        }
+    }
+}
+
+/// A session address: `name` on this machine, `host/name` elsewhere, and either
+/// half spelled `@group` to mean a group instead.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Target {
-    pub host: Option<String>,
-    pub session: String,
+    pub host: Option<Named>,
+    pub session: Named,
 }
 
 impl Target {
@@ -122,11 +162,11 @@ impl Target {
         match text.split_once('/') {
             None => Ok(Self {
                 host: None,
-                session: text.to_string(),
+                session: Named::parse(text)?,
             }),
             Some((host, session)) if !host.is_empty() && !session.is_empty() => Ok(Self {
-                host: Some(host.to_string()),
-                session: session.to_string(),
+                host: Some(Named::parse(host)?),
+                session: Named::parse(session)?,
             }),
             Some(_) => bail!("expected `session` or `host/session`, got {text:?}"),
         }
@@ -141,20 +181,60 @@ mod tests {
     fn a_bare_name_is_a_local_session() {
         let t = Target::parse("build").unwrap();
         assert_eq!(t.host, None);
-        assert_eq!(t.session, "build");
+        assert_eq!(t.session, Named::Session("build".into()));
     }
 
     #[test]
     fn a_slash_splits_host_from_session() {
         let t = Target::parse("gpu-box/api").unwrap();
-        assert_eq!(t.host.as_deref(), Some("gpu-box"));
-        assert_eq!(t.session, "api");
+        assert_eq!(t.host, Some(Named::Session("gpu-box".into())));
+        assert_eq!(t.session, Named::Session("api".into()));
     }
 
     #[test]
     fn a_half_written_target_is_an_error_not_a_guess() {
         assert!(Target::parse("gpu-box/").is_err());
         assert!(Target::parse("/api").is_err());
+    }
+
+    #[test]
+    fn an_at_sign_marks_a_group_rather_than_a_session() {
+        let t = Target::parse("@pi").unwrap();
+        assert_eq!(t.host, None);
+        assert_eq!(t.session, Named::Group("pi".into()));
+    }
+
+    #[test]
+    fn a_group_can_be_narrowed_to_a_session_in_it() {
+        let t = Target::parse("@pi/build").unwrap();
+        assert_eq!(t.host, Some(Named::Group("pi".into())));
+        assert_eq!(t.session, Named::Session("build".into()));
+    }
+
+    #[test]
+    fn a_group_can_be_narrowed_to_a_machine() {
+        let t = Target::parse("gpu-box/@pi").unwrap();
+        assert_eq!(t.host, Some(Named::Session("gpu-box".into())));
+        assert_eq!(t.session, Named::Group("pi".into()));
+    }
+
+    /// The whole point of the sigil: nothing about the existing spellings
+    /// moves, so a command you have typed for weeks keeps going where it went.
+    #[test]
+    fn every_spelling_without_an_at_sign_means_what_it_always_did() {
+        let bare = Target::parse("build").unwrap();
+        assert_eq!(bare.host, None);
+        assert_eq!(bare.session, Named::Session("build".into()));
+        let qualified = Target::parse("gpu-box/api").unwrap();
+        assert_eq!(qualified.host, Some(Named::Session("gpu-box".into())));
+        assert_eq!(qualified.session, Named::Session("api".into()));
+    }
+
+    #[test]
+    fn a_bare_at_sign_is_an_error_not_an_empty_group() {
+        assert!(Target::parse("@").is_err());
+        assert!(Target::parse("@pi/").is_err());
+        assert!(Target::parse("@/build").is_err());
     }
 
     #[test]
