@@ -39,6 +39,8 @@ pub mod node;
 #[cfg(feature = "desktop")]
 pub mod service;
 #[cfg(feature = "desktop")]
+pub mod signature;
+#[cfg(feature = "desktop")]
 pub mod update;
 
 #[cfg(test)]

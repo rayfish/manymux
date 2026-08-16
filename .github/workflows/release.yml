@@ -149,6 +149,42 @@ jobs:
             shasum -a 256 ${{ matrix.name }} > ${{ matrix.name }}.sha256
           fi
 
+      # The signature is over the checksum sidecar, not the binary: 65 bytes,
+      # so there is no prehashing question to get wrong, and the sidecar is
+      # what says which binary it covers. `src/signature.rs` checks the pair.
+      #
+      # Skipped rather than failed when no key is configured, so a fork can cut
+      # its own releases. What that costs is caught at the other end: a client
+      # with a key compiled in says out loud that a release is unsigned.
+      #
+      # To set one up, once:
+      #
+      #   openssl genpkey -algorithm ed25519 -out release.pem
+      #   openssl pkey -in release.pem -pubout -outform DER | tail -c 32 | od -An -v -tx1 | tr -d ' \n'
+      #
+      # The first line is the secret, and goes in the RELEASE_SIGNING_KEY
+      # repository secret whole, `-----BEGIN` line included. The second prints
+      # the public half, which goes in `signature::RELEASE_KEY` and in
+      # `RELEASE_KEY` in install.sh. Keep `release.pem` off this machine and out
+      # of this repository.
+      - name: Sign the checksum
+        env:
+          RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
+        run: |
+          if [ -z "$RELEASE_SIGNING_KEY" ]; then
+            echo "no RELEASE_SIGNING_KEY secret; publishing this release unsigned"
+            exit 0
+          fi
+          umask 077
+          printf '%s' "$RELEASE_SIGNING_KEY" > signing-key.pem
+          openssl pkeyutl -sign -inkey signing-key.pem -rawin \
+            -in ${{ matrix.name }}.sha256 -out signature.bin
+          # Hex rather than raw, so the sidecar beside it stays a text file and
+          # a browser download cannot mangle it.
+          od -An -v -tx1 signature.bin | tr -d ' \n' > ${{ matrix.name }}.sha256.sig
+          rm -f signing-key.pem signature.bin
+          test "$(wc -c < ${{ matrix.name }}.sha256.sig)" -eq 128
+
       - name: Upload release assets
         uses: softprops/action-gh-release@v2
         env:
@@ -158,3 +194,4 @@ jobs:
           files: |
             ${{ matrix.name }}
             ${{ matrix.name }}.sha256
+            ${{ matrix.name }}.sha256.sig

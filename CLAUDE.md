@@ -132,6 +132,23 @@ Three consequences run through the whole codebase and are worth keeping intact:
   and `nohup` has to keep meaning what it means. `GRACE` also has to stay inside
   the window `node::stop` gives the socket to go quiet, or `mm stop` reports a
   node still listening when it is only still saying goodbye.
+- **What is signed is the checksum sidecar, and the key lives in three places
+  that have to agree.** Ed25519 over the sidecar's exact bytes, published hex
+  encoded as `<asset>.sha256.sig`: the signature says the sidecar is ours and
+  the sidecar says which binary it covers, so both are checked or neither
+  counts. The sidecar rather than the binary because it is 65 bytes, which
+  takes the prehashing question off the table entirely. Verified in process
+  (`src/signature.rs`) rather than by shelling out the way the rest of `update`
+  does, because there is nothing to shell out to: minisign is on almost no
+  machines, and the `openssl` macOS ships is a LibreSSL without `-rawin`. The
+  three places are `signature::RELEASE_KEY`, `RELEASE_KEY` in `install.sh`, and
+  the `RELEASE_SIGNING_KEY` secret the release workflow signs with; the first
+  two are the same public key and the third is its private half. An empty key
+  means no checking rather than refusing everything, or a build with no key
+  configured would be one nobody could update away from. An unsigned release is
+  a warning for the same reason, and that arm of the match in `update::apply`
+  becomes a `bail!` once the newest release on every channel carries a
+  signature.
 - **Watching is enforced at the node, and answered for.** `mm view` is an
   attach with `read_only`, and what makes it worth pointing at a session
   somebody else is working in is that `Attachment::send_input` drops the bytes

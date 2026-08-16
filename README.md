@@ -457,6 +457,30 @@ bash under Termux is the other exception: it searches `$PREFIX` rather than
 only once `pkg install bash-completion` has happened, which is not part of the
 Termux base and is not something `mm` can do for you.
 
+## Verifying a release
+
+Every release publishes `<asset>.sha256` beside the binary, and a signature over
+that sidecar as `<asset>.sha256.sig`: Ed25519, hex encoded. The chain is the
+ordinary one, and both halves count. The signature says the sidecar is ours, and
+the sidecar says which binary it was written for.
+
+`mm update` checks both by itself, with no tooling on the machine, and refuses
+to install a signature that is not ours. To check one by hand:
+
+```bash
+curl -fsSLO https://github.com/rayfish/manymux/releases/latest/download/mm-linux-x86_64.sha256
+curl -fsSLO https://github.com/rayfish/manymux/releases/latest/download/mm-linux-x86_64.sha256.sig
+xxd -r -p mm-linux-x86_64.sha256.sig > sig.bin
+openssl pkeyutl -verify -pubin -inkey release.pem -rawin \
+    -in mm-linux-x86_64.sha256 -sigfile sig.bin
+sha256sum -c mm-linux-x86_64.sha256
+```
+
+The checksum on its own catches a download that arrived wrong, and nothing more:
+it comes from the same place as the binary, so anything that can replace one can
+replace the other. The signature is what says a release was published by
+somebody holding the key, which the release host does not have.
+
 ## Install details
 
 Reaching a machine runs `ssh host mm agent` through a *non-interactive* shell,

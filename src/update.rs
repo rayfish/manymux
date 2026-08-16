@@ -14,6 +14,8 @@ use anyhow::{Context, Result, bail};
 use tokio::process::Command;
 use tracing::debug;
 
+use crate::signature;
+
 /// Where the release binaries are published, the same repo `install.sh` reads.
 const REPO: &str = "rayfish/manymux";
 
@@ -26,6 +28,13 @@ pub struct Available {
     pub checksum: String,
     /// SHA-256 of the binary running right now.
     pub running: String,
+    /// The checksum sidecar exactly as published, which is what the signature
+    /// below is over. Kept whole rather than reduced to the digest: a signature
+    /// is over bytes, and re-rendering them here would be a second opinion on
+    /// what was signed.
+    sidecar: Vec<u8>,
+    /// The published signature over that sidecar, if the release carries one.
+    signature: Option<String>,
 }
 
 impl Available {
@@ -96,14 +105,21 @@ pub async fn check(channel: Channel) -> Result<Available> {
         .context("checksumming the running binary")?;
 
     for tag in channel.tags().iter().copied() {
-        let Some(checksum) = published_checksum(tag, &asset).await else {
+        let Some(sidecar) = fetched(&format!("{}.sha256", download_url(tag, &asset))).await else {
+            continue;
+        };
+        let Some(checksum) = digest_in(&sidecar) else {
             continue;
         };
         return Ok(Available {
             tag: tag.to_string(),
+            signature: fetched(&format!("{}.sha256.sig", download_url(tag, &asset)))
+                .await
+                .map(|text| text.trim().to_string()),
             asset,
             checksum,
             running,
+            sidecar: sidecar.into_bytes(),
         });
     }
     match channel {
@@ -127,6 +143,29 @@ pub async fn apply(available: &Available) -> Result<PathBuf> {
             file_name(&binary),
             dir.display()
         );
+    }
+
+    // Before the download rather than after: whether this release is ours is
+    // answerable from two small files, and there is no reason to spend ten
+    // megabytes finding out that it is not.
+    match signature::check(
+        &available.sidecar,
+        available.signature.as_deref(),
+        signature::RELEASE_KEY,
+    )? {
+        signature::Signed::By => debug!("the release signature checks out"),
+        signature::Signed::Unchecked => {
+            debug!("this build has no release key, so nothing to check")
+        }
+        // Not fatal, and this is the one soft spot in the whole path. Releases
+        // published before signing existed carry no signature, and refusing
+        // them would strand everyone running one on a build they cannot update
+        // away from. Once the newest release on every channel is signed, this
+        // arm becomes a `bail!` and the sentence below goes away.
+        signature::Signed::Unsigned => eprintln!(
+            "mm: {} is not signed; installing it on its checksum alone",
+            available.tag
+        ),
     }
 
     // Staged beside the binary rather than in /tmp, so the rename below is
@@ -228,21 +267,25 @@ fn download_url(tag: &str, asset: &str) -> String {
     }
 }
 
-/// The published checksum for an asset, or `None` if that release has no such
-/// asset (or no such release).
-async fn published_checksum(tag: &str, asset: &str) -> Option<String> {
-    let url = format!("{}.sha256", download_url(tag, asset));
+/// A small published file, or `None` if the release has no such thing.
+async fn fetched(url: &str) -> Option<String> {
     let out = Command::new("curl")
-        .args(["-fsSL", &url])
+        .args(["-fsSL", url])
         .output()
         .await
         .ok()?;
     if !out.status.success() {
         return None;
     }
-    let text = String::from_utf8(out.stdout).ok()?;
-    let digest = text.split_whitespace().next()?.to_lowercase();
-    // Anything else means we are reading a redirect page rather than a sidecar.
+    String::from_utf8(out.stdout).ok()
+}
+
+/// The digest a checksum sidecar names.
+///
+/// Anything that is not one means we are reading a redirect page rather than a
+/// sidecar, which is what a missing asset looks like from here.
+fn digest_in(sidecar: &str) -> Option<String> {
+    let digest = sidecar.split_whitespace().next()?.to_lowercase();
     (digest.len() == 64 && digest.chars().all(|c| c.is_ascii_hexdigit())).then_some(digest)
 }
 
@@ -395,6 +438,8 @@ mod tests {
             asset: "mm-macos-aarch64".into(),
             checksum: "abc".into(),
             running: "abc".into(),
+            sidecar: Vec::new(),
+            signature: None,
         };
         assert!(!same.is_newer());
         let changed = Available {

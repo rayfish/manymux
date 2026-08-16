@@ -187,6 +187,45 @@ verify_sha256() {
   ok "checksum verified"
 }
 
+# The release signing key, as the 32 raw bytes hex encoded. Empty while there is
+# none, which switches the check below off. Keep it the same as
+# `signature::RELEASE_KEY` in src/signature.rs.
+RELEASE_KEY=""
+
+# Check the signature over the checksum sidecar, when there is a key to check it
+# against and an openssl that can.
+#
+# Worth having even though this script came from the same origin as the release:
+# the two are written by different paths, and a stolen token that can replace a
+# release asset cannot re-sign it. Worth nothing against somebody who can
+# replace this script, which is why it is a check on top of the checksum rather
+# than the thing the install rests on.
+#
+# Skipped rather than failed where openssl is missing or is the LibreSSL macOS
+# ships, whose pkeyutl has no -rawin. `mm update` checks the same signature
+# properly from then on, with no tooling at all.
+verify_signature() {
+  local sha_file="$1" sig_file="$2"
+  [ -n "$RELEASE_KEY" ] || return 0
+  [ -f "$sig_file" ] || { info "release is not signed; installing on its checksum alone"; return 0; }
+  command -v openssl >/dev/null 2>&1 || return 0
+  printf '302a300506032b6570032100%s' "$RELEASE_KEY" \
+    | xxd -r -p > "$TMP/release-key.der" 2>/dev/null || return 0
+  tr -d ' \n' < "$sig_file" | xxd -r -p > "$TMP/release.sig" 2>/dev/null || return 0
+  if ! openssl pkeyutl -verify -pubin -keyform DER -inkey "$TMP/release-key.der" \
+      -rawin -in "$sha_file" -sigfile "$TMP/release.sig" >/dev/null 2>&1; then
+    # Tell the two apart: an openssl that cannot do this at all must not read as
+    # a bad signature, and a bad signature must not be shrugged off.
+    if openssl pkeyutl -verify -pubin -keyform DER -inkey "$TMP/release-key.der" \
+        -rawin -in "$sha_file" -sigfile "$TMP/release.sig" 2>&1 | grep -qi 'unknown option\|rawin'; then
+      info "this openssl cannot check Ed25519 signatures; checksum only"
+      return 0
+    fi
+    die "the release signature is not ours. Refusing to install."
+  fi
+  ok "signature verified"
+}
+
 # Download the binary and its sidecar, and check one against the other.
 #
 # Retried once, because the nightly release is rebuilt in place: for a few
@@ -208,7 +247,11 @@ Refusing to install an unverified binary. Set MM_SKIP_VERIFY=1 to override."
       return 0
     fi
 
-    verify_sha256 "$TMP/$BIN" "$TMP/$BIN.sha256" && return 0
+    if verify_sha256 "$TMP/$BIN" "$TMP/$BIN.sha256"; then
+      curl -fsSL "${url}.sha256.sig" -o "$TMP/$BIN.sha256.sig" 2>/dev/null || true
+      verify_signature "$TMP/$BIN.sha256" "$TMP/$BIN.sha256.sig"
+      return 0
+    fi
 
     [ "$attempt" = "1" ] || die "the download does not match its checksum twice over.
 Refusing to install. Set MM_SKIP_VERIFY=1 to override, or try again later."
