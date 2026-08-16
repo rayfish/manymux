@@ -8,6 +8,10 @@ use crate::style;
 pub struct SessionRow {
     pub host: String,
     pub session: SessionInfo,
+    /// Which group it is in, if any. The client's own bookkeeping rather than
+    /// anything the machine said, which is why it arrives beside the session
+    /// rather than on it.
+    pub group: Option<String>,
 }
 
 impl SessionRow {
@@ -42,6 +46,10 @@ impl Cell {
 
 const HEADER: [&str; 5] = ["TARGET", "TITLE", "ATTACHED", "IDLE", "BELL"];
 
+/// Where the group goes when there is one, between the handle and what the
+/// session is doing.
+const GROUP_AT: usize = 1;
+
 /// Render `mm ls` output.
 ///
 /// One `TARGET` column rather than separate host and session columns, because
@@ -52,11 +60,20 @@ pub fn session_table(rows: &[SessionRow]) -> String {
         return format!("{}\n", style::faint("no sessions"));
     }
 
-    let mut table = vec![HEADER.map(|head| Cell::new(head.to_string(), style::label(head)))];
+    // A column nobody is using is a column nobody should be reading past, so a
+    // fleet with no groups gets the table it has always had.
+    let grouped = rows.iter().any(|row| row.group.is_some());
+
+    let mut table: Vec<Vec<Cell>> = vec![
+        HEADER
+            .iter()
+            .map(|head| Cell::new(head.to_string(), style::label(head)))
+            .collect(),
+    ];
     table.extend(rows.iter().map(|row| {
         let info = &row.session;
         let target = row.target();
-        [
+        vec![
             Cell::new(target.clone(), paint_target(&row.host, &target)),
             Cell::new(
                 truncate(&info.title, 40),
@@ -67,8 +84,18 @@ pub fn session_table(rows: &[SessionRow]) -> String {
             bell(info.bells),
         ]
     }));
+    if grouped {
+        for (line, row) in table.iter_mut().skip(1).zip(rows) {
+            line.insert(GROUP_AT, group(row.group.as_deref()));
+        }
+        table[0].insert(
+            GROUP_AT,
+            Cell::new("GROUP".to_string(), style::label("GROUP")),
+        );
+    }
 
-    let widths: Vec<usize> = (0..HEADER.len())
+    let columns = HEADER.len() + usize::from(grouped);
+    let widths: Vec<usize> = (0..columns)
         .map(|i| table.iter().map(|row| row[i].width()).max().unwrap_or(0))
         .collect();
 
@@ -83,6 +110,15 @@ pub fn session_table(rows: &[SessionRow]) -> String {
         out.push('\n');
     }
     out
+}
+
+/// A session in no group leaves the cell empty rather than saying so: the
+/// column is there for the ones that are in one.
+fn group(name: Option<&str>) -> Cell {
+    match name {
+        Some(name) => Cell::new(name.to_string(), style::value(name)),
+        None => Cell::new(String::new(), String::new()),
+    }
 }
 
 /// The machine kept quieter than the session name, so a column of targets reads
@@ -176,6 +212,14 @@ mod tests {
         SessionRow {
             host: host.to_string(),
             session,
+            group: None,
+        }
+    }
+
+    fn grouped(host: &str, session: SessionInfo, group: &str) -> SessionRow {
+        SessionRow {
+            group: Some(group.to_string()),
+            ..row(host, session)
         }
     }
 
@@ -193,6 +237,22 @@ mod tests {
         assert_eq!(lines[1], "gpu-box/api  claude  ○ -       2m    *");
         // This machine's own sessions need no prefix, and typing one works.
         assert_eq!(lines[2], "notes        vim     ● 1       0s");
+    }
+
+    /// A column nobody is using is a column nobody should read past, so the
+    /// table is unchanged for anyone not using groups.
+    #[test]
+    fn the_group_column_appears_only_once_something_is_in_one() {
+        let rows = vec![
+            grouped("gpu-box", info("api", "claude", 0, 120, 1), "pi"),
+            row(crate::hosts::this_machine(), info("notes", "vim", 1, 0, 0)),
+        ];
+        let out = session_table(&rows);
+        let lines: Vec<_> = out.lines().collect();
+        assert_eq!(lines[0], "TARGET       GROUP  TITLE   ATTACHED  IDLE  BELL");
+        assert_eq!(lines[1], "gpu-box/api  pi     claude  ○ -       2m    *");
+        // In no group, so the cell is empty rather than saying so.
+        assert_eq!(lines[2], "notes               vim     ● 1       0s");
     }
 
     #[test]

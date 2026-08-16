@@ -2071,3 +2071,77 @@ fn the_new_key_starts_a_session_on_the_machine_you_are_on() {
     let _ = client.kill();
     let _ = client.wait();
 }
+
+/// A group spans machines, and nothing on the wire carries it: this is one
+/// machine's view of two machines' sessions, held in a file of its own.
+#[test]
+fn a_group_holds_sessions_from_more_than_one_machine() {
+    let world = World::new("groups");
+
+    world.ok("laptop", &["new", "-d", "-n", "build", "sleep", "60"]);
+    world.wait_for_node("laptop");
+    world.ok(
+        "laptop",
+        &["new", "-d", "-n", "train", "gpu-box", "sleep", "60"],
+    );
+
+    world.ok("laptop", &["group", "build", "pi"]);
+    world.ok("laptop", &["group", "gpu-box/train", "pi"]);
+
+    let listed = world.ok("laptop", &["groups"]);
+    assert!(listed.contains("pi"), "{listed}");
+    assert!(listed.contains("build"), "{listed}");
+    assert!(listed.contains("train"), "{listed}");
+
+    // With no name, the session comes out of whatever it was in.
+    world.ok("laptop", &["group", "build"]);
+    let after = world.ok("laptop", &["groups"]);
+    assert!(!after.contains("build"), "cleared, so not listed: {after}");
+    assert!(after.contains("train"), "and the other one stayed: {after}");
+}
+
+/// The whole reason membership is keyed on the pid and the start time: a name
+/// moves, and the session must not move with it.
+#[test]
+fn a_renamed_session_stays_in_its_group() {
+    let world = World::new("groups-rename");
+
+    world.ok("laptop", &["new", "-d", "-n", "build", "sleep", "60"]);
+    world.ok("laptop", &["group", "build", "pi"]);
+    world.ok("laptop", &["rename", "build", "nightly"]);
+
+    let listed = world.ok("laptop", &["groups"]);
+    assert!(listed.contains("pi"), "{listed}");
+    assert!(listed.contains("nightly"), "{listed}");
+}
+
+/// A group names more than one session, and a kill acts on exactly one and
+/// cannot be undone. The same reason a bare machine name is only accepted for
+/// going somewhere.
+#[test]
+fn a_group_is_refused_where_one_session_is_meant() {
+    let world = World::new("groups-refuse");
+
+    world.ok("laptop", &["new", "-d", "-n", "build", "sleep", "60"]);
+    world.ok("laptop", &["group", "build", "pi"]);
+
+    let out = world.run("laptop", &["kill", "@pi"]);
+    assert!(!out.status.success(), "a group is not a session to kill");
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert!(said.contains("names more than one session"), "{said}");
+}
+
+/// The column is there only when there is something to put in it: a fleet with
+/// no groups reads exactly as it always has.
+#[test]
+fn the_listing_shows_a_group_column_only_once_something_is_in_one() {
+    let world = World::new("groups-column");
+
+    world.ok("laptop", &["new", "-d", "-n", "build", "sleep", "60"]);
+    let plain = world.ok("laptop", &["ls"]);
+    assert!(!plain.to_lowercase().contains("group"), "{plain}");
+
+    world.ok("laptop", &["group", "build", "pi"]);
+    let grouped = world.ok("laptop", &["ls"]);
+    assert!(grouped.contains("pi"), "{grouped}");
+}

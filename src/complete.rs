@@ -26,6 +26,7 @@ use clap_complete::engine::{
 use clap_complete::{CompleteEnv, Shell};
 
 use manymux::client::Stream;
+use manymux::client::groups::Groups;
 use manymux::hosts::{Hosts, LOCAL, is_this_machine};
 use manymux::proto::{Request, Response, SessionInfo};
 
@@ -108,6 +109,18 @@ pub fn hosts_or_local() -> ArgValueCompleter {
         names.extend(watched());
         candidates(prefixed(current, names))
     })
+}
+
+/// Group names, for `mm group`.
+///
+/// A local file read, so this starts no node, installs nothing and waits on no
+/// ssh, which is the rule every completer here is held to.
+pub fn group_names() -> ArgValueCompleter {
+    ArgValueCompleter::new(|current: &OsStr| candidates(prefixed(current, groups())))
+}
+
+fn groups() -> Vec<String> {
+    Groups::load().map(|held| held.names()).unwrap_or_default()
 }
 
 /// Machines being watched, for `rm`. Not this one: it is not on the list.

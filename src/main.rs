@@ -5,7 +5,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::{Result, bail};
+use anyhow::{Result, anyhow, bail};
 use clap::{Parser, Subcommand, ValueHint};
 use clap_complete::Shell;
 use tokio::signal::unix::{SignalKind, signal};
@@ -13,6 +13,7 @@ use tokio::task::JoinHandle;
 use tracing::debug;
 
 use manymux::client::attach::{self, Mode, Outcome, Wait};
+use manymux::client::groups::Groups;
 use manymux::client::switch::{Cycle, Located};
 use manymux::client::{Attached, Stream};
 use manymux::hosts::{Hosts, is_this_machine, this_machine};
@@ -146,6 +147,22 @@ enum Command {
         target: String,
         name: String,
     },
+
+    /// Put a session in a group, or take it out of one.
+    ///
+    /// A group is a subset of sessions you can narrow the client to, and it
+    /// spans machines. It lives here rather than at the node, so it works
+    /// against a machine running any build of mm. With no name, the session is
+    /// taken out of whatever it is in.
+    Group {
+        #[arg(add = complete::targets())]
+        target: String,
+        /// The group. Omit to ungroup.
+        #[arg(add = complete::group_names())]
+        name: Option<String>,
+    },
+    /// List the groups and what is in them.
+    Groups,
 
     /// Put mm on a machine you can ssh into, by running the installer there.
     ///
@@ -398,6 +415,46 @@ async fn run(cli: Cli) -> Result<u8> {
                     to: name,
                 })
                 .await?;
+            Ok(OK)
+        }
+
+        Command::Group { target, name } => {
+            let at = locate(&socket, &target, Bare::Session).await?;
+            // The pid and the start time are what membership is keyed on, and
+            // only the machine holding the session knows them.
+            let sessions = sessions_on(&socket, &at.host).await?;
+            let session = sessions
+                .iter()
+                .find(|s| s.name == at.session)
+                .ok_or_else(|| anyhow!("no session named {} on {}", at.session, at.host))?;
+            let mut groups = Groups::load()?;
+            match &name {
+                Some(name) => groups.assign(name, &at.host, session),
+                None => groups.clear(&at.host, session),
+            }
+            groups.save()?;
+            Ok(OK)
+        }
+
+        Command::Groups => {
+            let listing = everywhere(&socket).await?;
+            let mut groups = Groups::load()?;
+            // The listing is the only thing that says which sessions are still
+            // running, so this is where the file gets tidied.
+            groups.prune(&listing.reached(), &listing.sessions);
+            groups.save()?;
+            for (name, count) in groups.tally(&listing.sessions) {
+                println!(
+                    "{} {}",
+                    style::bold(&name),
+                    style::faint(&format!("({count})"))
+                );
+                for hosted in &listing.sessions {
+                    if groups.group_of(&hosted.host, &hosted.session) == Some(name.as_str()) {
+                        println!("  {}", qualified(&hosted.host, &hosted.session.name));
+                    }
+                }
+            }
             Ok(OK)
         }
 
@@ -767,10 +824,20 @@ async fn list(socket: &Path, host: Option<String>) -> Result<u8> {
         None => everywhere(socket).await?,
     };
 
+    // The listing is the only thing that says which sessions are still running,
+    // so this is where the group file gets tidied. Only the machines that
+    // answered count: one that is asleep has said nothing about its sessions.
+    let mut groups = Groups::load().unwrap_or_default();
+    groups.prune(&listing.reached(), &listing.sessions);
+    let _ = groups.save();
+
     let rows: Vec<_> = listing
         .sessions
         .into_iter()
         .map(|hosted| term::SessionRow {
+            group: groups
+                .group_of(&hosted.host, &hosted.session)
+                .map(str::to_string),
             host: hosted.host,
             session: hosted.session,
         })
