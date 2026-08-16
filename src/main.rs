@@ -884,6 +884,14 @@ async fn do_attach(
     // Asked for before the first attach, so the first switch key has something
     // to go on.
     let mut listing = Some(spawn_listing(socket));
+    // What the machines last said, kept for the pids a group is keyed on.
+    let mut snapshot = Snapshot::default();
+    let mut groups = Groups::load().unwrap_or_default();
+    // Landing in a session that is in a group is landing in that work, so the
+    // switch keys should walk that work. Read once here rather than derived
+    // from the current session, because widening out of a group you are still
+    // sitting in has to be possible.
+    let mut settled = false;
 
     let mut held = attach::hold(screen)?;
     let mut mode = Mode::Focus;
@@ -973,7 +981,20 @@ async fn do_attach(
         }
         match outcome {
             Outcome::Switch(motion) => {
-                take_listing(&mut listing, &mut cycle).await;
+                take_listing(&mut listing, &mut cycle, &mut snapshot, &mut groups).await;
+                // The first listing to land is the first chance to know what
+                // group this run started in, and it lands before the key that
+                // asked for it is acted on. Done once: after this the focus is
+                // the popup's to move, and re-reading it would undo a widening.
+                if !settled && !snapshot.is_empty() {
+                    settled = true;
+                    if let Some(info) = snapshot.info(cycle.current()) {
+                        let group = groups
+                            .group_of(&cycle.current().host, info)
+                            .map(str::to_string);
+                        cycle.focus(group);
+                    }
+                }
                 hopped = false;
                 if let Some(next) = cycle.step(motion) {
                     cycle.moved_to(next);
@@ -1201,37 +1222,93 @@ async fn start_beside(socket: &Path, host: &str) -> Result<String> {
     Ok(name)
 }
 
+/// What every machine said it was running, and which machines said anything.
+///
+/// The whole `SessionInfo` rather than a name, because group membership is
+/// keyed on the pid and the start time and the popup draws titles, idle times
+/// and bells from it. The hosts that answered come with it because pruning a
+/// group must consider only those: a machine that is asleep has said nothing
+/// about its sessions, and reading that silence as "they ended" would empty its
+/// groups while you were away from it.
+#[derive(Default)]
+struct Snapshot {
+    sessions: Vec<manymux::proto::HostedSession>,
+    reached: Vec<String>,
+}
+
+impl Snapshot {
+    /// What a machine said about one session, for the pid a group is keyed on.
+    fn info(&self, at: &Located) -> Option<&manymux::proto::SessionInfo> {
+        self.sessions
+            .iter()
+            .find(|hosted| hosted.host == at.host && hosted.session.name == at.session)
+            .map(|hosted| &hosted.session)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.sessions.is_empty()
+    }
+}
+
+/// The listing as the cycle wants it: an address, and the group it is in.
+fn entries(snapshot: &Snapshot, groups: &Groups) -> Vec<manymux::client::switch::Entry> {
+    snapshot
+        .sessions
+        .iter()
+        .map(|hosted| {
+            manymux::client::switch::Entry::new(
+                Located::new(&hosted.host, &hosted.session.name),
+                groups
+                    .group_of(&hosted.host, &hosted.session)
+                    .map(str::to_string),
+            )
+        })
+        .collect()
+}
+
 /// Ask every machine what it is running, off to one side, so that no keystroke
 /// waits on ssh.
-fn spawn_listing(socket: &Path) -> JoinHandle<Vec<Located>> {
+fn spawn_listing(socket: &Path) -> JoinHandle<Snapshot> {
     let socket = socket.to_path_buf();
     tokio::spawn(async move {
         match everywhere(&socket).await {
-            Ok(listing) => listing
-                .sessions
-                .into_iter()
-                .map(|hosted| Located::new(hosted.host, hosted.session.name))
-                .collect(),
+            Ok(listing) => Snapshot {
+                reached: listing.reached(),
+                sessions: listing.sessions,
+            },
             Err(e) => {
                 debug!("could not list sessions for the switch keys: {e:#}");
-                Vec::new()
+                Snapshot::default()
             }
         }
     })
 }
 
-/// Hand the cycle the listing, if one has arrived or arrives shortly.
+/// Hand the cycle the listing, if one has arrived or arrives shortly, and keep
+/// it for the popup to draw from.
 ///
 /// What is already known stands rather than being replaced by nothing, and a
 /// listing still out there asking is left running rather than thrown away.
-async fn take_listing(pending: &mut Option<JoinHandle<Vec<Located>>>, cycle: &mut Cycle) {
+///
+/// This is also where the group file gets tidied: the listing is the only thing
+/// that says which sessions are still running, and only the machines that
+/// answered count towards it.
+async fn take_listing(
+    pending: &mut Option<JoinHandle<Snapshot>>,
+    cycle: &mut Cycle,
+    snapshot: &mut Snapshot,
+    groups: &mut Groups,
+) {
     let Some(mut task) = pending.take() else {
         return;
     };
     match tokio::time::timeout(LISTING_WAIT, &mut task).await {
-        Ok(Ok(sessions)) => {
-            if !sessions.is_empty() {
-                cycle.refresh(sessions);
+        Ok(Ok(landed)) => {
+            if !landed.is_empty() {
+                groups.prune(&landed.reached, &landed.sessions);
+                let _ = groups.save();
+                *snapshot = landed;
+                cycle.refresh(entries(snapshot, groups));
             }
         }
         Ok(Err(e)) => debug!("the listing task did not finish: {e}"),
