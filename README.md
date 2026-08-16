@@ -87,11 +87,17 @@ never noticed, so a wifi hop or a closed lid just puts a line on that row and
 the screen comes back as it was:
 
 ```
-gpu-box/long is not answering, reconnecting in 4s
+not answering, retrying in 4s  ctrl-c to stop
 ```
 
-It keeps trying for about two minutes. `Ctrl-]` then `d` gives up early, and so
-does `Ctrl-C`.
+It keeps trying, quickly at first and then every ten seconds, and it never
+stops on its own: the session is still running on a machine that never noticed
+you left, so a laptop shut for the weekend opens on the session you were in.
+Giving up is yours to do, with `Ctrl-C` or `Ctrl-]` then `d`.
+
+What it goes back to is the session you were in when the connection went, not
+the one you started on: if you attached with `mm a gpu-box` and tabbed on from
+there, that is where it puts you.
 
 ## Watching without typing
 
@@ -157,14 +163,20 @@ one `Ctrl-]` then `tab tab tab` walks through your sessions.
 
 | | |
 |---|---|
-| `tab`, `n` | next session on this machine |
-| `p`, `shift-tab` | previous |
+| `tab` | next session on this machine |
+| `shift-tab` | previous |
 | `h` | next machine |
 | `H` | previous machine |
 | `l` | the one you came from |
+| `n` | start a session on this machine and go to it |
 | `r` | rename this session |
 | `d` | detach |
 | `esc`, `enter`, `Ctrl-]` | back to focus |
+
+`n` starts a shell on the machine you are on, the way `mm new` would, and puts
+you in it in focus mode: it is the one control key that does not leave the mode
+on, because what follows a new session is typing rather than another hop. The
+node picks the name, and `mm ls` has it from then on.
 
 `r` opens a prompt on the mark row: type a name, `enter` renames the session,
 `esc` leaves it alone. It is the same rename `mm rename` does, so the mark and

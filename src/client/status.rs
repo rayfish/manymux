@@ -31,11 +31,12 @@ const GUTTER: u16 = 2;
 /// ones a session can be driven without.
 const HINTS: &[&str] = &[
     "tab next",
-    "p prev",
+    "s-tab prev",
     // Early, because it is the only way into the view: the wheel is left to
     // the terminal so that a drag selects, and a key nobody can find is a
     // feature nobody has.
     "[ scroll",
+    "n new",
     "r rename",
     "d detach",
     "esc focus",
@@ -165,6 +166,13 @@ impl Status {
     /// once it has been up long enough.
     pub fn set_notice(&mut self, notice: &str) {
         self.notice = Some(notice.to_string());
+    }
+
+    /// Whether the row is already saying something for the client. Asked by
+    /// the pump loop, which owns the clock every notice is taken down by and
+    /// does not otherwise know one was put there before it started.
+    pub fn has_notice(&self) -> bool {
+        self.notice.is_some()
     }
 
     pub fn clear_notice(&mut self) {
@@ -1023,6 +1031,21 @@ mod tests {
         assert!(painted.contains("[ scroll"), "{painted:?}");
     }
 
+    /// Starting a session is the one thing on the row that leaves the session
+    /// you are in for one that did not exist a moment ago, so it is worth a
+    /// hint of its own: `n` walked the list until this build, and a hand that
+    /// learnt it there has to be told what it does now.
+    #[test]
+    fn the_hints_offer_the_key_that_starts_a_session() {
+        let mut status = Status::new("srv/zsh");
+        status.set_mode(Mode::Control);
+        let painted = status.repaint(Size::new(80, 24));
+        assert!(painted.contains("n new"), "{painted:?}");
+        // And both directions of the one gesture that walks the list.
+        assert!(painted.contains("tab next"), "{painted:?}");
+        assert!(painted.contains("s-tab prev"), "{painted:?}");
+    }
+
     /// A row with room for some of them shows some of them, in order, rather
     /// than going blank because the last one would not fit.
     #[test]
@@ -1030,7 +1053,7 @@ mod tests {
         let mut status = Status::new("srv/zsh");
         status.set_mode(Mode::Control);
         let painted = status.repaint(Size::new(40, 24));
-        assert!(painted.contains("tab next  p prev"), "{painted:?}");
+        assert!(painted.contains("tab next  s-tab prev"), "{painted:?}");
         assert!(!painted.contains("l last"), "{painted:?}");
         assert!(painted.contains("\x1b[24;30H"), "{painted:?}");
     }

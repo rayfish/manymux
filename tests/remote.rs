@@ -1565,7 +1565,7 @@ fn an_attach_whose_connection_drops_comes_back_by_itself() {
                 .status()
                 .expect("running pkill");
         }
-        if cut && !noticed && seen.contains("reconnecting") {
+        if cut && !noticed && seen.contains("retrying in") {
             noticed = true;
             // Everything from here is what happens after it says so.
             seen.clear();
@@ -1588,6 +1588,94 @@ fn an_attach_whose_connection_drops_comes_back_by_itself() {
         world.ok("gpu-box", &["ls", "local"]).contains("long"),
         "the session outlives the connection to it"
     );
+
+    let _ = client.kill();
+    let _ = client.wait();
+}
+
+/// The control key that starts a session starts it on the machine the client
+/// is on, not the one it was typed from, and lands you in it. Two hops away
+/// here: the key is pressed on the laptop and the session appears on gpu-box.
+#[test]
+fn the_new_key_starts_a_session_on_the_machine_you_are_on() {
+    use std::io::{Read, Write};
+    use std::os::fd::AsFd;
+    use std::sync::mpsc;
+
+    let world = World::new("control-new");
+    world.ok("laptop", &["add", "gpu-box"]);
+    world.ok("gpu-box", &["new", "-d", "-n", "long", "sleep", "300"]);
+    world.wait_for_node("gpu-box");
+
+    let (pty, pts) = pty_process::blocking::open().unwrap();
+    pty.resize(pty_process::Size::new(24, 80)).unwrap();
+    let mut client = pty_process::blocking::Command::new(MM)
+        .arg("--socket")
+        .arg(world.socket("laptop"))
+        .args(["attach", "gpu-box/long"])
+        .env("MM_CONFIG_DIR", world.dir.join("laptop"))
+        .env("MM_SSH", world.ssh_stub())
+        .env("MM_LOG", "manymux=warn")
+        .env("TERM", "xterm-256color")
+        .spawn(pts)
+        .expect("attaching on a terminal");
+
+    let (seen_tx, seen_rx) = mpsc::channel();
+    let mut reading =
+        unsafe { pty_process::blocking::Pty::from_fd(pty.as_fd().try_clone_to_owned().unwrap()) };
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 1024];
+        while let Ok(read @ 1..) = reading.read(&mut buf) {
+            if seen_tx.send(buf[..read].to_vec()).is_err() {
+                return;
+            }
+        }
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut seen = String::new();
+    let mut pressed = false;
+    let started = loop {
+        if let Ok(chunk) = seen_rx.recv_timeout(Duration::from_millis(200)) {
+            seen.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        // Once the client is on the screen, Ctrl-] n.
+        if !pressed && seen.contains("gpu-box/long") {
+            pressed = true;
+            (&pty).write_all(b"\x1dn").unwrap();
+            seen.clear();
+        }
+        // The node picked the name, so the listing is what says which it is.
+        if pressed {
+            let listing = world.ok("gpu-box", &["ls", "local"]);
+            let started: Vec<&str> = listing
+                .lines()
+                .skip(1)
+                .filter_map(|line| line.split_whitespace().next())
+                .filter(|name| *name != "long")
+                .collect();
+            if let [name] = started[..] {
+                break name.to_string();
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "pressed={pressed}; the terminal saw: {seen:?}"
+        );
+    };
+
+    // And the client went with it: the mark row names the session it started,
+    // which is the whole gesture rather than a session left running elsewhere.
+    let landed = Instant::now() + Duration::from_secs(10);
+    while !seen.contains(&format!("gpu-box/{started}")) {
+        if let Ok(chunk) = seen_rx.recv_timeout(Duration::from_millis(200)) {
+            seen.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        assert!(
+            Instant::now() < landed,
+            "started {started} but stayed put; the terminal saw: {seen:?}"
+        );
+    }
 
     let _ = client.kill();
     let _ = client.wait();

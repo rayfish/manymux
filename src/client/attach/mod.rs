@@ -36,24 +36,27 @@ pub use keys::{
 pub use terminal::{Held, Wait, hold, run, session_size, terminal_size, waiting};
 
 /// How long to wait before trying to reach a lost session again, by how many
-/// tries have failed, or `None` to stop trying.
+/// tries have failed.
 ///
 /// Short at first because the common reason is a wifi hop or a laptop lid,
 /// which is over in seconds, and then flat rather than doubling: the terminal
 /// is sitting there showing the session, and the difference between checking
 /// every ten seconds and every minute is whether it comes back by itself or
-/// you go and do it yourself. Two minutes in total, because a client is a
-/// command somebody typed and it cannot sit on their terminal all day.
-pub fn reconnect_after(attempt: u32) -> Option<Duration> {
-    if attempt == 0 || attempt > TRIES {
-        return None;
-    }
-    Some(Duration::from_secs(
-        2u64.saturating_pow(attempt - 1).min(SLOWEST),
-    ))
+/// you go and do it yourself.
+///
+/// It never stops. The session is still running on a machine that never
+/// noticed the client left, so there is nothing here for a clock to decide:
+/// coming back to a laptop after a weekend and finding the session still on
+/// the screen is what the project is for, and the way out is the keystroke
+/// [`Wait`] is waiting for rather than an attempt somebody ran out of.
+pub fn reconnect_after(attempt: u32) -> Duration {
+    Duration::from_secs(2u64.saturating_pow(attempt.saturating_sub(1)).min(SLOWEST))
 }
 
-const TRIES: u32 = 15;
+/// The delay every attempt past the first few gets. Slow enough that a machine
+/// which is off for days is not costing an ssh process, a name to resolve and
+/// a connect to wait out every second, quick enough that a lid opened again is
+/// back before a hand reaches the keyboard.
 const SLOWEST: u64 = 10;
 
 /// How the attach ended.
@@ -63,6 +66,9 @@ pub enum Outcome {
     /// A switch key was pressed. Which session it lands on is the caller's to
     /// work out: this half of the client knows nothing about hosts.
     Switch(Motion),
+    /// The new key was pressed. Starting the session and landing in it is the
+    /// caller's for the same reason.
+    New,
     /// The session's process exited with this code.
     Exited(i32),
     /// The host went away.
@@ -119,31 +125,42 @@ mod tests {
     use super::*;
 
     /// A dropped connection is usually a wifi hop or a laptop lid, so the
-    /// first tries are quick. What it must not do is either give up on the
-    /// first failure or sit on somebody's terminal indefinitely.
+    /// first tries are quick. What it must not do is give up on the first
+    /// failure, or keep spending an ssh process every second on a machine
+    /// that is plainly not there.
     #[test]
-    fn a_reconnect_tries_quickly_at_first_and_then_gives_up() {
-        assert_eq!(reconnect_after(1), Some(Duration::from_secs(1)));
-        assert_eq!(reconnect_after(2), Some(Duration::from_secs(2)));
-        assert_eq!(reconnect_after(3), Some(Duration::from_secs(4)));
-        assert_eq!(reconnect_after(4), Some(Duration::from_secs(8)));
+    fn a_reconnect_tries_quickly_at_first_and_then_settles() {
+        assert_eq!(reconnect_after(1), Duration::from_secs(1));
+        assert_eq!(reconnect_after(2), Duration::from_secs(2));
+        assert_eq!(reconnect_after(3), Duration::from_secs(4));
+        assert_eq!(reconnect_after(4), Duration::from_secs(8));
         assert_eq!(
             reconnect_after(5),
-            Some(Duration::from_secs(10)),
+            Duration::from_secs(SLOWEST),
             "and flat from there"
         );
-        assert_eq!(reconnect_after(TRIES), Some(Duration::from_secs(10)));
-        assert_eq!(reconnect_after(TRIES + 1), None);
-        assert_eq!(reconnect_after(0), None, "there is no attempt zero");
     }
 
+    /// The session is still running on a machine that never noticed anybody
+    /// left, so there is nothing here worth giving up on. Somebody walking
+    /// away for a weekend and coming back to their session is the whole point
+    /// of the project, and the way out is a keystroke rather than a clock.
     #[test]
-    fn a_reconnect_gives_the_machine_about_two_minutes() {
-        let total: Duration = (1..=TRIES).filter_map(reconnect_after).sum();
-        assert!(
-            (110..=130).contains(&total.as_secs()),
-            "waited {}s in total",
-            total.as_secs()
-        );
+    fn a_reconnect_never_gives_up_by_itself() {
+        for attempt in [20, 500, 100_000, u32::MAX] {
+            assert_eq!(
+                reconnect_after(attempt),
+                Duration::from_secs(SLOWEST),
+                "attempt {attempt}"
+            );
+        }
+    }
+
+    /// There is no attempt zero: the count is incremented before the wait it
+    /// pays for. Answered rather than left to overflow, since a delay of none
+    /// would be a loop spinning ssh as fast as it can start it.
+    #[test]
+    fn a_reconnect_that_has_not_failed_yet_still_waits() {
+        assert_eq!(reconnect_after(0), Duration::from_secs(1));
     }
 }

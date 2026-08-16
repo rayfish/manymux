@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::fmt::{self, Display, Formatter};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -826,8 +827,15 @@ async fn do_attach(
     let mut seeded: HashSet<String> = HashSet::new();
     // Failed attempts to get back to a session the connection dropped under.
     // Zero whenever the last attach worked, which is what makes a connection
-    // that comes back and goes again get the full patience a second time.
+    // that comes back and goes again start over at the quick delays.
     let mut lost = 0;
+    // Whether this run has been attached to anything yet, which is what tells
+    // a command that did not work from a connection that went.
+    let mut attached = false;
+    // Something the last key has to say for itself, for the mark row of the
+    // attach that follows it. Nothing else here has anywhere to say it: the
+    // terminal between two attaches is showing a session.
+    let mut notice: Option<String> = None;
     let (outcome, where_) = loop {
         let target = cycle.current().clone();
         let mut where_ = qualified(&target.host, &target.session);
@@ -838,33 +846,42 @@ async fn do_attach(
         };
         let session = match attach_to(socket, &target, history, watching).await {
             Ok(session) => session,
-            // A hop onto a session that has gone since the listing. Stay where
-            // you were and put the dead entry out of the cycle, rather than
-            // throwing away a working attach over it. A second failure in a row
-            // is the machine's, not the listing's, and is reported.
-            Err(e) if hopped => {
+            // A hop onto a session that has gone since the listing was taken:
+            // the machine answered and has no such session. Stay where you
+            // were and put the dead entry out of the cycle, rather than
+            // throwing away a working attach over it.
+            Err(Missed::Gone(e)) if hopped => {
                 debug!("could not attach to {where_}: {e:#}");
                 cycle.forget(&target);
                 cycle.undo();
                 hopped = false;
                 continue;
             }
-            // Still not back. The machine being unreachable and the session
-            // having gone while it was look the same from here, and both are
-            // worth another try: a node restarting is a session that comes back
-            // under the same name.
-            Err(e) if lost > 0 => {
+            // Anything else, once this run has been attached to something, is
+            // waited out and never reported. The machine being unreachable and
+            // the session having gone with the node that held it look the same
+            // from here, and both are worth another try: a node restarting is
+            // a session that can come back under the same name. Which target
+            // is waited for matters, and it is this one: a drop in the moment
+            // after a hop must wait for the session hopped to, not walk back
+            // to the one the command line named.
+            Err(e) if attached => {
                 debug!("could not get back to {where_}: {e:#}");
                 match wait_to_reconnect(&mut held, &where_, &mut lost).await {
                     Wait::Retry => continue,
                     Wait::GiveUp => break (Outcome::Disconnected, where_),
                 }
             }
-            Err(e) => return Err(e),
+            // The first attach of the run, which is a command that did not
+            // work rather than a connection that went: `mm attach` naming a
+            // session nobody is running says so and gives the shell back.
+            Err(e) => return Err(e.into()),
         };
         lost = 0;
+        attached = true;
 
-        let (outcome, renamed) = attach::run(&mut held, session, &where_, mode).await?;
+        let (outcome, renamed) =
+            attach::run(&mut held, session, &where_, mode, notice.take().as_deref()).await?;
         // Renamed from inside, so the name this run has been using is nobody's
         // now: the cycle would hop to a session that is not there, and the line
         // printed on the way out would name it too.
@@ -887,6 +904,27 @@ async fn do_attach(
                 // key carries on from wherever this one left you.
                 mode = Mode::Control;
             }
+            // A session on the machine you were just on, and straight into it.
+            // The listing is asked for again rather than corrected here: the
+            // node picked the name, and what the switch keys walk is what the
+            // machines say they are running.
+            Outcome::New => match start_beside(socket, &target.host).await {
+                Ok(name) => {
+                    cycle.moved_to(Located::new(&target.host, &name));
+                    hopped = true;
+                    listing = Some(spawn_listing(socket));
+                    mode = Mode::Focus;
+                }
+                // Stay where you were and say so on the row. A key that does
+                // nothing and says nothing reads as a broken client, and there
+                // is no other surface to say it on: the terminal is about to
+                // show the session this key was pressed in.
+                Err(e) => {
+                    debug!("could not start a session on {}: {e:#}", target.host);
+                    notice = Some("could not start a session here".to_string());
+                    mode = Mode::Focus;
+                }
+            },
             // The whole point of the project is that the session is still
             // running on a machine that never noticed you left, so a wifi hop
             // or a closed lid is not a reason to put somebody back at their
@@ -915,19 +953,46 @@ async fn do_attach(
             println!("[disconnected from {where_}]");
             Ok(FAILED)
         }
-        Outcome::Switch(_) => unreachable!("switches never leave the loop above"),
+        Outcome::Switch(_) | Outcome::New => {
+            unreachable!("switches never leave the loop above")
+        }
     }
 }
 
 /// Count one failed attempt at a lost session and sit out the delay it earns.
 ///
-/// Running out of attempts is [`Wait::GiveUp`] without anybody having to press
-/// anything, so the caller has one thing to check rather than two.
+/// There is no attempt that ends the waiting: [`Wait::GiveUp`] comes from
+/// somebody pressing something, which is the only thing that should end it.
+/// The session is still running on a machine that never noticed anybody left.
 async fn wait_to_reconnect(held: &mut attach::Held, where_: &str, lost: &mut u32) -> Wait {
-    *lost += 1;
-    match attach::reconnect_after(*lost) {
-        Some(delay) => attach::waiting(held, where_, delay).await,
-        None => Wait::GiveUp,
+    *lost = lost.saturating_add(1);
+    attach::waiting(held, where_, attach::reconnect_after(*lost)).await
+}
+
+/// Why a session could not be attached to.
+///
+/// Which half of the trip failed, and the two mean opposite things: a machine
+/// that never answered is one to wait for, while a node that answered and has
+/// no such session is a listing that went stale under the switch keys.
+enum Missed {
+    Unreachable(anyhow::Error),
+    Gone(anyhow::Error),
+}
+
+impl From<Missed> for anyhow::Error {
+    fn from(missed: Missed) -> Self {
+        match missed {
+            Missed::Unreachable(e) | Missed::Gone(e) => e,
+        }
+    }
+}
+
+impl Display for Missed {
+    /// For the log line, which wants the reason and not the reading of it.
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Missed::Unreachable(e) | Missed::Gone(e) => write!(f, "{e:#}"),
+        }
     }
 }
 
@@ -937,11 +1002,39 @@ async fn attach_to(
     target: &Located,
     history: u32,
     watching: bool,
-) -> Result<Attached> {
-    let stream = open(socket, &target.host).await?;
+) -> Result<Attached, Missed> {
+    let stream = open(socket, &target.host)
+        .await
+        .map_err(Missed::Unreachable)?;
     stream
         .attach(&target.session, attach::session_size(), history, watching)
         .await
+        .map_err(Missed::Gone)
+}
+
+/// Start a session on the machine a client is already sitting on, for the
+/// control key that asks for one.
+///
+/// `open` rather than `open_or_start`: there is a node on that machine and
+/// this client is attached to it. A key pressed inside a session is also no
+/// place to be asking anybody for consent to install anything.
+async fn start_beside(socket: &Path, host: &str) -> Result<String> {
+    let spec = SpawnSpec {
+        // The node's counter names it, the way it does for any spawn without
+        // one: there is no prompt here and nobody typed anything.
+        name: None,
+        // The login shell.
+        command: Vec::new(),
+        // Only meaningful on this machine; elsewhere the session starts in the
+        // node's own working directory. The rule `mm new` follows.
+        cwd: is_this_machine(host).then(current_dir).flatten(),
+        size: attach::session_size(),
+    };
+    let mut stream = open(socket, host).await?;
+    let Response::Spawned { name } = stream.call(&Request::Spawn(spec)).await? else {
+        bail!("unexpected response to spawn");
+    };
+    Ok(name)
 }
 
 /// Ask every machine what it is running, off to one side, so that no keystroke

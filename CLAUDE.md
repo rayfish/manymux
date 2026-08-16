@@ -171,14 +171,29 @@ Three consequences run through the whole codebase and are worth keeping intact:
   for. `do_attach` keeps `held`, so the terminal stays in raw mode showing the
   screen as the session last painted it, and only the mark row changes
   (`terminal::waiting`). `attach::reconnect_after` is short at first and then
-  flat, for two minutes in total, because the first failures are a lid or a
-  network hop and the rest are somebody who has walked away. Two things this
-  needs. The wait reads the keyboard, or it would be a wait nobody could leave:
-  the mode key's detach gets out, and so does Ctrl-C, which has nowhere else to
-  go while there is no session to send it to. And a failure to reattach is
-  another lost attempt rather than an error, because from here a machine that
-  is unreachable and a session that has gone look the same, and a node
-  restarting is a session that comes back under the same name.
+  flat at ten seconds, and it never runs out: the first failures are a lid or a
+  network hop, the rest are somebody who walked away, and a session that
+  outlives the connection is the one thing the project is for, so the clock has
+  nothing to decide. Three things this needs. The wait reads the keyboard, or
+  it would be a wait nobody could leave, and it is now the *only* way out: the
+  mode key's detach gets out, and so does Ctrl-C, which has nowhere else to go
+  while there is no session to send it to. The mark row says so, which is why
+  it no longer repeats the target sitting two columns to its right. And a
+  failure to reattach is another lost attempt rather than an error, once this
+  run has been attached to anything at all (`attached` in `do_attach`); only
+  the first attach can fail outright, because that one is a command that did
+  not work rather than a connection that went.
+- **What a reconnect goes back to is the session you were in, and telling that
+  from a stale listing is what `main::Missed` is for.** The loop reattaches to
+  `cycle.current()`, which a hop has already moved, so a drop a moment after
+  `Ctrl-] tab` waits for the session hopped to rather than walking back to the
+  one the command line named. That needs the two ways an attach can fail kept
+  apart, since they mean opposite things: `open()` failing is a machine that
+  never answered and is waited for, while an error out of `Stream::attach` is a
+  node that answered and has no such session, which is a listing gone stale
+  under the switch keys and the one case that forgets the entry and undoes the
+  hop. Reading every failure the second way, as this once did, meant a closed
+  lid mid-hop dropped a live session from the cycle and ended the attach.
 - **The daemon gives up on a machine it cannot reach, and a client is what
   starts it again.** `peers::retry_after` is three growing delays and then
   nothing: a retry is an ssh process, a name to resolve and a connect to wait
@@ -361,7 +376,13 @@ Three consequences run through the whole codebase and are worth keeping intact:
   may never ring. Nothing reads it now, and it is still answered because a
   client from the build that did read it is still out there: a node that stopped
   saying so would have it call every new host old. A sentence is worth writing
-  only where a key was pressed. Note also that replacing the binary is not
+  only where a key was pressed. What does *not* go on the stream is the key
+  that starts a session (`Action::New`, `Outcome::New`), which looks like the
+  same shape and is not: a rename is done to the session at the other end of
+  that stream, while a new one needs a host to start it on, a name back and a
+  fresh attach, none of which this half of the client is allowed to know. So it
+  is handed back the way a switch is, and `main::start_beside` does the work.
+  Note also that replacing the binary is not
   enough for any of these: the node keeps running the build it started from
   until `mm restart`, which `update::is_stale` says for this machine and nothing
   says for a host you reach over ssh.

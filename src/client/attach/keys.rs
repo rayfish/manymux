@@ -351,6 +351,10 @@ pub enum Motion {
 pub enum Action {
     Detach,
     Switch(Motion),
+    /// Start a session on the machine this one is on, and go and sit in it.
+    /// Where that is and what it gets called is the caller's, for the same
+    /// reason a switch is: this half of the client knows nothing about hosts.
+    New,
     /// Send this machine's clipboard to the session, if there is an image on
     /// it. Deciding that is the caller's: this half of the client knows nothing
     /// about clipboards.
@@ -539,7 +543,8 @@ const VIEW_KEYS: &[(&[u8], Scroll)] = &[
 ///
 /// Control mode stays on: one mode key then `tab tab tab` walks through the
 /// sessions on the machine you are on, and `h` is how you change machine.
-/// `Esc`, `Enter` or the mode key goes back to focus, `d` detaches,
+/// `Esc`, `Enter` or the mode key goes back to focus, `n` starts a session
+/// here and lands you in it, `d` detaches,
 /// and the mode key hit twice in a row quickly also sends one through for
 /// whatever wants it inside the session. Any other key drops back to focus and
 /// passes both bytes through unchanged, so a mistyped mode key costs you
@@ -726,7 +731,11 @@ impl KeyFilter {
     /// the next key carries on walking without a mode key of its own.
     fn after(action: Action) -> Mode {
         match action {
-            Action::Detach | Action::Paste => Mode::Focus,
+            // A new session is a fresh shell waiting to be typed into, which
+            // is why it is the one key here that does not leave the mode on:
+            // what follows a hop is often another hop, what follows this is
+            // a command.
+            Action::Detach | Action::Paste | Action::New => Mode::Focus,
             Action::Switch(_) => Mode::Control,
             Action::Scroll(Scroll::Leave) => Mode::Focus,
             // Every other move keeps the view up, wherever it was opened from:
@@ -757,9 +766,13 @@ impl KeyFilter {
     fn controlling(&self, b: u8) -> Option<Action> {
         let action = match b {
             b'd' | b'D' => Action::Detach,
-            b'\t' | b'n' | b'N' => Action::Switch(Motion::Next),
-            b'p' | b'P' => Action::Switch(Motion::Previous),
+            // Tab and shift-tab are the whole of walking the sessions, rather
+            // than a letter each beside them: one gesture with a direction is
+            // less to remember than two keys, and it leaves the letters for
+            // the things done to a session rather than the moves between them.
+            b'\t' => Action::Switch(Motion::Next),
             b'l' | b'L' => Action::Switch(Motion::Last),
+            b'n' | b'N' => Action::New,
             // The one key that reads its own case, because shift already means
             // backwards here: `H` is to `h` what shift-tab is to tab, rather
             // than a second letter to remember.
@@ -1622,6 +1635,12 @@ mod tests {
         );
         assert_eq!(f.wanted_name().as_deref(), Some(""));
 
+        let mut f = KeyFilter::new(KEY);
+        assert_eq!(
+            f.filter(b"\x1b[93;5u\x1b[110u"),
+            asked(Action::New, Mode::Focus)
+        );
+
         // Shift is the alternate the terminal reports beside the key, since the
         // client's own keys read their case: `H` is not `h`, and the two go
         // opposite ways.
@@ -2232,17 +2251,36 @@ mod tests {
             asked(Action::Switch(Motion::Next), Mode::Control)
         );
         assert_eq!(
-            f.filter(b"p"),
+            f.filter(SHIFT_TAB),
             asked(Action::Switch(Motion::Previous), Mode::Control)
         );
         assert_eq!(
             f.filter(b"l"),
             asked(Action::Switch(Motion::Last), Mode::Control)
         );
-        assert_eq!(
-            f.filter(b"n"),
-            asked(Action::Switch(Motion::Next), Mode::Control)
-        );
+    }
+
+    /// One gesture walks the sessions, which is what leaves the letters for
+    /// the things a session is done to rather than moved through. `p` was the
+    /// other half of a pair whose first half is now `new`, so it is nobody's
+    /// key and the session gets it.
+    #[test]
+    fn the_letters_no_longer_walk_the_list() {
+        let mut f = KeyFilter::default();
+        assert_eq!(f.filter(&[KEY, b'p']), forwarded(&[KEY, b'p']));
+    }
+
+    /// The one control key that leaves the mode. A hop puts you where another
+    /// session already is and you may well want the next one; a new session is
+    /// a fresh shell, and what comes after it is typing.
+    #[test]
+    fn the_new_key_asks_for_a_session_and_leaves_the_keyboard_in_focus() {
+        let mut f = KeyFilter::default();
+        assert_eq!(f.filter(&[KEY, b'n']), asked(Action::New, Mode::Focus));
+
+        // Both cases, like every key here but the two that move machine.
+        let mut f = KeyFilter::default();
+        assert_eq!(f.filter(&[KEY, b'N']), asked(Action::New, Mode::Focus));
     }
 
     #[test]

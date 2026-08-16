@@ -230,8 +230,12 @@ pub enum Wait {
 /// send it to, and which is what a hand reaches for anyway.
 pub async fn waiting(held: &mut Held, target: &str, delay: Duration) -> Wait {
     let mut status = Status::new(target);
+    // Which session this is about is already on the mark two columns to the
+    // right, so the room goes on the way out instead: the waiting no longer
+    // ends by itself, and a row that does not say how to leave is a row that
+    // has to. A notice too long for the terminal is not shown at all.
     status.set_notice(&format!(
-        "{target} is not answering, reconnecting in {}s",
+        "not answering, retrying in {}s  ctrl-c to stop",
         delay.as_secs().max(1)
     ));
     write_now(&status.repaint(terminal_size()));
@@ -268,6 +272,10 @@ const INTERRUPT: u8 = 0x03;
 ///
 /// `mode` is where the keyboard starts, which is how a hop carries control
 /// mode through the reattach.
+/// `notice` is something the caller has to say about the key that led here,
+/// which it has nowhere else to say it: between two attaches the terminal is
+/// showing a session, and a line printed onto it would sit in the middle of
+/// somebody's screen until the next repaint.
 /// The name the session answers to at the end comes back with the outcome:
 /// a rename from inside the session changes what the caller has to call it,
 /// and this half of the client has no way to tell it any other way.
@@ -276,6 +284,7 @@ pub async fn run(
     session: Attached,
     target: &str,
     mode: Mode,
+    notice: Option<&str>,
 ) -> Result<(Outcome, Option<String>)> {
     let watching = session.read_only;
     let mut status = Status::new(target);
@@ -283,6 +292,9 @@ pub async fn run(
         status = status.watching();
     }
     status.set_mode(mode);
+    if let Some(notice) = notice {
+        status.set_notice(notice);
+    }
     let screen = held.screen;
     let on_alternate = Arc::clone(&held.on_alternate);
     // One write, so there is never a frame showing an erased screen with no
@@ -459,8 +471,12 @@ async fn pump(
     // wiped first. Counted rather than flagged because a drag across the
     // desktop asks more than once before the first answer arrives.
     let mut owed = 0usize;
-    // When the notice on the row stops being worth showing.
-    let mut notice_until: Option<tokio::time::Instant> = None;
+    // When the notice on the row stops being worth showing. Already set if the
+    // caller arrived with something to say, which needs the same few seconds
+    // as one a key here put there.
+    let mut notice_until: Option<tokio::time::Instant> = status
+        .has_notice()
+        .then(|| tokio::time::Instant::now() + NOTICE_FOR);
     // Notifications for the terminal, waiting for a safe moment to be
     // written, and the rule for which of them get one.
     let mut pending = String::new();
@@ -495,6 +511,21 @@ async fn pump(
                     Some(Action::Switch(motion)) => {
                         writer.detach().await?;
                         return Ok(Outcome::Switch(motion));
+                    }
+                    // Every hop in a viewing run is another view, so the
+                    // session this would start is one you could not type
+                    // into. Said on the row rather than swallowed, the same
+                    // as a rename asked for from here.
+                    Some(Action::New) if watching => {
+                        status.set_notice("watching, so nothing here can start a session");
+                        notice_until = Some(tokio::time::Instant::now() + NOTICE_FOR);
+                        restate = true;
+                        settle(&mut stdout, &output, &status, &mut pending, &mut restate)
+                            .await?;
+                    }
+                    Some(Action::New) => {
+                        writer.detach().await?;
+                        return Ok(Outcome::New);
                     }
                     // A host from before the view existed answers for no
                     // window, so there is nothing to open. Said on the row
