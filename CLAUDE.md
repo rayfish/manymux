@@ -348,6 +348,19 @@ Three consequences run through the whole codebase and are worth keeping intact:
   over live output and this cannot. What pauses is the picture and never the
   program, since the session runs on and the resync that closing the box asks
   for paints wherever it has got to.
+- **What the session said while nobody was painting it is not all in the
+  screen, so a dump is painted over a terminal put back to nothing**
+  (`terminal::given_back`, written beside `REGROWN`). A screen is cells plus
+  the replay `node::events` rides with it, and a replay can only say what the
+  program has *on*: a mode it switched **off** while a client surface was up
+  was dropped with the rest of that output and has no other way of ever
+  reaching the terminal. It showed up as the thing that mode is for. A program
+  that pops the kitty keyboard protocol on its way out popped it under an open
+  popup, so the terminal went on reporting key releases at the shell that
+  followed it, and every keystroke typed `[103;1:3u` into whatever was running.
+  So the set the replay answers for is switched off first, which is the same
+  set a hop undoes and the reason the two are one function: neither may grow a
+  member the other has not heard of.
 - **The cells under the box belong to the box, and it clears its own.** The
   session's screen there was painted over when the popup went up and is put
   back by the resync closing it asks for, so nothing else is going to: a box

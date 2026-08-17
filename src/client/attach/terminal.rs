@@ -48,8 +48,6 @@ fn setup(mode: &dyn ScreenMode) -> String {
 /// the node switches back on for the session is exactly what has to be
 /// switched off again here, or it leaks into what follows.
 fn undone() -> String {
-    use std::fmt::Write as _;
-
     let mut undone = String::new();
     // Both of these home the cursor, so they go first, while the alternate
     // screen is still up and the cursor there is about to be discarded.
@@ -58,27 +56,43 @@ fn undone() -> String {
     undone.push_str("\x1b[?6l"); // absolute cursor addressing, not origin mode
 
     undone.push_str("\x1b[?25h"); // show the cursor
-    undone.push_str("\x1b[0 q"); // the cursor shape this terminal defaults to
     undone.push_str("\x1b[0m"); // default attributes
     undone.push_str("\x1b[?7h"); // autowrap on
     undone.push_str("\x1b[4l"); // replace mode, not insert
     undone.push_str("\x1b[?1l\x1b>"); // normal cursor keys and keypad
-    for mode in crate::node::events::REPLAYED_MODES {
-        let _ = write!(undone, "\x1b[?{mode}l");
-    }
-
-    // The extended-keys protocols, off the same way. A program that asked
-    // for one and was left running is asking the terminal it is no longer
-    // on, and a shell handed one back still in that mode reads `\x1b[13;2u`
-    // where it expects a carriage return.
-    //
-    // The count is kitty's whole stack, because the pushing was the
-    // program's and there is no telling how deep it went; popping past the
-    // bottom does nothing. The set that follows is for a program that
-    // changed the flags without pushing, which the pops cannot undo.
-    undone.push_str("\x1b[<16u\x1b[=0;1u");
-    undone.push_str("\x1b[>4;0m"); // and xterm's older modifyOtherKeys
+    undone.push_str(&given_back());
     undone
+}
+
+/// Everything the program in the session switched on, switched back off: the
+/// private modes a reattach replays, the extended-keys protocols, and the
+/// cursor shape.
+///
+/// Exactly the set [`crate::node::events::Scanner::replay`] answers for, and
+/// that pairing is the whole point of it. A replay says what is *on* and has no
+/// way to say what was turned off, so it can only be trusted about a terminal
+/// that has just been put back to nothing. Both callers need that. A hop hands
+/// the terminal to a session that never asked for any of this; a screen the
+/// client asked for is answering for a stretch where the session was not being
+/// painted at all, and a mode switched off in that stretch has no other way of
+/// ever reaching the terminal. That one showed up as a program leaving the
+/// terminal reporting key releases at the shell that followed it: the pop was
+/// dropped under the popup, and every keystroke after it typed `[103;1:3u`
+/// into whatever was running.
+///
+/// The kitty count is the whole stack, because the pushing was the program's
+/// and there is no telling how deep it went; popping past the bottom does
+/// nothing. The set that follows is for a program that changed the flags
+/// without pushing, which the pops cannot undo.
+fn given_back() -> String {
+    let mut off = String::new();
+    off.push_str("\x1b[0 q"); // the cursor shape this terminal defaults to
+    for mode in crate::node::events::REPLAYED_MODES {
+        let _ = write!(off, "\x1b[?{mode}l");
+    }
+    off.push_str("\x1b[<16u\x1b[=0;1u");
+    off.push_str("\x1b[>4;0m"); // and xterm's older modifyOtherKeys
+    off
 }
 
 /// Sent before every attach, because the terminal is changing hands there
@@ -1197,6 +1211,10 @@ async fn pump(
                     if owed > 0 {
                         owed -= 1;
                         if ours {
+                            // What the dump replays is what the program has
+                            // on, so what it turned off since goes off here:
+                            // see `given_back`.
+                            stdout.write_all(given_back().as_bytes()).await?;
                             stdout.write_all(REGROWN.as_bytes()).await?;
                         }
                     }
@@ -1632,6 +1650,29 @@ mod tests {
                 "hopping leaves {sequence:?} unsent"
             );
         }
+    }
+
+    /// A screen the client asked for is painted over a terminal put back to
+    /// nothing, because the replay riding with it says what the program has on
+    /// and can say nothing about what it turned off. Without this, a program
+    /// that popped the keyboard protocol while the popup was up left the
+    /// terminal reporting key releases at the shell that followed it.
+    #[cfg(feature = "desktop")]
+    #[test]
+    fn a_screen_the_client_asked_for_is_painted_over_the_modes_switched_off() {
+        let off = given_back();
+        for mode in crate::node::events::REPLAYED_MODES {
+            assert!(
+                off.contains(&format!("\x1b[?{mode}l")),
+                "a dump would replay private mode {mode} onto one already on"
+            );
+        }
+        for sequence in ["\x1b[<16u", "\x1b[=0;1u", "\x1b[>4;0m", "\x1b[0 q"] {
+            assert!(off.contains(sequence), "{sequence:?} is never sent");
+        }
+        // The pair the whole thing rests on: a hop undoes the same set, so
+        // neither can grow a member the other has not heard of.
+        assert!(undone().contains(&off));
     }
 
     /// A hop is a detach for the session being left, but not for the terminal:
