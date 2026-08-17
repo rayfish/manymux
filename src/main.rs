@@ -20,7 +20,7 @@ use manymux::client::{Attached, Stream};
 use manymux::hosts::{Hosts, is_this_machine, this_machine};
 use manymux::lock::held as held_lock;
 use manymux::node::{Config, Node};
-use manymux::proto::{Request, Response, SpawnSpec};
+use manymux::proto::{HostedSession, Request, Response, SpawnSpec};
 use manymux::settings::{Screen, Settings};
 use manymux::update::Channel;
 use manymux::{config, log, style, term};
@@ -1398,9 +1398,14 @@ struct Listed {
 }
 
 impl Listed {
-    /// A heading per machine, then its sessions, in the order the listing
-    /// arrived: by machine, then oldest first. The same order the switch keys
-    /// walk, so the popup and the keys never disagree about what is next.
+    /// A tree two deep: a heading per machine, the groups on that machine under
+    /// it with their sessions inside, and whatever is in no group last.
+    ///
+    /// Within every run the order is the listing's, which is oldest first and
+    /// never by name, for the reason every other listing has it: a name moves
+    /// under a rename and the rows would shuffle beneath a hand walking them.
+    /// A group's place is where its oldest session falls, which rests on the
+    /// same thing.
     ///
     /// Narrowed to the focused group when there is one, because that is what
     /// every other way of moving around is narrowed to.
@@ -1413,32 +1418,47 @@ impl Listed {
     fn of(snapshot: &Snapshot, groups: &Groups, focus: Option<&str>, current: &Located) -> Self {
         let mut rows = Vec::new();
         let mut at = Vec::new();
-        let mut machine: Option<&str> = None;
-        for hosted in &snapshot.sessions {
-            let group = groups.group_of(&hosted.host, &hosted.session);
-            if let Some(focus) = focus
-                && group != Some(focus)
-            {
-                continue;
+        // Every session that is going to be drawn, each beside the group it is
+        // in, still in the order the listing arrived: by machine, then oldest
+        // first. Which makes each machine's sessions a run, and the run is what
+        // the tree is built out of.
+        let showing: Vec<(&HostedSession, Option<&str>)> = snapshot
+            .sessions
+            .iter()
+            .map(|hosted| (hosted, groups.group_of(&hosted.host, &hosted.session)))
+            .filter(|(_, group)| focus.is_none_or(|focus| *group == Some(focus)))
+            .collect();
+
+        let mut rest = showing.as_slice();
+        while let Some((first, _)) = rest.first() {
+            let machine = first.host.as_str();
+            let (run, left) = rest.split_at(rest.partition_point(|(h, _)| h.host == machine));
+            rest = left;
+            rows.push(Row::heading(machine));
+
+            // The groups on this machine first, each with its sessions under
+            // it, in the order their first session appears: a group's place in
+            // the list moves only when the oldest session in it ends, which is
+            // the same thing the sessions' own order rests on.
+            let mut drawn: Vec<&str> = Vec::new();
+            for (_, group) in run {
+                let Some(group) = *group else { continue };
+                if drawn.contains(&group) {
+                    continue;
+                }
+                drawn.push(group);
+                rows.push(Row::subheading(group));
+                for (hosted, _) in run.iter().filter(|(_, g)| *g == Some(group)) {
+                    Self::session(&mut rows, &mut at, hosted, current, 2);
+                }
             }
-            if machine != Some(hosted.host.as_str()) {
-                machine = Some(&hosted.host);
-                rows.push(Row::heading(&hosted.host));
+            // Then whatever is in no group, last and a step in, where it reads
+            // as the rest of the machine rather than as another group. A
+            // heading of its own would be a group called "no group", which is
+            // the one thing a group is not.
+            for (hosted, _) in run.iter().filter(|(_, group)| group.is_none()) {
+                Self::session(&mut rows, &mut at, hosted, current, 1);
             }
-            let here = *current == Located::new(&hosted.host, &hosted.session.name);
-            let mut note = term::duration(hosted.session.idle);
-            if hosted.session.bells > 0 {
-                note = format!("{note} *");
-            }
-            if here {
-                note = "●".to_string();
-            }
-            rows.push(
-                Row::new(at.len(), &hosted.session.name)
-                    .detail(&hosted.session.title)
-                    .note(note),
-            );
-            at.push(Located::new(&hosted.host, &hosted.session.name));
         }
         let landed = current.clone();
         let on = at.iter().position(|there| *there == landed).unwrap_or(0);
@@ -1475,6 +1495,35 @@ impl Listed {
             at,
             groups: names,
         }
+    }
+
+    /// One session row, and the address that goes with it.
+    ///
+    /// The two are pushed together and never apart: the row's id is its index
+    /// in `at`, which is how the popup can hand back a row without ever being
+    /// told what a machine is.
+    fn session(
+        rows: &mut Vec<Row>,
+        at: &mut Vec<Located>,
+        hosted: &HostedSession,
+        current: &Located,
+        indent: u16,
+    ) {
+        let here = *current == Located::new(&hosted.host, &hosted.session.name);
+        let mut note = term::duration(hosted.session.idle);
+        if hosted.session.bells > 0 {
+            note = format!("{note} *");
+        }
+        if here {
+            note = "●".to_string();
+        }
+        rows.push(
+            Row::new(at.len(), &hosted.session.name)
+                .detail(&hosted.session.title)
+                .note(note)
+                .indent(indent),
+        );
+        at.push(Located::new(&hosted.host, &hosted.session.name));
     }
 }
 

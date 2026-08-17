@@ -39,6 +39,11 @@ const MIN_COLS: u16 = 24;
 /// one row.
 const WIDEST: u16 = 60;
 
+/// Columns a row moves in per level of the tree. Two, because the deepest row
+/// is four columns in and the label column is eighteen: a step wide enough to
+/// read costs the session names the room to be told apart.
+const STEP: u16 = 2;
+
 /// One line of the list.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Row {
@@ -52,9 +57,17 @@ pub struct Row {
     /// Right column: idle time and bells, or the mark on the row you are in.
     pub note: String,
     /// A heading rather than something you can land on: a machine's name above
-    /// its sessions. Skipped by the highlight, since Enter on one would have
-    /// nothing to attach to.
+    /// its sessions, or a group's above the sessions in it. Skipped by the
+    /// highlight, since Enter on one would have nothing to attach to.
     pub heading: bool,
+    /// How far in the row sits, in steps of [`STEP`] columns. The list is a
+    /// tree two deep, and this is the only thing that says so: a machine at
+    /// nothing, a group and the sessions in no group one step in, and the
+    /// sessions in a group one further.
+    ///
+    /// It also tells the two kinds of heading apart, which `h` needs: a machine
+    /// is the only heading at nothing.
+    pub indent: u16,
 }
 
 impl Row {
@@ -65,6 +78,7 @@ impl Row {
             detail: String::new(),
             note: String::new(),
             heading: false,
+            indent: 0,
         }
     }
 
@@ -78,11 +92,24 @@ impl Row {
         self
     }
 
+    /// How far in this row sits. See [`Row::indent`].
+    pub fn indent(mut self, indent: u16) -> Self {
+        self.indent = indent;
+        self
+    }
+
+    /// A machine's name, which is what `h` walks between.
     pub fn heading(label: impl Into<String>) -> Self {
         Self {
             heading: true,
             ..Self::new(usize::MAX, label)
         }
+    }
+
+    /// A group's name, under the machine whose sessions are in it. A heading
+    /// like the machine's, and set apart from one by sitting a step in.
+    pub fn subheading(label: impl Into<String>) -> Self {
+        Self::heading(label).indent(1)
     }
 }
 
@@ -164,17 +191,22 @@ impl Picker {
         self.rows.iter().position(|row| !row.heading)
     }
 
-    /// The first row under the next heading, or the previous one.
+    /// The first row under the next machine, or the previous one.
     ///
     /// A bigger step of the same gesture: with the machines drawn as headings,
     /// `h` jumping between them is what it obviously means, and it commits
     /// nothing, which Enter is for.
+    ///
+    /// Machines only, never the groups under one. Those are walked with the
+    /// same key every other row is, and a key that stepped over both would give
+    /// a machine with three groups on it three presses where it used to have
+    /// one.
     pub fn next_heading(&mut self, forwards: bool) {
         let len = self.rows.len();
         if len == 0 {
             return;
         }
-        let mut seen_heading = false;
+        let mut seen_machine = false;
         let mut next = self.at;
         for _ in 0..len {
             next = if forwards {
@@ -183,21 +215,30 @@ impl Picker {
                 (next + len - 1) % len
             };
             if self.rows[next].heading {
-                seen_heading = true;
+                seen_machine |= self.rows[next].indent == 0;
                 continue;
             }
-            // Going back, the row wanted is the first under the heading rather
+            // Going back, the row wanted is the first under the machine rather
             // than the last one above it, so keep walking to the top of the run.
-            if seen_heading && (forwards || self.starts_a_run(next)) {
+            if seen_machine && (forwards || self.starts_a_machine(next)) {
                 self.at = next;
                 return;
             }
         }
     }
 
-    /// Whether this row is the first under its heading.
-    fn starts_a_run(&self, index: usize) -> bool {
-        index == 0 || self.rows[index - 1].heading
+    /// Whether this row is the first that can be landed on under its machine.
+    ///
+    /// Which is not the same as sitting under a heading, now that a group is
+    /// one too: the first session of the first group on a machine has two
+    /// headings above it, and the first session of the second group has one and
+    /// is in the middle of its machine's run.
+    fn starts_a_machine(&self, index: usize) -> bool {
+        self.rows[..index]
+            .iter()
+            .rev()
+            .take_while(|row| row.heading)
+            .any(|row| row.indent == 0)
     }
 
     /// One row on, skipping headings and wrapping at both ends.
@@ -285,8 +326,12 @@ impl Picker {
     /// the only thing telling you where the popup stops and the session behind
     /// it starts.
     fn paint(&self, row: &Row, width: u16, here: bool) -> String {
+        // The tree, and the whole of it: a row says where it sits by how far in
+        // it starts, and nothing else in the box draws the shape.
+        let inset = " ".repeat(usize::from(row.indent * STEP));
         if row.heading {
-            return format!(" {} ", style::host(&fit(&row.label, width - 2)));
+            let label = fit(&format!("{inset}{}", row.label), width - 2);
+            return format!("  {}", style::host(&label));
         }
 
         // Six columns of gap, and the note pinned to the right. The detail
@@ -296,7 +341,9 @@ impl Picker {
         const NOTE: u16 = 6;
         let label_width = 18.min(width.saturating_sub(GAPS + NOTE));
         let detail_width = width.saturating_sub(GAPS + NOTE + label_width);
-        let label = fit(&row.label, label_width);
+        // Inside the label's column rather than in front of it, so the detail
+        // and the note stay in line down the box however deep the row is.
+        let label = fit(&format!("{inset}{}", row.label), label_width);
         let detail = fit(&row.detail, detail_width);
         let note = right(&row.note, NOTE);
 
@@ -555,6 +602,91 @@ mod tests {
         let p = picker(vec![Row::new(0, "a")], 0);
         assert!(p.draw(Size { cols: 20, rows: 24 }).is_empty());
         assert!(p.draw(Size { cols: 80, rows: 4 }).is_empty());
+    }
+
+    /// The tree is drawn by the indent and by nothing else, so the indent has
+    /// to survive the columns: a group's sessions sit in from the group, which
+    /// sits in from the machine.
+    #[test]
+    fn the_tree_is_drawn_a_step_in_per_level() {
+        let rows = vec![
+            Row::heading("dev.box.ray"),
+            Row::subheading("pi"),
+            Row::new(0, "build").indent(2),
+            Row::new(1, "spare").indent(1),
+        ];
+        let lines = seen(&picker(rows, 3), BIG);
+        let column = |needle: &str| {
+            lines
+                .iter()
+                .find(|line| line.contains(needle))
+                .map(|line| line.find(needle).unwrap())
+                .unwrap_or_else(|| panic!("{needle} was not drawn: {lines:#?}"))
+        };
+        assert!(column("dev.box.ray") < column("pi"), "{lines:#?}");
+        assert!(column("pi") < column("build"), "{lines:#?}");
+        // And what is in no group sits with the groups rather than inside one.
+        assert_eq!(column("pi"), column("spare"), "{lines:#?}");
+    }
+
+    /// The detail and the note are read down the box as columns, so a deeper
+    /// row must not push them along: the indent is spent out of the name's own
+    /// column.
+    #[test]
+    fn a_deeper_row_keeps_the_columns_beside_it_in_line() {
+        let rows = vec![
+            Row::new(0, "shallow").detail("zsh").note("1m"),
+            Row::new(1, "deep").detail("zsh").note("2m").indent(2),
+        ];
+        let lines = seen(&picker(rows, 0), BIG);
+        let ends: Vec<usize> = lines
+            .iter()
+            .filter(|line| line.contains("zsh"))
+            .map(|line| line.find("zsh").unwrap())
+            .collect();
+        assert_eq!(ends.len(), 2, "{lines:#?}");
+        assert_eq!(ends[0], ends[1], "the detail column moved: {lines:#?}");
+    }
+
+    /// `h` walks machines. A group is a heading too now, and stepping over both
+    /// would give a machine with three groups on it three presses where it used
+    /// to have one.
+    #[test]
+    fn the_host_key_steps_over_the_groups_under_a_machine() {
+        let rows = vec![
+            Row::heading("box"),
+            Row::subheading("pi"),
+            Row::new(0, "a").indent(2),
+            Row::subheading("web"),
+            Row::new(1, "b").indent(2),
+            Row::heading("gpu"),
+            Row::new(2, "c").indent(1),
+        ];
+        let mut p = picker(rows, 0);
+        p.next_heading(true);
+        assert_eq!(p.chosen().unwrap().id, 2, "on to the next machine");
+        p.next_heading(true);
+        assert_eq!(p.chosen().unwrap().id, 0, "and around to the first");
+    }
+
+    /// Going back lands on the first session under the machine, which is no
+    /// longer the row after a heading: the first group's first session has two
+    /// headings above it, and the second group's has one in the middle of the
+    /// run.
+    #[test]
+    fn stepping_back_a_machine_lands_on_its_first_session() {
+        let rows = vec![
+            Row::heading("box"),
+            Row::subheading("pi"),
+            Row::new(0, "a").indent(2),
+            Row::subheading("web"),
+            Row::new(1, "b").indent(2),
+            Row::heading("gpu"),
+            Row::new(2, "c").indent(1),
+        ];
+        let mut p = picker(rows, 6);
+        p.next_heading(false);
+        assert_eq!(p.chosen().unwrap().id, 0, "the top of box's run");
     }
 
     #[test]

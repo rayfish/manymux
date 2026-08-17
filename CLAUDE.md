@@ -295,6 +295,18 @@ Three consequences run through the whole codebase and are worth keeping intact:
   it may name a row that is *not* the session at the other end of the attach
   stream, and `tag::RENAME` renames that one by design, so it goes back to
   `main` as a `Request::Rename` to that row's machine.
+- **The session list is a tree two deep, and the indent is the whole of it.**
+  A machine, the groups on it with their sessions inside, and whatever is in no
+  group last and a step in, where it reads as the rest of the machine rather
+  than as another group: a heading saying "no group" would name the one thing a
+  group is not. A group spanning machines appears under each of them, because
+  the question the list answers first is which machine, and `mm groups` is
+  where a group is read whole. `Row::indent` draws it and also tells the two
+  kinds of heading apart, which `h` needs: a machine is the only heading at
+  nothing, and a key that stepped over groups too would give a machine with
+  three of them three presses where it used to have one. The indent is spent
+  out of the label's own column, or a deep row would push the detail and the
+  note along and the box would stop reading as columns.
 - **A window with no room for the box hands the job to the mark row.** Since the
   popup *is* the mode, a terminal too short to draw one (`Picker::draw` answers
   nothing) was a client that had taken the keyboard and a `tab` that changed
