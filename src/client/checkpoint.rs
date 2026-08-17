@@ -776,10 +776,25 @@ mod tests {
         assert!(!still_wrapped(&argv(&["claude", "--continue"])));
         assert!(!still_wrapped(&argv(&["/usr/bin/zsh", "-l"])));
         assert!(!still_wrapped(&[]));
-        // The plain wrapper is read through rather than refused, since that
-        // one is still an argv.
+
+        // The distinction the caller turns on, and the reason it asks this of
+        // the *answer* rather than of the raw foreground. The plain wrapper
+        // carries the marker and is read straight through, which is what a
+        // machine reports in the moment between a spawn and the command
+        // reaching the front of the terminal; asked of the raw form, a save
+        // taken straight after a restore was refused for describing exactly
+        // what it had just started.
         assert!(still_wrapped(&ran), "the spawn form does carry the marker");
-        assert_eq!(resumed(&ran[1..]), argv(&["claude", "--continue"]));
+        let read_through = resumed(&ran[1..]);
+        assert_eq!(read_through, argv(&["claude", "--continue"]));
+        assert!(
+            !still_wrapped(&read_through),
+            "so the answer is clean and the caller keeps it"
+        );
+
+        // Where nothing could read it, the answer still carries the marker and
+        // the caller refuses it.
+        assert!(still_wrapped(&resumed(&buried)));
     }
 
     /// The wrapper exists so that quitting the program leaves you where you

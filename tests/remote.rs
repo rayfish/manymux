@@ -2748,3 +2748,64 @@ fn restoring_over_sessions_that_are_already_running_still_puts_the_groups_back()
         "a restore onto a running session still has its group to put back: {groups}"
     );
 }
+
+/// The ssh half, which is the half with no way round: on this machine a
+/// checkpoint reads `/proc` itself, and for a machine reached over ssh the
+/// only source is what its node answers. Asserting that a row for it merely
+/// *appears*, as the listing tests do, leaves every remote session free to be
+/// written down as an empty prompt in a directory nobody chose.
+#[test]
+#[cfg(target_os = "linux")]
+fn a_checkpoint_records_what_a_machine_over_ssh_is_running_and_where() {
+    let world = World::new("checkpoint-remote");
+
+    world.ok("laptop", &["new", "-d", "-n", "here", "sleep", "60"]);
+    world.wait_for_node("laptop");
+    world.ok(
+        "laptop",
+        &["new", "-d", "-n", "there", "gpu-box", "sleep", "60"],
+    );
+    world.ok("laptop", &["group", "gpu-box/there", "work"]);
+    world.ok("laptop", &["checkpoint", "save"]);
+
+    let shown = world.ok("laptop", &["checkpoint", "show"]);
+    let row = shown
+        .lines()
+        .find(|line| line.contains("gpu-box/there"))
+        .unwrap_or_else(|| panic!("no row for the far machine: {shown}"));
+    assert!(
+        row.contains("sleep 60"),
+        "the far machine's command, not a bare prompt: {row}"
+    );
+    assert!(
+        row.contains(" in /"),
+        "and the directory it is working in: {row}"
+    );
+    assert!(row.contains("work"), "and the group it is in: {row}");
+
+    // Then the other direction: the far machine loses its sessions and the
+    // checkpoint puts them back over ssh. `spawn_kept` is the one caller that
+    // sends a working directory to another machine, and this is the only
+    // thing that ever exercises it.
+    let far = world.socket("gpu-box");
+    let stopped = Command::new(MM)
+        .arg("--socket")
+        .arg(&far)
+        .args(["stop", "--force"])
+        .env("MM_CONFIG_DIR", world.dir.join("gpu-box"))
+        .output()
+        .expect("stopping the far node");
+    assert!(stopped.status.success(), "{stopped:?}");
+
+    let gone = world.ok("laptop", &["ls", "gpu-box"]);
+    assert!(!gone.contains("there"), "the far session survived: {gone}");
+
+    world.ok("laptop", &["checkpoint", "restore"]);
+    let back = world.ok("laptop", &["ls", "gpu-box"]);
+    assert!(
+        back.contains("there"),
+        "it did not come back over ssh: {back}"
+    );
+    let groups = world.ok("laptop", &["groups"]);
+    assert!(groups.contains("work"), "nor its group: {groups}");
+}

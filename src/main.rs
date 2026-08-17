@@ -1181,17 +1181,6 @@ async fn save_checkpoint(socket: &Path, host: Option<String>) -> Result<Saved> {
             ));
             continue;
         }
-        // A wrapper from an earlier restore that the shell never got out of
-        // the way of. Written down it would gain another shell on every save
-        // and restore, so it is refused rather than recorded wrongly.
-        if checkpoint::still_wrapped(&found.foreground) {
-            give_up(format!(
-                "{} on {} is still inside the shell a restore started it with, \
-                 so it is left out",
-                hosted.session.name, hosted.host
-            ));
-            continue;
-        }
         // The pid the machine answered with, against the one the listing gave.
         // A session that ended and was replaced by another of the same name
         // between the two questions is one this would otherwise write down
@@ -1208,6 +1197,24 @@ async fn save_checkpoint(socket: &Path, host: Option<String>) -> Result<Saved> {
         } else {
             checkpoint::resumed(&found.foreground)
         };
+        // A wrapper from an earlier restore that nothing above could read
+        // through. Asked of the answer rather than of the raw foreground,
+        // which is the whole distinction: the plain wrapper shape *is* read
+        // through, and it is what a machine reports in the moment between the
+        // spawn and the command reaching the front of the terminal. Refusing
+        // on the raw form failed a save taken straight after a restore, on a
+        // runner slow enough for that moment to be the one being asked about.
+        // What is left here is the shape nothing can read: quoted inside a
+        // login shell's own snippet, which would gain another shell on every
+        // save and restore.
+        if checkpoint::still_wrapped(&command) {
+            give_up(format!(
+                "{} on {} is still inside the shell a restore started it with, \
+                 so it is left out",
+                hosted.session.name, hosted.host
+            ));
+            continue;
+        }
         sessions.push(Kept {
             host: hosted.host.clone(),
             name: hosted.session.name.clone(),
