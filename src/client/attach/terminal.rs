@@ -407,14 +407,14 @@ fn host_of(target: &str) -> Option<&str> {
 /// hints have it back. Long enough to read without looking for it.
 const NOTICE_FOR: Duration = Duration::from_secs(5);
 
-/// How often the view moves a line under a drag held against its edge.
+/// How often the view moves under a drag held against its edge.
 ///
-/// A screenful in about a second and a half: fast enough that reaching for the
-/// line above the window is a gesture rather than a wait, slow enough to let go
-/// on the line you meant. Every one of these repaints the window, which is why
-/// it is a line at a time and not three: a notch is a hand asking for a jump
-/// and this is a hand asking to keep going.
-const CHASE_EVERY: Duration = Duration::from_millis(60);
+/// How far it moves each time is [`scroll::step`], which ramps; this is the
+/// clock both are spent against. Twenty a second, because every one of them
+/// repaints the window, and a frame rate past what the eye reads as smooth is
+/// bytes over ssh with nothing to show for them. Speed is worth having in the
+/// step instead, where it costs a bigger jump and not another screenful.
+const CHASE_EVERY: Duration = Duration::from_millis(50);
 
 /// Ask the node for the session's screen, and note that it owes an erased,
 /// homed one to paint it onto.

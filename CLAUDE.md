@@ -579,6 +579,18 @@ Three consequences run through the whole codebase and are worth keeping intact:
   different line once the view has moved, and a chase with nowhere left to go
   stops asking rather than ticking against the end of the buffer for as long as
   the button is down.
+- **And it speeds up while it is held, because the hand is asking for two
+  different things** (`scroll::step`). The line just above the window wants one
+  line a move and the chance to let go on it; everything back to where a build
+  started wants a great deal more than that, and at one line a move it is a
+  wait with nothing to do in it. Everywhere else with an edge to drag past
+  tells the two apart by how far past the edge the pointer went, which is the
+  one thing a terminal will not say, so the ramp is on how long the hand has
+  held instead. What grows is the step and not the clock: a move costs a
+  repaint of the window whatever distance it covers, so speed bought in the
+  step is free and speed bought in the frame rate is a screenful of bytes over
+  ssh per line. The count resets whenever the chase ends, or a second drag
+  somewhere else would open at whatever speed the first one worked up to.
 - **Which makes a selection longer than a block possible, so the block is
   stretched over it** (`wanted`, and `COPY_LINES` where that stops). The text
   of a selection is built out of the one block in hand (`holds`), which was

@@ -102,6 +102,8 @@ pub struct Scrollback {
     /// the row under the pointer a different line: the same spot read again
     /// against the new offset is where the drag has got to.
     chasing: Option<Spot>,
+    /// Moves the chase in hand has made, which is what it speeds up with.
+    chased: u64,
     /// A copy asked for before the lines to make it out of had arrived.
     ///
     /// A hand moving quickly presses, drags and lets go inside one read, which
@@ -169,6 +171,33 @@ pub enum Chased {
     /// stopped growing. Worth saying out loud: a view that stopped moving
     /// under a hand still asking it to reads as one that stopped working.
     Full,
+}
+
+/// Chase moves between one rung of the ramp and the next, and the rung it
+/// stops climbing at. With [`terminal::CHASE_EVERY`] behind them these are the
+/// speed: a line a move to start with, a dozen of them from two seconds in.
+///
+/// The rungs are what get taller rather than the clock getting faster, since a
+/// move costs a repaint of the window whatever it covers: at the top of the
+/// ramp that is a screenful every two frames instead of forty frames a second
+/// to say the same thing.
+///
+/// [`terminal::CHASE_EVERY`]: crate::client::attach::terminal
+const FASTER_EVERY: u64 = 4;
+const FASTEST: u64 = 12;
+
+/// Lines one move of a chase covers, by how many it has already made.
+///
+/// A hand held at the edge is asking for two different things at two different
+/// moments: the line just above the window, which wants one line at a time and
+/// the chance to let go on it, and everything back to where a build started,
+/// which at one line a move is a wait with nothing to do in it. Everything else
+/// with an edge to drag past reads the two apart from how far past the edge the
+/// pointer went, which is the one thing a terminal will not say: it clamps what
+/// it reports to the window it has. So the ramp is on how long the hand has
+/// been holding, which is the other thing it is telling us.
+fn step(chased: u64) -> u64 {
+    (1 + chased / FASTER_EVERY).min(FASTEST)
 }
 
 impl Selection {
@@ -239,6 +268,7 @@ impl Scrollback {
             search: None,
             selection: None,
             chasing: None,
+            chased: 0,
             owed: false,
             painted: Vec::new(),
         }
@@ -474,7 +504,7 @@ impl Scrollback {
     /// selected before.
     pub fn select_from(&mut self, spot: Spot) {
         let at = self.cell(spot);
-        self.chasing = None;
+        self.stop_chasing();
         self.selection = Some(Selection {
             anchor: at,
             head: at,
@@ -486,7 +516,11 @@ impl Scrollback {
     /// report arriving out of order rather than a gesture.
     pub fn select_to(&mut self, spot: Spot) {
         let at = self.cell(spot);
-        self.chasing = self.at_an_edge(spot).then_some(spot);
+        if self.at_an_edge(spot) {
+            self.chasing = Some(spot);
+        } else {
+            self.stop_chasing();
+        }
         if let Some(selection) = &mut self.selection {
             selection.head = at;
         }
@@ -513,11 +547,18 @@ impl Scrollback {
     /// Let go of the button. What is selected is untouched; what ends is the
     /// hand's claim on the view.
     pub fn let_go(&mut self) {
-        self.chasing = None;
+        self.stop_chasing();
     }
 
-    /// Move the view a line the way a drag held at an edge is pointing, and
-    /// take the line that uncovers into the selection.
+    /// The hand is no longer asking for the view, whichever way it stopped.
+    /// The count goes with it, so the next chase starts slow again.
+    fn stop_chasing(&mut self) {
+        self.chasing = None;
+        self.chased = 0;
+    }
+
+    /// Move the view the way a drag held at an edge is pointing, and take the
+    /// lines that uncovers into the selection.
     ///
     /// On a clock rather than on the reports, because a hand holding still at
     /// the edge of the window is a hand the terminal has nothing to say about:
@@ -527,26 +568,33 @@ impl Scrollback {
         let Some(spot) = self.chasing else {
             return Chased::Stopped;
         };
+        self.chased += 1;
+        let step = step(self.chased);
         let was = self.offset;
         if spot.row <= 1 {
-            self.up(1);
+            self.up(step);
         } else {
-            self.down(1);
+            self.down(step);
         }
         if self.offset == was {
             // The oldest line there is, or the live screen: nothing that way.
-            self.chasing = None;
+            self.stop_chasing();
             return Chased::Stopped;
         }
         self.select_to(spot);
-        if self.spans() > COPY_LINES {
-            // Put back the line that would have made it too long to copy. A
+        let over = self.spans().saturating_sub(COPY_LINES);
+        if over > 0 {
+            // Give back the lines that would have made it too long to copy. A
             // selection that grew past what one block holds is one that copies
             // nothing, and stopping where it can still be taken is the only
             // answer that keeps the gesture worth making.
-            self.offset = was;
+            if spot.row <= 1 {
+                self.down(over);
+            } else {
+                self.up(over);
+            }
             self.select_to(spot);
-            self.chasing = None;
+            self.stop_chasing();
             return Chased::Full;
         }
         Chased::Moved
@@ -1447,6 +1495,55 @@ mod tests {
         assert_eq!(view.chase(), Chased::Stopped);
     }
 
+    /// A chase starts at a line a move and speeds up while it is held. The
+    /// first move is the one that has to be small: reaching for the line just
+    /// above the window is the common gesture, and a chase that opened at full
+    /// speed would take a screenful before the hand could let go of it.
+    #[test]
+    fn a_chase_starts_slow_and_speeds_up_while_it_is_held() {
+        assert_eq!(step(1), 1);
+        assert_eq!(step(FASTER_EVERY), 2);
+        assert_eq!(step(FASTER_EVERY * FASTEST), FASTEST, "and stops there");
+        assert_eq!(step(10_000), FASTEST);
+
+        let mut view = view(1000);
+        view.select_from(at(24, 1));
+        view.select_to(at(1, 1));
+        for _ in 0..FASTER_EVERY {
+            assert_eq!(view.chase(), Chased::Moved);
+            answer(&mut view, 1000);
+        }
+        assert_eq!(
+            view.offset(),
+            FASTER_EVERY - 1 + 2,
+            "a line each until the rung, then two"
+        );
+    }
+
+    /// Letting go and starting again starts slow again, or a second drag
+    /// somewhere else would open at whatever speed the first one worked up to.
+    #[test]
+    fn a_chase_that_ended_starts_over() {
+        let mut view = view(1000);
+        view.select_from(at(24, 1));
+        view.select_to(at(1, 1));
+        for _ in 0..FASTER_EVERY * 4 {
+            view.chase();
+            answer(&mut view, 1000);
+        }
+        assert!(
+            view.chase() == Chased::Moved && view.offset() > 24,
+            "well into it"
+        );
+
+        view.let_go();
+        view.select_from(at(24, 1));
+        view.select_to(at(1, 1));
+        let was = view.offset();
+        assert_eq!(view.chase(), Chased::Moved);
+        assert_eq!(view.offset() - was, 1);
+    }
+
     /// The block stretches over a selection longer than the window, or the
     /// copy would be made out of lines that are not here and come back short.
     #[test]
@@ -1454,14 +1551,21 @@ mod tests {
         let mut view = view(1000);
         view.select_from(at(24, 1));
         view.select_to(at(1, 1));
-        for _ in 0..100 {
+        while view.offset() < 100 {
             assert_eq!(view.chase(), Chased::Moved);
             answer(&mut view, 1000);
         }
-        assert_eq!(view.offset(), 100);
+        let reached = view.offset();
         let copied = view.copied().unwrap();
-        assert_eq!(copied.lines().count(), 124, "the screenful and the hundred");
-        assert_eq!(copied.lines().next(), Some("line 876"));
+        assert_eq!(
+            copied.lines().count(),
+            reached as usize + 24,
+            "the screenful and everything chased past it"
+        );
+        assert_eq!(
+            copied.lines().next(),
+            Some(&*format!("line {}", 976 - reached))
+        );
     }
 
     /// And it stops growing where one block stops being able to hold it. A
@@ -1483,12 +1587,15 @@ mod tests {
             }
         };
         assert_eq!(ended, Chased::Full);
-        assert_eq!(
-            moved,
-            COPY_LINES - 24,
-            "a screenful of it was already there"
+        assert!(
+            moved < COPY_LINES - 24,
+            "and it got there in fewer moves than lines, having sped up: {moved}"
         );
         assert!(!view.chasing());
+        // The block the last move asked for stops where the selection did, so
+        // the copy is one line past it: the release asks again, which is the
+        // same round trip a copy made before its lines arrived waits out.
+        answer(&mut view, 5000);
         assert_eq!(
             view.copied().unwrap().lines().count(),
             COPY_LINES as usize,

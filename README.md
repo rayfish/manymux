@@ -335,8 +335,9 @@ Then the mouse is manymux's for the whole attach. A notch opens the view and
 moves it, and a drag selects: press, drag, let go, and what you dragged over is
 on your clipboard. Double click takes the word under it, which counts a path or
 a URL as one word, and triple click takes the line. Hold the drag against the
-top or bottom of the window and the view moves under it a line at a time, so a
-selection is not limited to what happens to be on the screen. Letting go at the
+top or bottom of the window and the view moves under it, a line at a time to
+begin with and faster the longer you hold, so a selection is not limited to
+what happens to be on the screen. Letting go at the
 live screen gives it straight back, so the session never appears to stop;
 scrolled back, the highlight stays where you left it and so does the view.
 
