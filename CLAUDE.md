@@ -308,18 +308,30 @@ Three consequences run through the whole codebase and are worth keeping intact:
   coordinates from the top that would go straight over a box drawn before it.
   The rows it opens on are the caller's, built after the write, so the box shows
   what just happened without asking anything.
-- **The session list is a tree two deep, and the indent is the whole of it.**
-  A machine, the groups on it with their sessions inside, and whatever is in no
-  group last and a step in, where it reads as the rest of the machine rather
-  than as another group: a heading saying "no group" would name the one thing a
-  group is not. A group spanning machines appears under each of them, because
-  the question the list answers first is which machine, and `mm groups` is
-  where a group is read whole. `Row::indent` draws it and also tells the two
-  kinds of heading apart, which `h` needs: a machine is the only heading at
-  nothing, and a key that stepped over groups too would give a machine with
-  three of them three presses where it used to have one. The indent is spent
-  out of the label's own column, or a deep row would push the detail and the
-  note along and the box would stop reading as columns.
+- **The session list leads with the groups, and a machine is what is left.**
+  A group spans machines, so it is the machines that break up under it: nested
+  the other way, the one thing a group is for, seeing a piece of work in one
+  place, was the one thing the list would not show. So the groups come first,
+  each whole and headed `@name` the way it is typed and the way `mm a @pi`
+  spells it, then whatever is in no group under the machine it is on. No
+  heading says "no group": that would name the one thing a group is not.
+  Inside a group every row carries its machine, this one included, because
+  there the machine is what tells two rows apart, and half-qualifying only the
+  far ones leaves the eye working out which kind of row it is looking at. The
+  ungrouped rows are bare, since the heading above them already said it.
+  Sections are ordered by their first session and sessions by `started`, never
+  by name, for the reason every listing here has: a name moves under a rename
+  and the rows would shuffle beneath a hand walking them.
+- **A group heading and a machine heading are the same thing to the picker.**
+  Siblings in the list, skipped the same way, and `h` steps between them
+  without caring which it landed on: with the groups leading, a key that walked
+  only machines would step over most of the screen. So there is one
+  `Row::heading` and the label says which it is. `Row::indent` is left doing
+  nothing but drawing, and it is spent out of the label's own column, or a
+  deeper row would push the detail and the note along and the box would stop
+  reading as columns. The name column takes the widest name in the list between
+  `MIN_LABEL` and `MAX_LABEL`, because `host/session` needs room that a bare
+  session name would waste on the detail.
 - **A window with no room for the box hands the job to the mark row.** Since the
   popup *is* the mode, a terminal too short to draw one (`Picker::draw` answers
   nothing) was a client that had taken the keyboard and a `tab` that changed
@@ -465,6 +477,14 @@ Three consequences run through the whole codebase and are worth keeping intact:
   and `set_scroll` are a pair: no history to move is no reason to take the
   mouse, so a host too old to answer for a window keeps its wheel and gets a
   sentence on the row when the key is pressed.
+- **The view paints row by row and never erases the screen.** An erase and a
+  repaint leaves the screen blank for as long as the lines after it take to
+  arrive, which at one notch is nothing and at a wheel being spun is a flicker
+  per frame. So every row is written over the one before it with a clear to the
+  end of the line, which is also what keeps a long line from showing through
+  under a shorter one. And a window with no block yet paints *nothing* rather
+  than blanking: the session is on the screen, one frame more of it is no lie,
+  and blanking to wait is the flicker again with nothing to show for it.
 - **The view opens before it knows how much history there is, so the opening
   move cannot be clamped** (`Scrollback::answered`). `total` is zero until the
   host answers, and a move back clamped against zero is a move thrown away. It

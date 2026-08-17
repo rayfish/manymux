@@ -1439,36 +1439,54 @@ impl Listed {
             .filter(|(_, group)| focus.is_none_or(|focus| *group == Some(focus)))
             .collect();
 
-        let mut rest = showing.as_slice();
-        while let Some((first, _)) = rest.first() {
-            let machine = first.host.as_str();
-            let (run, left) = rest.split_at(rest.partition_point(|(h, _)| h.host == machine));
-            rest = left;
-            rows.push(Row::heading(machine));
+        // The groups first, each one whole. A group spans machines, so it is
+        // the machines that break up under it and not the other way round:
+        // nested the other way, the one thing a group is for, seeing a piece of
+        // work in one place, was the one thing the list would not show.
+        //
+        // In the order their first session appears, which is by machine and
+        // then oldest first, so a group's place moves only when the oldest
+        // session in it ends. Ordering by name would shuffle the list under a
+        // rename, which is what every listing here is written to avoid.
+        let mut drawn: Vec<&str> = Vec::new();
+        for (_, group) in &showing {
+            let Some(group) = *group else { continue };
+            if drawn.contains(&group) {
+                continue;
+            }
+            drawn.push(group);
+            rows.push(Row::heading(format!("@{group}")));
+            for (hosted, _) in showing.iter().filter(|(_, g)| *g == Some(group)) {
+                // Every row carries its machine, this one included. Inside a
+                // group the machine is what tells two rows apart and is worth
+                // the columns, and half-qualifying only the far ones would
+                // leave the eye working out which kind of row it is looking at.
+                let label = format!("{}/{}", hosted.host, hosted.session.name);
+                Self::session(&mut rows, &mut at, hosted, current, label);
+            }
+        }
 
-            // The groups on this machine first, each with its sessions under
-            // it, in the order their first session appears: a group's place in
-            // the list moves only when the oldest session in it ends, which is
-            // the same thing the sessions' own order rests on.
-            let mut drawn: Vec<&str> = Vec::new();
-            for (_, group) in run {
-                let Some(group) = *group else { continue };
-                if drawn.contains(&group) {
-                    continue;
-                }
-                drawn.push(group);
-                rows.push(Row::subheading(group));
-                for (hosted, _) in run.iter().filter(|(_, g)| *g == Some(group)) {
-                    Self::session(&mut rows, &mut at, hosted, current, 2);
-                }
+        // Then whatever is in no group, under the machine it is on, which is
+        // the only thing left to gather it by. No heading says "no group": that
+        // would name the one thing a group is not, and with the groups above it
+        // the rest of the list needs no introduction.
+        let mut machine: Option<&str> = None;
+        for (hosted, group) in &showing {
+            if group.is_some() {
+                continue;
             }
-            // Then whatever is in no group, last and a step in, where it reads
-            // as the rest of the machine rather than as another group. A
-            // heading of its own would be a group called "no group", which is
-            // the one thing a group is not.
-            for (hosted, _) in run.iter().filter(|(_, group)| group.is_none()) {
-                Self::session(&mut rows, &mut at, hosted, current, 1);
+            if machine != Some(hosted.host.as_str()) {
+                machine = Some(&hosted.host);
+                rows.push(Row::heading(&hosted.host));
             }
+            // Bare, because the heading above it already says the machine.
+            Self::session(
+                &mut rows,
+                &mut at,
+                hosted,
+                current,
+                hosted.session.name.clone(),
+            );
         }
         let landed = current.clone();
         let on = at.iter().position(|there| *there == landed).unwrap_or(0);
@@ -1489,7 +1507,10 @@ impl Listed {
                 ""
             };
             group_rows.push(
-                Row::new(names.len(), &name)
+                // Spelt the way it is typed and the way the session list
+                // heads it, so the same thing is not two things across two
+                // lists one key apart.
+                Row::new(names.len(), format!("@{name}"))
                     .detail(count.to_string())
                     .note(mark),
             );
@@ -1517,7 +1538,7 @@ impl Listed {
         at: &mut Vec<Located>,
         hosted: &HostedSession,
         current: &Located,
-        indent: u16,
+        label: String,
     ) {
         let here = *current == Located::new(&hosted.host, &hosted.session.name);
         let mut note = term::duration(hosted.session.idle);
@@ -1528,10 +1549,11 @@ impl Listed {
             note = "●".to_string();
         }
         rows.push(
-            Row::new(at.len(), &hosted.session.name)
+            Row::new(at.len(), label)
                 .detail(&hosted.session.title)
                 .note(note)
-                .indent(indent),
+                // One step in, under whichever heading gathered it.
+                .indent(1),
         );
         at.push(Located::new(&hosted.host, &hosted.session.name));
     }

@@ -12,11 +12,12 @@
 //! building, and is all here so it can be tested without a terminal.
 //!
 //! The one thing that gets in the way of that selection is the wheel, since a
-//! terminal reporting the mouse to us is a terminal not selecting with it. So
-//! the reports are asked for only while this view is up (`attach::wheel_is_ours`),
-//! which is where the wheel is the gesture and elsewhere the drag is; and inside
-//! the view a drag needs the modifier terminals give for exactly this, shift
-//! almost everywhere and option in iTerm2.
+//! terminal reporting the mouse to us is a terminal not selecting with it. The
+//! reports are worth it anyway (`attach::wheel_is_ours`): this screen is the
+//! terminal's alternate one, which keeps no scrollback and has no wheel of its
+//! own to fall back on, so not asking for them left the gesture reaching
+//! nobody. A drag still selects under the modifier terminals keep for exactly
+//! this, shift almost everywhere and option in iTerm2.
 //!
 //! The window moves locally inside a block that has already arrived, and a
 //! block is a few screenfuls. A request per wheel notch would be a round trip
@@ -314,28 +315,41 @@ impl Scrollback {
     }
 
     /// The screen as it should now look: every row of the session's part of it,
-    /// erased first, with the cursor left where nothing will type over it.
+    /// each clearing what was on it as it is written.
     ///
-    /// Blank while the first block is still on its way, because painting the
-    /// live screen underneath a half-drawn view reads as a bug rather than a
-    /// wait.
+    /// Row by row rather than an erase and a repaint. The erase left the screen
+    /// blank for as long as it took the lines after it to be drawn, which at
+    /// one notch is nothing and at a wheel being spun is a flicker on every
+    /// frame. Writing each row over the one before it never shows an empty
+    /// screen, and clearing to the end of each line is what keeps a long line
+    /// from showing through under a shorter one that replaced it.
+    ///
+    /// Nothing at all while the first block is on its way, rather than a blank
+    /// screen: what is up is the session, one frame more of it is no lie, and
+    /// blanking the screen to wait is the flicker again with nothing to show
+    /// for it.
     pub fn paint(&self) -> String {
-        let rows = self.page();
-        let mut out = String::from("\x1b[0m\x1b[H\x1b[2J");
-        if !self.covered() {
-            return out;
-        }
         let Some(block) = &self.block else {
-            return out;
+            return String::new();
         };
+        if !self.covered() {
+            return String::new();
+        }
+        let rows = self.page();
         let lines = block.window(self.offset, rows);
         // A window at the very top of a short buffer has fewer lines than the
         // screen has rows, and they go at the bottom of it: the oldest line
         // sits where it would have been had you scrolled to it.
         let blank = rows.saturating_sub(lines.len() as u64);
-        for (row, line) in lines.iter().enumerate() {
-            let row = blank + row as u64 + 1;
-            out.push_str(&format!("\x1b[{row};1H\x1b[0m{line}"));
+        let mut out = String::from("\x1b[0m");
+        for row in 1..=rows {
+            // The pen goes back to default per row: the line about to be
+            // written sets its own colours, and the clear that precedes it
+            // would otherwise clear to whatever the line above left set.
+            out.push_str(&format!("\x1b[{row};1H\x1b[0m\x1b[K"));
+            if row > blank {
+                out.push_str(&lines[(row - blank - 1) as usize]);
+            }
         }
         out
     }
@@ -515,11 +529,19 @@ mod tests {
         let mut view = view(100);
         view.up(1);
         let painted = view.paint();
-        assert!(painted.starts_with("\x1b[0m\x1b[H\x1b[2J"), "{painted:?}");
+        // No screen-wide erase: each row clears itself as it is written, so
+        // there is never a frame with an empty screen in it.
+        assert!(!painted.contains("\x1b[2J"), "{painted:?}");
         // The window ends one line back from the newest, so its last line is
         // line 98 of 0..100, and it goes on the last row the session has.
-        assert!(painted.contains("\x1b[24;1H\x1b[0mline 98"), "{painted:?}");
-        assert!(painted.contains("\x1b[1;1H\x1b[0mline 75"), "{painted:?}");
+        assert!(
+            painted.contains("\x1b[24;1H\x1b[0m\x1b[Kline 98"),
+            "{painted:?}"
+        );
+        assert!(
+            painted.contains("\x1b[1;1H\x1b[0m\x1b[Kline 75"),
+            "{painted:?}"
+        );
         assert!(!painted.contains("line 99"), "{painted:?}");
     }
 
@@ -529,8 +551,21 @@ mod tests {
     fn a_short_buffer_paints_against_the_bottom_of_the_screen() {
         let view = view(3);
         let painted = view.paint();
-        assert!(painted.contains("\x1b[22;1H\x1b[0mline 0"), "{painted:?}");
-        assert!(painted.contains("\x1b[24;1H\x1b[0mline 2"), "{painted:?}");
+        assert!(
+            painted.contains("\x1b[22;1H\x1b[0m\x1b[Kline 0"),
+            "{painted:?}"
+        );
+        assert!(
+            painted.contains("\x1b[24;1H\x1b[0m\x1b[Kline 2"),
+            "{painted:?}"
+        );
+        // And the rows above them are cleared rather than left holding
+        // whatever the last window put there, which is the job the erase this
+        // no longer does used to do.
+        assert!(
+            painted.contains("\x1b[1;1H\x1b[0m\x1b[K\x1b["),
+            "{painted:?}"
+        );
     }
 
     /// The window is only ever asked for inside the block, but it is asked for
@@ -605,11 +640,13 @@ mod tests {
         assert!(!view.step(true));
     }
 
-    /// Until the first block lands there is nothing to draw, and drawing the
-    /// live screen instead would read as the key not having worked.
+    /// Until the first block lands there is nothing to draw, so nothing is
+    /// drawn: the session is on the screen and one frame more of it is no lie,
+    /// where blanking the screen to wait is a flicker with nothing to show for
+    /// it. The block is a round trip away and paints over it when it lands.
     #[test]
-    fn a_view_with_nothing_in_it_yet_paints_an_empty_screen() {
+    fn a_view_with_nothing_in_it_yet_leaves_the_screen_alone() {
         let view = Scrollback::new(SIZE);
-        assert_eq!(view.paint(), "\x1b[0m\x1b[H\x1b[2J");
+        assert_eq!(view.paint(), "");
     }
 }
