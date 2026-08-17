@@ -186,6 +186,21 @@ Three consequences run through the whole codebase and are worth keeping intact:
   run has been attached to anything at all (`attached` in `do_attach`); only
   the first attach can fail outright, because that one is a command that did
   not work rather than a connection that went.
+- **An attempt to get back has a deadline, because the waiting does not**
+  (`main::REACH_FOR`, ten seconds, applied by `reaching` and only once
+  `attached`). The wait is unbounded on purpose and reads the keyboard
+  throughout; the *attempt* reads nothing, so a try that never returns is a
+  terminal frozen on `reconnecting` with a row that has stopped counting and a
+  Ctrl-C nobody is reading. ssh gets there without any network being down:
+  `ControlMaster=auto` puts every command on one shared connection and
+  connecting to a control socket has no deadline of any kind, so a wedged
+  master hangs each client until it expires on its own schedule. Two clients
+  hanging and coming back together is the shape of it from outside. Dropping
+  the attempt is what ends it, which works because `ssh::spawn` sets
+  `kill_on_drop`: the hung ssh goes with the future instead of being left
+  holding the master. The bound belongs to reconnects alone, since the first
+  attach of a run is a command somebody typed and may legitimately be a cold
+  ssh, a node starting, or an install being answered.
 - **The row is the only thing that moves while a connection is gone, so it has
   to.** Everything above it is the session as it was painted before the drop,
   which is the point; a row written once and left there is a client that has

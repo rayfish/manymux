@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::fmt::{self, Display, Formatter};
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
@@ -931,7 +932,8 @@ async fn do_attach(
         } else {
             0
         };
-        let session = match attach_to(socket, &target, history, watching).await {
+        let session = match reaching(attach_to(socket, &target, history, watching), attached).await
+        {
             Ok(session) => session,
             // The way back out of a session that ended is gone too, and there
             // is nothing further back than the one you came from. So the run
@@ -1364,6 +1366,54 @@ impl Display for Missed {
     }
 }
 
+/// How long one attempt at getting back is given before it counts as a
+/// failure.
+///
+/// There has to be a number here, because the one thing an attempt cannot be
+/// given is forever. ssh's own `ConnectTimeout` is about reaching a machine,
+/// and the way this hangs is a step further in: `ControlMaster=auto` puts every
+/// command on one shared connection, and connecting to a control socket has no
+/// deadline of any kind. A master whose network went takes everything
+/// multiplexed onto it with it, which is a whole terminal sitting on
+/// `reconnecting` with a row that has stopped counting and a Ctrl-C nobody is
+/// reading, until the master times out on its own schedule or somebody works
+/// out what a control socket is. Two clients on one master hang and then come
+/// back together, which is the shape of it from outside.
+///
+/// Ten seconds because it is the wrong side of every honest reattach and the
+/// right side of nobody's patience: a handshake onto a machine that is there
+/// takes under a second, and a retry costs a line on the row rather than
+/// anything real.
+const REACH_FOR: Duration = Duration::from_secs(10);
+
+/// One attempt at reaching a session, with a deadline on it once this run has
+/// been attached to something.
+///
+/// Not before that. The first attach of a run is a command somebody typed, and
+/// it is allowed to take as long as it takes: a cold ssh, a node being started,
+/// an install being offered and answered. What is bounded is a reconnect, which
+/// nobody asked for and which has somewhere to go when it fails, namely round
+/// the loop to a row that counts down and reads the keyboard.
+///
+/// Dropping the attempt is what stops it: `ssh::spawn` sets `kill_on_drop`, so
+/// the ssh that was hanging goes with the future rather than being left to
+/// hold the master open behind us.
+async fn reaching(
+    attempt: impl Future<Output = Result<Attached, Missed>>,
+    bounded: bool,
+) -> Result<Attached, Missed> {
+    if !bounded {
+        return attempt.await;
+    }
+    match tokio::time::timeout(REACH_FOR, attempt).await {
+        Ok(reached) => reached,
+        Err(_) => Err(Missed::Unreachable(anyhow!(
+            "no answer in {}s",
+            REACH_FOR.as_secs()
+        ))),
+    }
+}
+
 /// Open a stream to wherever a session is, and attach to it.
 async fn attach_to(
     socket: &Path,
@@ -1743,4 +1793,38 @@ fn current_dir() -> Option<String> {
     std::env::current_dir()
         .ok()
         .map(|p| p.to_string_lossy().into_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An attempt that never answers, which is what a client multiplexed onto
+    /// a dead ssh master is: nothing fails, nothing times out, and the row
+    /// stops counting because the loop never comes back round to it.
+    async fn never() -> Result<Attached, Missed> {
+        std::future::pending().await
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_reconnect_that_never_answers_is_a_failed_attempt() {
+        // tokio's clock, not the wall's: this test spends no real time at all.
+        let at = tokio::time::Instant::now();
+        let missed = reaching(never(), true).await;
+        assert!(matches!(missed, Err(Missed::Unreachable(_))));
+        assert!(at.elapsed() >= REACH_FOR, "it waited {:?}", at.elapsed());
+    }
+
+    /// The first attach of a run is a command somebody typed: a cold ssh, a
+    /// node being started and an install being answered are all allowed to
+    /// take longer than a reconnect is.
+    #[tokio::test(start_paused = true)]
+    async fn the_first_attach_of_a_run_is_given_as_long_as_it_takes() {
+        assert!(
+            tokio::time::timeout(REACH_FOR * 10, reaching(never(), false))
+                .await
+                .is_err(),
+            "the first attach was cut short"
+        );
+    }
 }
