@@ -157,7 +157,7 @@ impl Encoded {
     /// the middle is.
     fn parse(input: &[u8]) -> Option<Self> {
         let rest = input.strip_prefix(b"\x1b[")?;
-        let end = rest.iter().position(|b| (0x40..=0x7e).contains(b))?;
+        let end = rest.iter().position(|b| final_byte(*b))?;
         let mut fields = std::str::from_utf8(&rest[..end]).ok()?.split(';');
         let mut shifted = None;
         let (code, mods, event) = match rest[end] {
@@ -303,7 +303,7 @@ fn sequence(input: &[u8]) -> Option<usize> {
     match rest.first()? {
         // A control sequence, which runs to its final byte.
         b'[' => {
-            let end = rest[1..].iter().position(|b| (0x40..=0x7e).contains(b))?;
+            let end = rest[1..].iter().position(|b| final_byte(*b))?;
             Some(3 + end)
         }
         // SS3, which is one byte and is how a terminal in application-keypad
@@ -556,9 +556,13 @@ impl Report {
 /// What it costs is the terminal's own selection, which a terminal stops doing
 /// with a bare drag the moment somebody is reporting the mouse. Every terminal
 /// keeps it under a modifier, which is where tmux has had it for twenty years,
-/// and it is the smaller loss: a session you cannot scroll is one you cannot
-/// read, while a selection you cannot make without holding shift is one you can
-/// still make.
+/// and it is the smaller loss by default: a session you cannot scroll is one you
+/// cannot read, while a selection you cannot make without holding shift is one
+/// you can still make. Which modifier, and whether it works at all, is the
+/// terminal's business and not ours, so the trade is the person's to refuse:
+/// `mm config mouse terminal` leaves the mouse alone and the scroll key is then
+/// the only way in. That arrives here inside `history`, since a wheel with
+/// nowhere to go and a wheel somebody wants back come to the same thing.
 ///
 /// Never while the session has asked for reports of its own, which is the half
 /// of the old rule that stays: two readers on one wheel, and a program that
@@ -578,10 +582,11 @@ pub(super) fn wheel_is_ours(history: bool, session_mouse: bool) -> bool {
 /// sent of its own accord.
 const SHIFT_TAB: &[u8] = b"\x1b[Z";
 
-/// The keys that move a popup's highlight, in the spellings terminals send
-/// them in.
+/// The keys that move a popup's highlight, each in the plain spelling a
+/// terminal sends it in when nothing has asked for a longer one.
 ///
-/// Matched before the bytes are looked at one at a time, for the same reason
+/// Matched through [`Special`], which reads the longer spellings back to these,
+/// and matched before the bytes are looked at one at a time, for the same reason
 /// [`VIEW_KEYS`] is: read a byte at a time the Esc starting `\x1b[A` is the Esc
 /// that closes the popup, so reaching for a cursor key would shut the list.
 const PICK_KEYS: &[(&[u8], Pick)] = &[
@@ -591,23 +596,19 @@ const PICK_KEYS: &[(&[u8], Pick)] = &[
     // rather than only in the control-mode match, so it moves the group list
     // too: read a byte at a time there, its Esc is the Esc that closes.
     (SHIFT_TAB, Pick::Up),
-    // The application-keypad spellings, which a program may have left the
-    // terminal in.
-    (b"\x1bOA", Pick::Up),
-    (b"\x1bOB", Pick::Down),
 ];
 
-/// The keys that move the view, in the spellings terminals send them in.
+/// The keys that move the view, each in the plain spelling a terminal sends it
+/// in when nothing has asked for a longer one.
 ///
-/// Matched before the bytes are looked at one at a time, so that the escape
-/// starting each of them is not mistaken for the bare Esc that leaves.
+/// Read through [`Special`] and matched before the bytes are looked at one at a
+/// time, so that the escape starting each of them is not mistaken for the bare
+/// Esc that leaves.
 const VIEW_KEYS: &[(&[u8], Scroll)] = &[
     (b"\x1b[5~", Scroll::PageUp),
     (b"\x1b[6~", Scroll::PageDown),
     (b"\x1b[A", Scroll::Up(1)),
     (b"\x1b[B", Scroll::Down(1)),
-    (b"\x1bOA", Scroll::Up(1)), // the application-keypad spellings, which a
-    (b"\x1bOB", Scroll::Down(1)), // program may have left the terminal in
     (b"\x1b[H", Scroll::Top),
     (b"\x1b[1~", Scroll::Top),
     (b"\x1b[7~", Scroll::Top),
@@ -615,6 +616,82 @@ const VIEW_KEYS: &[(&[u8], Scroll)] = &[
     (b"\x1b[4~", Scroll::Bottom),
     (b"\x1b[8~", Scroll::Bottom),
 ];
+
+/// A key that types nothing, as a terminal spells it, with everything an
+/// extended-keys mode adds to the spelling taken back off.
+///
+/// The arrows and the paging keys are the keys [`Encoded`] cannot speak for:
+/// they are escape sequences rather than bytes, and they end in a letter or a
+/// `~` rather than the `u` that protocol uses. So they are matched against the
+/// tables above, and matching the plain spelling alone missed exactly what
+/// [`Encoded::down`] once missed. A terminal asked to report event types stops
+/// resending `\x1b[A` for a held arrow and sends `\x1b[1;1:2A`, so holding one
+/// in the popup moved the highlight once and stopped, but only while a program
+/// like `pi` had the terminal in that mode: the same hand on the same key
+/// worked in every other session.
+///
+/// Modifiers are read off and then ignored. Ctrl-Up in a list is a hand
+/// reaching for up, and there is nothing else here for it to mean.
+struct Special {
+    /// How many bytes of the input the sequence took.
+    len: usize,
+    /// The number in front, which names the key in the `~` spellings and is 1
+    /// for the ones a final letter names.
+    number: u32,
+    /// The final byte: `A` for up, `~` for the numbered keys.
+    ends: u8,
+    /// 1 press, 2 repeat, 3 release, as [`Encoded`] reads it.
+    event: u8,
+}
+
+impl Special {
+    /// Read one such key off the front of `input`, if what is there is one.
+    fn parse(input: &[u8]) -> Option<Self> {
+        // SS3, which is how a terminal in application-keypad mode spells the
+        // arrows. It carries no parameters at all, so there is nothing an
+        // extended mode could have added to it.
+        if let Some(rest) = input.strip_prefix(b"\x1bO") {
+            let ends = *rest.first()?;
+            return final_byte(ends).then_some(Self {
+                len: 3,
+                number: 1,
+                ends,
+                event: PRESS,
+            });
+        }
+        let rest = input.strip_prefix(b"\x1b[")?;
+        let end = rest.iter().position(|b| final_byte(*b))?;
+        let mut fields = std::str::from_utf8(&rest[..end]).ok()?.split(';');
+        // An absent number is 1, which is what the protocol says a missing
+        // parameter means and what makes `\x1b[A` and `\x1b[1;5A` one key.
+        let number = match fields.next() {
+            None | Some("") => 1,
+            Some(field) => number(field)?,
+        };
+        let (_, event) = modifiers(fields.next());
+        Some(Self {
+            len: 2 + end + 1,
+            number,
+            ends: rest[end],
+            event,
+        })
+    }
+
+    /// Whether this is the key `plain` names, held down rather than let go of.
+    fn is(&self, plain: &[u8]) -> bool {
+        let Some(named) = Self::parse(plain) else {
+            return false;
+        };
+        (self.event == PRESS || self.event == REPEAT)
+            && self.number == named.number
+            && self.ends == named.ends
+    }
+}
+
+/// Whether this byte ends a control sequence.
+fn final_byte(b: u8) -> bool {
+    (0x40..=0x7e).contains(&b)
+}
 
 /// Watches the keystroke stream for the key that changes mode, and reads the
 /// keys that follow it.
@@ -1089,9 +1166,8 @@ impl KeyFilter {
             // own and have to be read whole before the escape starting them is
             // taken for the Esc that leaves.
             if self.mode == Mode::Scroll
-                && let Some((_, scroll)) = VIEW_KEYS
-                    .iter()
-                    .find(|(spelling, _)| input[i..].starts_with(spelling))
+                && let Some(key) = Special::parse(&input[i..])
+                && let Some((_, scroll)) = VIEW_KEYS.iter().find(|(plain, _)| key.is(plain))
             {
                 let action = Action::Scroll(*scroll);
                 self.mode = Self::after(action, self.mode);
@@ -1104,13 +1180,12 @@ impl KeyFilter {
             }
             // The same, for the arrows that move a popup's highlight.
             if matches!(self.mode, Mode::Control | Mode::Picking)
-                && let Some((spelling, pick)) = PICK_KEYS
-                    .iter()
-                    .find(|(spelling, _)| input[i..].starts_with(spelling))
+                && let Some(key) = Special::parse(&input[i..])
+                && let Some((_, pick)) = PICK_KEYS.iter().find(|(plain, _)| key.is(plain))
             {
-                self.spell(spelling);
+                self.spell(&input[i..i + key.len]);
                 self.pressed = None;
-                i += spelling.len();
+                i += key.len;
                 let action = Action::Pick(*pick);
                 self.mode = Self::after(action, self.mode);
                 return Keystrokes {
@@ -1415,7 +1490,13 @@ impl KeyFilter {
             return Some(action);
         }
         if self.mode == Mode::Picking {
-            // The same, for the group list.
+            // The same, for the group list, Shift-Tab included: it walks the
+            // list back, and a terminal asked for a protocol that can say which
+            // key was held spells it as tab with shift rather than as `CSI Z`,
+            // where reading the byte behind it walks the list the other way.
+            if key.code == TAB && key.mods & SHIFT != 0 {
+                return Some(Action::Pick(Pick::Up));
+            }
             let action = byte.and_then(|b| self.picking(b))?;
             self.opening(action);
             return Some(action);
@@ -1632,6 +1713,25 @@ mod tests {
             f.filter(b"\x1b"),
             asked(Action::Scroll(Scroll::Leave), Mode::Focus)
         );
+    }
+
+    /// The view's keys are read the same way the popup's are, so a held arrow
+    /// keeps moving it and a released one moves nothing. A long build is
+    /// scrolled by holding a key more often than by pressing one.
+    #[test]
+    fn an_arrow_held_down_keeps_moving_the_view() {
+        let mut f = KeyFilter::new(KEY);
+        f.set_scroll(true);
+        f.filter(&[KEY, SCROLL_KEY]);
+        for keys in [&b"\x1b[A"[..], &b"\x1b[1;1:2A"[..], &b"\x1b[1;5A"[..]] {
+            assert_eq!(
+                f.filter(keys),
+                asked(Action::Scroll(Scroll::Up(1)), Mode::Scroll),
+                "{keys:?}"
+            );
+        }
+        assert_eq!(f.filter(b"\x1b[1;1:3A").action, None, "a key let go of");
+        assert_eq!(f.filter(b"\x1b[1;1:3A").mode, Mode::Scroll);
     }
 
     /// Nothing typed at the view reaches the session: the screen is showing the
@@ -2699,6 +2799,80 @@ mod tests {
                 f.filter(key),
                 asked(Action::Pick(Pick::Up), Mode::Picking),
                 "{key:?}"
+            );
+        }
+    }
+
+    /// A terminal asked to report event types stops resending the plain
+    /// spelling of a held key, so an arrow held down in the popup arrives once
+    /// and then only as repeats. Dropping those made holding one move the
+    /// highlight exactly once, and only while a program like `pi` had the
+    /// terminal in that mode.
+    #[test]
+    fn an_arrow_held_down_keeps_moving_a_list() {
+        // Press, repeat, repeat, in the spelling those modes use.
+        let held: &[&[u8]] = &[b"\x1b[A", b"\x1b[1;1:2A", b"\x1b[1;1:2A"];
+        for keys in held {
+            let mut f = picking();
+            assert_eq!(
+                f.filter(keys),
+                asked(Action::Pick(Pick::Up), Mode::Picking),
+                "{keys:?}"
+            );
+        }
+        for keys in held {
+            let mut f = KeyFilter::new(KEY);
+            f.filter(&[KEY]);
+            assert_eq!(
+                f.filter(keys),
+                asked(Action::Pick(Pick::Up), Mode::Control),
+                "{keys:?}"
+            );
+        }
+    }
+
+    /// The same key with a modifier held, and the same key spelt the long way
+    /// with no modifier at all: both are somebody reaching for up.
+    #[test]
+    fn an_arrow_spelt_the_long_way_moves_a_list() {
+        for keys in [&b"\x1b[1;5B"[..], &b"\x1b[1;1:1B"[..], &b"\x1bOB"[..]] {
+            let mut f = picking();
+            assert_eq!(
+                f.filter(keys),
+                asked(Action::Pick(Pick::Down), Mode::Picking),
+                "{keys:?}"
+            );
+        }
+    }
+
+    /// Letting go of an arrow is not a keystroke, and it must not be read as
+    /// the Esc it starts with either: that would close the list under the hand
+    /// still holding the key.
+    #[test]
+    fn letting_go_of_an_arrow_moves_nothing_and_closes_nothing() {
+        let mut f = picking();
+        assert_eq!(
+            f.filter(b"\x1b[1;1:3A"),
+            Keystrokes {
+                forward: Vec::new(),
+                action: None,
+                mode: Mode::Picking,
+                rest: Vec::new(),
+            }
+        );
+    }
+
+    /// Shift-Tab spelt the way a terminal in an extended-keys mode spells it,
+    /// which is tab with shift rather than `CSI Z`. Read as the byte behind it
+    /// alone, it walked the list the wrong way.
+    #[test]
+    fn shift_tab_walks_the_group_list_back_in_either_spelling() {
+        for keys in [SHIFT_TAB, &b"\x1b[9;2u"[..]] {
+            let mut f = picking();
+            assert_eq!(
+                f.filter(keys),
+                asked(Action::Pick(Pick::Up), Mode::Picking),
+                "{keys:?}"
             );
         }
     }
