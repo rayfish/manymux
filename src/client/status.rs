@@ -1266,9 +1266,9 @@ mod tests {
         assert!(painted.contains("\x1b[24;70H"), "{painted:?}");
     }
 
-    /// The wheel no longer opens the view, because the mouse is the terminal's
-    /// while the session is live so that a drag can select. That leaves the key
-    /// as the only way in, and a way in nobody can see is no way in.
+    /// The wheel opens the view too, but the key is the way in for a hand that
+    /// would rather not reach for the mouse, and the only one on a session that
+    /// asked for the mouse itself. A way in nobody can see is no way in.
     #[test]
     fn the_hints_offer_the_key_that_opens_the_view() {
         let mut status = Status::new("srv/zsh");

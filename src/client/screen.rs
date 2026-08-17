@@ -91,10 +91,11 @@ impl ScreenMode for Alternate {
         // appears to be. On a surface of its own the coordinates mean what they
         // say.
         //
-        // Alternate scroll goes with it. The wheel is read here only while the
-        // view is up, so that the mouse is the terminal's the rest of the time
-        // and a drag selects; but a terminal on its alternate screen with
-        // nobody reporting turns a notch into arrow keys, and those land in
+        // Alternate scroll goes with it. The client reports the mouse here for
+        // the whole attach, so most of the time nothing is left for a notch to
+        // be turned into; but while a session has asked for the mouse itself
+        // the client's tracking is off, and a terminal on its alternate screen
+        // with nobody reporting turns a notch into arrow keys, which land in
         // whatever is reading the session's input. Scrolling up at a shell
         // would walk its history. Saved first, so what the terminal had is what
         // it gets back: one that does not know how to save it keeps the setting

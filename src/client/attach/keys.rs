@@ -529,23 +529,33 @@ impl Report {
 /// Whether the wheel is the client's to read, or the terminal's to do what it
 /// likes with.
 ///
-/// Only while the view is up. Reporting the mouse is what stops a drag from
-/// selecting, so a client that holds it for the whole attach is one you cannot
-/// copy a line out of without a modifier held down; and with the view closed
-/// there is nothing here for a notch to move anyway. What the view is open on
-/// has already been decided by then: it opens only on a screen the client owns
-/// and a host new enough to answer for a window.
+/// For the whole attach, wherever there is a history of our own to move:
+/// a screen the client owns, and a host new enough to answer for a window.
+/// This used to be only while the view was already up, which left the wheel
+/// doing nothing at all for the rest of the attach: the client's screen is the
+/// terminal's alternate one, where the terminal has no scrollback to offer, and
+/// [`crate::client::screen::Alternate`] switches alternate scroll off besides,
+/// so a notch reached nobody. A program that repaints in place on the primary
+/// screen and asks for no mouse of its own, which `pi` is, was unscrollable by
+/// the gesture everyone reaches for first.
 ///
-/// Never while the session has asked for reports of its own, which is both
-/// halves of the same rule: two readers on one wheel, and a client that turned
-/// tracking on would turn it off again on the way out of the view, leaving a
-/// program that asked for the mouse without one.
+/// What it costs is the terminal's own selection, which a terminal stops doing
+/// with a bare drag the moment somebody is reporting the mouse. Every terminal
+/// keeps it under a modifier, which is where tmux has had it for twenty years,
+/// and it is the smaller loss: a session you cannot scroll is one you cannot
+/// read, while a selection you cannot make without holding shift is one you can
+/// still make.
+///
+/// Never while the session has asked for reports of its own, which is the half
+/// of the old rule that stays: two readers on one wheel, and a program that
+/// asked for the mouse must keep every report, including the wheel it draws its
+/// own scrolling from.
 ///
 /// Desktop-only, like the terminal it is a rule about: a mobile app has no
 /// wheel to route and its own idea of what a drag is.
 #[cfg(feature = "desktop")]
-pub(super) fn wheel_is_ours(view_open: bool, session_mouse: bool) -> bool {
-    view_open && !session_mouse
+pub(super) fn wheel_is_ours(history: bool, session_mouse: bool) -> bool {
+    history && !session_mouse
 }
 
 /// Shift-Tab, spelt the way a terminal sends it when nothing has asked for a
@@ -1462,9 +1472,29 @@ mod tests {
     /// The mode key, whatever it is. Named because a control byte in the middle
     /// of a byte string is unreadable.
     const KEY: u8 = DEFAULT_PREFIX;
-    /// The key opens the view and the wheel moves it from there: the client
-    /// asks the terminal for reports only once there is a window for them to
-    /// move, so that the rest of the time a drag is a selection.
+    /// A notch with no view up opens one, which is the whole point of holding
+    /// the wheel for the attach rather than for the view: the gesture everybody
+    /// reaches for first is the wheel, and it cannot open what it is not being
+    /// reported for.
+    #[test]
+    fn a_notch_on_the_live_session_opens_the_view() {
+        let mut f = KeyFilter::new(KEY);
+        f.set_scroll(true);
+        f.set_wheel(true);
+        assert_eq!(f.mode, Mode::Focus, "the view is not up");
+        assert_eq!(
+            f.filter(b"\x1b[<64;10;5M"),
+            Keystrokes {
+                forward: Vec::new(),
+                action: Some(Action::Scroll(Scroll::Up(scroll::WHEEL))),
+                mode: Mode::Scroll,
+                rest: Vec::new(),
+            }
+        );
+    }
+
+    /// And the key still opens it, for a hand that would rather not reach for
+    /// the mouse and for a terminal reporting nothing.
     #[test]
     fn the_wheel_moves_the_view_the_key_opened() {
         let mut f = KeyFilter::new(KEY);
@@ -1518,26 +1548,34 @@ mod tests {
         assert_eq!(f.filter(b"\x1b[<0;10;5M\x1b[<0;10;5m"), forwarded(b""));
     }
 
-    /// The mouse is the terminal's while you are looking at the live session,
-    /// so a drag selects and a double click takes a word, the way they do in
-    /// any other program. A client holding mouse reports for the whole attach
-    /// is a client you cannot copy a line out of without a modifier held, and
-    /// the wheel it holds them for has nothing to scroll until the view is up.
+    /// The wheel is the client's wherever there is a history of our own for a
+    /// notch to move, and for the whole attach rather than only once the view
+    /// is up. The client's screen is the terminal's alternate one, which has no
+    /// scrollback to offer and no alternate scroll either, so a notch that is
+    /// not reported reaches nobody at all.
     #[cfg(feature = "desktop")]
     #[test]
-    fn the_wheel_is_the_clients_only_while_the_view_is_up() {
+    fn the_wheel_is_the_clients_wherever_there_is_a_history_to_move() {
         assert!(wheel_is_ours(true, false));
-        assert!(!wheel_is_ours(false, false), "nothing to scroll yet");
     }
 
-    /// A program that asked for the mouse keeps it, view or no view. Taking it
-    /// would leave two readers on one wheel, and giving it back on the way out
-    /// of the view would switch off tracking the client never switched on.
+    /// Inline, and on a host too old to answer for a window, there is nothing
+    /// here for a notch to move: the terminal keeps the wheel, and with it the
+    /// bare drag that selects.
+    #[cfg(feature = "desktop")]
+    #[test]
+    fn the_terminal_keeps_the_wheel_where_there_is_no_history_of_ours() {
+        assert!(!wheel_is_ours(false, false));
+        assert!(!wheel_is_ours(false, true));
+    }
+
+    /// A program that asked for the mouse keeps it, history or no history.
+    /// Taking it would leave two readers on one wheel, and a full-screen program
+    /// draws its own scrolling from exactly these reports.
     #[cfg(feature = "desktop")]
     #[test]
     fn the_wheel_is_never_taken_from_a_session_that_asked_for_it() {
         assert!(!wheel_is_ours(true, true));
-        assert!(!wheel_is_ours(false, true));
     }
 
     /// While the session has the mouse, every report is its own and the client

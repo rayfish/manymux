@@ -395,10 +395,10 @@ const NOTICE_FOR: Duration = Duration::from_secs(5);
 
 /// Take the wheel, or give it back.
 ///
-/// When that is, and why it is so rarely, is [`wheel_is_ours`]. The arrow
-/// keys a terminal would make of a notch with nobody reporting are not this
-/// function's problem: alternate scroll is off for the whole run of
-/// attaches, in [`crate::client::screen`].
+/// When that is, and when it is not, is [`wheel_is_ours`]. The arrow keys a
+/// terminal would make of a notch with nobody reporting are not this function's
+/// problem: alternate scroll is off for the whole run of attaches, in
+/// [`crate::client::screen`].
 async fn own_the_wheel(
     stdout: &mut Stdout,
     keys: &mut KeyFilter,
@@ -620,6 +620,11 @@ async fn pump(
     // has the lines in its own buffer and its own wheel is better than
     // anything here.
     keys.set_scroll(screen.mode().owns_the_screen());
+    // The wheel is a stricter question than the key: taking the mouse off the
+    // terminal costs it the bare-drag selection, so it is worth doing only
+    // where a notch has somewhere to go. A host that cannot answer for a window
+    // gets a sentence on the row when the key is pressed, and keeps its wheel.
+    let history = scrolls && screen.mode().owns_the_screen();
     let mut output = Filter::new(screen);
     // The view over the session's history, while it is up.
     let mut scrolling: Option<Scrollback> = None;
@@ -1056,10 +1061,10 @@ async fn pump(
                     restate = true;
                     settle(&mut stdout, &output, &status, &mut pending, &mut restate).await?;
                 }
-                // The view has just opened or just closed, and the wheel
-                // goes with it: the terminal has the mouse back the moment
-                // there is a live session to select on.
-                let ours = wheel_is_ours(scrolling.is_some(), output.session_mouse());
+                // The session may have asked for the mouse, or given it back,
+                // and the wheel goes with that: a program that wants reports
+                // gets every one of them, the wheel included.
+                let ours = wheel_is_ours(history, output.session_mouse());
                 own_the_wheel(&mut stdout, &mut keys, &mut wheel, ours).await?;
                 if chunk.is_empty() {
                     break 'chunk;
@@ -1108,7 +1113,7 @@ async fn pump(
                     // The session may have just asked for the mouse, or
                     // given it back. Only between sequences, like the mark.
                     if output.at_boundary() {
-                        let ours = wheel_is_ours(scrolling.is_some(), output.session_mouse());
+                        let ours = wheel_is_ours(history, output.session_mouse());
                         own_the_wheel(&mut stdout, &mut keys, &mut wheel, ours).await?;
                     }
                     // A screen switch went no further than this client, so
@@ -1183,6 +1188,15 @@ async fn pump(
                 Update::View(window) => {
                     if let Some(view) = scrolling.as_mut() {
                         view.take(window);
+                        // The block was asked for around where the window was
+                        // before the host said how much history there is, so a
+                        // move made before the first answer may have been
+                        // brought back inside it and left the block covering
+                        // somewhere else. Asking again is a no-op when it does
+                        // cover, which is every case but that one.
+                        if let Some(request) = view.wanted() {
+                            writer.view(&request).await?;
+                        }
                         status.set_scrolled(Some(view.offset()));
                         stdout.write_all(view.paint().as_bytes()).await?;
                         stdout

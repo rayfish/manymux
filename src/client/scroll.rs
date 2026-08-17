@@ -39,7 +39,23 @@ pub struct Scrollback {
     /// Zero is the live screen's last line, which is where the view opens.
     offset: u64,
     /// Lines in the whole buffer, screen included, as the host last said.
+    ///
+    /// Meaningless until [`Self::answered`], and zero until then, which is why
+    /// that flag exists rather than a `None` here: every use of this is
+    /// arithmetic, and an `Option` in the middle of it would be unwrapped to
+    /// zero at each one and mean nothing.
     total: u64,
+    /// Whether the host has answered once, and so whether `total` is worth
+    /// clamping against.
+    ///
+    /// The view opens before anything has been asked for, so the first move
+    /// back is made against a total of zero. Clamped against that it is thrown
+    /// away, which nobody noticed while the view was opened by a key that only
+    /// opened it: the first thing that moved was the second thing you pressed.
+    /// The wheel opens it and moves it in one gesture, so the lost move is the
+    /// first notch, and a wheel whose first notch does nothing reads as a wheel
+    /// that does not work.
+    answered: bool,
     /// What we have: where its bottom sits, and its lines, oldest first.
     block: Option<Block>,
     /// The last thing asked for, so a window the host cannot fill any better
@@ -98,6 +114,7 @@ impl Scrollback {
         Self {
             offset: 0,
             total: 0,
+            answered: false,
             block: None,
             asked: None,
             rows: session_size(size).rows,
@@ -214,6 +231,15 @@ impl Scrollback {
     /// the window's top edge cannot go past the oldest line, or a screenful of
     /// blank would sit above lines that do exist.
     pub fn up(&mut self, lines: u64) {
+        // Nothing to clamp against yet, so the move stands and the request
+        // built from it asks for the block around where it landed. `take` does
+        // the clamping when the answer says how much history there is, which
+        // is the same clamp a move made later gets and one round trip earlier
+        // than owing it to a second one.
+        if !self.answered {
+            self.offset += lines;
+            return;
+        }
         let furthest = self.total.saturating_sub(self.page());
         self.offset = (self.offset + lines).min(furthest);
     }
@@ -231,7 +257,14 @@ impl Scrollback {
     }
 
     /// The oldest line the host still has.
+    ///
+    /// As far back as there is, which before the first answer is as far back as
+    /// there could be: `take` brings it to whatever turned out to exist.
     pub fn top(&mut self) {
+        if !self.answered {
+            self.offset = u64::MAX;
+            return;
+        }
         self.offset = self.total.saturating_sub(self.page());
     }
 
@@ -269,6 +302,7 @@ impl Scrollback {
     /// Take a block the host sent, and learn from it where the ends are.
     pub fn take(&mut self, window: Window) {
         self.total = window.total;
+        self.answered = true;
         // A buffer that trimmed under the request, or one shorter than a
         // screen: keep the window inside what exists.
         let furthest = self.total.saturating_sub(self.page());
@@ -343,6 +377,36 @@ mod tests {
         let view = Scrollback::new(SIZE);
         assert_eq!(view.offset(), 0);
         assert!(view.at_bottom());
+    }
+
+    /// The bug the wheel found: the view opens on the first notch, so the move
+    /// that opened it is made before the host has said how much history there
+    /// is. Clamped against a total of zero it was thrown away, and the first
+    /// notch of the gesture did nothing at all.
+    #[test]
+    fn the_move_that_opened_the_view_is_not_lost_to_a_total_nobody_knows_yet() {
+        let mut view = Scrollback::new(SIZE);
+        view.up(WHEEL);
+        answer(&mut view, 100);
+        assert_eq!(view.offset(), 3, "the notch that opened the view moved it");
+    }
+
+    /// And it is still a move, so what exists still bounds it: a hand that
+    /// spun the wheel into a session with barely any history lands on the
+    /// oldest line rather than past it.
+    #[test]
+    fn an_opening_move_past_the_end_is_brought_back_when_the_answer_lands() {
+        let mut view = Scrollback::new(SIZE);
+        view.up(10_000);
+        answer(&mut view, 100);
+        assert_eq!(view.offset(), 100 - 24);
+
+        // `g` before the first answer means the same thing, and cannot say so
+        // in lines because it does not yet know how many there are.
+        let mut view = Scrollback::new(SIZE);
+        view.top();
+        answer(&mut view, 100);
+        assert_eq!(view.offset(), 100 - 24);
     }
 
     #[test]

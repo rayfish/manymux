@@ -423,29 +423,47 @@ Three consequences run through the whole codebase and are worth keeping intact:
   two hops away must not be a round trip. Whether the host can do either rides
   on `Response::Attached { scroll }`, and a host that cannot says so on the mark
   row rather than leaving a key that does nothing.
-- **The mouse is the terminal's except while that view is up**
-  (`attach::wheel_is_ours`). A terminal reporting the mouse to us is a terminal
-  not selecting with it, so a client that held tracking for the whole attach was
-  a client you could not copy a line out of without a modifier held down. The
-  reports are worth that only where the wheel is the gesture, which is the view,
-  and the view is where the key opens it: the wheel cannot open what it is not
-  being reported for. Two things follow. `Alternate::setup` switches alternate
-  scroll off (`?1007s` then `?1007l`, restored with `?1007r`), because with
-  nobody reporting, a notch on the terminal's alternate screen becomes arrow
-  keys and they land in whatever is reading the session's input. And the key has
-  to be on the hints row, since the gesture that used to find it is gone. A
-  session that asked for the mouse itself keeps every report as before: taking
-  it would leave two readers on one wheel, and giving it back on the way out of
-  the view would switch off tracking the client never switched on.
-- **The wheel is the terminal's to route, not ours.** A program that asked for
-  mouse tracking gets SGR reports, one on its own alternate screen without
-  tracking gets the terminal's alternate-scroll arrows, and ordinary output
-  leaves the wheel scrolling the terminal's own scrollback. All three are right
-  only while the session's screen switches and mouse modes reach the terminal,
-  which is what inline allows and what `Filter::owns_the_screen` decides.
-  Nothing in the client reads a wheel event and nothing should: that way lies
-  tmux's copy mode, and between `avt` on the node and the terminal's own
-  scrollback there is nothing left for it to do.
+- **The wheel is ours wherever we have a history for it to move**
+  (`attach::wheel_is_ours`), which on the alternate screen is the whole attach.
+  This was once the other way round, held only while the view was already up, on
+  the reasoning that a terminal reporting the mouse is a terminal not selecting
+  with it. What that missed is where the notch went instead: the client's screen
+  *is* the terminal's alternate one, which keeps no scrollback of its own, and
+  `Alternate::setup` switches alternate scroll off besides (`?1007s` then
+  `?1007l`, restored with `?1007r`) so a notch cannot become arrow keys into
+  whatever is reading the session. So a notch reached nobody at all, and the
+  common case is worse than it sounds: a program that repaints in place on the
+  primary screen and asks for no mouse of its own, which `pi` is, could not be
+  scrolled by the gesture everyone reaches for first. Now the first notch opens
+  the view and moves it, which is what tmux does and what the mode was always
+  shaped for (`KeyFilter::after` has said "a wheel notch in focus mode opens it
+  and stays" since before one could). The cost is the bare drag that selects,
+  which every terminal keeps under a modifier: a session you cannot scroll is
+  one you cannot read, and a selection needing shift is one you can still make.
+  The key stays on the hints row, for a hand that would rather not reach for the
+  mouse.
+- **A session that asked for the mouse keeps every report, wheel included.**
+  That half of the old rule is untouched and is what the whole thing rests on:
+  two readers on one wheel is one of them reading input meant for the other, and
+  a full-screen program draws its own scrolling from exactly these reports. So
+  `wheel_is_ours` is false while `Filter::session_mouse` is true, and inline it
+  is false always, because there the terminal has the lines in its own buffer
+  and its own wheel is better than anything here. Which is also why `set_wheel`
+  and `set_scroll` are a pair: no history to move is no reason to take the
+  mouse, so a host too old to answer for a window keeps its wheel and gets a
+  sentence on the row when the key is pressed.
+- **The view opens before it knows how much history there is, so the opening
+  move cannot be clamped** (`Scrollback::answered`). `total` is zero until the
+  host answers, and a move back clamped against zero is a move thrown away. It
+  went unnoticed while a key that only opened the view was the way in, since the
+  first thing that moved was the second thing you pressed. The wheel opens and
+  moves in one gesture, so the lost move became the first notch, and a wheel
+  whose first notch does nothing reads as a wheel that does not work. So a move
+  made before the first answer stands, the block is asked for around where it
+  landed, and `take` does the clamping when the answer says what exists, which
+  is one round trip rather than two. `Update::View` asks again after taking one,
+  because a window brought back inside a short history can leave the block
+  covering somewhere else.
 - **A resize is repainted from the node, not left to the session.** Telling the
   node the new size redraws nothing: a shell that printed and went quiet has no
   answer to a SIGWINCH, so the screen keeps the old geometry, marks on rows that
