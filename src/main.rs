@@ -1738,6 +1738,26 @@ fn same_machine(named: &str, at: &str) -> bool {
     named == at || (is_this_machine(named) && is_this_machine(at))
 }
 
+/// A machine named on a command line, under the name a listing gives it.
+///
+/// The two spellings of this machine are not the same string, and an attach
+/// compares them as one: `mm new` with no host says `local`, `mm attach
+/// local/build` says it outright, and every listing labels this machine with
+/// its own short name. A [`Located`] whose host is the other spelling matches
+/// no row of the listing, so the session the run is *in* was in none of it: the
+/// popup opened highlighting somebody else's session with Enter over it, no row
+/// wore the mark, and the group the run narrows to on the way in was read off a
+/// session nothing could find. Applied where a typed word stops being one and
+/// becomes the address a whole run compares against, rather than at each of the
+/// places that compare.
+fn as_listed(host: &str) -> &str {
+    if is_this_machine(host) {
+        this_machine()
+    } else {
+        host
+    }
+}
+
 /// How long a switch key waits on a listing that has not landed yet, before
 /// going with whatever it already knows. A machine that is asleep must not
 /// leave the terminal sitting there.
@@ -1763,7 +1783,7 @@ async fn do_attach(
     screen: Screen,
     watching: bool,
 ) -> Result<u8> {
-    let mut cycle = Cycle::new(Located::new(host, name));
+    let mut cycle = Cycle::new(Located::new(as_listed(host), name));
     // Asked for before the first attach, so the first switch key has something
     // to go on.
     let mut listing = Some(spawn_listing(socket));
@@ -2710,6 +2730,42 @@ mod tests {
         let missed = reaching(never(), true).await;
         assert!(matches!(missed, Err(Missed::Unreachable(_))));
         assert!(at.elapsed() >= REACH_FOR, "it waited {:?}", at.elapsed());
+    }
+
+    fn hosted(name: &str) -> HostedSession {
+        HostedSession {
+            host: this_machine().to_string(),
+            session: manymux::proto::SessionInfo {
+                name: name.to_string(),
+                title: name.to_string(),
+                command: "zsh".into(),
+                pid: 1,
+                size: manymux::proto::Size::new(80, 24),
+                attached: 0,
+                idle: 0,
+                bells: 0,
+                started: std::time::SystemTime::UNIX_EPOCH,
+            },
+        }
+    }
+
+    /// The bug this closes: `mm new` with no host names this machine `local`,
+    /// while the listing the popup is drawn from calls it by its own name, so
+    /// the session the run was in matched no row. The popup opened on the first
+    /// session in the list with Enter over it, and no row wore the mark.
+    #[test]
+    fn the_popup_opens_on_the_session_the_run_is_in_however_the_machine_was_named() {
+        let snapshot = Snapshot {
+            sessions: vec![hosted("build"), hosted("test")],
+            answered: vec![this_machine().to_string()],
+        };
+        let current = Located::new(as_listed(LOCAL), "test");
+        let listed = Listed::of(&snapshot, &Groups::default(), None, &current);
+        let row = &listed.rows.sessions[listed.rows.at];
+        assert_eq!(row.label, "test");
+        // And the same row is the one wearing the mark, since both are the same
+        // comparison and a highlight without one reads as a listing gone stale.
+        assert_eq!(row.note, "●");
     }
 
     /// The first attach of a run is a command somebody typed: a cold ssh, a
