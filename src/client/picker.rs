@@ -715,7 +715,7 @@ mod tests {
     fn the_tree_is_drawn_a_step_in_per_level() {
         let rows = vec![
             Row::heading("@pi"),
-            Row::heading("dev.box.ray").indent(1),
+            Row::heading("web-box").indent(1),
             Row::new(0, "build").indent(2),
             Row::heading("gpu-box"),
             Row::new(1, "spare").indent(1),
@@ -728,12 +728,12 @@ mod tests {
                 .map(|line| line.find(needle).unwrap())
                 .unwrap_or_else(|| panic!("{needle} was not drawn: {lines:#?}"))
         };
-        assert!(column("@pi") < column("dev.box.ray"), "{lines:#?}");
-        assert!(column("dev.box.ray") < column("build"), "{lines:#?}");
+        assert!(column("@pi") < column("web-box"), "{lines:#?}");
+        assert!(column("web-box") < column("build"), "{lines:#?}");
         // A group and a machine with nothing grouped on it are siblings: the
         // group is not inside the machine, nor the machine inside the group.
         assert_eq!(column("@pi"), column("gpu-box"), "{lines:#?}");
-        assert_eq!(column("dev.box.ray"), column("spare"), "{lines:#?}");
+        assert_eq!(column("web-box"), column("spare"), "{lines:#?}");
     }
 
     /// The cells under the box are the box's: the session's screen there was
@@ -823,7 +823,7 @@ mod tests {
     #[test]
     fn every_row_is_drawn_the_same_width() {
         let rows = vec![
-            Row::heading("dev.box.ray"),
+            Row::heading("web-box"),
             Row::new(0, "build").detail("cargo test").note("2m"),
             Row::new(1, "a-much-longer-session-name").detail("nvim"),
         ];

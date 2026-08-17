@@ -279,14 +279,14 @@ mod tests {
     fn the_rules_apply_to_bytes_from_anywhere() {
         let raw = Raw {
             stat: "1234 (zsh) S 1 1234 1234 34816 5678 0".to_string(),
-            cwd: "/home/dario/rayfish".to_string(),
+            cwd: "/srv/project".to_string(),
             cmdline: b"claude\0--continue\0".to_vec(),
         };
         assert_eq!(tpgid(&raw.stat), Some(5678));
         assert_eq!(
             raw.read(),
             Foreground {
-                cwd: Some("/home/dario/rayfish".to_string()),
+                cwd: Some("/srv/project".to_string()),
                 argv: vec!["claude".to_string(), "--continue".to_string()],
             }
         );

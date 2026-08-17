@@ -22,6 +22,7 @@ use crate::lock::held;
 use crate::proto::{
     Doing, EventKind, Found, SessionEvent, SessionInfo, Size, SpawnSpec, View, ViewRequest,
 };
+use crate::shell;
 use crate::user;
 
 /// Lines of scrollback kept per session. Enough to scroll back through a long
@@ -562,28 +563,8 @@ fn launch(spec: &SpawnSpec) -> Launch {
     }
     Launch {
         label: named(&spec.command),
-        argv: vec![shell, "-lc".to_string(), shell_command(&spec.command)],
+        argv: vec![shell, "-lc".to_string(), shell::join(&spec.command)],
     }
-}
-
-/// Join argv into one shell command, so an argument with spaces or quotes in it
-/// survives the trip through `-c`.
-fn shell_command(argv: &[String]) -> String {
-    argv.iter()
-        .map(|arg| quote(arg))
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-/// Quote an argument for a POSIX shell. Everything inside single quotes is
-/// literal, so the only thing needing care is a single quote itself: close the
-/// quoting, emit an escaped one, open it again.
-fn quote(arg: &str) -> String {
-    let safe = |b: &u8| b.is_ascii_alphanumeric() || b"-_./:=@,+".contains(b);
-    if !arg.is_empty() && arg.as_bytes().iter().all(safe) {
-        return arg.to_string();
-    }
-    format!("'{}'", arg.replace('\'', "'\\''"))
 }
 
 /// A short human label for a command, used as the default session name and as
@@ -644,17 +625,6 @@ mod tests {
         );
         // The listing shows what was asked for, not the wrapper.
         assert_eq!(launched.label, "claude --resume");
-    }
-
-    #[test]
-    fn quoting_survives_spaces_and_quotes() {
-        assert_eq!(shell_command(&["echo".into(), "a b".into()]), "echo 'a b'");
-        assert_eq!(
-            shell_command(&["sh".into(), "-c".into(), "printf 'hi'".into()]),
-            r#"sh -c 'printf '\''hi'\'''"#
-        );
-        // A plain word is left alone, so the common case stays readable.
-        assert_eq!(shell_command(&["/usr/bin/vim".into()]), "/usr/bin/vim");
     }
 
     #[test]

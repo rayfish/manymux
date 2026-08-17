@@ -390,9 +390,9 @@ Three consequences run through the whole codebase and are worth keeping intact:
   far ones leaves the eye working out which kind of row it is looking at. The
   A machine goes on a line of its own inside a group rather than in front of
   every name: `host/name` is how a session is addressed and was the obvious
-  label, but a real host name is most of the column, and with `dev.box.ray/` in
-  front of it there was no room left to tell `rayfish-iroh-dev` from
-  `rayfish-iroh-debug`, which is the one thing the row exists to say. So every
+  label, but a real host name is most of the column, and with a mesh name and a
+  slash in front of it there was no room left to tell `service-iroh-dev` from
+  `service-iroh-debug`, which is the one thing the row exists to say. So every
   session sits under a machine either way and a group is a level above that.
   Sections are ordered by their first session and sessions by `started`, never
   by name, for the reason every listing here has: a name moves under a rename
@@ -550,6 +550,21 @@ Three consequences run through the whole codebase and are worth keeping intact:
   what follows, and `checkpoint::shell_command` reads that back out when it is
   a plain command. Only a plain one: the words of `a | b` are not an argv, and
   quoting them as one execs a program with that name.
+- **A flag that asks which conversation is not a flag that says which**
+  (`checkpoint::resuming`). The table's `already` list is there because these
+  programs reject `--resume <id> --continue` rather than picking between two
+  answers, so anything that has named a conversation is left exactly as it is.
+  But `--resume` takes its conversation optionally, and bare it opens a chooser
+  and waits: restored as captured, the session comes back sitting at a menu
+  having resumed nothing, and from outside that is indistinguishable from a
+  program that started. So the bare form is taken out and `--continue` put in
+  its place, which is what the person meant by it — the conversation in this
+  directory, said in the one way that needs no keyboard. It is the only place
+  here that rewrites what it captured rather than recording it, and what earns
+  the exception is that running this one as captured cannot do what it was
+  doing. `picks` is the set it applies to, since the distinction is per flag:
+  `--session-id` without a value is an error rather than a menu, and its
+  program will say so.
 - **A checkpoint is the client's, and the first one on a machine cannot ask the
   node anything.** `src/client/checkpoint.rs` is `checkpoint.toml` beside the
   host list: which session was where, running what, in which group. It is here
