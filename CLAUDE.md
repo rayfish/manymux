@@ -295,6 +295,19 @@ Three consequences run through the whole codebase and are worth keeping intact:
   it may name a row that is *not* the session at the other end of the attach
   stream, and `tag::RENAME` renames that one by design, so it goes back to
   `main` as a `Request::Rename` to that row's machine.
+- **Everything but Enter on a session comes back to the popup.** Grouping a
+  session, naming one, narrowing to a group: none of them is a gesture that goes
+  anywhere, so landing in the session afterwards threw away the list you were
+  working from and made a second move two more keys. They all detach and
+  reattach, because the write is `main`'s to make and this half of the client
+  may not know what a group is, so the way back is `mode`: `Outcome::Chose`
+  leaves it at `Mode::Control` and only `Chose::Go` sets it to `Mode::Focus`.
+  Which needs the other half of it, since control mode *is* the popup: an attach
+  that starts there opens the box itself (`greet` in `pump`), and it has to wait
+  for the frame that repaints on attach, a screen dump painting by absolute
+  coordinates from the top that would go straight over a box drawn before it.
+  The rows it opens on are the caller's, built after the write, so the box shows
+  what just happened without asking anything.
 - **The session list is a tree two deep, and the indent is the whole of it.**
   A machine, the groups on it with their sessions inside, and whatever is in no
   group last and a step in, where it reads as the rest of the machine rather

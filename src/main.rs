@@ -1057,10 +1057,21 @@ async fn do_attach(
             // host, a group or a pid is.
             Outcome::Chose(chose) => {
                 hopped = false;
+                // Back to the list, because that is where the gesture was made
+                // and none of these is a gesture that goes anywhere: grouping a
+                // session, naming one, narrowing to a group all leave you
+                // exactly where you were, and dropping into the session
+                // afterwards throws away the place you were working from. Enter
+                // on a session is the one that means go, and it is the one that
+                // sets this back to `Focus` below.
+                mode = Mode::Control;
                 match chose {
                     // A hop like any other, so the way back is recorded the
                     // same way and `Motion::Last` reaches it.
                     Chose::Go(row) => {
+                        // The one that goes somewhere, and so the one that
+                        // leaves you in the session rather than over it.
+                        mode = Mode::Focus;
                         if let Some(there) = listed.at.get(row)
                             && *there != target
                         {
@@ -1122,7 +1133,6 @@ async fn do_attach(
                 // Whatever it was, what the machines are running may have moved
                 // under it, and a press is the only thing that ever asks.
                 listing = Some(spawn_listing(socket));
-                mode = Mode::Focus;
             }
             Outcome::Switch(motion) => {
                 take_listing(&mut listing, &mut cycle, &mut snapshot, &mut groups).await;

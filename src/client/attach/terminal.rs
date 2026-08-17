@@ -641,6 +641,15 @@ async fn pump(
     // Whether the frame that repaints the screen on attach has been and
     // gone. Everything after it is the session speaking for itself.
     let mut painted = false;
+    // Whether this attach still owes the popup its opening.
+    //
+    // Arriving in control mode is arriving with the popup up, since that is
+    // what control mode looks like: an attach that started there and drew
+    // nothing was a client holding the keyboard with nothing on the screen
+    // saying so. It cannot be drawn until the repaint has been, though, because
+    // that frame is a screen dump and paints by absolute coordinates from the
+    // top, straight over anything already there.
+    let mut greet = mode == Mode::Control;
     // Screens still owed for a resize, and so still to be painted onto one
     // wiped first. Counted rather than flagged because a drag across the
     // desktop asks more than once before the first answer arrives.
@@ -1136,6 +1145,14 @@ async fn pump(
                         restate |= output.take_dirty();
                     }
                     settle(&mut stdout, &output, &status, &mut pending, &mut restate).await?;
+                    // The screen is up, so the box has something to sit on. The
+                    // rows are the ones the caller handed over, which it built
+                    // after whatever brought us back here, so this opens on
+                    // what is true rather than asking and waiting.
+                    if std::mem::take(&mut greet) {
+                        popup = Some(Popup::sessions(&rows));
+                        draw_popup(&mut stdout, &popup, &mut status, &mut restate).await?;
+                    }
                 }
                 // The screen we asked for. Its own switches are how a dump
                 // paints both buffers, so they are swallowed and dropped
