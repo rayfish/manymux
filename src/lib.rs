@@ -24,6 +24,7 @@ pub mod lock;
 pub mod notify;
 pub mod proto;
 pub mod settings;
+pub mod shell;
 pub mod ssh;
 pub mod style;
 pub mod term;

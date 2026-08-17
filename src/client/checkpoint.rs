@@ -910,6 +910,31 @@ mod tests {
         );
     }
 
+    /// The line `mm checkpoint show` prints under each session is the line that
+    /// runs, so it is built the way the node builds one: `to_spawn` joined with
+    /// `shell::join`. Anything else printed would be a second opinion about
+    /// what is about to happen, and the words that make the two disagree are
+    /// exactly the ones somebody reads that row to check.
+    ///
+    /// `SHELL` is a program that exits, since the wrapper ends by exec'ing a
+    /// login shell and this is not a terminal.
+    #[test]
+    fn the_line_that_is_printed_is_the_line_that_runs() {
+        let words = argv(&["printf", "%s|", "a b", r#"c'd"#, "--flag=x y"]);
+        let line = crate::shell::join(&to_spawn(&words));
+        let ran = std::process::Command::new("sh")
+            .arg("-lc")
+            .arg(&line)
+            .env("SHELL", "/bin/true")
+            .output()
+            .expect("a shell to run the line with");
+        assert_eq!(
+            String::from_utf8_lossy(&ran.stdout),
+            "a b|c'd|--flag=x y|",
+            "the words come back as they were, out of {line}"
+        );
+    }
+
     #[test]
     fn the_checkpoint_file_round_trips() {
         let checkpoint = Checkpoint {

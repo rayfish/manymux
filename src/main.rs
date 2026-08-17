@@ -25,7 +25,7 @@ use manymux::node::{Config, Node};
 use manymux::proto::{Doing, HostedSession, Request, Response, SpawnSpec};
 use manymux::settings::{Screen, Settings};
 use manymux::update::Channel;
-use manymux::{config, log, style, term};
+use manymux::{config, log, shell, style, term};
 
 mod complete;
 mod completions;
@@ -1532,6 +1532,9 @@ async fn restore_checkpoint(socket: &Path, host: Option<String>, dry_run: bool) 
     if dry_run {
         for kept in &wanted {
             println!("{}", restoring(kept));
+            if let Some(line) = spawning(kept) {
+                println!("  {}", style::faint(&line));
+            }
         }
         return Ok(OK);
     }
@@ -1681,6 +1684,24 @@ fn restoring(kept: &Kept) -> String {
     )
 }
 
+/// The line the node will be handed for one entry, spelled the way it will
+/// reach a shell.
+///
+/// Worth a row of its own because the row above it is not the whole story: what
+/// runs is the captured command inside the wrapper that keeps the login shell
+/// behind it (`checkpoint::to_spawn`), and the one question anybody asks a
+/// checkpoint before restarting a machine is what it is actually going to run.
+/// Built from the same `to_spawn` the restore sends and joined with the same
+/// quoter the node runs it through (`shell::join`), so this cannot become a
+/// second opinion about what happens.
+///
+/// `None` for a session that was sitting at a prompt: an empty spawn is the
+/// login shell, which the row above already says in words.
+fn spawning(kept: &Kept) -> Option<String> {
+    let argv = checkpoint::to_spawn(&kept.command);
+    (!argv.is_empty()).then(|| shell::join(&argv))
+}
+
 /// `mm checkpoint show`: what is written down, and nothing else.
 ///
 /// Contacts no machine on purpose. This is the one command that still answers
@@ -1702,6 +1723,9 @@ fn show_checkpoint() -> Result<u8> {
     );
     for kept in &checkpoint.sessions {
         println!("{}", restoring(kept));
+        if let Some(line) = spawning(kept) {
+            println!("  {}", style::faint(&line));
+        }
     }
     Ok(OK)
 }

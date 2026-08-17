@@ -438,6 +438,15 @@ again as it was, and a session sitting at a prompt comes back as a login shell
 in the same directory. The file is plain TOML and is meant to be edited before
 you restore it.
 
+`show` and `restore --dry-run` put the line each session will actually be
+started with under it, since what runs is the captured command inside a wrapper
+that keeps the login shell behind it:
+
+```
+dev.box.ray/manymux @rayfish claude --continue in /home/dario/rayfish/manymux
+  exec sh -mc '"$@"; exec "${SHELL:-/bin/sh}" -l' sh claude --continue
+```
+
 Four things worth knowing:
 
 - **Groups belong to the client**, so take the checkpoint from the machine you
