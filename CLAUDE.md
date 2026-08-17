@@ -606,6 +606,24 @@ Three consequences run through the whole codebase and are worth keeping intact:
   under a shorter one. And a window with no block yet paints *nothing* rather
   than blanking: the session is on the screen, one frame more of it is no lie,
   and blanking to wait is the flicker again with nothing to show for it.
+- **A selected cell is painted a colour, and reverse video is not one**
+  (`scroll::SELECTED`). Reverse says *swap the two colours this cell already
+  has*, which is a different answer per cell: over a coloured path it takes the
+  text's colour as the background and one selection comes out a patchwork, and
+  over a run the program drew reversed itself, which is how `pi` draws the
+  message you typed, swapping again lands back where it started and the
+  selection is invisible. So every selected cell gets the same explicit pair,
+  opening with a reset because bold, underline and the program's own reverse
+  all belong to the cell underneath. The pair is spelt out rather than left to
+  the terminal's own selection colour, which no escape sequence can ask for; a
+  near-white on a near-black reads the same on a light terminal and a dark one.
+  What that needs is the other half: the line's pen is *accumulated* through
+  the walk and reissued after a reset when the highlight ends, since what a
+  cell looks like is every SGR before it on the line, and the pens inside the
+  highlight are held rather than written or the text would show through the
+  thing covering it. Ending a highlight with `\x1b[27m`, as this did, turned
+  off a reverse the *program* had asked for and painted the rest of its line
+  wrong.
 - **A highlight stops at the edge of the screen, and starts where the hand
   pointed.** A selection that runs off the end of a line takes the blanks with
   it, or a block dragged down the screen comes apart at every short line in it,

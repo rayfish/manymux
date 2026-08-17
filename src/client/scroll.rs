@@ -725,11 +725,35 @@ fn plain(line: &str, from: u16, to: u16) -> String {
     out
 }
 
-/// The same walk, with those cells written in reverse video.
+/// What a selected cell is painted with: one colour for every selected cell,
+/// whatever the program had drawn there.
 ///
-/// The pen is put back rather than cleared, so a highlight over coloured text
-/// leaves the colour either side of it alone: `\x1b[27m` turns reverse off and
-/// says nothing about anything else.
+/// A colour of its own rather than reverse video, which is what this was and
+/// which cannot say what it means. Reverse is not a colour, it is *swap the two
+/// this cell already has*, so a selection over coloured text takes the text's
+/// colour as its background and comes out a patchwork: teal behind a path,
+/// white behind the words either side of it, one selection in three colours.
+/// And over a run the program itself drew reversed, which is how `pi` draws the
+/// message you typed, swapping again lands back where it started and the
+/// selection is invisible.
+///
+/// It starts with a reset for the same reason: bold, underline and the
+/// program's own reverse are all attributes of the cell underneath, and a
+/// selection that kept them would be showing the thing it is drawn over. Which
+/// is why the pair is spelt out rather than left to the terminal's own
+/// selection colour, that being something no escape sequence can ask for: a
+/// near-white on a near-black is the one thing that reads the same on a light
+/// terminal and a dark one.
+const SELECTED: &str = "\x1b[0;48;5;253;38;5;235m";
+
+/// The same walk, with the selected cells painted in [`SELECTED`] and the
+/// line's own pen put back after them.
+///
+/// The pen is *accumulated* rather than reissued as it arrives: what a cell
+/// looks like is every SGR sequence before it on the line, so the way back to
+/// the line's own colours after a highlight is a reset and then all of them
+/// again. Inside the highlight they are held rather than written, or the
+/// colours of the text would show through the thing covering it.
 ///
 /// `to` is a column of the screen and never a stand-in for the end of the line:
 /// what this writes goes onto a row that is only so wide, and cells written
@@ -737,17 +761,23 @@ fn plain(line: &str, from: u16, to: u16) -> String {
 /// is made true.
 fn highlighted(line: &str, from: u16, to: u16) -> String {
     let mut out = String::new();
+    // The line's own pen as it stands at this point in the walk.
+    let mut pen = String::new();
     let mut inside = false;
     let end = walk(line, |piece| match piece {
-        // The line's own pen, kept exactly as it came: the highlight is
-        // something drawn over the colours rather than instead of them.
-        Piece::Pen(pen) => out.push_str(pen),
+        Piece::Pen(seq) => {
+            pen.push_str(seq);
+            if !inside {
+                out.push_str(seq);
+            }
+        }
         Piece::Char(c, col) => {
             let wanted = col >= from && col < to;
             if wanted && !inside {
-                out.push_str("\x1b[7m");
+                out.push_str(SELECTED);
             } else if !wanted && inside {
-                out.push_str("\x1b[27m");
+                out.push_str("\x1b[0m");
+                out.push_str(&pen);
             }
             inside = wanted;
             out.push(c);
@@ -764,13 +794,14 @@ fn highlighted(line: &str, from: u16, to: u16) -> String {
         let gap = from.saturating_sub(end);
         out.push_str(&" ".repeat(usize::from(gap)));
         if !inside {
-            out.push_str("\x1b[7m");
+            out.push_str(SELECTED);
         }
         out.push_str(&" ".repeat(usize::from(to.saturating_sub(end.max(from)))));
         inside = true;
     }
     if inside {
-        out.push_str("\x1b[27m");
+        out.push_str("\x1b[0m");
+        out.push_str(&pen);
     }
     out
 }
@@ -1223,18 +1254,43 @@ mod tests {
         assert_eq!(view.copied().as_deref(), Some("line"));
     }
 
-    /// The highlight is drawn over the line's own colours rather than instead
-    /// of them: what comes back off the wire is coloured text, and a copy mode
-    /// that dropped the colours would repaint the screen in white on the way
-    /// past.
+    /// The highlight is one colour over whatever was there, and the line's own
+    /// pen is put back after it: what comes back off the wire is coloured text,
+    /// and a copy mode that dropped the colours would repaint the screen in
+    /// white on the way past.
     #[test]
-    fn the_highlight_leaves_the_lines_own_colours_alone() {
+    fn the_highlight_covers_the_colours_and_puts_them_back() {
         let coloured = "\x1b[31mred\x1b[0m plain";
-        let painted = highlighted(coloured, 4, 9);
-        assert!(painted.contains("\x1b[31m"), "{painted:?}");
+        let painted = highlighted(coloured, 0, 3);
+        assert!(painted.starts_with("\x1b[31m"), "{painted:?}");
         assert_eq!(plain(&painted, 0, u16::MAX), "red plain");
-        // Reverse goes on at the fifth cell and off after the ninth.
-        assert!(painted.contains("\x1b[7mplain\x1b[27m"), "{painted:?}");
+        // The selected cells are the selection's colour, and what follows is
+        // the pen the line had by then, reissued from a clean slate.
+        assert!(
+            painted.contains(&format!("{SELECTED}red\x1b[0m")),
+            "{painted:?}"
+        );
+        assert!(painted.ends_with("\x1b[31m\x1b[0m plain"), "{painted:?}");
+    }
+
+    /// Reverse video cannot say "selected": it swaps the two colours a cell
+    /// already has, so over a run the program drew reversed itself, which is
+    /// how `pi` draws the message you typed, swapping again lands back where it
+    /// started and the selection is invisible. Every selected cell is painted
+    /// the same whatever was under it.
+    #[test]
+    fn a_highlight_over_reversed_text_is_still_visible() {
+        let painted = highlighted("\x1b[7mtyped\x1b[27m out", 0, 5);
+        // The selection's own colours are the last thing written before the
+        // cells, and they open with a reset, so the program's reverse is off
+        // under them however it got there.
+        assert!(painted.contains(&format!("{SELECTED}typed")), "{painted:?}");
+        assert!(SELECTED.starts_with("\x1b[0;"), "{SELECTED:?}");
+        // And it comes back for what was not selected.
+        assert!(
+            painted.ends_with("\x1b[0m\x1b[7m\x1b[27m out"),
+            "{painted:?}"
+        );
     }
 
     /// The columns a hand points at are cells, and a coloured line has more
@@ -1254,8 +1310,8 @@ mod tests {
     #[test]
     fn a_highlight_past_the_end_of_a_line_covers_the_rest_of_the_row() {
         let painted = highlighted("ab", 0, 6);
-        assert!(painted.starts_with("\x1b[7mab"), "{painted:?}");
-        assert!(painted.contains("    \x1b[27m"), "{painted:?}");
+        assert!(painted.starts_with(&format!("{SELECTED}ab")), "{painted:?}");
+        assert!(painted.ends_with("    \x1b[0m"), "{painted:?}");
     }
 
     /// A hand moving quickly presses, drags and lets go inside one read, which
@@ -1315,7 +1371,7 @@ mod tests {
         view.select_from(at(24, 1));
         view.select_to(at(24, 4));
         let painted = view.paint();
-        assert!(painted.contains("\x1b[7m"), "{painted:?}");
+        assert!(painted.contains(SELECTED), "{painted:?}");
         assert_eq!(painted.matches("\x1b[K").count(), 1, "one row: {painted:?}");
     }
 
@@ -1349,8 +1405,11 @@ mod tests {
     #[test]
     fn a_highlight_past_a_short_line_starts_where_the_selection_does() {
         let painted = highlighted("ab", 5, 9);
-        assert!(painted.starts_with("ab   \x1b[7m"), "{painted:?}");
-        assert!(painted.ends_with("    \x1b[27m"), "{painted:?}");
+        assert!(
+            painted.starts_with(&format!("ab   {SELECTED}")),
+            "{painted:?}"
+        );
+        assert!(painted.ends_with("    \x1b[0m"), "{painted:?}");
         assert_eq!(plain(&painted, 0, u16::MAX).chars().count(), 9);
     }
 
