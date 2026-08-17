@@ -331,13 +331,21 @@ scroll with the wheel than select with a bare drag, ask for it:
 mm config mouse client
 ```
 
-Then a notch opens the view and moves it, the way tmux does, and selection
-moves under whichever modifier your terminal keeps for it (Option in iTerm2,
-Shift in most others). Some do not offer one, which is why this is a setting.
+Then the mouse is manymux's for the whole attach. A notch opens the view and
+moves it, and a drag selects: press, drag, let go, and what you dragged over is
+on your clipboard. Double click takes the word under it, which counts a path or
+a URL as one word, and triple click takes the line. A click that selects nothing
+gives the screen straight back.
+
+The copy goes to your terminal over OSC 52, which most terminals refuse until
+you say otherwise (iTerm2: Settings > General > Selection). Without that the
+highlight works and nothing lands on the clipboard, and there is no way for
+manymux to tell.
 
 Nothing here is taken from a program that asked for the mouse itself: Claude
 Code, vim and htop keep every report, wheel and drag alike, under either
-setting.
+setting. Inside one of those, selecting is that program's business exactly as
+it is over plain ssh.
 
 `Ctrl-] /` searches everything the session has printed, all ten thousand lines
 of it. `n` walks back through the matches and `N` comes back towards the live

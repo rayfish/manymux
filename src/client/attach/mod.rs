@@ -29,7 +29,7 @@ mod terminal;
 
 pub use keys::{
     Action, DEFAULT_PREFIX, Find, KeyFilter, Keystrokes, Mode, Motion, PASTE_KEY, Pick, Rename,
-    Scroll, prefix,
+    Scroll, Select, Spot, prefix,
 };
 
 use super::picker;

@@ -507,14 +507,42 @@ Three consequences run through the whole codebase and are worth keeping intact:
   roll, repaint, and getting it wrong paints over the lines it was meant to
   save.
 - **The alternate screen has a view of its own instead** (`src/client/scroll.rs`,
-  `tag::VIEW`, `tag::FIND`). It is not tmux's copy mode and must not become one:
-  no selection and no yank, because the terminal's own selection works on what
-  the view is showing, on the modifier every terminal keeps for it while the
-  wheel is being reported. Lines come a few screenfuls at a time and matches
+  `tag::VIEW`, `tag::FIND`). Lines come a few screenfuls at a time and matches
   all at once, both for the same reason: a wheel notch or an `n` on a machine
   two hops away must not be a round trip. Whether the host can do either rides
   on `Response::Attached { scroll }`, and a host that cannot says so on the mark
   row rather than leaving a key that does nothing.
+- **Selecting is the client's wherever the mouse is, and the terminal's
+  wherever it is not.** This rule used to read "not tmux's copy mode and must
+  not become one: no selection and no yank", on the grounds that the terminal's
+  own selection already works on what the view is showing. That holds exactly
+  while the terminal still has the mouse, and `mouse = client` is the request
+  that takes it away: the same `?1000h` that brings the wheel here is what stops
+  a bare drag selecting. So taking the mouse and reading only the wheel left the
+  gesture reaching nobody, which is the state the wheel itself was in before it
+  was read here, and the rule was an argument that had lost its premise. What
+  keeps it from being tmux's copy mode is what is *not* here: no keyboard
+  selection, no marks, no registers, and what comes out goes to the system
+  clipboard over OSC 52 (`clipboard::to_terminal`) rather than somewhere only
+  manymux can paste from. Three things it rests on. `?1002h` goes on beside
+  `?1000h`, since press-and-release says nothing about the moves between them
+  and a drag is nothing else. A selection is held in the buffer's coordinates
+  rather than the screen's, so scrolling moves the highlight and not what is
+  selected. And a press on the live screen opens the view under it, because the
+  view is the only surface here whose picture stands still and the only one
+  whose cells the client actually holds: on the live screen the node holds the
+  screen and the client is a pipe between it and the terminal, with nothing of
+  its own to reverse.
+- **A click is not a selection, and a stray one costs nothing.** One cell under
+  a press that never moved is not what anybody meant to copy, and copying it
+  would throw away what was on the clipboard, which is usually the thing they
+  were about to paste. So `Scrollback::copied` drops a one-cell selection unless
+  it came from a second or third click, where a one-letter word is exactly what
+  was asked for. The other half is the view that press opened: a release that
+  copied nothing, at the bottom of the history, closes it again, or a misclick
+  would leave somebody in a paused picture of the session with an Esc to find.
+  Scrolled back, the same click is somebody pointing at something and the view
+  stays.
 - **The wheel is the terminal's until somebody asks for it here**
   (`settings::Mouse`, `mm config mouse client`, reaching `wheel_is_ours` folded
   into `history`). Reading the wheel means asking the terminal to report the

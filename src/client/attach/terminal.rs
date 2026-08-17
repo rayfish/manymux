@@ -18,7 +18,7 @@ use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::mpsc;
 
 use super::keys::wheel_is_ours;
-use super::{Action, Chose, Find, KeyFilter, Mode, Outcome, Pick, Rename, Rows, Scroll};
+use super::{Action, Chose, Find, KeyFilter, Mode, Outcome, Pick, Rename, Rows, Scroll, Select};
 use crate::client::picker::Picker;
 use crate::client::screen::ScreenMode;
 use crate::client::scroll::Scrollback;
@@ -423,13 +423,32 @@ async fn ask_for_the_screen(writer: &mut SessionWriter, owed: &mut usize) -> Res
     Ok(())
 }
 
-/// What the client says to take the mouse: report buttons, in the SGR
-/// spelling.
-const WHEEL_OURS: &str = "\x1b[?1000h\x1b[?1006h";
+/// What the client says to take the mouse: report buttons and the moves made
+/// with one held, in the SGR spelling.
+///
+/// `?1002h` is what makes a drag visible. `?1000h` alone reports a press and a
+/// release and nothing between them, which is enough for a wheel and not enough
+/// for a selection: the terminal has stopped selecting by then, so a client
+/// that took the mouse and did not read the moves took the gesture away from
+/// everybody.
+const WHEEL_OURS: &str = "\x1b[?1000h\x1b[?1002h\x1b[?1006h";
 
 /// And to give it back. In the other order, so nothing is left reporting in a
 /// spelling that is no longer switched on.
-const WHEEL_THEIRS: &str = "\x1b[?1006l\x1b[?1000l";
+const WHEEL_THEIRS: &str = "\x1b[?1006l\x1b[?1002l\x1b[?1000l";
+
+/// What the row says about a copy that just happened.
+///
+/// Worth saying because there is nothing else to see: the highlight was already
+/// there, the clipboard is somewhere else, and a terminal that refuses OSC 52
+/// refuses it in silence. The count rather than the text, since the text is on
+/// the screen two rows up.
+fn copied_says(text: &str) -> String {
+    match text.lines().count() {
+        0 | 1 => "copied".to_string(),
+        lines => format!("copied {lines} lines"),
+    }
+}
 
 /// Take the wheel, or give it back.
 ///
@@ -1006,6 +1025,75 @@ async fn pump(
                                 writer.view(&request).await?;
                             }
                             stdout.write_all(painted.as_bytes()).await?;
+                            stdout
+                                .write_all(status.repaint(terminal_size()).as_bytes())
+                                .await?;
+                            stdout.flush().await?;
+                        }
+                    }
+                    // A drag, which only means anything where there is a view
+                    // to drag over. On a host too old for one the client never
+                    // took the mouse in the first place, so this cannot arrive;
+                    // the arm is here because the reports and the window are
+                    // switched on by the same flag and nothing should depend on
+                    // remembering that.
+                    Some(Action::Select(_)) if !scrolls => {
+                        keys.set_mode(Mode::Focus);
+                        status.set_mode(Mode::Focus);
+                    }
+                    Some(Action::Select(what)) => {
+                        let view = scrolling
+                            .get_or_insert_with(|| Scrollback::new(terminal_size()));
+                        match what {
+                            Select::From(at) => view.select_from(at),
+                            Select::To(at) => view.select_to(at),
+                            Select::Word(at) => view.select_word(at),
+                            Select::Line(at) => view.select_line(at),
+                            // Letting go changes nothing about what is
+                            // selected. It is the moment the selection becomes
+                            // worth having, which is a different thing.
+                            Select::Done => {}
+                        }
+                        let copied = match what {
+                            Select::Done => view.copied(),
+                            _ => None,
+                        };
+                        // A click that selected nothing, made on the live
+                        // screen: the press opened the view under it, and
+                        // leaving somebody in a paused picture of the session
+                        // they were looking at, with an Esc to press to get out
+                        // of it, is not what a stray click deserves. Scrolled
+                        // back, the same click is somebody pointing at
+                        // something in the history and the view stays.
+                        let stray = matches!(what, Select::Done)
+                            && copied.is_none()
+                            && !view.selecting()
+                            && view.at_bottom();
+                        if stray {
+                            scrolling = None;
+                            status.set_scrolled(None);
+                            keys.set_mode(Mode::Focus);
+                            status.set_mode(Mode::Focus);
+                            ask_for_the_screen(&mut writer, &mut owed).await?;
+                            restate = true;
+                            settle(&mut stdout, &output, &status, &mut pending, &mut restate)
+                                .await?;
+                        } else {
+                            let wanted = view.wanted();
+                            let painted = view.paint();
+                            status.set_scrolled(Some(view.offset()));
+                            if let Some(request) = wanted {
+                                writer.view(&request).await?;
+                            }
+                            stdout.write_all(painted.as_bytes()).await?;
+                            if let Some(text) = &copied {
+                                stdout
+                                    .write_all(clipboard::to_terminal(text).as_bytes())
+                                    .await?;
+                                status.set_notice(&copied_says(text));
+                                notice_until =
+                                    Some(tokio::time::Instant::now() + NOTICE_FOR);
+                            }
                             stdout
                                 .write_all(status.repaint(terminal_size()).as_bytes())
                                 .await?;

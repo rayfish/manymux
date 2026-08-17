@@ -405,6 +405,10 @@ pub enum Action {
     /// Move the view over the session's history, or open or close it. Where it
     /// is and what it shows is [`super::scroll`]'s; this only says which way.
     Scroll(Scroll),
+    /// Something happened to the selection being dragged out in the view.
+    /// Where the cells are and what text they hold is [`super::scroll`]'s, the
+    /// same as everything else about that window.
+    Select(Select),
     /// Something happened to the search. The text being typed lives in the key
     /// filter, since that is what a keyboard mode is; everything done with it
     /// is the caller's.
@@ -463,6 +467,28 @@ pub enum Scroll {
     Leave,
 }
 
+/// A drag, in the four things a hand does with a mouse.
+///
+/// Selecting happens in the view and nowhere else, so a press on the live
+/// screen opens it first: that is where the client holds the lines and paints
+/// every row itself, and it is the only surface here whose picture stands
+/// still. On the live screen the node holds the screen and the client is a pipe
+/// between it and the terminal, with no cells of its own to reverse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Select {
+    /// The button went down here: a selection starts, and anything selected
+    /// before it goes.
+    From(Spot),
+    /// Dragged to here with the button still down.
+    To(Spot),
+    /// Let go. What is selected is what gets copied.
+    Done,
+    /// A second click in the same place, which takes the word under it.
+    Word(Spot),
+    /// And a third, which takes the whole line.
+    Line(Spot),
+}
+
 /// Which of the client's two modes the keyboard is in.
 ///
 /// Modal like vim, and for the same reason: the keys that drive the client are
@@ -502,31 +528,54 @@ pub enum Mode {
 struct Report {
     len: usize,
     button: u8,
-    /// A press. Releases end in `m` and are dropped: the wheel has no release,
-    /// and a click's two halves would move the view twice.
+    /// A press. A release ends in `m` instead, and for the wheel there is no
+    /// such thing: a notch is one report and reading its halves would move the
+    /// view twice.
     press: bool,
+    /// The pointer moved with a button held, which is what a drag is made of
+    /// and what `?1002h` adds to `?1000h`.
+    motion: bool,
+    /// Where on the screen, in cells, counting from one.
+    at: Spot,
 }
 
-/// Buttons 64 and 65, once the modifier bits (shift 4, meta 8, ctrl 16) are
-/// taken off. 66 and 67 are the horizontal wheel, which has nowhere to go here.
+/// Buttons 64 and 65, once the modifier bits (shift 4, meta 8, ctrl 16) and the
+/// motion bit are taken off. 66 and 67 are the horizontal wheel, which has
+/// nowhere to go here.
 const WHEEL_UP: u8 = 64;
 const WHEEL_DOWN: u8 = 65;
+/// The button a selection is made with. The other two are swallowed: the client
+/// asked for these reports and the session did not, so there is nowhere to
+/// forward them to.
+const LEFT: u8 = 0;
 const MODIFIERS: u8 = 4 | 8 | 16;
+/// Motion, reported with whichever button is down.
+const MOTION: u8 = 32;
+
+/// A cell on the screen, counting from one, the way a terminal reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Spot {
+    pub col: u16,
+    pub row: u16,
+}
 
 impl Report {
     fn parse(input: &[u8]) -> Option<Self> {
         let rest = input.strip_prefix(b"\x1b[<")?;
         let end = rest.iter().position(|b| matches!(b, b'M' | b'm'))?;
-        let button = std::str::from_utf8(&rest[..end])
-            .ok()?
-            .split(';')
-            .next()?
-            .parse::<u16>()
-            .ok()?;
+        let mut fields = std::str::from_utf8(&rest[..end]).ok()?.split(';');
+        let button = fields.next()?.parse::<u16>().ok()?;
+        let button = u8::try_from(button).ok()?;
+        // A report with no coordinates is not one. They are the whole of what a
+        // drag says, and a zero would be a cell that does not exist.
+        let col = fields.next()?.parse::<u16>().ok()?;
+        let row = fields.next()?.parse::<u16>().ok()?;
         Some(Self {
             len: 3 + end + 1,
-            button: u8::try_from(button).ok()? & !MODIFIERS,
+            button: button & !(MODIFIERS | MOTION),
             press: rest[end] == b'M',
+            motion: button & MOTION != 0,
+            at: Spot { col, row },
         })
     }
 
@@ -737,6 +786,11 @@ pub struct KeyFilter {
     /// takes nothing from the session, and dropping the ones that are not the
     /// wheel keeps a stray click from typing into a shell.
     wheel: bool,
+    /// The last press: where, when, and how many have landed there in a row.
+    ///
+    /// A double click is a fact about the hand and the clock rather than about
+    /// the screen, so it is counted here and the view is told what it means.
+    clicked: Option<(Spot, Instant, u8)>,
     /// What is being typed at a prompt, while one is open, and which prompt
     /// it is.
     ///
@@ -791,6 +845,19 @@ fn rest_after(action: Action, left: &[u8]) -> Vec<u8> {
         _ => Vec::new(),
     }
 }
+
+/// How far a wheel report moves the view, signed, for adding up a spin.
+fn lines(scroll: Scroll) -> i64 {
+    match scroll {
+        Scroll::Up(lines) => lines as i64,
+        Scroll::Down(lines) => -(lines as i64),
+        _ => 0,
+    }
+}
+
+/// How long after a click a second one in the same place is a double rather
+/// than two singles. What every toolkit uses, give or take.
+const CLICK_AGAIN: Duration = Duration::from_millis(400);
 
 /// Take the last character off a line being typed, if there is one.
 ///
@@ -848,13 +915,15 @@ pub struct Keystrokes {
     pub action: Option<Action>,
     /// The mode the client is in now, for the row at the bottom of the screen.
     pub mode: Mode,
-    /// What was left of the chunk, for the one action you do type through:
-    /// moving a popup's highlight.
+    /// What was left of the chunk, for the two things you do carry on through:
+    /// moving a popup's highlight, and anything the mouse did.
     ///
     /// Everything else ends the chunk it was found in, because nobody types
     /// through a detach or a switch. A highlight move is not like those: two
     /// writes a moment apart arrive as one read, so `tab` then `Enter` is one
-    /// chunk, and dropping the rest there loses the keystroke that commits.
+    /// chunk, and dropping the rest there loses the keystroke that commits. The
+    /// mouse is the same the whole time rather than now and then, since one
+    /// gesture is many reports and they arrive together.
     /// Empty for every other action, which keeps that rule where it was.
     pub rest: Vec<u8>,
 }
@@ -869,6 +938,7 @@ impl KeyFilter {
             spelling: vec![prefix],
             scroll: false,
             wheel: false,
+            clicked: None,
             prompt: None,
         }
     }
@@ -946,6 +1016,10 @@ impl KeyFilter {
             // and leaves you there. Cancelling the prompt is cancelling the
             // prompt, not leaving.
             Action::Find(_) => Mode::Scroll,
+            // And so is a drag: the press that starts one opens the view under
+            // it, and letting go leaves you looking at what you selected rather
+            // than back in a session that has moved on underneath.
+            Action::Select(_) => Mode::Scroll,
             // The rename prompt is its own mode, and the only ways out of it
             // are sending the name and giving up on it.
             Action::Rename(Rename::Run | Rename::Cancel) => Mode::Focus,
@@ -1063,6 +1137,71 @@ impl KeyFilter {
         Some(Action::Scroll(scroll))
     }
 
+    /// What the mouse just did, out of however many reports of it are in this
+    /// chunk.
+    ///
+    /// Every report is swallowed whether or not it means anything here: the
+    /// client asked the terminal for them and the session did not, so a click
+    /// forwarded on would be typed into whatever is running.
+    ///
+    /// Both kinds coalesce, and for the same reason. A hand spinning the wheel
+    /// and a hand dragging both send several reports before the client is next
+    /// read, and answering only the first would leave the rest to be read as
+    /// keystrokes and the screen a gesture behind the hand. A wheel adds its
+    /// notches up; a drag has no sum, only a latest, so the ones behind it are
+    /// dropped. Neither runs past a report of the other kind, which is why the
+    /// remainder goes back through [`rest_after`]: a drag and the release that
+    /// ends it arrive as one chunk more often than not.
+    fn mousing(&mut self, input: &[u8], i: &mut usize, now: Instant) -> Option<Action> {
+        let first = Report::parse(&input[*i..])?;
+        *i += first.len;
+        if let Some(scroll) = first.scroll() {
+            let mut net = lines(scroll);
+            while let Some(next) = Report::parse(&input[*i..]) {
+                let Some(scroll) = next.scroll() else { break };
+                *i += next.len;
+                net += lines(scroll);
+            }
+            return match net {
+                0 => None,
+                net if net > 0 => Some(Action::Scroll(Scroll::Up(net as u64))),
+                net => Some(Action::Scroll(Scroll::Down(net.unsigned_abs()))),
+            };
+        }
+        if first.button != LEFT {
+            return None;
+        }
+        if first.motion {
+            let mut at = first.at;
+            while let Some(next) = Report::parse(&input[*i..]) {
+                if !next.motion || next.button != LEFT {
+                    break;
+                }
+                *i += next.len;
+                at = next.at;
+            }
+            return Some(Action::Select(Select::To(at)));
+        }
+        if !first.press {
+            return Some(Action::Select(Select::Done));
+        }
+        // A press, and the second and third in the same place mean more than
+        // the first. Counted here rather than in the view because it is a fact
+        // about the hand and the clock, and the view knows about neither.
+        let clicks = match self.clicked {
+            Some((was, at, clicks)) if was == first.at && now.duration_since(at) < CLICK_AGAIN => {
+                clicks.saturating_add(1)
+            }
+            _ => 1,
+        };
+        self.clicked = Some((first.at, now, clicks));
+        Some(Action::Select(match clicks {
+            1 => Select::From(first.at),
+            2 => Select::Word(first.at),
+            _ => Select::Line(first.at),
+        }))
+    }
+
     /// Open the prompt an action asks for, if it asks for one. The tables above
     /// say what a key means and do nothing, so that they can be asked from
     /// either spelling; this is the one thing that has to happen either way.
@@ -1132,36 +1271,22 @@ impl KeyFilter {
             // terminal for them, the session did not, and forwarding a click
             // it never asked to hear about would type into whatever is
             // running.
-            if self.wheel
-                && let Some(report) = Report::parse(&input[i..])
-            {
-                // Every report in the chunk, not just this one. A hand moving
-                // the wheel sends several before the client is next read, and
-                // stopping at the first would leave the rest to be read as
-                // keystrokes and the view a notch behind the hand.
-                let mut net = 0i64;
-                let mut report = Some(report);
-                while let Some(this) = report {
-                    i += this.len;
-                    net += match this.scroll() {
-                        Some(Scroll::Up(lines)) => lines as i64,
-                        Some(Scroll::Down(lines)) => -(lines as i64),
-                        _ => 0,
-                    };
-                    report = Report::parse(&input[i..]);
-                }
-                let scroll = match net {
-                    0 => continue,
-                    net if net > 0 => Scroll::Up(net as u64),
-                    net => Scroll::Down(net.unsigned_abs()),
+            if self.wheel && Report::parse(&input[i..]).is_some() {
+                let Some(action) = self.mousing(input, &mut i, now) else {
+                    continue;
                 };
-                let action = Action::Scroll(scroll);
                 self.mode = Self::after(action, self.mode);
                 return Keystrokes {
                     forward,
                     action: Some(action),
                     mode: self.mode,
-                    rest: Vec::new(),
+                    // Whatever is left of the chunk, always: a hand does one
+                    // thing at a time and the reports of it arrive together, so
+                    // `mousing` stops at the first report that means something
+                    // else and this is what hands that one on. A spin and the
+                    // click that follows it, or a drag and the release that
+                    // ends it, are one read more often than not.
+                    rest: input[i..].to_vec(),
                 };
             }
             // The keys that drive the view, which are escape sequences of their
@@ -1638,13 +1763,134 @@ mod tests {
     }
 
     /// The client asked the terminal for these reports; the session did not.
-    /// Forwarding a click it never asked to hear about would type into it.
+    /// Forwarding one it never asked to hear about would type into it, whether
+    /// or not the client had anything to do with it.
     #[test]
-    fn a_click_the_client_asked_for_is_swallowed_rather_than_forwarded() {
+    fn nothing_the_mouse_does_is_forwarded_to_the_session() {
+        for reports in [
+            &b"\x1b[<0;10;5M"[..],  // a press
+            &b"\x1b[<32;10;5M"[..], // dragged
+            &b"\x1b[<0;10;5m"[..],  // let go
+            &b"\x1b[<1;10;5M"[..],  // the middle button, which means nothing here
+            &b"\x1b[<2;10;5M"[..],  // nor the right
+            &b"\x1b[<64;1;1M"[..],  // and the wheel
+        ] {
+            let mut f = KeyFilter::new(KEY);
+            f.set_scroll(true);
+            f.set_wheel(true);
+            assert!(
+                f.filter(reports).forward.is_empty(),
+                "{}",
+                String::from_utf8_lossy(reports)
+            );
+        }
+    }
+
+    /// The three halves of a drag, in the spelling `?1002h` reports them in.
+    #[test]
+    fn a_drag_is_a_press_a_move_and_a_release() {
         let mut f = KeyFilter::new(KEY);
         f.set_scroll(true);
         f.set_wheel(true);
-        assert_eq!(f.filter(b"\x1b[<0;10;5M\x1b[<0;10;5m"), forwarded(b""));
+        assert_eq!(
+            f.filter(b"\x1b[<0;10;5M").action,
+            Some(Action::Select(Select::From(Spot { col: 10, row: 5 })))
+        );
+        assert_eq!(
+            f.filter(b"\x1b[<32;14;7M").action,
+            Some(Action::Select(Select::To(Spot { col: 14, row: 7 })))
+        );
+        let done = f.filter(b"\x1b[<0;14;7m");
+        assert_eq!(done.action, Some(Action::Select(Select::Done)));
+        assert_eq!(done.mode, Mode::Scroll, "a drag opens the view under it");
+    }
+
+    /// A hand moving sends a report per cell, and they arrive in one read. Only
+    /// the latest says anything, and the release behind them has to survive the
+    /// chunk: dropped, the button would still be down as far as this is
+    /// concerned.
+    #[test]
+    fn a_dragging_hand_is_read_as_where_it_got_to_and_then_let_go() {
+        let mut f = KeyFilter::new(KEY);
+        f.set_scroll(true);
+        f.set_wheel(true);
+        f.filter(b"\x1b[<0;1;1M");
+        let moved = f.filter(b"\x1b[<32;2;1M\x1b[<32;3;1M\x1b[<32;9;4M\x1b[<0;9;4m");
+        assert_eq!(
+            moved.action,
+            Some(Action::Select(Select::To(Spot { col: 9, row: 4 })))
+        );
+        assert_eq!(
+            f.filter(&moved.rest).action,
+            Some(Action::Select(Select::Done)),
+            "the release was handed back rather than eaten"
+        );
+    }
+
+    /// A wheel spin is still added up, and a report of the other kind ends the
+    /// run rather than being swallowed into it.
+    #[test]
+    fn a_spin_stops_at_the_press_that_follows_it() {
+        let mut f = KeyFilter::new(KEY);
+        f.set_scroll(true);
+        f.set_wheel(true);
+        let spun = f.filter(b"\x1b[<64;1;1M\x1b[<64;1;1M\x1b[<0;3;2M");
+        assert_eq!(
+            spun.action,
+            Some(Action::Scroll(Scroll::Up(2 * scroll::WHEEL)))
+        );
+        assert_eq!(
+            f.filter(&spun.rest).action,
+            Some(Action::Select(Select::From(Spot { col: 3, row: 2 })))
+        );
+    }
+
+    /// Two clicks in the same place inside the window are a double click, and
+    /// three are a triple. Further apart in time, or in place, they are clicks.
+    #[test]
+    fn clicking_twice_takes_a_word_and_three_times_takes_the_line() {
+        let mut f = KeyFilter::new(KEY);
+        f.set_scroll(true);
+        f.set_wheel(true);
+        let at = Instant::now();
+        let spot = Spot { col: 4, row: 2 };
+        assert_eq!(
+            f.filter_at(b"\x1b[<0;4;2M", at).action,
+            Some(Action::Select(Select::From(spot)))
+        );
+        assert_eq!(
+            f.filter_at(b"\x1b[<0;4;2M", at + Duration::from_millis(120))
+                .action,
+            Some(Action::Select(Select::Word(spot)))
+        );
+        assert_eq!(
+            f.filter_at(b"\x1b[<0;4;2M", at + Duration::from_millis(240))
+                .action,
+            Some(Action::Select(Select::Line(spot)))
+        );
+        // A click a second later is a click again, and so is one next door.
+        assert_eq!(
+            f.filter_at(b"\x1b[<0;4;2M", at + Duration::from_secs(1))
+                .action,
+            Some(Action::Select(Select::From(spot)))
+        );
+        assert_eq!(
+            f.filter_at(b"\x1b[<0;9;2M", at + Duration::from_millis(1100))
+                .action,
+            Some(Action::Select(Select::From(Spot { col: 9, row: 2 })))
+        );
+    }
+
+    /// Nothing about the mouse is read while the terminal still has it. Every
+    /// report then is the session's own doing, and reading one would be reading
+    /// input meant for whatever asked for it.
+    #[test]
+    fn the_mouse_says_nothing_here_while_the_session_has_it() {
+        let mut f = KeyFilter::new(KEY);
+        f.set_scroll(true);
+        let dragged = f.filter(b"\x1b[<0;10;5M");
+        assert_eq!(dragged.action, None);
+        assert_eq!(dragged.forward, b"\x1b[<0;10;5M", "and it goes through");
     }
 
     /// The wheel is the client's wherever there is a history of our own for a
