@@ -274,6 +274,12 @@ exec env MM_CONFIG_DIR="{dir}/$host" "{mm}" --socket "{dir}/$host.sock" agent
     /// window is short here and wide enough on a slow runner to catch every
     /// time, so a test that wants the settled answer waits for it rather than
     /// asserting on whichever side of the race it landed.
+    ///
+    /// Gated like its only caller: reading what a session is doing needs
+    /// `/proc`, so every test that takes a checkpoint is Linux-only, and a
+    /// helper left ungated is dead code everywhere else — which `-D warnings`
+    /// makes a build failure rather than a warning.
+    #[cfg(target_os = "linux")]
     fn settled(&self, machine: &str) -> String {
         let deadline = Instant::now() + Duration::from_secs(15);
         let mut last = String::new();
