@@ -606,6 +606,20 @@ Three consequences run through the whole codebase and are worth keeping intact:
   under a shorter one. And a window with no block yet paints *nothing* rather
   than blanking: the session is on the screen, one frame more of it is no lie,
   and blanking to wait is the flicker again with nothing to show for it.
+- **A highlight stops at the edge of the screen, and starts where the hand
+  pointed.** A selection that runs off the end of a line takes the blanks with
+  it, or a block dragged down the screen comes apart at every short line in it,
+  and both halves of writing those blanks were wrong. Padded to "the end of the
+  line" spelt `u16::MAX` and capped at a thousand, a selection over a blank row
+  put a thousand cells of reverse video on the screen: on a wide window that is
+  six rows of white, wrapped onto the rows below and painted before them, with
+  the text that was under them gone. It used to tidy itself up, since every row
+  was repainted after; now that only the changed rows are, it stays. So
+  `selected_on` clamps to the screen's width, which is why `Scrollback` knows
+  its columns at all. And the cells between the end of a short line and where
+  the selection starts are neither text nor selected, so `highlighted` writes
+  them plain: without them the reverse block began at column zero, which on an
+  empty row is the whole row highlighted from the wrong end.
 - **And only the rows that changed, which is what makes a drag smooth**
   (`Scrollback::painted`). A pointer moving reports every cell it crosses and
   each report moves the highlight by a row or less, so painting the window per

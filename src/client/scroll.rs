@@ -71,6 +71,13 @@ pub struct Scrollback {
     asked: Option<ViewRequest>,
     /// Rows the session's part of the screen has, which is what a page is.
     rows: u16,
+    /// Columns it has, which is where a highlight has to stop.
+    ///
+    /// A row is as wide as the screen and no wider: a highlight padded past
+    /// that wraps onto the row below and takes the picture with it, since what
+    /// wrapped is written before the rows under it and there is nothing to say
+    /// it happened.
+    cols: u16,
     /// The last search: what was looked for, where it was found, and which of
     /// those the view is sitting on.
     search: Option<Search>,
@@ -195,6 +202,7 @@ impl Scrollback {
             block: None,
             asked: None,
             rows: session_size(size).rows,
+            cols: session_size(size).cols,
             search: None,
             selection: None,
             owed: false,
@@ -275,6 +283,7 @@ impl Scrollback {
 
     pub fn resize(&mut self, size: Size) {
         self.rows = session_size(size).rows;
+        self.cols = session_size(size).cols;
         // Every row is somewhere else now, so what was painted where says
         // nothing about what is there.
         self.painted.clear();
@@ -407,7 +416,7 @@ impl Scrollback {
         let row = u64::from(spot.row).clamp(1, rows);
         Cell {
             line: self.offset + (rows - row),
-            col: spot.col.saturating_sub(1),
+            col: spot.col.saturating_sub(1).min(self.cols.saturating_sub(1)),
         }
     }
 
@@ -586,6 +595,10 @@ impl Scrollback {
     }
 
     /// Which columns of the line at `offset` are selected, if any of them are.
+    ///
+    /// A line that the selection runs off the end of is selected to the edge of
+    /// the screen and not one cell further: this is what is about to be drawn,
+    /// and a row drawn wider than the screen wraps onto the row beneath it.
     fn selected_on(&self, offset: u64) -> Option<(u16, u16)> {
         let (first, last) = self.selection?.ends();
         if offset > first.line || offset < last.line {
@@ -595,9 +608,9 @@ impl Scrollback {
         let to = if offset == last.line {
             last.col.saturating_add(1)
         } else {
-            u16::MAX
+            self.cols
         };
-        (from < to).then_some((from, to))
+        (from < to).then_some((from, to.min(self.cols)))
     }
 
     /// The screen as it should now look: the rows of the session's part of it
@@ -717,6 +730,11 @@ fn plain(line: &str, from: u16, to: u16) -> String {
 /// The pen is put back rather than cleared, so a highlight over coloured text
 /// leaves the colour either side of it alone: `\x1b[27m` turns reverse off and
 /// says nothing about anything else.
+///
+/// `to` is a column of the screen and never a stand-in for the end of the line:
+/// what this writes goes onto a row that is only so wide, and cells written
+/// past that wrap onto the row below. [`Scrollback::selected_on`] is where that
+/// is made true.
 fn highlighted(line: &str, from: u16, to: u16) -> String {
     let mut out = String::new();
     let mut inside = false;
@@ -739,11 +757,16 @@ fn highlighted(line: &str, from: u16, to: u16) -> String {
     // or a dragged-over empty line would show nothing at all and a multi-line
     // selection would come apart at every short line in it.
     if to > end {
+        // The cells between the end of the text and where the selection starts
+        // are neither text nor selected, and something has to be written over
+        // them or the highlight begins at the wrong column: on a line shorter
+        // than `from`, and on an empty one that is column zero.
+        let gap = from.saturating_sub(end);
+        out.push_str(&" ".repeat(usize::from(gap)));
         if !inside {
             out.push_str("\x1b[7m");
         }
-        let blanks = usize::from(to.min(u16::MAX - 1).saturating_sub(end.max(from)));
-        out.push_str(&" ".repeat(blanks.min(1000)));
+        out.push_str(&" ".repeat(usize::from(to.saturating_sub(end.max(from)))));
         inside = true;
     }
     if inside {
@@ -1294,6 +1317,41 @@ mod tests {
         let painted = view.paint();
         assert!(painted.contains("\x1b[7m"), "{painted:?}");
         assert_eq!(painted.matches("\x1b[K").count(), 1, "one row: {painted:?}");
+    }
+
+    /// A row is as wide as the screen. Padded past that, the cells wrap onto
+    /// the row below and the one after it: a selection over a blank line put a
+    /// thousand cells of reverse video on the screen, which on a wide window is
+    /// six rows of white with the text that was under them gone. Only the rows
+    /// that changed are painted, so nothing comes back to tidy that up.
+    #[test]
+    fn a_highlight_stops_at_the_edge_of_the_screen() {
+        let mut view = view(100);
+        // Two rows, so the upper one is selected to the end of the line.
+        view.select_from(at(23, 3));
+        view.select_to(at(24, 5));
+        let painted = view.paint();
+        let widest = painted
+            .split("\x1b[K")
+            .map(|row| plain(row, 0, u16::MAX).chars().count())
+            .max()
+            .unwrap_or(0);
+        assert!(
+            widest <= usize::from(SIZE.cols),
+            "{widest} cells: {painted:?}"
+        );
+    }
+
+    /// And it starts at the column the hand pointed at. On a line shorter than
+    /// that column, the cells in between are the ones nobody selected, so the
+    /// highlight on an empty row began at column zero and ran the width of the
+    /// screen.
+    #[test]
+    fn a_highlight_past_a_short_line_starts_where_the_selection_does() {
+        let painted = highlighted("ab", 5, 9);
+        assert!(painted.starts_with("ab   \x1b[7m"), "{painted:?}");
+        assert!(painted.ends_with("    \x1b[27m"), "{painted:?}");
+        assert_eq!(plain(&painted, 0, u16::MAX).chars().count(), 9);
     }
 
     /// A row nothing has been painted to is not a row painted blank. The first
