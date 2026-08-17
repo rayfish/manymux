@@ -293,8 +293,15 @@ Three consequences run through the whole codebase and are worth keeping intact:
   of its group, and one typed on another machine would not even be seen.
   `started` is there for the one case the pid cannot answer, a machine that
   rebooted and reused the number. Pruning considers only the hosts that
-  *answered* (`Listing::reached`), or a machine that is asleep loses its
-  sessions out of their groups while you are away from it. A group is a set of
+  *answered* (`Listing::answering`), or a machine that is asleep loses its
+  sessions out of their groups while you are away from it. `answering` and not
+  `reached`, which is the same list with this machine taken out of it because
+  this machine is never watched: fed that one, pruning kept every local member
+  of every group forever, on the machine you actually work on, and nothing
+  showed it because every view of a group counts the sessions the listing knows
+  about and a dead member appears in none of them. Two lists that differ by one
+  entry and answer different questions, so the fix was a second accessor rather
+  than a change to the first. A group is a set of
   live sessions and nothing else, so the last one ending takes the group with
   it and `Cycle::refresh` clears a focus that has emptied: left narrowed to
   nothing, every switch key would do nothing with no way to find out why.
@@ -310,6 +317,20 @@ Three consequences run through the whole codebase and are worth keeping intact:
   it may name a row that is *not* the session at the other end of the attach
   stream, and `tag::RENAME` renames that one by design, so it goes back to
   `main` as a `Request::Rename` to that row's machine.
+- **A row of the group list is not a session, and `Popup::subject` is the one
+  place that may say so.** The ids a picker hands back are indexes into the
+  list it was built from, so a group row's id indexes `Listed::groups` and a
+  session row's indexes `Listed::at`, and the two lists share one key table
+  because they share one mode. Read off the picker whichever list was showing,
+  `n` in the group list therefore put the session that happened to sit at that
+  index into the new group, on whatever machine it was on, and said nothing
+  because the write worked. So `subject` answers `None` while narrowing, and
+  the two prompts ask *whether there is a popup* before they ask it: a `None`
+  from a popup with no session means do nothing, while a `None` because there
+  is no popup at all means the session at the other end of the stream, which is
+  how a client with no list of its own drives a rename. A key with nothing to
+  act on is refused where it is pressed rather than at the Enter, or a name has
+  been typed for nothing.
 - **Everything but Enter on a session comes back to the popup.** Grouping a
   session, naming one, narrowing to a group: none of them is a gesture that goes
   anywhere, so landing in the session afterwards threw away the list you were

@@ -2125,6 +2125,34 @@ fn a_group_holds_sessions_from_more_than_one_machine() {
     assert!(after.contains("train"), "and the other one stayed: {after}");
 }
 
+/// A group is a set of live sessions and nothing else, so the last one ending
+/// takes the group with it. On this machine as much as on any other: pruning
+/// used to be handed the list of machines worth telling the node about, which
+/// leaves this one out because this one is never watched, and a local member
+/// was therefore kept forever. Nothing showed it, since every view of a group
+/// counts the sessions the listing knows about.
+#[test]
+fn a_group_whose_last_local_session_ended_is_gone() {
+    let world = World::new("groups-prune-local");
+
+    world.ok("laptop", &["new", "-d", "-n", "build", "sleep", "60"]);
+    world.wait_for_node("laptop");
+    world.ok("laptop", &["group", "build", "pi"]);
+    assert!(world.ok("laptop", &["groups"]).contains("pi"));
+
+    world.ok("laptop", &["kill", "build"]);
+    world.ok("laptop", &["groups"]);
+    // The file rather than the listing: every view of a group counts the
+    // sessions that are running, so a dead member shows up in none of them and
+    // the only place the leak is visible is on disk.
+    let file = world.dir.join("laptop").join("groups.toml");
+    let left = std::fs::read_to_string(&file).unwrap_or_default();
+    assert!(
+        !left.contains("pi"),
+        "the last session in it ended: {left:?}"
+    );
+}
+
 /// The whole reason membership is keyed on the pid and the start time: a name
 /// moves, and the session must not move with it.
 #[test]

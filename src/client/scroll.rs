@@ -393,11 +393,17 @@ impl Scrollback {
         // is the same clamp a move made later gets and one round trip earlier
         // than owing it to a second one.
         if !self.answered {
-            self.offset += lines;
+            // Saturating, because `top` parks the view at the far end before
+            // there is a far end to park it at: `g` and then anything that
+            // moves back, inside the round trip to the node, is an add to
+            // `u64::MAX`. Which is the panic in a debug build and, worse, the
+            // wrap in a release one, where the oldest line there is becomes two
+            // lines above the live screen.
+            self.offset = self.offset.saturating_add(lines);
             return;
         }
         let furthest = self.total.saturating_sub(self.page());
-        self.offset = (self.offset + lines).min(furthest);
+        self.offset = self.offset.saturating_add(lines).min(furthest);
     }
 
     pub fn down(&mut self, lines: u64) {
@@ -1083,6 +1089,22 @@ mod tests {
         view.up(WHEEL);
         answer(&mut view, 100);
         assert_eq!(view.offset(), 3, "the notch that opened the view moved it");
+    }
+
+    /// `g` before the first answer parks the view at a far end nobody has
+    /// named yet, and anything that moves back from there is an add to
+    /// `u64::MAX`: a panic in a debug build, and in a release one the oldest
+    /// line there is turning into two lines above the live screen. Both ends of
+    /// the gesture happen inside one round trip to the node, so it is a key
+    /// sequence rather than a race.
+    #[test]
+    fn moving_back_from_the_far_end_before_it_is_known_stays_at_the_end() {
+        let mut view = Scrollback::new(SIZE);
+        view.top();
+        view.up(WHEEL);
+        view.page_up();
+        answer(&mut view, 100);
+        assert_eq!(view.offset(), 100 - 24, "still the oldest line there is");
     }
 
     /// And it is still a move, so what exists still bounds it: a hand that

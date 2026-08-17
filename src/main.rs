@@ -444,7 +444,7 @@ async fn run(cli: Cli) -> Result<u8> {
             let mut groups = Groups::load()?;
             // The listing is the only thing that says which sessions are still
             // running, so this is where the file gets tidied.
-            groups.prune(&listing.reached(), &listing.sessions);
+            groups.prune(&listing.answering(), &listing.sessions);
             groups.save()?;
             for (name, count) in groups.tally(&listing.sessions) {
                 println!(
@@ -831,7 +831,7 @@ async fn list(socket: &Path, host: Option<String>) -> Result<u8> {
     // so this is where the group file gets tidied. Only the machines that
     // answered count: one that is asleep has said nothing about its sessions.
     let mut groups = Groups::load().unwrap_or_default();
-    groups.prune(&listing.reached(), &listing.sessions);
+    groups.prune(&listing.answering(), &listing.sessions);
     let _ = groups.save();
 
     let rows: Vec<_> = listing
@@ -1034,7 +1034,7 @@ async fn do_attach(
                             Err(_) => continue,
                         },
                         None => everywhere(&socket).await.map(|listing| Snapshot {
-                            reached: listing.reached(),
+                            answered: listing.answering(),
                             sessions: listing.sessions,
                         }),
                     };
@@ -1082,7 +1082,7 @@ async fn do_attach(
         // hands its pending listing to the popup, so nothing is ever left for
         // `take_listing` to find.
         if let Some(fresher) = held_lock(&seen).take() {
-            groups.prune(&fresher.reached, &fresher.sessions);
+            groups.prune(&fresher.answered, &fresher.sessions);
             let _ = groups.save();
             snapshot = fresher;
             cycle.refresh(entries(&snapshot, &groups));
@@ -1466,7 +1466,11 @@ async fn start_beside(socket: &Path, host: &str) -> Result<String> {
 #[derive(Default)]
 struct Snapshot {
     sessions: Vec<manymux::proto::HostedSession>,
-    reached: Vec<String>,
+    /// Which machines said so, this one included: it is what pruning is
+    /// allowed to act on, and it is `Listing::answering` rather than
+    /// `Listing::reached`, which leaves this machine out for a different
+    /// question entirely.
+    answered: Vec<String>,
 }
 
 impl Snapshot {
@@ -1730,7 +1734,7 @@ fn spawn_listing(socket: &Path) -> JoinHandle<Snapshot> {
     tokio::spawn(async move {
         match everywhere(&socket).await {
             Ok(listing) => Snapshot {
-                reached: listing.reached(),
+                answered: listing.answering(),
                 sessions: listing.sessions,
             },
             Err(e) => {
@@ -1762,7 +1766,7 @@ async fn take_listing(
     match tokio::time::timeout(LISTING_WAIT, &mut task).await {
         Ok(Ok(landed)) => {
             if !landed.is_empty() {
-                groups.prune(&landed.reached, &landed.sessions);
+                groups.prune(&landed.answered, &landed.sessions);
                 let _ = groups.save();
                 *snapshot = landed;
                 cycle.refresh(entries(snapshot, groups));

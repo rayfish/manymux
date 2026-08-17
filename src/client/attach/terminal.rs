@@ -646,11 +646,20 @@ impl Popup {
         }
     }
 
-    /// The session row the popup is acting on, whichever list is showing.
+    /// The session row the popup is acting on, if it is on one.
+    ///
+    /// Narrowing, it is on none: the highlighted row there is a *group*, and
+    /// its id indexes the groups. Answered with that id, `n` in the group list
+    /// put whatever session happened to sit at that index in `Listed::at` into
+    /// the new group, silently and on whatever machine it was on, because the
+    /// write succeeded and there was nothing to say. `n` is live in both lists
+    /// only because they share one key table; it is advertised in neither
+    /// list's hints but the move list's.
     fn subject(&self) -> Option<usize> {
         match self.what {
             Showing::Moving { row } => Some(row),
-            _ => self.picker.chosen().map(|row| row.id),
+            Showing::Sessions => self.picker.chosen().map(|row| row.id),
+            Showing::Narrowing => None,
         }
     }
 }
@@ -888,6 +897,21 @@ async fn pump(
                     // already share. Enter creates it and puts the session in
                     // it, necessarily: a group is a set of live sessions, so an
                     // empty one cannot exist.
+                    // A new group is a session put in one, since a group with
+                    // nothing in it cannot exist. So a list with no session
+                    // under the highlight has nothing to name, and the prompt
+                    // is refused rather than opened: at the Enter a name has
+                    // been typed and refusing it there throws the typing away.
+                    Some(Action::GroupName(Rename::Open))
+                        if popup.as_ref().is_none_or(|up| up.subject().is_none()) =>
+                    {
+                        keys.stop_typing();
+                        status.set_grouping(None);
+                        status.set_notice("no session here to put in a group");
+                        notice_until = Some(tokio::time::Instant::now() + NOTICE_FOR);
+                        restate = true;
+                        draw_popup(&mut stdout, &mut popup, &mut status, &mut restate).await?;
+                    }
                     Some(Action::GroupName(step)) => {
                         match step {
                             Rename::Open | Rename::Typed => {
@@ -1164,15 +1188,25 @@ async fn pump(
                                 // `tag::RENAME` renames that one by design. So
                                 // it goes back to the caller, which can reach
                                 // the machine holding it.
-                                let session = popup.as_ref().and_then(Popup::subject);
-                                match session {
-                                    Some(session) if !wanted.trim().is_empty() => {
-                                        status.set_popup(Popped::None);
-                                        writer.detach().await?;
-                                        return Ok(Outcome::Chose(Chose::Named {
-                                            session,
-                                            to: wanted,
-                                        }));
+                                match popup.as_ref() {
+                                    // A popup is up, so it names the row, and a
+                                    // list with no session under the highlight
+                                    // names nothing: this is the one place the
+                                    // two meanings of "no session" have to stay
+                                    // apart, or a prompt opened over the group
+                                    // list would rename the session at the
+                                    // other end of the stream instead.
+                                    Some(up) => {
+                                        if let Some(session) = up.subject()
+                                            && !wanted.trim().is_empty()
+                                        {
+                                            status.set_popup(Popped::None);
+                                            writer.detach().await?;
+                                            return Ok(Outcome::Chose(Chose::Named {
+                                                session,
+                                                to: wanted,
+                                            }));
+                                        }
                                     }
                                     // No popup, so this is a client driving the
                                     // prompt without one: the session at the
@@ -1180,7 +1214,7 @@ async fn pump(
                                     // it could mean. Nothing is said here, the
                                     // row keeps the old name until the host
                                     // answers.
-                                    _ => writer.rename(&wanted).await?,
+                                    None => writer.rename(&wanted).await?,
                                 }
                             }
                         }
@@ -1791,6 +1825,37 @@ mod tests {
     #[test]
     fn a_list_with_nothing_in_it_still_names_itself() {
         assert_eq!(Popup::sessions(&Rows::default()).line(), "sessions: none");
+    }
+
+    /// The group list is about where you are looking, not about a session, so
+    /// nothing that acts on a session may read a row of it as one. Its ids
+    /// index the groups; handed back as a session, `n` there put whatever
+    /// happened to sit at that index in the session list into the new group,
+    /// on whatever machine it was on, and said nothing because the write
+    /// worked.
+    #[test]
+    fn the_group_list_has_no_session_under_its_highlight() {
+        let rows = Rows {
+            sessions: vec![Row::new(0, "build"), Row::new(1, "api")],
+            groups: vec![Row::new(0, "pi"), Row::new(1, "web")],
+            at: 1,
+        };
+        let sessions = Popup::sessions(&rows);
+        assert_eq!(sessions.subject(), Some(1), "the highlighted session");
+
+        let narrowing = Popup {
+            picker: Picker::new("groups", NARROW_HINTS, rows.groups.clone(), 0),
+            what: Showing::Narrowing,
+        };
+        assert_eq!(narrowing.subject(), None);
+
+        // Moving is the one that carries a session across from the other list,
+        // which is why it holds the row rather than reading it off the picker.
+        let moving = Popup {
+            picker: Picker::new("move", MOVE_HINTS, rows.groups, 0),
+            what: Showing::Moving { row: 1 },
+        };
+        assert_eq!(moving.subject(), Some(1));
     }
 
     /// A mode the node turns back on for a session, and the client forgets to

@@ -65,12 +65,23 @@ impl Listing {
     /// resubscribe to any it had given up on. This machine is not one of them:
     /// it is never watched, being where the watching happens.
     pub(crate) fn reached(&self) -> Vec<String> {
-        let mut hosts: Vec<String> = self
-            .answered
-            .iter()
-            .filter(|host| !is_this_machine(host))
-            .cloned()
-            .collect();
+        let mut hosts = self.answering();
+        hosts.retain(|host| !is_this_machine(host));
+        hosts
+    }
+
+    /// Every machine that answered, this one included.
+    ///
+    /// Which is what pruning a group wants and [`Self::reached`] is not: that
+    /// one leaves this machine out because this machine is never watched, and
+    /// pruning fed the same list kept every local member of every group
+    /// forever. A group that had ended on the machine you actually work on
+    /// stayed in `groups.toml`, and its name stayed in the completions, with
+    /// nothing on any screen to say so: every view of a group counts the
+    /// sessions the listing knows about, so a dead member is invisible in all
+    /// of them.
+    pub(crate) fn answering(&self) -> Vec<String> {
+        let mut hosts = self.answered.clone();
         hosts.sort();
         hosts.dedup();
         hosts
@@ -423,6 +434,23 @@ mod tests {
         listing.add("asleep", Err(anyhow!("no answer in 5s")));
 
         assert_eq!(listing.reached(), vec!["api", "gpu-box"]);
+    }
+
+    /// And what a group is pruned against, which is the same list with this
+    /// machine back in it. Fed `reached`, pruning kept every local member of
+    /// every group forever: this machine is never in that list, and a member
+    /// whose machine did not answer is a member nothing has been said about.
+    #[test]
+    fn pruning_counts_this_machine_among_the_ones_that_answered() {
+        let mut listing = Listing::default();
+        listing.add(this_machine(), Ok(vec![session("here")]));
+        listing.add("gpu-box", Ok(vec![session("build")]));
+        listing.add("asleep", Err(anyhow!("no answer in 5s")));
+
+        let answering = listing.answering();
+        assert!(answering.contains(&this_machine().to_string()));
+        assert!(answering.contains(&"gpu-box".to_string()));
+        assert!(!answering.contains(&"asleep".to_string()));
     }
 
     fn at(name: &str, pid: u32, started: u64) -> SessionInfo {
