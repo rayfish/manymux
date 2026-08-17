@@ -295,6 +295,17 @@ Three consequences run through the whole codebase and are worth keeping intact:
   it may name a row that is *not* the session at the other end of the attach
   stream, and `tag::RENAME` renames that one by design, so it goes back to
   `main` as a `Request::Rename` to that row's machine.
+- **A window with no room for the box hands the job to the mark row.** Since the
+  popup *is* the mode, a terminal too short to draw one (`Picker::draw` answers
+  nothing) was a client that had taken the keyboard and a `tab` that changed
+  nothing anybody could see. So `Status` has three states rather than two
+  (`Popped`): no popup and the row lists the keys, a popup drawn and the row
+  says nothing about keys because the box already does, or a popup with nowhere
+  to go and the row stands in for it. What it stands in with is the highlight
+  first and the keys after, and the keys are what gets cut when the row runs
+  out: a list whose keys you have to remember still works, and one you cannot
+  see at all does not. The group lists bring their own two keys rather than the
+  session ladder, since `d` there is not a detach.
 - **`Mode::Picking` is a mode because the session keys must not reach it**, and
   `KeyFilter::after` takes the mode the key arrived in for the same reason: a
   move that answered `Mode::Control` meant the key after one in the group list

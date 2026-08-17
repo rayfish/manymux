@@ -22,7 +22,7 @@ use super::{Action, Chose, Find, KeyFilter, Mode, Outcome, Pick, Rename, Rows, S
 use crate::client::picker::Picker;
 use crate::client::screen::ScreenMode;
 use crate::client::scroll::Scrollback;
-use crate::client::status::{self, Filter, Status};
+use crate::client::status::{self, Filter, Popped, Status};
 use crate::client::{Attached, SessionHalves, SessionReader, SessionWriter, Update};
 use crate::clipboard;
 use crate::notify;
@@ -467,6 +467,11 @@ fn keyboard() -> mpsc::Receiver<Vec<u8>> {
 /// One write, so there is never a frame with half a box on it, and the mark row
 /// last: it is the thing that says the client has the keyboard, and it must not
 /// be painted over by the box it is telling you about.
+///
+/// A window with no room for a box gets nothing back from [`Picker::draw`], and
+/// the mark row takes the job over ([`Popped::Cramped`]). Without that, control
+/// mode on a short terminal was a keyboard the client had taken and a tab that
+/// changed nothing on the screen.
 async fn draw_popup(
     stdout: &mut tokio::io::Stdout,
     popup: &Option<Popup>,
@@ -477,8 +482,13 @@ async fn draw_popup(
         return Ok(());
     };
     let size = terminal_size();
-    status.set_popped(true);
-    let drawn = format!("{}{}", popup.picker.draw(size), status.repaint(size));
+    let box_drawn = popup.picker.draw(size);
+    status.set_popup(if box_drawn.is_empty() {
+        Popped::Cramped(popup.line())
+    } else {
+        Popped::Drawn
+    });
+    let drawn = format!("{box_drawn}{}", status.repaint(size));
     stdout.write_all(drawn.as_bytes()).await?;
     stdout.flush().await?;
     *restate = false;
@@ -548,6 +558,20 @@ impl Popup {
         Self {
             picker: Picker::new("sessions", SESSION_HINTS, rows.sessions.clone(), rows.at),
             what: Showing::Sessions,
+        }
+    }
+
+    /// The whole popup in one line, for a window with no room to draw the box.
+    ///
+    /// The title and the highlight, which is what the box says that this row
+    /// cannot work out for itself: which list is open, and which row Enter
+    /// would take.
+    fn line(&self) -> String {
+        match self.picker.chosen() {
+            Some(row) => format!("{}: {}", self.picker.title(), row.label),
+            // A list with nothing in it still has to say which list it is, or
+            // the row goes blank in a mode that is still holding the keyboard.
+            None => format!("{}: none", self.picker.title()),
         }
     }
 
@@ -746,7 +770,7 @@ async fn pump(
                                 let what = up.what;
                                 let subject = up.subject();
                                 let Some(chosen) = chosen else { continue };
-                                status.set_popped(false);
+                                status.set_popup(Popped::None);
                                 writer.detach().await?;
                                 return Ok(match (what, subject) {
                                     (Showing::Sessions, _) => {
@@ -786,7 +810,7 @@ async fn pump(
                                 if let Some(session) = session
                                     && !name.trim().is_empty()
                                 {
-                                    status.set_popped(false);
+                                    status.set_popup(Popped::None);
                                     writer.detach().await?;
                                     return Ok(Outcome::Chose(Chose::NewGroup {
                                         session,
@@ -939,7 +963,7 @@ async fn pump(
                                 let session = popup.as_ref().and_then(Popup::subject);
                                 match session {
                                     Some(session) if !wanted.trim().is_empty() => {
-                                        status.set_popped(false);
+                                        status.set_popup(Popped::None);
                                         writer.detach().await?;
                                         return Ok(Outcome::Chose(Chose::Named {
                                             session,
@@ -1026,7 +1050,7 @@ async fn pump(
                     )
                 {
                     popup = None;
-                    status.set_popped(false);
+                    status.set_popup(Popped::None);
                     writer.resync().await?;
                     owed += 1;
                     restate = true;
@@ -1427,7 +1451,28 @@ async fn paste(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::client::picker::Row;
     use crate::settings::Screen;
+
+    /// A window with no room for a box leaves the mark row to say what the
+    /// popup would have: which list is open, and which row Enter would take.
+    #[test]
+    fn a_popup_with_no_room_to_draw_says_itself_in_one_line() {
+        let rows = Rows {
+            sessions: vec![Row::new(0, "build"), Row::new(1, "api")],
+            groups: Vec::new(),
+            at: 1,
+        };
+        assert_eq!(Popup::sessions(&rows).line(), "sessions: api");
+    }
+
+    /// An empty list still has to name itself. Saying nothing there would be a
+    /// blank row in a mode that is still holding the keyboard, which is the
+    /// thing this row exists to stop.
+    #[test]
+    fn a_list_with_nothing_in_it_still_names_itself() {
+        assert_eq!(Popup::sessions(&Rows::default()).line(), "sessions: none");
+    }
 
     /// A mode the node turns back on for a session, and the client forgets to
     /// turn off, is left on in the shell. Focus reporting was the one that got
