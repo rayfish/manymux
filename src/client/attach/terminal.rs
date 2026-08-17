@@ -973,17 +973,44 @@ async fn pump(
                             // without holding a borrow of it.
                             Scroll::Leave => {}
                         }
-                        let wanted = view.wanted();
-                        let painted = view.paint();
-                        status.set_scrolled(Some(view.offset()));
-                        if let Some(request) = wanted {
-                            writer.view(&request).await?;
+                        // Scrolled all the way back down, which is somebody
+                        // arriving at the live screen rather than asking to
+                        // look at a window that happens to sit on it. The view
+                        // is a picture of where the session was, so sitting in
+                        // it at the bottom is the one place it says nothing the
+                        // session would not say better, and leaving costs an
+                        // Esc nobody thinks to press. Only on the way down:
+                        // opening the view is a move up made from the bottom,
+                        // and a history shorter than the screen never leaves
+                        // it, so reading this off the offset alone would open
+                        // the view and shut it in the same notch.
+                        let landed = view.at_bottom()
+                            && matches!(
+                                motion,
+                                Scroll::Down(_) | Scroll::PageDown | Scroll::Bottom
+                            );
+                        if landed {
+                            scrolling = None;
+                            status.set_scrolled(None);
+                            keys.set_mode(Mode::Focus);
+                            status.set_mode(Mode::Focus);
+                            ask_for_the_screen(&mut writer, &mut owed).await?;
+                            restate = true;
+                            settle(&mut stdout, &output, &status, &mut pending, &mut restate)
+                                .await?;
+                        } else {
+                            let wanted = view.wanted();
+                            let painted = view.paint();
+                            status.set_scrolled(Some(view.offset()));
+                            if let Some(request) = wanted {
+                                writer.view(&request).await?;
+                            }
+                            stdout.write_all(painted.as_bytes()).await?;
+                            stdout
+                                .write_all(status.repaint(terminal_size()).as_bytes())
+                                .await?;
+                            stdout.flush().await?;
                         }
-                        stdout.write_all(painted.as_bytes()).await?;
-                        stdout
-                            .write_all(status.repaint(terminal_size()).as_bytes())
-                            .await?;
-                        stdout.flush().await?;
                     }
                     // The same shape as a search, and the same reason for
                     // it: the name lives in the key filter until Enter, so
