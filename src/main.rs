@@ -192,7 +192,7 @@ enum Command {
     /// desktop notification a watching node raises, and the one an attached
     /// terminal is asked to show.
     Config {
-        /// `notify` or `screen`. Left out, every setting is listed.
+        /// `notify`, `screen` or `mouse`. Left out, every setting is listed.
         #[arg(add = complete::settings())]
         key: Option<String>,
         /// What to set it to. Left out, the setting is printed rather than

@@ -1042,14 +1042,14 @@ fn a_setting_is_written_where_the_next_command_reads_it() {
 
     assert_eq!(
         world.ok("laptop", &["config"]).trim(),
-        "notify on\nscreen alternate"
+        "notify on\nscreen alternate\nmouse client"
     );
 
     world.ok("laptop", &["config", "notify", "off"]);
     assert_eq!(world.ok("laptop", &["config", "notify"]).trim(), "off");
     assert_eq!(
         world.ok("laptop", &["config"]).trim(),
-        "notify off\nscreen alternate"
+        "notify off\nscreen alternate\nmouse client"
     );
 
     // A refusal rather than a file with a typo in it that changes nothing.
@@ -1061,7 +1061,7 @@ fn a_setting_is_written_where_the_next_command_reads_it() {
     // including that what a setting takes depends on which one it is.
     assert_eq!(
         world.complete("laptop", &["config", ""]),
-        vec!["notify", "screen"]
+        vec!["notify", "screen", "mouse"]
     );
     assert_eq!(
         world.complete("laptop", &["config", "notify", ""]),
@@ -1070,6 +1070,10 @@ fn a_setting_is_written_where_the_next_command_reads_it() {
     assert_eq!(
         world.complete("laptop", &["config", "screen", ""]),
         vec!["alternate", "inline"]
+    );
+    assert_eq!(
+        world.complete("laptop", &["config", "mouse", ""]),
+        vec!["client", "terminal"]
     );
 }
 

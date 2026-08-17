@@ -499,6 +499,17 @@ Three consequences run through the whole codebase and are worth keeping intact:
   one you cannot read, and a selection needing shift is one you can still make.
   The key stays on the hints row, for a hand that would rather not reach for the
   mouse.
+- **Which modifier gives the drag back is the terminal's business, so the trade
+  is the person's to refuse** (`settings::Mouse`, `mm config mouse terminal`).
+  Every terminal keeps selection under *some* modifier and no two agree which,
+  and the one in front of somebody may not do it at all: that is a fact about
+  their terminal, which nothing here can see and no amount of reasoning about
+  what the wheel is worth can answer. So `mouse` is a setting rather than a
+  flag, since it is a fact about the terminal you sit at rather than about one
+  attach, and it arrives at `wheel_is_ours` folded into `history`: a wheel with
+  nowhere to go and a wheel somebody wants back are the same thing to everything
+  downstream. What it must not touch is the key, which still opens the view, or
+  giving the mouse back would take the history with it.
 - **A session that asked for the mouse keeps every report, wheel included.**
   That half of the old rule is untouched and is what the whole thing rests on:
   two readers on one wheel is one of them reading input meant for the other, and
@@ -565,6 +576,20 @@ Three consequences run through the whole codebase and are worth keeping intact:
   which is the kind of difference nobody thinks to report. Releases are still
   dropped, and that is the half the rule was written for: the ctrl you were
   holding reports its own release the moment you let go of the mode key.
+- **The keys with no byte behind them are read the same way, through
+  `Special`.** `Encoded` speaks the `u` and `~` spellings and knows nothing of a
+  sequence ending in a letter, so the arrows and the paging keys are matched
+  against `PICK_KEYS` and `VIEW_KEYS` instead. Matching the plain spelling
+  literally, as that once did, missed exactly what `Encoded::down` missed one
+  layer up: a held arrow stops arriving as `\x1b[A` and starts arriving as
+  `\x1b[1;1:2A`, so holding one walked the popup once and stopped, while holding
+  tab beside it worked. So the tables hold the plain spelling alone, `Special`
+  reads every longer one back to it, and the parameters an extended mode adds
+  are read off and dropped: a release moves nothing, and Ctrl-Up in a list is a
+  hand reaching for up. The same protocols respell Shift-Tab as tab with shift,
+  which is a key that means the *opposite* of the byte behind it, so both lists
+  answer for that chord themselves rather than letting `Encoded::byte` walk them
+  forwards.
 - **A mode the client is holding is left by a keystroke and by nothing else.**
   A session that asked for mouse tracking or focus reporting has the terminal
   sending reports whenever the hand or the window moves, and those arrive on the

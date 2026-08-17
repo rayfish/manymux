@@ -27,7 +27,7 @@ use crate::client::{Attached, SessionHalves, SessionReader, SessionWriter, Updat
 use crate::clipboard;
 use crate::notify;
 use crate::proto::{HostedEvent, Renamed, Size};
-use crate::settings::Screen;
+use crate::settings::{Mouse, Screen, Settings};
 
 /// Sent before attaching.
 ///
@@ -640,7 +640,10 @@ async fn pump(
     // terminal costs it the bare-drag selection, so it is worth doing only
     // where a notch has somewhere to go. A host that cannot answer for a window
     // gets a sentence on the row when the key is pressed, and keeps its wheel.
-    let history = scrolls && screen.mode().owns_the_screen();
+    // The last word is the person sitting at the terminal, whose one may not
+    // give selection back under a modifier the way most do.
+    let history =
+        scrolls && screen.mode().owns_the_screen() && Settings::or_default().mouse == Mouse::Client;
     let mut output = Filter::new(screen);
     // The view over the session's history, while it is up.
     let mut scrolling: Option<Scrollback> = None;
