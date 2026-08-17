@@ -145,6 +145,46 @@ pub async fn greet(host: &str) -> Result<()> {
     Ok(())
 }
 
+/// Run a shell command on `host` and hand back what it printed.
+///
+/// The one thing here that asks a machine for something without going through
+/// `mm agent`, and it is what lets a checkpoint be taken of a machine whose
+/// node predates checkpoints: the node is asked first and, when it says it has
+/// never heard of the question, the files it would have read are read directly
+/// instead. That works against any version, including none at all, because
+/// nothing on the far side has to have heard of anything.
+///
+/// stdout comes back as bytes rather than text on purpose: what is fetched
+/// this way is `/proc` content, and a `cmdline` is NUL-separated and need not
+/// be UTF-8 at all. Deciding what any of it means belongs to the caller, so
+/// that the rules live in one place rather than half here and half in a shell
+/// script somebody has to keep in step.
+pub async fn ask(host: &str, script: &str) -> Result<Vec<u8>> {
+    let out = base(Tty::No)
+        .arg(host)
+        .arg("--")
+        // One string, for the remote shell to read as a command rather than as
+        // a program and its arguments, the way `install` does.
+        .arg(script)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await
+        .with_context(|| format!("running ssh {host}"))?;
+    if !out.status.success() {
+        let said = String::from_utf8_lossy(&out.stderr);
+        let said = said.trim();
+        bail!(
+            "asking {host} what it is running failed ({}){}{}",
+            out.status,
+            if said.is_empty() { "" } else { ": " },
+            said
+        );
+    }
+    Ok(out.stdout)
+}
+
 /// Put `mm` on a machine you can already ssh into, by running the published
 /// installer there.
 ///

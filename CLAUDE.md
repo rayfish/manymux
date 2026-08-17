@@ -560,11 +560,20 @@ Three consequences run through the whole codebase and are worth keeping intact:
   node it would grow only on the machines that had been restarted, which are
   the ones that did not need it. And the awkward one: the node holding the
   sessions worth saving is, on any machine, running the build from before this
-  existed, so it refuses the question and the only fix is the restart being
-  avoided. On this machine there is a way round and it is why `foreground` is
-  in the library rather than under `node`: the client is on that machine, so it
-  reads `/proc` itself from the pid the listing has always carried. A machine
-  reached over ssh has no such way round and is named rather than guessed at.
+  existed, so it refuses the question. On this machine the client reads `/proc`
+  itself from the pid the listing has always carried, which is why `foreground`
+  is in the library rather than under `node`. On another machine the same three
+  files are read over the ssh that is already open (`ssh::ask`,
+  `checkpoint::read_proc`), so nothing on the far side has to have heard of
+  checkpoints, or of manymux. Two passes, because *which* process to describe
+  is decided here: the first brings back each leader's `stat` and the second
+  that process's directory and argv. The far end runs `cat` and `readlink` and
+  decides nothing, which is the whole point — a script that worked out what a
+  ` (deleted)` suffix meant would be a second copy of rules that took three
+  review rounds to get right, drifting from the first the week after. There is
+  a test that both ways of reading one process agree, and it earned its keep
+  immediately: `readlink` writes a trailing newline that `read_link` does not,
+  and hex-encoded with the rest it landed on the end of every directory.
 - **A restored session keeps the shell behind it, and that wrapper must be seen
   through on the way back in.** The node runs a spawn as `shell -lc <command>`,
   so a session restored as `claude --continue` *ends when claude exits*, where

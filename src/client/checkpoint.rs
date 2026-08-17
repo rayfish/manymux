@@ -29,8 +29,15 @@
 //! question. That is why [`crate::foreground`] is in the library rather than
 //! under `node`: a client on the same machine reads `/proc` itself, from the
 //! pid the listing already carries, and needs nothing from the node but the
-//! listing it has always given. A machine reached over ssh has no such way
-//! round, and is named rather than guessed at.
+//! listing it has always given.
+//!
+//! A machine reached over ssh is read the same way, over the connection that
+//! is already open ([`read_proc`], [`read_back`]). The far end `cat`s and
+//! `readlink`s and decides nothing; every rule about what that means is
+//! applied here, on the same functions the local path uses. That is not
+//! tidiness: a shell script that worked out which process was in front, or
+//! what a ` (deleted)` suffix meant, would be a second implementation of rules
+//! that took three review rounds to get right, and it would drift.
 
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -456,6 +463,88 @@ fn unwrapped(argv: &[String]) -> &[String] {
         }
         _ => argv,
     }
+}
+
+/// A shell command that prints one `/proc` file per pid, and decides nothing.
+///
+/// The far end reads and this end parses, which is the whole point: a script
+/// that worked out which process was in front, or what a `(deleted)` suffix
+/// meant, would be a second copy of rules that took three review rounds to get
+/// right and would drift from the first the week after. So it `cat`s and it
+/// `readlink`s, and that is all it does.
+///
+/// Hex for the contents because a `cmdline` is NUL-separated and need not be
+/// UTF-8, neither of which survives a line of shell output. `od` is POSIX, so
+/// this needs nothing installed. A pid that has gone prints an empty body
+/// rather than failing, since a session ending between two questions is
+/// ordinary.
+pub fn read_proc(pids: &[u32], want: Want) -> String {
+    let pids: Vec<String> = pids.iter().map(u32::to_string).collect();
+    // `P` opens a record and `X` carries the bytes, so a pid that answers
+    // nothing is still a record and still lines up with what was asked about.
+    format!(
+        "for p in {}; do printf 'P %s\\n' \"$p\"; \
+         printf 'X %s\\n' \"$({} | od -An -v -tx1 | tr -d ' \\n')\"; done",
+        pids.join(" "),
+        want.reader()
+    )
+}
+
+/// Which `/proc` file a pass is after.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Want {
+    /// The leader's, for the process group in front of its terminal.
+    Stat,
+    /// Where that process is. A link rather than a file, so `readlink`, and it
+    /// writes a newline that `std::fs::read_link` does not: hex-encoded with
+    /// the rest, that newline lands on the end of the directory and the two
+    /// ways of reading the same process stop agreeing. The inner `printf %s`
+    /// is what takes it off, and takes off only the trailing ones, so a path
+    /// with a newline inside it is still carried exactly.
+    Cwd,
+    /// Its argv, NUL-separated and not necessarily UTF-8, which is why all of
+    /// this is hex in the first place.
+    Cmdline,
+}
+
+impl Want {
+    fn reader(self) -> &'static str {
+        match self {
+            Self::Stat => "cat /proc/$p/stat 2>/dev/null",
+            Self::Cwd => "printf %s \"$(readlink /proc/$p/cwd 2>/dev/null)\"",
+            Self::Cmdline => "cat /proc/$p/cmdline 2>/dev/null",
+        }
+    }
+}
+
+/// The bytes each pid answered with, in the order the records arrived.
+///
+/// Anything that is not a record this wrote is skipped rather than guessed at:
+/// a login shell on the far side is free to print a banner before the command
+/// runs, and a checkpoint is not the place to find out that somebody's
+/// `.profile` says hello.
+pub fn read_back(out: &[u8]) -> Vec<(u32, Vec<u8>)> {
+    let text = String::from_utf8_lossy(out);
+    let mut found = Vec::new();
+    let mut pid = None;
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("P ") {
+            pid = rest.trim().parse::<u32>().ok();
+        } else if let Some(rest) = line.strip_prefix("X ")
+            && let Some(p) = pid.take()
+        {
+            found.push((p, unhex(rest.trim())));
+        }
+    }
+    found
+}
+
+fn unhex(text: &str) -> Vec<u8> {
+    let digits: Vec<u8> = text.bytes().filter(|b| b.is_ascii_hexdigit()).collect();
+    digits
+        .chunks_exact(2)
+        .filter_map(|pair| u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok())
+        .collect()
 }
 
 /// Whether a wrapper of ours is still in this command after everything above

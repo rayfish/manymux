@@ -1368,34 +1368,139 @@ fn warn_about_shared_directories(sessions: &[Kept]) {
 
 /// What every session on one machine is doing.
 ///
-/// Two ways to the same answer, and the local one is not an optimisation. A
-/// node only learns to answer `Request::Snapshot` in the build that added it,
-/// so on any machine the *first* checkpoint would be refused by the very node
-/// whose sessions are worth saving, and the only way to fix that is the
-/// restart being avoided. On this machine there is a way round, because the
-/// client is on it: `/proc` is right there, and the pid is in the listing the
-/// node has always given. A machine reached over ssh has no such way round.
+/// Three ways to the same answer, and the two that do not ask the node are not
+/// optimisations. A node only learns to answer `Request::Snapshot` in the build
+/// that added it, so on any machine the *first* checkpoint is refused by the
+/// very node whose sessions are worth saving, and restarting it to fix that is
+/// the thing the checkpoint exists to make safe. On this machine `/proc` is
+/// right there. On another, the same files are read over the ssh that is
+/// already open, which needs nothing on the far side to have heard of
+/// checkpoints, or of manymux at all.
 async fn what_is_doing(socket: &Path, host: &str, listing: &Listing) -> Result<Vec<Doing>> {
+    let here: Vec<&HostedSession> = listing
+        .sessions
+        .iter()
+        .filter(|hosted| hosted.host == host)
+        .collect();
+
     if is_this_machine(host) {
-        return Ok(listing
-            .sessions
+        return Ok(here
             .iter()
-            .filter(|hosted| hosted.host == host)
-            .map(|hosted| {
-                let front = manymux::foreground::of(hosted.session.pid);
-                Doing {
-                    name: hosted.session.name.clone(),
-                    pid: hosted.session.pid,
-                    cwd: front.cwd,
-                    foreground: front.argv,
-                }
-            })
+            .map(|hosted| doing(&hosted.session, manymux::foreground::of(hosted.session.pid)))
             .collect());
     }
-    match open(socket, host).await?.call(&Request::Snapshot).await? {
-        Response::Snapshot(doing) => Ok(doing),
+
+    match open(socket, host)
+        .await?
+        .request(&Request::Snapshot)
+        .await?
+    {
+        Response::Snapshot(answers) => Ok(answers),
+        // The refusal of a node that predates the question, which is an answer
+        // rather than a failure: it says to go and read the files instead.
+        Response::Error(said) => {
+            debug!("{host} cannot be asked what it is doing ({said}); reading /proc over ssh");
+            over_ssh(host, &here).await
+        }
         other => bail!("unexpected response to a snapshot: {other:?}"),
     }
+}
+
+/// One session's answer, however the three files were come by.
+fn doing(session: &manymux::proto::SessionInfo, front: manymux::foreground::Foreground) -> Doing {
+    Doing {
+        name: session.name.clone(),
+        pid: session.pid,
+        cwd: front.cwd,
+        foreground: front.argv,
+    }
+}
+
+/// Read what a machine is doing out of its `/proc`, over ssh.
+///
+/// Two passes, because which process to describe is decided *here*: the first
+/// brings back each session leader's `stat`, this end works out what is in
+/// front of its terminal, and the second brings back that process's directory
+/// and argv. Two round trips rather than one is the price of the far side
+/// deciding nothing, and ssh shares one connection per machine so the second
+/// costs a message rather than a handshake.
+///
+/// A machine that cannot answer at all leaves every session it holds without a
+/// directory, which is reported and counted against the save the way any other
+/// undescribable session is.
+async fn over_ssh(host: &str, here: &[&HostedSession]) -> Result<Vec<Doing>> {
+    use manymux::foreground::{Foreground, Raw};
+
+    let leaders: Vec<u32> = here.iter().map(|hosted| hosted.session.pid).collect();
+    if leaders.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let stats = checkpoint::read_back(
+        &manymux::ssh::ask(
+            host,
+            &checkpoint::read_proc(&leaders, checkpoint::Want::Stat),
+        )
+        .await?,
+    );
+    let stat_of = |pid: u32| -> String {
+        stats
+            .iter()
+            .find(|(answered, _)| *answered == pid)
+            .map(|(_, bytes)| String::from_utf8_lossy(bytes).into_owned())
+            .unwrap_or_default()
+    };
+
+    // Whose directory and argv to ask for, decided by the same rule the local
+    // path uses, on the same bytes.
+    let fronts: Vec<u32> = leaders
+        .iter()
+        .map(|&leader| {
+            manymux::foreground::in_front(leader, manymux::foreground::tpgid(&stat_of(leader)))
+        })
+        .collect();
+
+    let cwds = checkpoint::read_back(
+        &manymux::ssh::ask(host, &checkpoint::read_proc(&fronts, checkpoint::Want::Cwd)).await?,
+    );
+    let argvs = checkpoint::read_back(
+        &manymux::ssh::ask(
+            host,
+            &checkpoint::read_proc(&fronts, checkpoint::Want::Cmdline),
+        )
+        .await?,
+    );
+    let bytes_of = |answers: &[(u32, Vec<u8>)], pid: u32| -> Vec<u8> {
+        answers
+            .iter()
+            .find(|(answered, _)| *answered == pid)
+            .map(|(_, bytes)| bytes.clone())
+            .unwrap_or_default()
+    };
+
+    Ok(here
+        .iter()
+        .zip(&fronts)
+        .map(|(hosted, &front)| {
+            let raw = Raw {
+                stat: stat_of(hosted.session.pid),
+                cwd: String::from_utf8_lossy(&bytes_of(&cwds, front)).into_owned(),
+                cmdline: bytes_of(&argvs, front),
+            };
+            // Non-UTF-8 is nothing rather than something close to it, here as
+            // in the local path: `from_utf8_lossy` on a path would name a
+            // directory that does not exist.
+            let front = if raw.cwd.contains('\u{fffd}') {
+                Foreground {
+                    cwd: None,
+                    argv: raw.read().argv,
+                }
+            } else {
+                raw.read()
+            };
+            doing(&hosted.session, front)
+        })
+        .collect())
 }
 
 /// `mm checkpoint restore`: start the saved sessions again.

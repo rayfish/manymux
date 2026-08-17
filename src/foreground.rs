@@ -19,11 +19,18 @@
 //! node holding those sessions is by definition running the build from before
 //! this existed and will refuse to be asked. See `client::checkpoint`.
 //!
-//! Linux only, and it answers a blank rather than a guess anywhere else. macOS
-//! has no `/proc`: the directory would come from `libproc` and the argv from a
-//! `KERN_PROCARGS2` sysctl, which is a separate piece of work. A blank is a
-//! real answer here, and a much better one than a wrong directory: a session
-//! restored in the wrong place resumes somebody else's conversation.
+//! Which is why the *parsing* here is split from the *reading* and none of it
+//! is gated to Linux: [`Raw`] applies every rule below to bytes somebody else
+//! fetched, so a machine reached over ssh is read by the same code, and a
+//! checkpoint of a Linux box can be taken from a Mac.
+//!
+//! Reading is Linux only, and answers a blank rather than a guess anywhere
+//! else. macOS has no `/proc`: the directory would come from `libproc` and the
+//! argv from a `KERN_PROCARGS2` sysctl, which is a separate piece of work. A
+//! blank is a real answer here, and a much better one than a wrong directory:
+//! a session restored in the wrong place resumes somebody else's conversation.
+//! Note that this cuts only one way — a Mac cannot describe its *own*
+//! sessions, but it can describe a Linux machine's over ssh.
 
 /// The program holding a session's terminal, and the directory it is in.
 ///
@@ -66,10 +73,7 @@ pub fn of(leader: u32) -> Foreground {
     // back a line later. A session whose build had `cd`ed into a directory
     // since removed came out recorded in the leader's, which for a program
     // that resumes by directory is somebody else's conversation.
-    let front = match in_front_of(leader) {
-        Some(front) if front != leader => front,
-        _ => leader,
-    };
+    let front = in_front_of(leader);
     Foreground {
         cwd: cwd_of(front),
         argv: argv_of(front),
@@ -99,17 +103,6 @@ pub fn our_session() -> Option<u32> {
     (sid > 0).then_some(sid as u32)
 }
 
-/// The process group in front of the session's terminal.
-///
-/// `None` when the answer is not usable: a negative `tpgid` is a process with
-/// no controlling terminal, and a zero one is no foreground group at all.
-#[cfg(target_os = "linux")]
-fn in_front_of(leader: u32) -> Option<u32> {
-    let stat = std::fs::read_to_string(format!("/proc/{leader}/stat")).ok()?;
-    let tpgid = tpgid(&stat)?;
-    (tpgid > 0).then_some(tpgid as u32)
-}
-
 /// The `tpgid` field of a `/proc/<pid>/stat` line.
 ///
 /// Read from after the *last* `)` rather than by splitting the line from the
@@ -118,26 +111,45 @@ fn in_front_of(leader: u32) -> Option<u32> {
 /// the left walks into the middle of that name and reads a different field,
 /// for those processes only, which is the kind of bug that works on every
 /// machine it is tested on.
-#[cfg(target_os = "linux")]
-fn tpgid(stat: &str) -> Option<i32> {
+///
+/// Not gated to Linux, and none of the three below are: a client reading a
+/// machine it reached over ssh parses the same bytes on whatever it happens to
+/// be running, which is how a checkpoint of a Linux box can be taken from a
+/// Mac. Only the *reading* is Linux's.
+pub fn tpgid(stat: &str) -> Option<i32> {
     let after = &stat[stat.rfind(')')? + 1..];
     // What follows the name is state, ppid, pgrp, session, tty_nr, tpgid.
     after.split_whitespace().nth(5)?.parse().ok()
 }
 
-/// Where a process is, or `None` if that cannot be read as a path.
+/// Which process a `tpgid` names, given the leader it was read from.
+///
+/// Both halves of an answer come from one process or neither does, so this is
+/// where that is decided: a `tpgid` that is not usable, or that is the leader
+/// itself, means the leader is what to describe.
+pub fn in_front(leader: u32, tpgid: Option<i32>) -> u32 {
+    match tpgid {
+        Some(front) if front > 0 && front as u32 != leader => front as u32,
+        _ => leader,
+    }
+}
+
+/// Where a process is, given what its `cwd` link points at.
 ///
 /// A directory that has been deleted out from under the process reads as
 /// `<path> (deleted)`, which is the kernel annotating rather than answering.
 /// Restoring into a directory of that literal name is not what anybody meant,
 /// so it is refused: no directory beats a wrong one everywhere here.
+pub fn cwd_from(link: &str) -> Option<String> {
+    (!link.is_empty() && !link.ends_with(" (deleted)")).then(|| link.to_string())
+}
+
 #[cfg(target_os = "linux")]
 fn cwd_of(pid: u32) -> Option<String> {
     let path = std::fs::read_link(format!("/proc/{pid}/cwd")).ok()?;
     // Not lossy: a path that is not UTF-8 cannot be put in a `SpawnSpec`, and
     // a lossily mangled one names a directory that does not exist.
-    let path = path.into_os_string().into_string().ok()?;
-    (!path.ends_with(" (deleted)")).then_some(path)
+    cwd_from(&path.into_os_string().into_string().ok()?)
 }
 
 /// The argv of a process, as separate words, or nothing if it cannot be read
@@ -159,12 +171,8 @@ fn cwd_of(pid: u32) -> Option<String> {
 /// as a different command with nothing said. The same argument [`cwd_of`]
 /// makes about a path it cannot represent, and it has to be the same answer,
 /// since a blank here is reported and counted while a mangled word is not.
-#[cfg(target_os = "linux")]
-fn argv_of(pid: u32) -> Vec<String> {
-    let Ok(raw) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
-        return Vec::new();
-    };
-    let Ok(text) = String::from_utf8(raw) else {
+pub fn argv_from(raw: &[u8]) -> Vec<String> {
+    let Ok(text) = std::str::from_utf8(raw) else {
         return Vec::new();
     };
     let mut argv: Vec<String> = text.split('\0').map(str::to_string).collect();
@@ -174,7 +182,47 @@ fn argv_of(pid: u32) -> Vec<String> {
     argv
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(target_os = "linux")]
+fn argv_of(pid: u32) -> Vec<String> {
+    match std::fs::read(format!("/proc/{pid}/cmdline")) {
+        Ok(raw) => argv_from(&raw),
+        Err(_) => Vec::new(),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn in_front_of(leader: u32) -> u32 {
+    let stat = std::fs::read_to_string(format!("/proc/{leader}/stat")).ok();
+    in_front(leader, stat.as_deref().and_then(tpgid))
+}
+
+/// The parsers above, over bytes somebody else read.
+///
+/// What makes a checkpoint of a machine reached over ssh possible without that
+/// machine having heard of checkpoints: the far end is asked for the same
+/// three files this reads locally, and every rule about what they mean is
+/// applied here, once. A shell script that decided any of it would be a second
+/// implementation of rules that took three review rounds to get right.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Raw {
+    /// The leader's `/proc/<pid>/stat`, for the foreground process group.
+    pub stat: String,
+    /// What `/proc/<front>/cwd` points at.
+    pub cwd: String,
+    /// `/proc/<front>/cmdline`, NULs and all.
+    pub cmdline: Vec<u8>,
+}
+
+impl Raw {
+    pub fn read(&self) -> Foreground {
+        Foreground {
+            cwd: cwd_from(&self.cwd),
+            argv: argv_from(&self.cmdline),
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -222,7 +270,7 @@ mod tests {
         // The test binary is its own process group leader in the usual case;
         // whatever the answer, asking about ourselves gives our own argv back
         // rather than an empty one.
-        let front = in_front_of(me).unwrap_or(me);
+        let front = in_front_of(me);
         assert!(
             !argv_of(front).is_empty(),
             "a live process has an argv, whether or not it leads its group"
@@ -249,7 +297,11 @@ mod tests {
     fn a_process_that_is_gone_is_a_blank_rather_than_a_failure() {
         assert_eq!(cwd_of(u32::MAX), None);
         assert!(argv_of(u32::MAX).is_empty());
-        assert_eq!(in_front_of(u32::MAX), None);
+        assert_eq!(
+            in_front_of(u32::MAX),
+            u32::MAX,
+            "nothing to read, so itself"
+        );
         assert_eq!(of(u32::MAX), Foreground::default());
     }
 }

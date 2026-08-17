@@ -453,11 +453,15 @@ Four things worth knowing:
   `/proc`. A machine that cannot say is named rather than guessed at, and its
   sessions are left out of the file: put back in the wrong directory, a program
   told to resume picks up somebody else's work.
-- **The first update on a machine cannot be checkpointed remotely.** Asking a
-  node what its sessions are doing is a request it only learned in the build
-  that added this, so a node older than that refuses. On the machine itself
-  there is a way round, and it is the one this takes: the client reads `/proc`
-  directly. Over ssh there is not.
+- **A machine whose node is too old to be asked is read directly instead.**
+  Asking a node what its sessions are doing is a request it only learned in
+  the build that added this, and the node holding the sessions worth saving is,
+  the first time round, always older than that. So when it refuses, the files
+  it would have read are read over the ssh connection that is already open.
+  Nothing on the far side needs to have heard of checkpoints, or of manymux at
+  all: the far end runs `cat` and `readlink`, and every rule about what that
+  means is applied at your end, once. It costs a second round trip per machine,
+  which a shared ssh connection makes a message rather than a handshake.
 
 The sessions do go, but they are hung up first and given a couple of seconds,
 so shells write their history and editors write their swap files rather than

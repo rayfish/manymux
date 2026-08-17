@@ -97,6 +97,13 @@ case "$1" in
     *install.sh*) echo "$1" > "$installed"; exit 0 ;;
 esac
 
+# A command for the remote shell rather than a program to run, which is what
+# real ssh does with anything it is handed. Matched on `/proc/` so it cannot
+# collide with the `mm` spellings below, which the ladder tests turn on.
+case "$1" in
+    */proc/*) exec sh -c "$1" ;;
+esac
+
 # Which names this machine answers to. Anything else is not found, and a shell
 # says so on stderr on its way out, which is the noise the client has to keep
 # off the terminal while it is still working out how this machine is spelled.
@@ -2843,4 +2850,134 @@ fn a_checkpoint_records_what_a_machine_over_ssh_is_running_and_where() {
     );
     let groups = world.ok("laptop", &["groups"]);
     assert!(groups.contains("work"), "nor its group: {groups}");
+}
+
+/// The two ways of reading what a session is doing have to agree, because a
+/// machine gets one or the other depending on how old its node is and nobody
+/// choosing between them knows which they got.
+///
+/// This runs the shell the ssh path sends, against a process on this machine,
+/// and holds its answer to what the local `/proc` read says about the same
+/// process. The far side decides nothing: it `cat`s and it `readlink`s, and
+/// every rule about what that means is applied on this end, once. Getting that
+/// wrong is how the two would drift.
+#[test]
+#[cfg(target_os = "linux")]
+fn reading_proc_over_a_shell_agrees_with_reading_it_here() {
+    use manymux::client::checkpoint::{Want, read_back, read_proc};
+    use manymux::foreground;
+
+    // A process with a command and a directory of its own, so both halves of
+    // the answer have something in them.
+    let mut child = Command::new("/bin/sh")
+        .args(["-c", "cd /tmp && exec sleep 30"])
+        .spawn()
+        .expect("spawning a process to describe");
+    std::thread::sleep(Duration::from_millis(400));
+    let pid = child.id();
+
+    let run = |script: String| -> Vec<u8> {
+        let out = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(&script)
+            .output()
+            .expect("running the script the ssh path sends");
+        assert!(out.status.success(), "{script}\n{out:?}");
+        out.stdout
+    };
+
+    // Pass one: the leader's stat, from which this end works out what is in
+    // front of the terminal.
+    let stats = read_back(&run(read_proc(&[pid], Want::Stat)));
+    assert_eq!(stats.len(), 1, "one record per pid asked about");
+    assert_eq!(stats[0].0, pid, "and it names the pid it answered for");
+    let stat = String::from_utf8_lossy(&stats[0].1).into_owned();
+    let front = foreground::in_front(pid, foreground::tpgid(&stat));
+
+    // Pass two: that process's directory and argv.
+    let cwd = read_back(&run(read_proc(&[front], Want::Cwd)));
+    let argv = read_back(&run(read_proc(&[front], Want::Cmdline)));
+    let raw = foreground::Raw {
+        stat,
+        cwd: String::from_utf8_lossy(&cwd[0].1).into_owned(),
+        cmdline: argv[0].1.clone(),
+    };
+
+    let over_shell = raw.read();
+    let locally = foreground::of(pid);
+    let _ = child.kill();
+    let _ = child.wait();
+
+    assert_eq!(
+        over_shell, locally,
+        "the same process described two ways has to come out the same"
+    );
+    assert_eq!(
+        over_shell.cwd.as_deref(),
+        Some("/tmp"),
+        "and it is the directory the process is actually in"
+    );
+    assert_eq!(over_shell.argv, vec!["sleep".to_string(), "30".to_string()]);
+}
+
+/// A `cmdline` is NUL-separated and need not be UTF-8, and a path can hold a
+/// space, so what comes back over a shell is hex rather than a line of text.
+/// The decoding has to survive all of that, since the alternative is a command
+/// that is quietly not the one that was running.
+#[test]
+#[cfg(target_os = "linux")]
+fn what_comes_back_over_a_shell_survives_nuls_and_spaces() {
+    use manymux::client::checkpoint::{Want, read_back, read_proc};
+
+    let dir = std::env::temp_dir().join(format!("mm one two-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    // `; :` so no shell `exec`s the sleep and takes the argv with it, and the
+    // empty argument sits between two others: a trailing one is padding from a
+    // rewritten process title and is dropped on purpose.
+    let mut child = Command::new("/bin/sh")
+        .args(["-c", "sleep 30; :", "sh", "two words", "", "after"])
+        .current_dir(&dir)
+        .spawn()
+        .expect("spawning");
+    std::thread::sleep(Duration::from_millis(400));
+    let pid = child.id();
+
+    let out = Command::new("/bin/sh")
+        .arg("-c")
+        .arg(read_proc(&[pid], Want::Cmdline))
+        .output()
+        .unwrap();
+    let back = read_back(&out.stdout);
+    let argv = manymux::foreground::argv_from(&back[0].1);
+
+    let out = Command::new("/bin/sh")
+        .arg("-c")
+        .arg(read_proc(&[pid], Want::Cwd))
+        .output()
+        .unwrap();
+    let cwd = read_back(&out.stdout);
+    let cwd = String::from_utf8_lossy(&cwd[0].1).into_owned();
+
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert_eq!(
+        argv,
+        vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "sleep 30; :".to_string(),
+            "sh".to_string(),
+            "two words".to_string(),
+            String::new(),
+            "after".to_string(),
+        ],
+        "an argument with a space in it, and an empty one between two others"
+    );
+    assert_eq!(
+        cwd,
+        dir.to_string_lossy(),
+        "a directory with spaces in its name"
+    );
 }
