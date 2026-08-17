@@ -518,8 +518,9 @@ impl Session {
     ///
     /// Apart from [`Self::info`] and off the listing path on purpose: this
     /// walks `/proc` per session, and a listing is asked for on every keypress
-    /// the popup takes. It also touches no lock, since none of it is ours to
-    /// know: the answer comes from the operating system.
+    /// the popup takes. What it reads is the operating system's rather than
+    /// ours, so the only lock it takes is the name's, after the walk and for
+    /// as long as a clone.
     pub fn doing(&self) -> Doing {
         let front = crate::foreground::of(self.pid);
         Doing {

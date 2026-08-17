@@ -56,12 +56,22 @@ pub struct Foreground {
 /// argv is what tells a prompt from a program.
 #[cfg(target_os = "linux")]
 pub fn of(leader: u32) -> Foreground {
-    let front = in_front_of(leader).unwrap_or(leader);
+    // Both halves come from one process, or neither does. The foreground
+    // process is where the work is and is free to have moved: a `cd` in a
+    // subshell, a build started from somewhere else. Falling back to the
+    // *leader's* directory when only the front's could not be read, as this
+    // first did, pairs one process's directory with another's command and
+    // marks the answer no differently: [`cwd_of`] refuses a deleted directory
+    // precisely so that no wrong one is offered, and the fallback handed one
+    // back a line later. A session whose build had `cd`ed into a directory
+    // since removed came out recorded in the leader's, which for a program
+    // that resumes by directory is somebody else's conversation.
+    let front = match in_front_of(leader) {
+        Some(front) if front != leader => front,
+        _ => leader,
+    };
     Foreground {
-        // The foreground process is where the work is, and it is free to have
-        // moved: a `cd` in a subshell, a build started from somewhere else.
-        // The leader's own directory is the fallback, not the answer.
-        cwd: cwd_of(front).or_else(|| cwd_of(leader)),
+        cwd: cwd_of(front),
         argv: argv_of(front),
     }
 }
@@ -130,28 +140,38 @@ fn cwd_of(pid: u32) -> Option<String> {
     (!path.ends_with(" (deleted)")).then_some(path)
 }
 
-/// The argv of a process, as separate words.
+/// The argv of a process, as separate words, or nothing if it cannot be read
+/// back exactly.
 ///
-/// Empty words are dropped, which is not tidying. A program that rewrites its
-/// own process title writes over the whole argv block and pads the rest of it
-/// with NULs: `pi` does, so read literally its argv is `pi` and seventy-five
-/// empty arguments. Handed back to a restore, those are quoted into `''` and
-/// passed to the program as arguments it never received.
+/// Only the *trailing* empty words are dropped, and that is not tidying. A
+/// program that rewrites its own process title writes over the whole argv
+/// block and pads the rest of it with NULs: `pi` does, so read literally its
+/// argv is `pi` and seventy-five empty arguments, each of which a restore
+/// would quote into `''` and hand to the program as something it never
+/// received. Every `cmdline` ends in a NUL besides. An empty word *between*
+/// two others is a real argument and is kept: dropping those, as this first
+/// did, turns `git commit --allow-empty-message -m ''` into a command missing
+/// its message.
 ///
-/// The words themselves are left exactly as they are. An earlier version
-/// trimmed each one, on a misreading of that padding as spaces, which would
-/// have quietly changed `rg ' foo '` and `git commit -m 'wip '` into different
-/// commands on the way back.
+/// Not UTF-8 is nothing rather than something close to it. `String::from_utf8_lossy`
+/// would put a replacement character where a byte was, and the caller would go
+/// on to quote that and exec it: a latin-1 filename in an argument comes back
+/// as a different command with nothing said. The same argument [`cwd_of`]
+/// makes about a path it cannot represent, and it has to be the same answer,
+/// since a blank here is reported and counted while a mangled word is not.
 #[cfg(target_os = "linux")]
 fn argv_of(pid: u32) -> Vec<String> {
     let Ok(raw) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
         return Vec::new();
     };
-    String::from_utf8_lossy(&raw)
-        .split('\0')
-        .filter(|arg| !arg.is_empty())
-        .map(str::to_string)
-        .collect()
+    let Ok(text) = String::from_utf8(raw) else {
+        return Vec::new();
+    };
+    let mut argv: Vec<String> = text.split('\0').map(str::to_string).collect();
+    while argv.last().is_some_and(|last| last.is_empty()) {
+        argv.pop();
+    }
+    argv
 }
 
 #[cfg(all(test, target_os = "linux"))]

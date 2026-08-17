@@ -82,8 +82,9 @@ impl Registry {
         sessions.get(name).cloned()
     }
 
-    /// Every live session, for the one caller that acts on all of them at once
-    /// rather than reporting them: the shutdown.
+    /// Every live session, for the callers that act on all of them at once
+    /// rather than one by one: the shutdown, and the walk that asks each what
+    /// it is working on.
     pub fn all(&self) -> Vec<Arc<Session>> {
         let mut sessions = held(&self.sessions);
         prune(&mut sessions);

@@ -2619,9 +2619,12 @@ fn a_session_that_cannot_be_described_stops_the_restart_rather_than_being_lost()
 
     let saved = world.run("laptop", &["checkpoint", "save"]);
     let said = String::from_utf8_lossy(&saved.stderr).to_string();
+    // Which of the two guards catches it depends on whether the reaped
+    // leader's directory or its command is missed first, and both are the
+    // same answer: this session is not described and is not written down.
     assert!(
-        said.contains("cannot say what pipe is running"),
-        "it has to say which session it could not describe: {said}"
+        said.contains("pipe") && said.contains("left out"),
+        "it has to name the session it could not describe: {said}"
     );
     assert!(
         !saved.status.success(),
@@ -2644,17 +2647,104 @@ fn a_session_that_cannot_be_described_stops_the_restart_rather_than_being_lost()
 /// machine with no sessions, and it must not rewrite the file on the way to
 /// saying so: a checkpoint reported as freshly saved that is actually
 /// untouched is worse than an error.
+/// Written by hand rather than by a save, so this holds on a machine that
+/// cannot describe its sessions at all. Reading a session's directory needs
+/// `/proc`, so on macOS every save reports what it could not write down and
+/// exits non-zero, and a test that asked one to succeed there was a test that
+/// only ever passed on Linux while claiming to cover both.
 #[test]
 fn saving_a_machine_that_does_not_answer_says_so_and_writes_nothing() {
     let world = World::new("checkpoint-typo");
 
     world.ok("laptop", &["new", "-d", "-n", "here", "sleep", "60"]);
     world.wait_for_node("laptop");
-    world.ok("laptop", &["checkpoint", "save"]);
-    let before = std::fs::read_to_string(world.dir.join("laptop").join("checkpoint.toml")).unwrap();
+
+    let file = world.dir.join("laptop").join("checkpoint.toml");
+    let before = "taken = 1\n\n[[sessions]]\nhost = \"laptop\"\nname = \"here\"\n\
+                  cwd = \"/tmp\"\ncommand = []\n";
+    std::fs::write(&file, before).unwrap();
 
     let out = world.run("laptop", &["checkpoint", "save", "--host", "nosuchbox"]);
     assert!(!out.status.success(), "a typo is not a success");
-    let after = std::fs::read_to_string(world.dir.join("laptop").join("checkpoint.toml")).unwrap();
-    assert_eq!(before, after, "and it left the checkpoint alone");
+    let said = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(said.contains("nosuchbox"), "it should name it: {said}");
+
+    let after = std::fs::read_to_string(&file).unwrap();
+    assert_eq!(after, before, "and it left the checkpoint alone");
+}
+
+/// The mechanism CI broke and a developer's machine could not: the wrapper a
+/// restore runs only works if the node's own `shell -lc …` gets out of its
+/// way first, and whether a shell does that by itself is not something to
+/// rely on. bash `exec`s a simple final command on one machine and not on
+/// another, because a profile that sets a trap turns the optimisation off,
+/// and dash never does it at all. Left to the shell, the sessions on such a
+/// machine came back wrapped one layer deeper every time.
+///
+/// So the wrapper says `exec` outright. This checks that against `/bin/sh`,
+/// which is the one that never optimises: if the shell is replaced there, it
+/// is replaced everywhere.
+#[test]
+#[cfg(target_os = "linux")]
+fn a_login_shell_gets_out_of_the_way_of_a_restored_command() {
+    let script = r#""$@"; exec "${SHELL:-/bin/sh}" -l"#;
+    let wrapped = format!("exec sh -mc '{script}' sh sleep 5");
+
+    let mut child = Command::new("/bin/sh")
+        .args(["-lc", &wrapped])
+        .spawn()
+        .expect("running a login shell");
+    std::thread::sleep(Duration::from_millis(400));
+
+    let argv = std::fs::read(format!("/proc/{}/cmdline", child.id())).unwrap_or_default();
+    let argv = String::from_utf8_lossy(&argv).replace('\0', " ");
+    let _ = child.kill();
+    let _ = child.wait();
+
+    assert!(
+        argv.starts_with("sh -mc"),
+        "the login shell was still there, so the command it started is what a \
+         checkpoint would read and the wrapper would nest: {argv:?}"
+    );
+    assert!(
+        !argv.contains("-lc"),
+        "and nothing of the login shell's own invocation is left: {argv:?}"
+    );
+}
+
+/// The cross-machine sequence the README documents, and the one thing about
+/// it that has to work: the machine puts its own sessions back, and the client
+/// holding the groups puts those back afterwards, arriving to find every name
+/// already taken. Skipping the grouping for a name that was already running,
+/// as this first did, left that sequence doing nothing at all while printing
+/// that it had worked.
+#[test]
+#[cfg(target_os = "linux")]
+fn restoring_over_sessions_that_are_already_running_still_puts_the_groups_back() {
+    let world = World::new("checkpoint-regroup");
+
+    world.ok("laptop", &["new", "-d", "-n", "build", "sleep", "60"]);
+    world.wait_for_node("laptop");
+    world.ok("laptop", &["group", "build", "pi"]);
+    world.ok("laptop", &["checkpoint", "save"]);
+
+    // The machine restarts and puts its own sessions back, which is what
+    // `--keep-sessions` does there. The group went with the old pids.
+    world.ok("laptop", &["restart", "--force"]);
+    world.wait_for_node("laptop");
+    world.ok("laptop", &["checkpoint", "restore"]);
+    world.ok("laptop", &["group", "build"]);
+    assert!(
+        !world.ok("laptop", &["groups"]).contains("pi"),
+        "the group is gone, which is the state the second half arrives in"
+    );
+
+    // Now the half that holds the groups runs, and finds the name taken.
+    let out = world.ok("laptop", &["checkpoint", "restore"]);
+    assert!(out.contains("already running"), "{out}");
+    let groups = world.ok("laptop", &["groups"]);
+    assert!(
+        groups.contains("pi") && groups.contains("build"),
+        "a restore onto a running session still has its group to put back: {groups}"
+    );
 }

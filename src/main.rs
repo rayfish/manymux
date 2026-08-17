@@ -308,10 +308,12 @@ enum CheckpointAction {
     /// Write down every session: its name, its group, where it is and what it
     /// is running.
     ///
-    /// Replaces whatever was written before. A machine that cannot say where
-    /// its sessions are is named rather than guessed at, and its sessions are
-    /// left out: put back in the wrong directory, a program told to resume
-    /// picks up somebody else's work.
+    /// Replaces what it asked about and leaves the rest of the file alone, so
+    /// narrowing to one machine does not throw away what is known about the
+    /// others. A machine that cannot say where its sessions are is named
+    /// rather than guessed at, and its sessions are left out: put back in the
+    /// wrong directory, a program told to resume picks up somebody else's
+    /// work.
     Save {
         /// Only this machine, or only that one.
         #[arg(long, add = complete::hosts_or_local())]
@@ -1130,28 +1132,35 @@ async fn save_checkpoint(socket: &Path, host: Option<String>) -> Result<Saved> {
 
     let mut sessions = Vec::new();
     let mut lost = 0;
+    // Live sessions this save could not describe. Their host answered, so the
+    // carry-over would drop whatever an earlier save knew about them; they are
+    // named here so it keeps that instead.
+    let mut undescribed: HashSet<(String, String)> = HashSet::new();
     for hosted in &listing.sessions {
         if !wanted(&hosted.host) {
             continue;
         }
+        let mut give_up = |why: String| {
+            eprintln!("mm: {why}");
+            undescribed.insert((hosted.host.clone(), hosted.session.name.clone()));
+            lost += 1;
+        };
         let Some(found) = doing.get(&(hosted.host.clone(), hosted.session.name.clone())) else {
             // Its machine refused the question, and is reported below rather
             // than once per session on it.
             if !refused.iter().any(|r| r.host == hosted.host) {
-                eprintln!(
-                    "mm: {} said nothing about {}",
+                give_up(format!(
+                    "{} said nothing about {}",
                     hosted.host, hosted.session.name
-                );
-                lost += 1;
+                ));
             }
             continue;
         };
         let Some(cwd) = found.cwd.clone() else {
-            eprintln!(
-                "mm: {} cannot say where {} is, so it is left out",
+            give_up(format!(
+                "{} cannot say where {} is, so it is left out",
                 hosted.host, hosted.session.name
-            );
-            lost += 1;
+            ));
             continue;
         };
         // The session this command was typed in. Its work is this command, and
@@ -1166,11 +1175,21 @@ async fn save_checkpoint(socket: &Path, host: Option<String>) -> Result<Saved> {
         // anywhere says so.
         let unknown = found.foreground.is_empty() && !ours_this_one;
         if unknown {
-            eprintln!(
-                "mm: {} cannot say what {} is running, so it is left out",
+            give_up(format!(
+                "{} cannot say what {} is running, so it is left out",
                 hosted.host, hosted.session.name
-            );
-            lost += 1;
+            ));
+            continue;
+        }
+        // A wrapper from an earlier restore that the shell never got out of
+        // the way of. Written down it would gain another shell on every save
+        // and restore, so it is refused rather than recorded wrongly.
+        if checkpoint::still_wrapped(&found.foreground) {
+            give_up(format!(
+                "{} on {} is still inside the shell a restore started it with, \
+                 so it is left out",
+                hosted.session.name, hosted.host
+            ));
             continue;
         }
         // The pid the machine answered with, against the one the listing gave.
@@ -1178,11 +1197,10 @@ async fn save_checkpoint(socket: &Path, host: Option<String>) -> Result<Saved> {
         // between the two questions is one this would otherwise write down
         // with the wrong work against the right name.
         if found.pid != hosted.session.pid {
-            eprintln!(
-                "mm: {} changed under the question, so {} is left out",
+            give_up(format!(
+                "{} changed under the question, so {} is left out",
                 hosted.host, hosted.session.name
-            );
-            lost += 1;
+            ));
             continue;
         }
         let command = if ours_this_one {
@@ -1222,7 +1240,11 @@ async fn save_checkpoint(socket: &Path, host: Option<String>) -> Result<Saved> {
         .into_iter()
         .filter(|at| wanted(at) && !refused.iter().any(|r| r.host == *at))
         .collect();
-    let mut carried_over = Checkpoint::load().unwrap_or_default().sessions;
+    // Read rather than shrugged at: a file broken by the hand-editing this
+    // invites would otherwise be replaced by whatever this save happens to
+    // cover, which is the one thing carrying over exists to prevent, and
+    // `restore` already refuses to guess at the same file.
+    let mut carried_over = Checkpoint::load()?.sessions;
     // Compared the way every other host name here is compared, and not as
     // strings. A file naming this machine `local` — a spelling a restore
     // accepts and a hand-edited file is likely to use — would otherwise miss
@@ -1230,9 +1252,34 @@ async fn save_checkpoint(socket: &Path, host: Option<String>) -> Result<Saved> {
     // the fresh entry: one session listed twice, the stale copy holding a
     // stale directory. The same happens on its own to a machine whose short
     // hostname changed.
-    carried_over.retain(|kept| !answered.iter().any(|at| same_machine(at, &kept.host)));
-    let carried = carried_over.len();
+    //
+    // A session that could not be described this time keeps its earlier entry
+    // if there is one. Its host answered, so the rule above would drop it, and
+    // dropping it is how a good checkpoint taken at ten o'clock was destroyed
+    // by a save at five past that happened to catch a session mid-pipeline:
+    // the record went, and the restart it was taken for was refused in the
+    // same breath, leaving neither. The entry is older than this moment and is
+    // said to be, and the session is still counted against the save, so
+    // nothing acts on it without somebody deciding to.
+    let mut kept_from_before = 0;
+    carried_over.retain(|kept| {
+        if undescribed.contains(&(kept.host.clone(), kept.name.clone())) {
+            kept_from_before += 1;
+            return true;
+        }
+        !answered.iter().any(|at| same_machine(at, &kept.host))
+    });
+    let carried = carried_over.len() - kept_from_before;
     sessions.extend(carried_over);
+    if kept_from_before > 0 {
+        println!(
+            "  {}",
+            style::amber(&format!(
+                "{kept_from_before} of those kept the entry an earlier save wrote, which \
+                 may name a directory they have since left"
+            ))
+        );
+    }
 
     Checkpoint {
         taken: Checkpoint::now(),
@@ -1380,7 +1427,8 @@ async fn restore_checkpoint(socket: &Path, host: Option<String>, dry_run: bool) 
     // In file order and one at a time, because the start time is stamped at the
     // spawn: restoring them in the order they were opened in is what puts every
     // listing's rows back where they were.
-    let mut started = Vec::new();
+    let mut started = 0;
+    let mut here = Vec::new();
     let mut failed = 0;
     let mut reached = Vec::new();
     for kept in &wanted {
@@ -1391,15 +1439,26 @@ async fn restore_checkpoint(socket: &Path, host: Option<String>, dry_run: bool) 
                 if !is_this_machine(&kept.host) {
                     reached.push(kept.host.clone());
                 }
-                started.push((kept.host.clone(), name, kept.group.clone()));
+                started += 1;
+                here.push((kept.host.clone(), name, kept.group.clone()));
             }
             // Already running, which is what a restore run twice looks like,
             // and what a machine that put its own sessions back looks like.
-            Ok(None) => println!(
-                "  {} is already running on {}",
-                style::bold(&kept.name),
-                kept.host
-            ),
+            //
+            // Its group is still put back, and that is the whole of the
+            // cross-machine story: the machine restores the sessions and the
+            // client that holds the groups restores those, so the second half
+            // arrives to find every name already taken. Skipping the grouping
+            // here, as this first did, left that documented sequence doing
+            // nothing at all and saying it had worked.
+            Ok(None) => {
+                println!(
+                    "  {} is already running on {}",
+                    style::bold(&kept.name),
+                    kept.host
+                );
+                here.push((kept.host.clone(), kept.name.clone(), kept.group.clone()));
+            }
             Err(e) => {
                 eprintln!("mm: {}: {e:#}", qualified(&kept.host, &kept.name));
                 failed += 1;
@@ -1411,21 +1470,28 @@ async fn restore_checkpoint(socket: &Path, host: Option<String>, dry_run: bool) 
     reached.dedup();
     note_reached(socket, reached).await;
 
-    // Only now do the new pids exist, and membership is keyed on them. Only
-    // the sessions this run started: one that was already running carries
-    // whatever group it already has, and a name reused by something unrelated
-    // must not be dragged into a group it was never in.
-    if started.iter().any(|(_, _, group)| group.is_some()) {
+    // Only now do the new pids exist, and membership is keyed on them.
+    if here.iter().any(|(_, _, group)| group.is_some()) {
         let listing = everywhere(socket).await?;
         let mut groups = Groups::load().unwrap_or_default();
-        for (host, name, group) in &started {
-            let (Some(group), Some(hosted)) = (
-                group,
-                listing
-                    .sessions
-                    .iter()
-                    .find(|h| h.host == *host && h.session.name == *name),
-            ) else {
+        for (host, name, group) in &here {
+            let Some(group) = group else { continue };
+            // Matched the way every host name here is matched. A raw string
+            // compare missed a file spelling this machine `local`, which is
+            // the spelling `--host` documents and a hand-edited file is likely
+            // to use, and the miss was silent: the line above had already said
+            // the group was put back.
+            let found = listing
+                .sessions
+                .iter()
+                .find(|h| same_machine(&h.host, host) && h.session.name == *name);
+            let Some(hosted) = found else {
+                eprintln!(
+                    "mm: {} came back but could not be found again, so it is \
+                     not in {group}",
+                    qualified(host, name)
+                );
+                failed += 1;
                 continue;
             };
             // Reported rather than propagated. The names come out of a file
@@ -1441,16 +1507,15 @@ async fn restore_checkpoint(socket: &Path, host: Option<String>, dry_run: bool) 
         groups.save()?;
     }
 
-    let machines = started
+    let machines = here
         .iter()
         .map(|(host, _, _)| host.as_str())
         .collect::<HashSet<_>>()
         .len();
     println!(
-        "{} put back {} session{} on {machines} machine{}",
+        "{} put back {started} session{} on {machines} machine{}",
         style::green("✓"),
-        started.len(),
-        if started.len() == 1 { "" } else { "s" },
+        if started == 1 { "" } else { "s" },
         if machines == 1 { "" } else { "s" }
     );
     Ok(if failed > 0 { FAILED } else { OK })

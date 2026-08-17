@@ -49,6 +49,10 @@ pub struct Resumable {
     /// beside one of these is arguing with a choice somebody already made, and
     /// these programs reject the combination rather than pick a winner.
     pub already: &'static [&'static str],
+    /// Runs that are not a conversation and have nothing to continue. Named
+    /// rather than guessed at from the shape, since the same position takes an
+    /// opening prompt.
+    pub subcommands: &'static [&'static str],
 }
 
 /// The programs worth knowing about, and how to continue them.
@@ -70,6 +74,16 @@ const RESUMED: &[Resumable] = &[
             "--from-pr",
             "--teleport",
         ],
+        subcommands: &[
+            "mcp",
+            "config",
+            "doctor",
+            "update",
+            "install",
+            "migrate-installer",
+            "setup-token",
+            "plugin",
+        ],
     },
     Resumable {
         program: "pi",
@@ -82,6 +96,15 @@ const RESUMED: &[Resumable] = &[
             "--session",
             "--session-id",
             "--fork",
+        ],
+        subcommands: &[
+            "install",
+            "remove",
+            "uninstall",
+            "update",
+            "list",
+            "config",
+            "auth",
         ],
     },
 ];
@@ -202,9 +225,13 @@ pub fn resumed(foreground: &[String]) -> Vec<String> {
     // `exec`: the login shell's `-lc` is outermost, and a wrapper a previous
     // restore added sits inside it.
     let mut argv = unwrapped(foreground).to_vec();
+    // A loop rather than one pass because these nest: a login shell that did
+    // not get out of the way holds a `-lc`, and a wrapper of ours can sit
+    // inside it. Each pass reads strictly inward, so it ends when there is
+    // nothing left to read; the equality is a stop for the pathological case
+    // where it would not shrink.
     while let Some(inner) = shell_command(&argv) {
         let inner = unwrapped(&inner).to_vec();
-        // Or a snippet that is only a shell name would spin.
         if inner == argv {
             break;
         }
@@ -215,20 +242,26 @@ pub fn resumed(foreground: &[String]) -> Vec<String> {
     }
     if let Some(resumable) = resumable(&argv)
         && !already_resuming(resumable, &argv)
-        && !a_subcommand(&argv)
+        && !a_subcommand(resumable, &argv)
     {
         argv.push(resumable.flag.to_string());
     }
     argv
 }
 
-/// Whether the first thing after the program is a word rather than a flag,
-/// which is how both of these spell a subcommand: `claude mcp serve`, `pi
-/// install …`. Such a run is not a conversation and has nothing to continue,
-/// and the flag added to one is rejected by the program rather than ignored,
-/// so the session comes back as a bare shell.
-fn a_subcommand(argv: &[String]) -> bool {
-    argv.get(1).is_some_and(|arg| !arg.starts_with('-'))
+/// Whether this run is one of the program's subcommands rather than a
+/// conversation: `claude mcp serve`, `pi install …`. Such a run has nothing to
+/// continue, and the flag added to one is rejected rather than ignored, so the
+/// session comes back as a bare shell.
+///
+/// Matched against the names, not against "the first word is not a flag". Both
+/// of these also take an opening prompt in that position, and `claude 'review
+/// the PR'` read as a subcommand is the failure this is meant to prevent
+/// arriving by the other door: no resume flag, so the restore starts a fresh
+/// conversation *and* hands it the prompt again as work to do.
+fn a_subcommand(resumable: &Resumable, argv: &[String]) -> bool {
+    argv.get(1)
+        .is_some_and(|arg| resumable.subcommands.contains(&arg.as_str()))
 }
 
 /// Whether this argv already says which conversation to pick up.
@@ -367,12 +400,24 @@ const KEEP_THE_SHELL: &str = r#""$@"; exec "${SHELL:-/bin/sh}" -l"#;
 /// again: one shell deeper every save-restore cycle, without bound. A test
 /// holds the round trip to a fixed point. It is also what makes a Ctrl-C reach
 /// the program rather than the thing that started it.
+///
+/// And the leading `exec` is what makes any of that reachable. All of this
+/// runs inside the node's own `shell -lc …`, and job control here only helps
+/// if that shell got out of the way first. Some do it by themselves for a
+/// simple final command and some never do, which was known; what was not is
+/// that the same shell does it on one machine and not on another. bash `exec`s
+/// this on a developer's box and did not on a CI runner, because a trap set by
+/// a profile turns the optimisation off, and the sessions there came back
+/// wrapped one layer deeper each time. Saying `exec` outright costs nothing
+/// and holds on bash, dash and zsh alike, which is measured rather than
+/// assumed.
 pub fn to_spawn(command: &[String]) -> Vec<String> {
     if command.is_empty() {
         // Already "the login shell" as far as a spawn is concerned.
         return Vec::new();
     }
     let mut argv = vec![
+        "exec".to_string(),
         "sh".to_string(),
         "-mc".to_string(),
         KEEP_THE_SHELL.to_string(),
@@ -411,6 +456,27 @@ fn unwrapped(argv: &[String]) -> &[String] {
         }
         _ => argv,
     }
+}
+
+/// Whether a wrapper of ours is still somewhere in this argv after everything
+/// above has had a go at reading through it.
+///
+/// The honest answer to a shell that did not get out of the way. `exec` and
+/// `-m` between them should mean the foreground of a restored session is the
+/// program, and [`unwrapped`] catches the plain shape if it is not; what
+/// neither catches is the wrapper buried inside a login shell's `-lc` snippet,
+/// where it arrives already quoted and is not an argv any more. Recorded as it
+/// stands, that is a session whose command gains a shell every time it is
+/// saved and restored, without bound, and it stays wrong for good.
+///
+/// So a caller that sees this writes the session down as one it could not
+/// describe, which is reported and counts against the save. Refusing to
+/// describe a session is a great deal better than describing it wrongly, and
+/// the reasoning that said this could not happen has already been wrong once:
+/// bash `exec`s the wrapper on one machine and not on another, depending on
+/// whether a profile happened to set a trap.
+pub fn still_wrapped(argv: &[String]) -> bool {
+    argv.iter().any(|word| word.contains(KEEP_THE_SHELL))
 }
 
 #[cfg(test)]
@@ -505,6 +571,29 @@ mod tests {
         assert_eq!(
             resumed(&argv(&["claude", "--dangerously-skip-permissions"])),
             argv(&["claude", "--dangerously-skip-permissions", "--continue"])
+        );
+    }
+
+    /// The same position takes an opening prompt, and that is a conversation
+    /// like any other. Read as a subcommand it gets no resume flag, so the
+    /// restore starts a fresh conversation *and* hands it the prompt again as
+    /// work to do, which for a session running without permission checks means
+    /// doing it twice.
+    #[test]
+    fn an_opening_prompt_is_not_a_subcommand() {
+        assert_eq!(
+            resumed(&argv(&["claude", "review the PR"])),
+            argv(&["claude", "review the PR", "--continue"])
+        );
+        assert_eq!(
+            resumed(&argv(&["pi", "fix the parser"])),
+            argv(&["pi", "fix the parser", "--continue"])
+        );
+        // And a word that is a subcommand of the *other* program is not one
+        // of this program's.
+        assert_eq!(
+            resumed(&argv(&["claude", "auth"])),
+            argv(&["claude", "auth", "--continue"])
         );
     }
 
@@ -626,11 +715,12 @@ mod tests {
         assert_eq!(first, argv(&["claude", "--continue"]));
 
         let ran = to_spawn(&first);
-        assert_eq!(ran[1], "-mc", "job control is what makes the rest true");
+        assert_eq!(ran[0], "exec", "so the login shell gets out of the way");
+        assert_eq!(ran[2], "-mc", "job control is what makes the rest true");
 
-        // What `/proc` reports for that session, thanks to the line above: the
-        // words after `$0`, which are the command itself.
-        let reported = ran[4..].to_vec();
+        // What `/proc` reports for that session, thanks to the two lines
+        // above: the words after `$0`, which are the command itself.
+        let reported = ran[5..].to_vec();
         assert_eq!(reported, first);
         assert_eq!(
             resumed(&reported),
@@ -640,17 +730,16 @@ mod tests {
     }
 
     /// The cycle has to be stable, or every checkpoint of an already-restored
-    /// session buries the command one wrapper deeper. It is not idle worry: a
-    /// restored session's foreground genuinely *is* the wrapper, because `sh`
-    /// forks the command rather than exec'ing it and hands the terminal to
-    /// nobody.
+    /// session buries the command one wrapper deeper.
     #[test]
     fn a_checkpoint_of_a_restored_session_is_the_same_checkpoint() {
         let first = resumed(&argv(&["claude", "--dangerously-skip-permissions"]));
         let ran = to_spawn(&first);
 
-        // What `/proc` reports for that session once it is running.
-        let second = resumed(&ran);
+        // The plain shape, which is what `/proc` shows in the window before
+        // job control has handed the terminal over.
+        let bare = ran[1..].to_vec();
+        let second = resumed(&bare);
         assert_eq!(second, first, "the wrapper is seen through, not recorded");
         assert_eq!(to_spawn(&second), ran, "so the round trip is a fixed point");
 
@@ -659,16 +748,51 @@ mod tests {
         assert!(resumed(&argv(&["/usr/bin/zsh", "-l"])).is_empty());
     }
 
+    /// The shape that CI found and a developer's machine could not: a login
+    /// shell that never got out of the way, leaving the wrapper quoted inside
+    /// its `-lc` snippet where it is no longer an argv. bash does this when a
+    /// profile has set a trap, which turns off the `exec` it would otherwise
+    /// do for a simple final command, so the same binary behaves one way on a
+    /// laptop and another on a runner.
+    ///
+    /// Recorded as it stands, the command gains a shell on every save and
+    /// restore and never comes back. So it is refused instead, and the caller
+    /// counts it against the save rather than writing it down wrongly.
+    #[test]
+    fn a_wrapper_a_shell_never_got_out_of_the_way_of_is_refused() {
+        let ran = to_spawn(&argv(&["claude", "--continue"]));
+        let buried = vec![
+            "/bin/bash".to_string(),
+            "-lc".to_string(),
+            // Quoted the way the node's own joiner would leave it.
+            format!("sh -mc '{}' sh claude --continue", KEEP_THE_SHELL),
+        ];
+        assert!(
+            still_wrapped(&buried),
+            "a wrapper inside a snippet is still a wrapper: {buried:?}"
+        );
+
+        // And the shapes that are fine are not caught by it.
+        assert!(!still_wrapped(&argv(&["claude", "--continue"])));
+        assert!(!still_wrapped(&argv(&["/usr/bin/zsh", "-l"])));
+        assert!(!still_wrapped(&[]));
+        // The plain wrapper is read through rather than refused, since that
+        // one is still an argv.
+        assert!(still_wrapped(&ran), "the spawn form does carry the marker");
+        assert_eq!(resumed(&ran[1..]), argv(&["claude", "--continue"]));
+    }
+
     /// The wrapper exists so that quitting the program leaves you where you
     /// were rather than ending the session.
     #[test]
     fn a_restored_command_keeps_the_shell_behind_it() {
         let spawn = to_spawn(&argv(&["claude", "--continue"]));
-        assert_eq!(spawn[0], "sh");
-        assert_eq!(spawn[1], "-mc", "with job control, for the reason above");
-        assert!(spawn[2].contains("exec"), "the shell is exec'd after it");
+        assert_eq!(spawn[0], "exec", "the login shell steps aside first");
+        assert_eq!(spawn[1], "sh");
+        assert_eq!(spawn[2], "-mc", "with job control, for the reason above");
+        assert!(spawn[3].contains("exec"), "the shell is exec'd after it");
         assert_eq!(
-            &spawn[3..],
+            &spawn[4..],
             &argv(&["sh", "claude", "--continue"])[..],
             "$0 first, then the words themselves, so nothing needs quoting here"
         );
