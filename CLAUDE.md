@@ -538,11 +538,31 @@ Three consequences run through the whole codebase and are worth keeping intact:
   would throw away what was on the clipboard, which is usually the thing they
   were about to paste. So `Scrollback::copied` drops a one-cell selection unless
   it came from a second or third click, where a one-letter word is exactly what
-  was asked for. The other half is the view that press opened: a release that
-  copied nothing, at the bottom of the history, closes it again, or a misclick
-  would leave somebody in a paused picture of the session with an Esc to find.
-  Scrolled back, the same click is somebody pointing at something and the view
-  stays.
+  was asked for.
+- **A gesture that ends at the bottom hands the screen back, whether it copied
+  anything or not.** The two ways one ends are a click that selected nothing
+  and a drag that has been taken, and both are somebody done with the mouse.
+  What is left otherwise is the view that the press opened: the session goes on
+  running and stops being painted, and the keys typed next go to the view
+  rather than to the shell, so a copy read as a client that had died, with an
+  Esc nobody thinks to press to get out of it. Scrolled back, the same release
+  is somebody taking a line out of the history they are reading, and there the
+  view is the point and stays. A copy still owed is neither and waits, since
+  the lines it needs are on their way.
+- **A copy is owed when the lines to make it out of have not arrived**
+  (`Scrollback::owed_copy`, finished in the `Update::View` arm). A hand moving
+  quickly presses, drags and lets go inside one read, which is one pass through
+  the client and no time at all for the block the press asked for to come back
+  over ssh. The cells are the screen's and are known throughout; what was
+  written on them is on the machine at the other end, so a release answered out
+  of an empty block put one blank line per line dragged over on the clipboard
+  and said `copied 3 lines` while doing it. Owed once and then forgotten: the
+  block on its way is the answer to the request the press made, so one that
+  does not cover the selection is a selection nothing later will cover either,
+  and a copy left owed would land on the clipboard the next time the view
+  moved. `Scrollback::line` answers for lines the block holds and no others for
+  the same reason, the window arithmetic saturating at both ends being what a
+  window wants and the opposite of what a selection wants.
 - **The wheel is the terminal's until somebody asks for it here**
   (`settings::Mouse`, `mm config mouse client`, reaching `wheel_is_ours` folded
   into `history`). Reading the wheel means asking the terminal to report the
@@ -586,6 +606,18 @@ Three consequences run through the whole codebase and are worth keeping intact:
   under a shorter one. And a window with no block yet paints *nothing* rather
   than blanking: the session is on the screen, one frame more of it is no lie,
   and blanking to wait is the flicker again with nothing to show for it.
+- **And only the rows that changed, which is what makes a drag smooth**
+  (`Scrollback::painted`). A pointer moving reports every cell it crosses and
+  each report moves the highlight by a row or less, so painting the window per
+  report writes a screenful to say a hundred bytes: one short drag came to
+  fifty kilobytes, and on a window twice the size it is four times that, which
+  is the terminal doing the painting rather than the hand doing the dragging.
+  Remembering what was painted is safe because nothing else paints over the
+  view while it is up: session output is held while a surface of the client's
+  owns the screen, and the mark row is not one of these rows. What it needs is
+  that a row nothing is known about is not a row painted blank, or the first
+  frame of a view opened over a short buffer would leave the session showing
+  through above it, and that a resize forgets the lot.
 - **The view opens before it knows how much history there is, so the opening
   move cannot be clamped** (`Scrollback::answered`). `total` is zero until the
   host answers, and a move back clamped against zero is a move thrown away. It

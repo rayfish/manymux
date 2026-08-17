@@ -1058,18 +1058,42 @@ async fn pump(
                             Select::Done => view.copied(),
                             _ => None,
                         };
-                        // A click that selected nothing, made on the live
-                        // screen: the press opened the view under it, and
-                        // leaving somebody in a paused picture of the session
-                        // they were looking at, with an Esc to press to get out
-                        // of it, is not what a stray click deserves. Scrolled
-                        // back, the same click is somebody pointing at
-                        // something in the history and the view stays.
-                        let stray = matches!(what, Select::Done)
-                            && copied.is_none()
-                            && !view.selecting()
-                            && view.at_bottom();
-                        if stray {
+                        // A gesture that is over, made on the live screen: the
+                        // press opened the view under it and there is nothing
+                        // left down here to look at. Whether it copied anything
+                        // or not, since the two ways it ends are a click that
+                        // selected nothing and a drag that has been taken, and
+                        // both are somebody done with the mouse.
+                        //
+                        // Leaving somebody in a paused picture of the session
+                        // they were looking at is what makes the gesture read
+                        // as a client that has died: the session goes on
+                        // running and stops being painted, and the keys they
+                        // type next go to the view rather than to the shell,
+                        // with only an Esc nobody thinks to press to get out of
+                        // it. Scrolled back, the same release is somebody
+                        // taking a line out of the history they are reading,
+                        // and there the view is the point and stays.
+                        //
+                        // A copy still owed is neither, and waits: the block it
+                        // needs is on its way, and `Update::View` finishes it.
+                        let done = matches!(what, Select::Done)
+                            && view.at_bottom()
+                            && (copied.is_some() || !view.selecting());
+                        let wanted = if done { None } else { view.wanted() };
+                        let painted = if done { String::new() } else { view.paint() };
+                        let offset = view.offset();
+                        if let Some(request) = wanted {
+                            writer.view(&request).await?;
+                        }
+                        if let Some(text) = &copied {
+                            stdout
+                                .write_all(clipboard::to_terminal(text).as_bytes())
+                                .await?;
+                            status.set_notice(&copied_says(text));
+                            notice_until = Some(tokio::time::Instant::now() + NOTICE_FOR);
+                        }
+                        if done {
                             scrolling = None;
                             status.set_scrolled(None);
                             keys.set_mode(Mode::Focus);
@@ -1079,21 +1103,8 @@ async fn pump(
                             settle(&mut stdout, &output, &status, &mut pending, &mut restate)
                                 .await?;
                         } else {
-                            let wanted = view.wanted();
-                            let painted = view.paint();
-                            status.set_scrolled(Some(view.offset()));
-                            if let Some(request) = wanted {
-                                writer.view(&request).await?;
-                            }
+                            status.set_scrolled(Some(offset));
                             stdout.write_all(painted.as_bytes()).await?;
-                            if let Some(text) = &copied {
-                                stdout
-                                    .write_all(clipboard::to_terminal(text).as_bytes())
-                                    .await?;
-                                status.set_notice(&copied_says(text));
-                                notice_until =
-                                    Some(tokio::time::Instant::now() + NOTICE_FOR);
-                            }
                             stdout
                                 .write_all(status.repaint(terminal_size()).as_bytes())
                                 .await?;
@@ -1395,23 +1406,53 @@ async fn pump(
                 // the session again, and painting lines over it would be a
                 // window nobody is looking at.
                 Update::View(window) => {
+                    // The copy a release could not be answered out of an empty
+                    // block, and whether the gesture it belongs to is over.
+                    let mut copied = None;
+                    let mut done = false;
                     if let Some(view) = scrolling.as_mut() {
                         view.take(window);
+                        copied = view.owed_copy();
+                        done = copied.is_some() && view.at_bottom();
                         // The block was asked for around where the window was
                         // before the host said how much history there is, so a
                         // move made before the first answer may have been
                         // brought back inside it and left the block covering
                         // somewhere else. Asking again is a no-op when it does
                         // cover, which is every case but that one.
-                        if let Some(request) = view.wanted() {
+                        if !done
+                            && let Some(request) = view.wanted()
+                        {
                             writer.view(&request).await?;
                         }
-                        status.set_scrolled(Some(view.offset()));
-                        stdout.write_all(view.paint().as_bytes()).await?;
+                        if !done {
+                            status.set_scrolled(Some(view.offset()));
+                            stdout.write_all(view.paint().as_bytes()).await?;
+                            stdout
+                                .write_all(status.repaint(terminal_size()).as_bytes())
+                                .await?;
+                            stdout.flush().await?;
+                        }
+                    }
+                    if let Some(text) = &copied {
                         stdout
-                            .write_all(status.repaint(terminal_size()).as_bytes())
+                            .write_all(clipboard::to_terminal(text).as_bytes())
                             .await?;
-                        stdout.flush().await?;
+                        status.set_notice(&copied_says(text));
+                        notice_until = Some(tokio::time::Instant::now() + NOTICE_FOR);
+                    }
+                    // The drag was over before its lines arrived, so this is
+                    // where it ends: the same handing back of the screen the
+                    // release would have done had it been able to answer.
+                    if done {
+                        scrolling = None;
+                        status.set_scrolled(None);
+                        keys.set_mode(Mode::Focus);
+                        status.set_mode(Mode::Focus);
+                        ask_for_the_screen(&mut writer, &mut owed).await?;
+                        restate = true;
+                        settle(&mut stdout, &output, &status, &mut pending, &mut restate)
+                            .await?;
                     }
                 }
                 // What the session is called now. The mark row is the only

@@ -334,8 +334,9 @@ mm config mouse client
 Then the mouse is manymux's for the whole attach. A notch opens the view and
 moves it, and a drag selects: press, drag, let go, and what you dragged over is
 on your clipboard. Double click takes the word under it, which counts a path or
-a URL as one word, and triple click takes the line. A click that selects nothing
-gives the screen straight back.
+a URL as one word, and triple click takes the line. Letting go at the live
+screen gives it straight back, so the session never appears to stop; scrolled
+back, the highlight stays where you left it and so does the view.
 
 The copy goes to your terminal over OSC 52, which most terminals refuse until
 you say otherwise (iTerm2: Settings > General > Selection). Without that the

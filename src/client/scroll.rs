@@ -76,6 +76,32 @@ pub struct Scrollback {
     search: Option<Search>,
     /// What is selected, while anything is.
     selection: Option<Selection>,
+    /// A copy asked for before the lines to make it out of had arrived.
+    ///
+    /// A hand moving quickly presses, drags and lets go inside one read, which
+    /// is one pass through the client and no time at all for the block the
+    /// press asked for to come back. The cells are the screen's and are known
+    /// throughout; what was written on them is on the machine at the other end.
+    /// So the copy waits for the answer already on its way, rather than being
+    /// answered out of an empty block, which put one blank line per line
+    /// dragged over on the clipboard and said `copied 3 lines` while doing it.
+    owed: bool,
+    /// What each row was last painted with, so a frame writes only the rows
+    /// that changed.
+    ///
+    /// A drag reports a cell at a time and every report moves the highlight by
+    /// a row or less, so repainting the window per report wrote a screenful to
+    /// say a hundred bytes: a short drag came to fifty kilobytes, and on a
+    /// window twice the size it is four times that. Nothing else paints over
+    /// the view while it is up, which is what makes remembering safe: session
+    /// output is held while a surface of the client's owns the screen, and the
+    /// mark row is not one of these rows.
+    ///
+    /// A row nothing is known about is `None` rather than an empty string, and
+    /// the two are not the same thing: the first frame of a view opened over a
+    /// short buffer has blank rows at the top, and those have to be written to
+    /// erase the session showing through underneath them.
+    painted: Vec<Option<String>>,
 }
 
 /// A selection, in the buffer's own coordinates rather than the screen's, so
@@ -171,6 +197,8 @@ impl Scrollback {
             rows: session_size(size).rows,
             search: None,
             selection: None,
+            owed: false,
+            painted: Vec::new(),
         }
     }
 
@@ -247,6 +275,9 @@ impl Scrollback {
 
     pub fn resize(&mut self, size: Size) {
         self.rows = session_size(size).rows;
+        // Every row is somewhere else now, so what was painted where says
+        // nothing about what is there.
+        self.painted.clear();
     }
 
     /// How far back the view is, for the row at the bottom of the screen.
@@ -476,7 +507,41 @@ impl Scrollback {
             self.selection = None;
             return None;
         }
+        if !self.holds(&selection) {
+            self.owed = true;
+            return None;
+        }
         self.selected()
+    }
+
+    /// The copy that was waiting for its lines, now that a block has arrived.
+    ///
+    /// Answered once and then forgotten, whatever the block turned out to hold.
+    /// The block on its way is the one the press asked for, so a block that
+    /// does not cover the selection is a selection nothing later will cover
+    /// either, and a request left standing would put a copy nobody asked for on
+    /// the clipboard the next time the view moved.
+    pub fn owed_copy(&mut self) -> Option<String> {
+        if !std::mem::take(&mut self.owed) {
+            return None;
+        }
+        let selection = self.selection?;
+        if !self.holds(&selection) {
+            return None;
+        }
+        self.selected()
+    }
+
+    /// Whether the block in hand has the lines a selection was made on, which
+    /// is what saying anything at all about its text needs.
+    fn holds(&self, selection: &Selection) -> bool {
+        let Some(block) = &self.block else {
+            return false;
+        };
+        let (first, last) = selection.ends();
+        // `first` is the further back of the two, so between them they are the
+        // ends of the range, and everything in it is a line of the same block.
+        first.line < block.top() && last.line >= block.from
     }
 
     /// The selected text, with the pen sequences taken out and the trailing
@@ -504,9 +569,19 @@ impl Scrollback {
         (!out.is_empty()).then_some(out)
     }
 
-    /// One line of the block, by how far back from the newest it is.
+    /// One line of the block, by how far back from the newest it is, and
+    /// nothing at all for a line the block does not reach.
+    ///
+    /// The window arithmetic saturates at both ends, so an offset outside the
+    /// block comes back with the nearest line rather than with nothing. That is
+    /// what a window wants, where the clamp is the view arriving at the top of
+    /// the buffer, and the opposite of what a selection wants, where it is a
+    /// line nobody pointed at being copied.
     fn line(&self, offset: u64) -> Option<&str> {
         let block = self.block.as_ref()?;
+        if offset < block.from || offset >= block.top() {
+            return None;
+        }
         block.window(offset, 1).first().map(String::as_str)
     }
 
@@ -525,8 +600,9 @@ impl Scrollback {
         (from < to).then_some((from, to))
     }
 
-    /// The screen as it should now look: every row of the session's part of it,
-    /// each clearing what was on it as it is written.
+    /// The screen as it should now look: the rows of the session's part of it
+    /// that are not already showing what they should, each clearing what was on
+    /// it as it is written.
     ///
     /// Row by row rather than an erase and a repaint. The erase left the screen
     /// blank for as long as it took the lines after it to be drawn, which at
@@ -535,16 +611,45 @@ impl Scrollback {
     /// screen, and clearing to the end of each line is what keeps a long line
     /// from showing through under a shorter one that replaced it.
     ///
+    /// And only the rows that changed, which is what makes a drag smooth: a
+    /// pointer moving reports every cell it crosses, and each report moves the
+    /// highlight by a row or less. Writing the window per report is a screenful
+    /// of bytes to say a hundred, and enough of them arrive per second that the
+    /// terminal is doing the painting rather than the hand doing the dragging.
+    ///
     /// Nothing at all while the first block is on its way, rather than a blank
     /// screen: what is up is the session, one frame more of it is no lie, and
     /// blanking the screen to wait is the flicker again with nothing to show
     /// for it.
-    pub fn paint(&self) -> String {
-        let Some(block) = &self.block else {
+    pub fn paint(&mut self) -> String {
+        let Some(wanted) = self.rows_now() else {
             return String::new();
         };
+        if self.painted.len() != wanted.len() {
+            self.painted = vec![None; wanted.len()];
+        }
+        let mut out = String::new();
+        for (i, line) in wanted.into_iter().enumerate() {
+            if self.painted[i].as_deref() == Some(line.as_str()) {
+                continue;
+            }
+            // The pen goes back to default per row: the line about to be
+            // written sets its own colours, and the clear that precedes it
+            // would otherwise clear to whatever the line above left set.
+            out.push_str(&format!("\x1b[{};1H\x1b[0m\x1b[K", i + 1));
+            out.push_str(&line);
+            self.painted[i] = Some(line);
+        }
+        out
+    }
+
+    /// What every row of the window should have on it, top row first, with the
+    /// highlight already drawn in. Nothing while there is no block to draw it
+    /// from.
+    fn rows_now(&self) -> Option<Vec<String>> {
+        let block = self.block.as_ref()?;
         if !self.covered() {
-            return String::new();
+            return None;
         }
         let rows = self.page();
         let lines = block.window(self.offset, rows);
@@ -552,21 +657,20 @@ impl Scrollback {
         // screen has rows, and they go at the bottom of it: the oldest line
         // sits where it would have been had you scrolled to it.
         let blank = rows.saturating_sub(lines.len() as u64);
-        let mut out = String::from("\x1b[0m");
-        for row in 1..=rows {
-            // The pen goes back to default per row: the line about to be
-            // written sets its own colours, and the clear that precedes it
-            // would otherwise clear to whatever the line above left set.
-            out.push_str(&format!("\x1b[{row};1H\x1b[0m\x1b[K"));
-            if row > blank {
-                let line = &lines[(row - blank - 1) as usize];
-                match self.selected_on(self.offset + (rows - row)) {
-                    Some((from, to)) => out.push_str(&highlighted(line, from, to)),
-                    None => out.push_str(line),
-                }
-            }
-        }
-        out
+        Some(
+            (1..=rows)
+                .map(|row| {
+                    if row <= blank {
+                        return String::new();
+                    }
+                    let line = &lines[(row - blank - 1) as usize];
+                    match self.selected_on(self.offset + (rows - row)) {
+                        Some((from, to)) => highlighted(line, from, to),
+                        None => line.clone(),
+                    }
+                })
+                .collect(),
+        )
     }
 }
 
@@ -901,7 +1005,7 @@ mod tests {
     /// on the first rows, and what there is belongs at the bottom.
     #[test]
     fn a_short_buffer_paints_against_the_bottom_of_the_screen() {
-        let view = view(3);
+        let mut view = view(3);
         let painted = view.paint();
         assert!(
             painted.contains("\x1b[22;1H\x1b[0m\x1b[Kline 0"),
@@ -998,7 +1102,7 @@ mod tests {
     /// it. The block is a round trip away and paints over it when it lands.
     #[test]
     fn a_view_with_nothing_in_it_yet_leaves_the_screen_alone() {
-        let view = Scrollback::new(SIZE);
+        let mut view = Scrollback::new(SIZE);
         assert_eq!(view.paint(), "");
     }
 
@@ -1129,5 +1233,81 @@ mod tests {
         let painted = highlighted("ab", 0, 6);
         assert!(painted.starts_with("\x1b[7mab"), "{painted:?}");
         assert!(painted.contains("    \x1b[27m"), "{painted:?}");
+    }
+
+    /// A hand moving quickly presses, drags and lets go inside one read, which
+    /// is one pass through the client and no time at all for the block the
+    /// press asked for to arrive. Answered out of what is there, the copy is a
+    /// blank line per line dragged over.
+    #[test]
+    fn a_copy_asked_for_before_its_lines_arrived_waits_for_them() {
+        let mut view = Scrollback::new(SIZE);
+        view.select_from(at(24, 1));
+        view.select_to(at(24, 4));
+        assert_eq!(view.copied(), None, "nothing to copy out of yet");
+        assert!(view.selecting(), "and the gesture is not over");
+
+        answer(&mut view, 100);
+        assert_eq!(view.owed_copy().as_deref(), Some("line"));
+    }
+
+    /// Owed once. The block that arrives is the answer to the request the press
+    /// made, so one that does not cover the selection is one nothing later will
+    /// cover either, and a copy still owed would land on the clipboard the next
+    /// time the view moved.
+    #[test]
+    fn a_copy_that_was_owed_is_answered_once() {
+        let mut view = Scrollback::new(SIZE);
+        view.select_from(at(24, 1));
+        view.select_to(at(24, 4));
+        view.copied();
+        answer(&mut view, 100);
+        assert!(view.owed_copy().is_some());
+        assert_eq!(view.owed_copy(), None);
+    }
+
+    /// Nothing is owed by a copy that could be made on the spot, or letting go
+    /// twice would copy twice.
+    #[test]
+    fn a_copy_that_could_be_made_owes_nothing() {
+        let mut view = view(100);
+        view.select_from(at(24, 1));
+        view.select_to(at(24, 4));
+        assert_eq!(view.copied().as_deref(), Some("line"));
+        assert_eq!(view.owed_copy(), None);
+    }
+
+    /// A drag reports every cell it crosses and each report moves the highlight
+    /// by a row or less. Painting the window per report writes a screenful to
+    /// say a hundred bytes, which is what a drag that stutters is made of.
+    #[test]
+    fn a_frame_paints_the_rows_that_changed_and_no_others() {
+        let mut view = view(100);
+        assert!(
+            view.paint().contains("line 99"),
+            "the first frame is all of it"
+        );
+        assert_eq!(view.paint(), "", "and the second says nothing");
+
+        view.select_from(at(24, 1));
+        view.select_to(at(24, 4));
+        let painted = view.paint();
+        assert!(painted.contains("\x1b[7m"), "{painted:?}");
+        assert_eq!(painted.matches("\x1b[K").count(), 1, "one row: {painted:?}");
+    }
+
+    /// A row nothing has been painted to is not a row painted blank. The first
+    /// frame of a view opened over a buffer shorter than the screen has blank
+    /// rows at the top, and the session is showing through underneath them.
+    #[test]
+    fn the_blank_rows_of_a_short_buffer_are_painted_the_first_time() {
+        let mut view = view(3);
+        let painted = view.paint();
+        assert_eq!(
+            painted.matches("\x1b[K").count(),
+            24,
+            "every row of the window: {painted:?}"
+        );
+        assert_eq!(view.paint(), "");
     }
 }
