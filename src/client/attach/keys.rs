@@ -1000,7 +1000,13 @@ impl KeyFilter {
             Action::Switch(_) => Mode::Control,
             // The popup stays up while the highlight is moving, and both ways
             // out of it go back to the session.
-            Action::Pick(Pick::Go | Pick::Cancel) => Mode::Focus,
+            Action::Pick(Pick::Go) => Mode::Focus,
+            // Except that a group list was opened *over* the session list, so
+            // the way out of one is back to the other: the hints on both of
+            // them say `esc` and mean it. Told apart by the mode the key
+            // arrived in, which is what the group lists have of their own.
+            Action::Pick(Pick::Cancel) if now == Mode::Picking => Mode::Control,
+            Action::Pick(Pick::Cancel) => Mode::Focus,
             Action::Pick(Pick::Move | Pick::Groups) => Mode::Picking,
             Action::Pick(_) => now,
             // Back to the group list rather than to the session: naming a group
@@ -3134,6 +3140,26 @@ mod tests {
             f.filter(SHIFT_TAB),
             asked(Action::Pick(Pick::Cancel), Mode::Focus)
         );
+    }
+
+    /// A group list is opened over the session list, so the way out of one is
+    /// back to the other: both lists' hints say `esc` and the popup's own
+    /// comment says it comes back to where the gesture started. It went to
+    /// `Mode::Focus` instead, which closes the box, and the session list cost
+    /// another `Ctrl-]` and a walk back to the row you were on.
+    #[test]
+    fn esc_out_of_a_group_list_goes_back_to_the_session_list() {
+        for key in [&b"\x1b"[..], &b"q"[..]] {
+            assert_eq!(
+                picking().filter(key),
+                asked(Action::Pick(Pick::Cancel), Mode::Control),
+                "{key:?}"
+            );
+        }
+        // And out of the session list it is out of the popup, as it always was.
+        let mut f = KeyFilter::new(DEFAULT_PREFIX);
+        f.set_mode(Mode::Control);
+        assert_eq!(f.filter(b"\x1b").mode, Mode::Focus);
     }
 
     /// The keys that act on a session mean nothing while a group is being

@@ -835,7 +835,28 @@ async fn pump(
                     // of the mode goes through too. Nothing to do here but stay
                     // out of its way: opening a popup to close it would put the
                     // box back on the screen.
-                    Some(Action::Pick(Pick::Cancel)) => {}
+                    // Esc out of a group list is out of that list and not out
+                    // of the popup: it was opened over the session list, and
+                    // both lists' hints say so. The session picker was
+                    // replaced rather than stacked under, so coming back is
+                    // building it again, on the row the gesture started from
+                    // where there was one. Out of the session list it is the
+                    // teardown below, like every other way of closing the box.
+                    Some(Action::Pick(Pick::Cancel)) => {
+                        if let Some(up) = popup.as_mut()
+                            && up.what != Showing::Sessions
+                        {
+                            let was = match up.what {
+                                Showing::Moving { row } => Some(row),
+                                _ => None,
+                            };
+                            *up = Popup::sessions(&rows);
+                            if let Some(row) = was {
+                                up.picker.point_at(row);
+                            }
+                            draw_popup(&mut stdout, &mut popup, &mut status, &mut restate).await?;
+                        }
+                    }
                     Some(Action::Pick(pick)) => {
                         // Every press asks, whether or not it moved anywhere.
                         // Asking only after a landing meant the first press
@@ -854,6 +875,17 @@ async fn pump(
                             // to where the gesture started.
                             Pick::Move | Pick::Groups => {
                                 let Some(row) = up.picker.chosen().map(|row| row.id) else {
+                                    // No row to act on, and the mode has
+                                    // already moved: `KeyFilter::after` reads
+                                    // the key, not what this arm decides about
+                                    // it, so leaving here without putting it
+                                    // back left the group table over the
+                                    // session list. Same shape as the bug
+                                    // `Popup::mode` was added for.
+                                    let back = up.mode();
+                                    keys.set_mode(back);
+                                    status.set_mode(back);
+                                    restate = true;
                                     continue;
                                 };
                                 let (title, hints, what) = if pick == Pick::Move {
@@ -1218,10 +1250,8 @@ async fn pump(
                                     // apart, or a prompt opened over the group
                                     // list would rename the session at the
                                     // other end of the stream instead.
-                                    Some(up) => {
-                                        if let Some(session) = up.subject()
-                                            && !wanted.trim().is_empty()
-                                        {
+                                    Some(up) => match up.subject() {
+                                        Some(session) if !wanted.trim().is_empty() => {
                                             status.set_popup(Popped::None);
                                             writer.detach().await?;
                                             return Ok(Outcome::Chose(Chose::Named {
@@ -1229,7 +1259,19 @@ async fn pump(
                                                 to: wanted,
                                             }));
                                         }
-                                    }
+                                        // Typed at a list with nothing under
+                                        // the highlight, which is a name typed
+                                        // for nothing. Said, because the box
+                                        // closes on its own here and a name
+                                        // that went nowhere in silence reads as
+                                        // a rename that worked.
+                                        None => {
+                                            status.set_notice("no session here to rename");
+                                            notice_until =
+                                                Some(tokio::time::Instant::now() + NOTICE_FOR);
+                                        }
+                                        Some(_) => {}
+                                    },
                                     // No popup, so this is a client driving the
                                     // prompt without one: the session at the
                                     // other end of the stream is the only one
@@ -1335,9 +1377,10 @@ async fn pump(
                 rows = fresh.borrow_and_update().clone();
                 if let Some(up) = popup.as_mut() {
                     if up.what == Showing::Sessions {
-                        up.picker.replace(rows.sessions.clone());
+                        up.picker.replace(rows.sessions.clone(), rows.at);
                     } else {
-                        up.picker.replace(rows.groups.clone());
+                        // A group list has no such row: `at` is a session's.
+                        up.picker.replace(rows.groups.clone(), 0);
                     }
                     draw_popup(&mut stdout, &mut popup, &mut status, &mut restate).await?;
                 }
@@ -1589,6 +1632,27 @@ async fn pump(
                         writer.view(&request).await?;
                     }
                     stdout.write_all(painted.as_bytes()).await?;
+                    stdout.write_all(status.repaint(size).as_bytes()).await?;
+                    stdout.flush().await?;
+                    continue;
+                }
+                // And a popup is a surface of ours too, so it is drawn again at
+                // the new geometry rather than left where it was: the screen
+                // asked for below is dropped while a box is up, so nothing else
+                // was going to touch it.
+                //
+                // Onto an erased screen, which is the half `Picker::cleared`
+                // cannot do: it blanks the rows the box gives up, in the
+                // columns the *new* box sits at, on the stated assumption that
+                // a resize repaints everything. A resize is also the one thing
+                // that moves the box sideways, so a narrower window left the
+                // old box's right edge standing in a column the new one never
+                // writes. Everything on this screen is at the old geometry
+                // anyway, and what is under the box is put back by the resync
+                // that closing it asks for.
+                if popup.is_some() {
+                    stdout.write_all(REGROWN.as_bytes()).await?;
+                    draw_popup(&mut stdout, &mut popup, &mut status, &mut restate).await?;
                     stdout.write_all(status.repaint(size).as_bytes()).await?;
                     stdout.flush().await?;
                     continue;

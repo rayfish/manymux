@@ -981,6 +981,15 @@ async fn do_attach(
         // Landed, so the exit that sent us here is somebody else's news now:
         // the next one to report is whatever this session does.
         ended = None;
+        // And the hop is over. What the flag above buys is one arm: a hop onto
+        // a session the listing was stale about, which is a thing that is true
+        // for exactly as long as the attach it describes has not happened.
+        // Left set, it was still set an hour later when the node holding the
+        // session restarted, and the drop that came back as `Missed::Gone` was
+        // read as that stale listing: the cycle forgot a live entry and the run
+        // walked back to the session the command line named, which is the one
+        // thing the arm below is written to stop.
+        hopped = false;
 
         // Before the rows are built, because the popup is drawn from them and
         // it opens on a keystroke inside the attach, where there is no asking

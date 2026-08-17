@@ -186,7 +186,7 @@ impl Picker {
     /// By id rather than by index, because a row index means something
     /// different the moment a session ends: the highlight would slide onto its
     /// neighbour under a hand that had not moved.
-    pub fn replace(&mut self, rows: Vec<Row>) {
+    pub fn replace(&mut self, rows: Vec<Row>, at: usize) {
         let was = self.chosen().map(|row| row.id);
         self.rows = rows;
         self.at = was
@@ -195,9 +195,33 @@ impl Picker {
                     .iter()
                     .position(|row| row.id == id && !row.heading)
             })
+            // Nothing was highlighted, which is a box that opened on an empty
+            // listing: the fan-out takes longer than the half second the switch
+            // keys give it, so on a slow fleet the *first* popup of a run always
+            // opens with nothing in it. The caller's row is where it should land
+            // then, for the same reason it lands there when a listing was ready:
+            // the session you are in is the one you are looking out from, and
+            // Enter is the next key. Falling back to the first row hopped you
+            // into somebody else's session.
+            .or_else(|| self.landable(at).is_some().then_some(at))
             .or_else(|| self.first())
             .unwrap_or(0);
         self.top = 0;
+    }
+
+    /// Put the highlight on the row with this id, if it is still here.
+    ///
+    /// For coming back to a list you left: the id is the caller's and outlives
+    /// the picker that was showing it, while an index does not survive a
+    /// listing landing in between.
+    pub fn point_at(&mut self, id: usize) {
+        if let Some(at) = self
+            .rows
+            .iter()
+            .position(|row| row.id == id && !row.heading)
+        {
+            self.at = at;
+        }
     }
 
     fn landable(&self, index: usize) -> Option<&Row> {
@@ -592,15 +616,47 @@ mod tests {
             2,
         );
         assert_eq!(p.chosen().unwrap().id, 9);
-        p.replace(vec![Row::new(8, "b"), Row::new(9, "c")]);
+        p.replace(vec![Row::new(8, "b"), Row::new(9, "c")], 0);
         assert_eq!(p.chosen().unwrap().id, 9);
     }
 
     #[test]
     fn a_highlight_whose_row_is_gone_lands_on_the_first_one_left() {
         let mut p = picker(vec![Row::new(7, "a"), Row::new(8, "b")], 1);
-        p.replace(vec![Row::new(7, "a")]);
+        p.replace(vec![Row::new(7, "a")], 0);
         assert_eq!(p.chosen().unwrap().id, 7);
+    }
+
+    /// The box a slow fleet opens is empty, so the first real listing lands
+    /// under a popup with nothing highlighted. It has to land on the session
+    /// this client is attached to, which is the row the caller names and the
+    /// same one the box opens on when a listing was ready in time. Falling
+    /// back to the first row put Enter, the obvious next key, into somebody
+    /// else's session.
+    #[test]
+    fn a_listing_landing_under_an_empty_popup_lands_on_the_session_you_are_in() {
+        let mut p = picker(Vec::new(), 0);
+        assert!(p.chosen().is_none());
+        p.replace(
+            vec![Row::new(0, "api"), Row::new(1, "build"), Row::new(2, "web")],
+            1,
+        );
+        assert_eq!(p.chosen().unwrap().label, "build");
+    }
+
+    /// And back to a list you left, on the row the gesture started from: `m`
+    /// then Esc. By id, because a listing may have landed in between.
+    #[test]
+    fn a_list_can_be_pointed_back_at_the_row_a_gesture_started_from() {
+        let mut p = picker(vec![Row::new(7, "a"), Row::new(8, "b")], 0);
+        p.point_at(8);
+        assert_eq!(p.chosen().unwrap().id, 8);
+        p.point_at(99);
+        assert_eq!(
+            p.chosen().unwrap().id,
+            8,
+            "a row that has gone moves nothing"
+        );
     }
 
     #[test]
@@ -689,7 +745,7 @@ mod tests {
         let tall: Vec<Row> = (0..10).map(|i| Row::new(i, format!("s{i}"))).collect();
         let mut p = picker(tall, 0);
         let before = seen(&mut p, BIG).len();
-        p.replace(vec![Row::new(0, "s0")]);
+        p.replace(vec![Row::new(0, "s0")], 0);
         let after = p.draw(BIG);
         assert!(
             seen(&mut p, BIG).len() < before,

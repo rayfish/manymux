@@ -234,7 +234,14 @@ Three consequences run through the whole codebase and are worth keeping intact:
   node that answered and has no such session, which is a listing gone stale
   under the switch keys and the one case that forgets the entry and undoes the
   hop. Reading every failure the second way, as this once did, meant a closed
-  lid mid-hop dropped a live session from the cycle and ended the attach.
+  lid mid-hop dropped a live session from the cycle and ended the attach. And
+  `hopped` is true only until the attach it describes happens, so it is cleared
+  on a landing as well as by the outcomes: a stale listing is a thing that can
+  be true of one attempt and not of the run. Left set for the life of the
+  attach, it was still set an hour later when the node restarted, and the
+  `Missed::Gone` that came back was read as that hop going stale: the cycle
+  forgot a live entry and the run walked back to the session the command line
+  named, waiting forever on the one thing this rule exists to stop.
 - **A session that ends hands back the one you came from, and only the session
   you named ends the attach.** `Cycle::fall_back` is the whole decision: a run
   that has hopped has somewhere to go back to and goes there, while a run that
@@ -363,7 +370,14 @@ Three consequences run through the whole codebase and are worth keeping intact:
   for the frame that repaints on attach, a screen dump painting by absolute
   coordinates from the top that would go straight over a box drawn before it.
   The rows it opens on are the caller's, built after the write, so the box shows
-  what just happened without asking anything.
+  what just happened without asking anything. Esc is the same argument one level
+  down: a group list is opened *over* the session list, so leaving one goes back
+  to the other rather than out of the popup, which is what both lists' hints say
+  and what the arm that opens them already claimed. It is told apart by the mode
+  the key arrived in, the group lists having one of their own, and coming back
+  means building the session picker again, since opening a group list replaced
+  it rather than stacking over it: `Showing::Moving` carries the row the gesture
+  started on so `Picker::point_at` can put the highlight back there.
 - **The session list leads with the groups, and a machine is what is left.**
   A group spans machines, so it is the machines that break up under it: nested
   the other way, the one thing a group is for, seeing a piece of work in one
@@ -468,9 +482,19 @@ Three consequences run through the whole codebase and are worth keeping intact:
   opens on the snapshot the switch keys already keep and is corrected when the
   answer lands, swapped in by `Picker::replace`, which holds the highlight on
   the same `Row::id` rather than the same index: a session ending three rows up
-  would otherwise move what Enter takes. The row ids are the caller's, which is
+  would otherwise move what Enter takes. Where nothing was highlighted it lands
+  on the caller's row, which is the box that opened on nothing: a fan-out slower
+  than the half second `take_listing` gives it means the *first* popup of a run
+  always opens empty, and falling back to the first row put Enter, the obvious
+  next key, into somebody else's session. The row ids are the caller's, which is
   what keeps hosts, groups and pids out of this half of the client, and the ids
-  the outcome carries belong to whichever listing was last drawn.
+  the outcome carries belong to whichever listing was last drawn. Which is also
+  the one thing about them that does not hold up: an id is a position in
+  `Listed::at`, so a listing landing between `m` and the Enter that commits it
+  redeems the id against a table that has renumbered. Freezing the list under a
+  two-key gesture is not enough on its own, since `main` resolves against the
+  newest listing either way; the fix is for the ids to carry which listing they
+  came from, and until they do this is a known hole rather than a solved one.
 - **A group is spelled `@name`, and no bare word is ever guessed at.**
   `gpu-box/pi` cannot say whether `pi` is a session or a group, and trying one
   then the other means making a group named after a session silently changes
@@ -751,7 +775,12 @@ Three consequences run through the whole codebase and are worth keeping intact:
   (`SessionWriter::resync`) and paints it over an erased, homed screen
   (`terminal::REGROWN`), for the same reason a hop erases. The scrolling region
   goes out first: the dump paints with newlines, and they would scroll against
-  the old fence.
+  the old fence. A popup is repainted here too, and onto the same erased
+  screen: the screen asked for is dropped while a box is up, so nothing else
+  was going to redraw it, and `Picker::cleared` blanks only the rows the box
+  gives up, in the columns the *new* box sits at. A resize is the one thing
+  that moves the box sideways, so a narrower window left the old box's right
+  edge standing in a column the new one never writes.
 - **The mode key has three spellings, not one.** A program that asks for the
   kitty keyboard protocol (`CSI > 7 u`, which `pi` sends on startup) or for
   xterm's `modifyOtherKeys` changes how the *terminal* encodes every chord, so
