@@ -393,6 +393,22 @@ fn host_of(target: &str) -> Option<&str> {
 /// hints have it back. Long enough to read without looking for it.
 const NOTICE_FOR: Duration = Duration::from_secs(5);
 
+/// Ask the node for the session's screen, and note that it owes an erased,
+/// homed one to paint it onto.
+///
+/// One call because they are one act. A dump starts painting wherever the
+/// cursor is and never erases, so a screen asked for and painted where it fell
+/// walks its own first rows off the top of the terminal, one `\r\n` at a time:
+/// a full-screen program leaves the cursor at the bottom on its way out, and
+/// what came back was the last lines of the session sitting under a blank half.
+/// These were two statements once, at four call sites, and the one place the
+/// second was missing showed nothing until somebody quit a pager.
+async fn ask_for_the_screen(writer: &mut SessionWriter, owed: &mut usize) -> Result<()> {
+    writer.resync().await?;
+    *owed += 1;
+    Ok(())
+}
+
 /// Take the wheel, or give it back.
 ///
 /// When that is, and when it is not, is [`wheel_is_ours`]. The arrow keys a
@@ -474,7 +490,7 @@ fn keyboard() -> mpsc::Receiver<Vec<u8>> {
 /// changed nothing on the screen.
 async fn draw_popup(
     stdout: &mut tokio::io::Stdout,
-    popup: &Option<Popup>,
+    popup: &mut Option<Popup>,
     status: &mut Status,
     restate: &mut bool,
 ) -> Result<()> {
@@ -700,7 +716,7 @@ async fn pump(
                 if keystrokes.mode == Mode::Control && was != Mode::Control && popup.is_none() {
                     let _ = asks.try_send(());
                     popup = Some(Popup::sessions(&rows));
-                    draw_popup(&mut stdout, &popup, &mut status, &mut restate).await?;
+                    draw_popup(&mut stdout, &mut popup, &mut status, &mut restate).await?;
                 }
                 settle(&mut stdout, &output, &status, &mut pending, &mut restate).await?;
                 match keystrokes.action {
@@ -804,7 +820,7 @@ async fn pump(
                             // through too. Unreachable: matched above.
                             Pick::Cancel => {}
                         }
-                        draw_popup(&mut stdout, &popup, &mut status, &mut restate).await?;
+                        draw_popup(&mut stdout, &mut popup, &mut status, &mut restate).await?;
                     }
                     // Naming a group, at the prompt the rename and the search
                     // already share. Enter creates it and puts the session in
@@ -834,7 +850,7 @@ async fn pump(
                             }
                         }
                         restate = true;
-                        draw_popup(&mut stdout, &popup, &mut status, &mut restate).await?;
+                        draw_popup(&mut stdout, &mut popup, &mut status, &mut restate).await?;
                     }
                     // A host from before the view existed answers for no
                     // window, so there is nothing to open. Said on the row
@@ -861,8 +877,7 @@ async fn pump(
                     Some(Action::Scroll(Scroll::Leave)) => {
                         scrolling = None;
                         status.set_scrolled(None);
-                        writer.resync().await?;
-                        owed += 1;
+                        ask_for_the_screen(&mut writer, &mut owed).await?;
                         restate = true;
                     }
                     // Typing, and what typing turns into. The needle lives
@@ -1028,7 +1043,7 @@ async fn pump(
                         // switch swallowed while it ran is only now
                         // answerable.
                         if output.take_switched() {
-                            writer.resync().await?;
+                            ask_for_the_screen(&mut writer, &mut owed).await?;
                         }
                         // The same discipline as everywhere else: never
                         // into the middle of a sequence the session is
@@ -1065,8 +1080,7 @@ async fn pump(
                 {
                     popup = None;
                     status.set_popup(Popped::None);
-                    writer.resync().await?;
-                    owed += 1;
+                    ask_for_the_screen(&mut writer, &mut owed).await?;
                     restate = true;
                     settle(&mut stdout, &output, &status, &mut pending, &mut restate).await?;
                 }
@@ -1094,7 +1108,7 @@ async fn pump(
                     } else {
                         up.picker.replace(rows.groups.clone());
                     }
-                    draw_popup(&mut stdout, &popup, &mut status, &mut restate).await?;
+                    draw_popup(&mut stdout, &mut popup, &mut status, &mut restate).await?;
                 }
             }
             update = reader.next() => match update? {
@@ -1111,11 +1125,19 @@ async fn pump(
                     }
                     let bytes = output.feed(&bytes);
                     // Fed to the filter either way, so its parser stays in
-                    // step with the byte stream, but not written while the
-                    // view is up: the screen is showing the history, and
-                    // the session painting over it is what leaving the view
-                    // asks the node to undo.
-                    if scrolling.is_none() {
+                    // step with the byte stream, but not written while
+                    // something of the client's owns the screen. The view is
+                    // showing history; the box is drawn over the session and
+                    // has no way to stay on top of it, since a line printed
+                    // scrolls the screen and takes the rows of the box already
+                    // drawn up with it. Redrawing after every chunk leaves one
+                    // copy of the box per line printed: a terminal composes
+                    // nothing, and the client is not the emulator here, so the
+                    // only surface either of these can own is the whole one.
+                    // The session goes on running behind both, and both are put
+                    // back by the resync that closing them asks for, so what
+                    // pauses is the picture and never the program.
+                    if scrolling.is_none() && popup.is_none() {
                         stdout.write_all(&bytes).await?;
                     }
                     on_alternate.store(output.on_alternate(), Ordering::Relaxed);
@@ -1135,7 +1157,7 @@ async fn pump(
                     // never fires: the terminal made the switch itself and
                     // kept both screens.
                     if output.take_switched() && painted {
-                        writer.resync().await?;
+                        ask_for_the_screen(&mut writer, &mut owed).await?;
                     }
                     painted = true;
                     // Only between sequences: a repaint written into the
@@ -1151,18 +1173,27 @@ async fn pump(
                     // what is true rather than asking and waiting.
                     if std::mem::take(&mut greet) {
                         popup = Some(Popup::sessions(&rows));
-                        draw_popup(&mut stdout, &popup, &mut status, &mut restate).await?;
+                        draw_popup(&mut stdout, &mut popup, &mut status, &mut restate).await?;
                     }
                 }
                 // The screen we asked for. Its own switches are how a dump
                 // paints both buffers, so they are swallowed and dropped
                 // rather than answered with another request.
                 Update::Screen(bytes) => {
+                    // Not onto an open box: this is a whole screen and would
+                    // take it with it. Closing the box asks for another, so
+                    // what is dropped here is painted a moment later anyway.
+                    let ours = popup.is_none();
                     if owed > 0 {
                         owed -= 1;
-                        stdout.write_all(REGROWN.as_bytes()).await?;
+                        if ours {
+                            stdout.write_all(REGROWN.as_bytes()).await?;
+                        }
                     }
-                    stdout.write_all(&output.feed(&bytes)).await?;
+                    let bytes = output.feed(&bytes);
+                    if ours {
+                        stdout.write_all(&bytes).await?;
+                    }
                     on_alternate.store(output.on_alternate(), Ordering::Relaxed);
                     output.take_switched();
                     output.take_dirty();
@@ -1285,8 +1316,7 @@ async fn pump(
                     stdout.flush().await?;
                     continue;
                 }
-                writer.resync().await?;
-                owed += 1;
+                ask_for_the_screen(&mut writer, &mut owed).await?;
             }
             // A notice the client put on the row has been up long enough.
             _ = expire(notice_until) => {

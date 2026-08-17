@@ -129,6 +129,15 @@ pub struct Picker {
     at: usize,
     /// The first row on screen, for a list longer than the box.
     top: usize,
+    /// Where the box was last drawn, so a box that has since changed shape can
+    /// clear what it used to cover.
+    ///
+    /// It has to clear it itself: the cells under a popup are the popup's, the
+    /// session's screen there having been painted over when the box went up and
+    /// put back by the resync that closing it asks for. Nothing else is going
+    /// to, and a box that grew when the first real listing landed left the top
+    /// of the old one sitting on the screen saying nothing.
+    drawn: Option<(u16, u16)>,
 }
 
 impl Picker {
@@ -144,6 +153,7 @@ impl Picker {
             rows,
             at,
             top: 0,
+            drawn: None,
         };
         // A caller that asked for a heading, or for a row past the end, gets
         // put somewhere it can act from rather than a popup whose Enter does
@@ -262,13 +272,16 @@ impl Picker {
     ///
     /// One string rather than a write per row, for the same reason
     /// `Status::setup` is one: there is never a frame showing half a box.
-    pub fn draw(&self, size: Size) -> String {
+    pub fn draw(&mut self, size: Size) -> String {
         let Some(shape) = self.shape(size) else {
             return String::new();
         };
         let mut out = String::from("\x1b7");
         let width = shape.inner;
         let label_width = self.label_width(width);
+        let height = u16::try_from(shape.visible).unwrap_or(u16::MAX) + FURNITURE;
+        out.push_str(&self.cleared(&shape, height));
+        self.drawn = Some((shape.row, height));
         let mut line = shape.row;
         let mut put = |line: u16, text: &str| {
             let mut piece = at(line, shape.col);
@@ -276,9 +289,12 @@ impl Picker {
             out.push_str(&piece);
         };
 
+        // The title sits in the rule rather than on a row of blanks. Padded
+        // with spaces it read as an unfinished edge next to the solid one above
+        // the hints, which is the same box drawn two ways.
         put(
             line,
-            &style::faint(&format!("┌{}┐", fit(&format!(" {} ", self.title), width))),
+            &style::faint(&format!("┌{}┐", rule(&format!(" {} ", self.title), width))),
         );
         line += 1;
 
@@ -312,6 +328,24 @@ impl Picker {
         );
         out.push_str("\x1b8");
         out
+    }
+
+    /// Blanks over the rows the last box covered that this one will not.
+    ///
+    /// Only the rows it gives up, never the ones it is about to paint: blanking
+    /// under the new box would be writing every cell twice and inviting the
+    /// flicker that the view had. The columns never change under a box that has
+    /// not moved sideways, and it only can when the terminal is resized, which
+    /// repaints everything anyway.
+    fn cleared(&self, shape: &Shape, height: u16) -> String {
+        let Some((was, was_high)) = self.drawn else {
+            return String::new();
+        };
+        let blank = " ".repeat(usize::from(shape.inner + 2));
+        (was..was.saturating_add(was_high))
+            .filter(|line| *line < shape.row || *line >= shape.row + height)
+            .map(|line| format!("{}{blank}", at(line, shape.col)))
+            .collect()
     }
 
     /// One row, exactly `width` columns wide.
@@ -441,6 +475,14 @@ fn fit(text: &str, width: u16) -> String {
     format!("{text}{}", " ".repeat(short))
 }
 
+/// The same, but what is left over is the box's own edge rather than blank, so
+/// a title sits in the rule instead of in a gap in it.
+fn rule(text: &str, width: u16) -> String {
+    let text = clip(text, width);
+    let short = usize::from(width.saturating_sub(columns(&text)));
+    format!("{text}{}", "─".repeat(short))
+}
+
 /// The same, padded on the left instead.
 fn right(text: &str, width: u16) -> String {
     let text = clip(text, width);
@@ -458,7 +500,7 @@ mod tests {
 
     /// What the popup drew, with the styling and the cursor moves taken out, so
     /// a test can read it the way a person would.
-    fn seen(picker: &Picker, size: Size) -> Vec<String> {
+    fn seen(picker: &mut Picker, size: Size) -> Vec<String> {
         let drawn = picker.draw(size);
         let mut lines = Vec::new();
         let mut plain = String::new();
@@ -568,7 +610,7 @@ mod tests {
         for _ in 0..30 {
             p.down();
         }
-        let lines = seen(&p, BIG);
+        let lines = seen(&mut p, BIG);
         assert!(
             lines.iter().any(|line| line.contains("s30")),
             "the highlighted row has to be on screen: {lines:#?}"
@@ -583,8 +625,8 @@ mod tests {
     #[test]
     fn a_label_wider_than_the_box_is_truncated_rather_than_wrapping_it() {
         let long = "a".repeat(200);
-        let p = picker(vec![Row::new(0, long)], 0);
-        for line in seen(&p, BIG) {
+        let mut p = picker(vec![Row::new(0, long)], 0);
+        for line in seen(&mut p, BIG) {
             assert!(
                 columns(&line) <= BIG.cols,
                 "{} columns: {line:?}",
@@ -595,8 +637,8 @@ mod tests {
 
     #[test]
     fn a_title_wider_than_the_box_is_truncated_too() {
-        let p = Picker::new("m".repeat(200), "⏎ go", vec![Row::new(0, "a")], 0);
-        for line in seen(&p, BIG) {
+        let mut p = Picker::new("m".repeat(200), "⏎ go", vec![Row::new(0, "a")], 0);
+        for line in seen(&mut p, BIG) {
             assert!(columns(&line) <= BIG.cols, "{line:?}");
         }
     }
@@ -605,7 +647,7 @@ mod tests {
     /// a frame with the rows squeezed out of it.
     #[test]
     fn a_window_too_small_for_the_box_gets_nothing() {
-        let p = picker(vec![Row::new(0, "a")], 0);
+        let mut p = picker(vec![Row::new(0, "a")], 0);
         assert!(p.draw(Size { cols: 20, rows: 24 }).is_empty());
         assert!(p.draw(Size { cols: 80, rows: 4 }).is_empty());
     }
@@ -617,11 +659,12 @@ mod tests {
     fn the_tree_is_drawn_a_step_in_per_level() {
         let rows = vec![
             Row::heading("@pi"),
-            Row::new(0, "dev.box.ray/build").indent(1),
+            Row::heading("dev.box.ray").indent(1),
+            Row::new(0, "build").indent(2),
             Row::heading("gpu-box"),
             Row::new(1, "spare").indent(1),
         ];
-        let lines = seen(&picker(rows, 3), BIG);
+        let lines = seen(&mut picker(rows, 4), BIG);
         let column = |needle: &str| {
             lines
                 .iter()
@@ -629,10 +672,38 @@ mod tests {
                 .map(|line| line.find(needle).unwrap())
                 .unwrap_or_else(|| panic!("{needle} was not drawn: {lines:#?}"))
         };
-        assert!(column("@pi") < column("dev.box.ray/build"), "{lines:#?}");
-        // A group and a machine are siblings: neither is inside the other.
+        assert!(column("@pi") < column("dev.box.ray"), "{lines:#?}");
+        assert!(column("dev.box.ray") < column("build"), "{lines:#?}");
+        // A group and a machine with nothing grouped on it are siblings: the
+        // group is not inside the machine, nor the machine inside the group.
         assert_eq!(column("@pi"), column("gpu-box"), "{lines:#?}");
-        assert_eq!(column("dev.box.ray/build"), column("spare"), "{lines:#?}");
+        assert_eq!(column("dev.box.ray"), column("spare"), "{lines:#?}");
+    }
+
+    /// The cells under the box are the box's: the session's screen there was
+    /// painted over when it went up. So a box that shrinks has to clear the
+    /// rows it gives up, or the first real listing landing under an open popup
+    /// leaves the old box's top sitting on the screen.
+    #[test]
+    fn a_box_that_changes_shape_clears_what_it_no_longer_covers() {
+        let tall: Vec<Row> = (0..10).map(|i| Row::new(i, format!("s{i}"))).collect();
+        let mut p = picker(tall, 0);
+        let before = seen(&mut p, BIG).len();
+        p.replace(vec![Row::new(0, "s0")]);
+        let after = p.draw(BIG);
+        assert!(
+            seen(&mut p, BIG).len() < before,
+            "the box should have shrunk"
+        );
+        let blanked = after.matches("\x1b[K").count() + after.matches("    ").count();
+        assert!(blanked > 0, "nothing was cleared: {after:?}");
+        // And the rows it gave up are written over with blanks, so what was on
+        // them is gone rather than left framed by nothing.
+        let lines = seen(&mut p, BIG);
+        assert!(
+            !lines.iter().any(|line| line.contains("s9")),
+            "a row from the taller box survived: {lines:#?}"
+        );
     }
 
     /// The detail and the note are read down the box as columns, so a deeper
@@ -644,7 +715,7 @@ mod tests {
             Row::new(0, "shallow").detail("zsh").note("1m"),
             Row::new(1, "deep").detail("zsh").note("2m").indent(2),
         ];
-        let lines = seen(&picker(rows, 0), BIG);
+        let lines = seen(&mut picker(rows, 0), BIG);
         let ends: Vec<usize> = lines
             .iter()
             .filter(|line| line.contains("zsh"))
@@ -700,8 +771,8 @@ mod tests {
             Row::new(0, "build").detail("cargo test").note("2m"),
             Row::new(1, "a-much-longer-session-name").detail("nvim"),
         ];
-        let p = picker(rows, 1);
-        let lines = seen(&p, BIG);
+        let mut p = picker(rows, 1);
+        let lines = seen(&mut p, BIG);
         let widths: Vec<u16> = lines.iter().map(|line| columns(line)).collect();
         assert!(
             widths.windows(2).all(|pair| pair[0] == pair[1]),

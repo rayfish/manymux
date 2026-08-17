@@ -318,7 +318,12 @@ Three consequences run through the whole codebase and are worth keeping intact:
   Inside a group every row carries its machine, this one included, because
   there the machine is what tells two rows apart, and half-qualifying only the
   far ones leaves the eye working out which kind of row it is looking at. The
-  ungrouped rows are bare, since the heading above them already said it.
+  A machine goes on a line of its own inside a group rather than in front of
+  every name: `host/name` is how a session is addressed and was the obvious
+  label, but a real host name is most of the column, and with `dev.box.ray/` in
+  front of it there was no room left to tell `rayfish-iroh-dev` from
+  `rayfish-iroh-debug`, which is the one thing the row exists to say. So every
+  session sits under a machine either way and a group is a level above that.
   Sections are ordered by their first session and sessions by `started`, never
   by name, for the reason every listing here has: a name moves under a rename
   and the rows would shuffle beneath a hand walking them.
@@ -330,8 +335,35 @@ Three consequences run through the whole codebase and are worth keeping intact:
   nothing but drawing, and it is spent out of the label's own column, or a
   deeper row would push the detail and the note along and the box would stop
   reading as columns. The name column takes the widest name in the list between
-  `MIN_LABEL` and `MAX_LABEL`, because `host/session` needs room that a bare
-  session name would waste on the detail.
+  `MIN_LABEL` and `MAX_LABEL`, since how much room a name needs depends on how
+  deep the tree is that day.
+- **A client of ours that owns part of the screen owns all of it, so the
+  session stops being painted while one is up.** The view already did this and
+  the popup now does too: with the session still painting, a box drawn over it
+  was gone within a second, and redrawing the box after every chunk is worse,
+  because a line printed *scrolls the screen* and takes the rows of the box
+  already drawn up with it, leaving one copy of the box per line. There is no
+  third answer. A terminal composes nothing, and the client is not the emulator
+  here: the node holds the screen, which is exactly why tmux can float a popup
+  over live output and this cannot. What pauses is the picture and never the
+  program, since the session runs on and the resync that closing the box asks
+  for paints wherever it has got to.
+- **The cells under the box belong to the box, and it clears its own.** The
+  session's screen there was painted over when the popup went up and is put
+  back by the resync closing it asks for, so nothing else is going to: a box
+  that changed shape, which it does the moment the first real listing lands
+  under an open popup, left the top of the old one on the screen framing
+  nothing. `Picker::drawn` remembers the last rectangle and only the rows given
+  up are blanked, never the ones about to be painted, or every keypress would
+  write each cell twice and invite the flicker the view had.
+- **What is drawn to the node is asked for and painted as one act**
+  (`terminal::ask_for_the_screen`). A dump starts painting wherever the cursor
+  is and never erases, so a screen asked for and painted where it fell walks
+  its own first rows off the top, one `\r\n` at a time. The erase and home are
+  `REGROWN`, spent against `owed`. These were two statements at four call
+  sites, and the one place the second was missing showed nothing until a pager
+  exited: `less` leaves the cursor at the bottom, so quitting one gave back the
+  last few lines of the session under a blank half screen.
 - **A window with no room for the box hands the job to the mark row.** Since the
   popup *is* the mode, a terminal too short to draw one (`Picker::draw` answers
   nothing) was a client that had taken the keyboard and a `tab` that changed

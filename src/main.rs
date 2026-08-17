@@ -1456,13 +1456,19 @@ impl Listed {
             }
             drawn.push(group);
             rows.push(Row::heading(format!("@{group}")));
+            // The machine on a line of its own rather than in front of every
+            // name. `host/name` is how a session is addressed, so it was the
+            // obvious label, but a real host name is most of the column: with
+            // `dev.box.ray/` in front of it there was no room left to tell
+            // `rayfish-iroh-dev` from `rayfish-iroh-debug`, and which session
+            // it is is the one thing the row exists to say.
+            let mut machine: Option<&str> = None;
             for (hosted, _) in showing.iter().filter(|(_, g)| *g == Some(group)) {
-                // Every row carries its machine, this one included. Inside a
-                // group the machine is what tells two rows apart and is worth
-                // the columns, and half-qualifying only the far ones would
-                // leave the eye working out which kind of row it is looking at.
-                let label = format!("{}/{}", hosted.host, hosted.session.name);
-                Self::session(&mut rows, &mut at, hosted, current, label);
+                if machine != Some(hosted.host.as_str()) {
+                    machine = Some(&hosted.host);
+                    rows.push(Row::heading(&hosted.host).indent(1));
+                }
+                Self::session(&mut rows, &mut at, hosted, current, 2);
             }
         }
 
@@ -1479,14 +1485,7 @@ impl Listed {
                 machine = Some(&hosted.host);
                 rows.push(Row::heading(&hosted.host));
             }
-            // Bare, because the heading above it already says the machine.
-            Self::session(
-                &mut rows,
-                &mut at,
-                hosted,
-                current,
-                hosted.session.name.clone(),
-            );
+            Self::session(&mut rows, &mut at, hosted, current, 1);
         }
         let landed = current.clone();
         let on = at.iter().position(|there| *there == landed).unwrap_or(0);
@@ -1538,7 +1537,7 @@ impl Listed {
         at: &mut Vec<Located>,
         hosted: &HostedSession,
         current: &Located,
-        label: String,
+        indent: u16,
     ) {
         let here = *current == Located::new(&hosted.host, &hosted.session.name);
         let mut note = term::duration(hosted.session.idle);
@@ -1549,11 +1548,12 @@ impl Listed {
             note = "●".to_string();
         }
         rows.push(
-            Row::new(at.len(), label)
+            // The name alone: whatever heading gathered it, machine included,
+            // is a line above it.
+            Row::new(at.len(), &hosted.session.name)
                 .detail(&hosted.session.title)
                 .note(note)
-                // One step in, under whichever heading gathered it.
-                .indent(1),
+                .indent(indent),
         );
         at.push(Located::new(&hosted.host, &hosted.session.name));
     }
