@@ -18,15 +18,16 @@ use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::mpsc;
 
 use super::keys::wheel_is_ours;
-use super::{Action, Find, KeyFilter, Mode, Outcome, Rename, Scroll};
+use super::{Action, Chose, Find, KeyFilter, Mode, Outcome, Pick, Rename, Rows, Scroll, Select};
+use crate::client::picker::Picker;
 use crate::client::screen::ScreenMode;
-use crate::client::scroll::Scrollback;
-use crate::client::status::{self, Filter, Status};
+use crate::client::scroll::{self, Chased, Scrollback};
+use crate::client::status::{self, Filter, Popped, Status};
 use crate::client::{Attached, SessionHalves, SessionReader, SessionWriter, Update};
 use crate::clipboard;
 use crate::notify;
 use crate::proto::{HostedEvent, Renamed, Size};
-use crate::settings::Screen;
+use crate::settings::{Mouse, Screen, Settings};
 
 /// Sent before attaching.
 ///
@@ -47,8 +48,6 @@ fn setup(mode: &dyn ScreenMode) -> String {
 /// the node switches back on for the session is exactly what has to be
 /// switched off again here, or it leaks into what follows.
 fn undone() -> String {
-    use std::fmt::Write as _;
-
     let mut undone = String::new();
     // Both of these home the cursor, so they go first, while the alternate
     // screen is still up and the cursor there is about to be discarded.
@@ -57,27 +56,43 @@ fn undone() -> String {
     undone.push_str("\x1b[?6l"); // absolute cursor addressing, not origin mode
 
     undone.push_str("\x1b[?25h"); // show the cursor
-    undone.push_str("\x1b[0 q"); // the cursor shape this terminal defaults to
     undone.push_str("\x1b[0m"); // default attributes
     undone.push_str("\x1b[?7h"); // autowrap on
     undone.push_str("\x1b[4l"); // replace mode, not insert
     undone.push_str("\x1b[?1l\x1b>"); // normal cursor keys and keypad
-    for mode in crate::node::events::REPLAYED_MODES {
-        let _ = write!(undone, "\x1b[?{mode}l");
-    }
-
-    // The extended-keys protocols, off the same way. A program that asked
-    // for one and was left running is asking the terminal it is no longer
-    // on, and a shell handed one back still in that mode reads `\x1b[13;2u`
-    // where it expects a carriage return.
-    //
-    // The count is kitty's whole stack, because the pushing was the
-    // program's and there is no telling how deep it went; popping past the
-    // bottom does nothing. The set that follows is for a program that
-    // changed the flags without pushing, which the pops cannot undo.
-    undone.push_str("\x1b[<16u\x1b[=0;1u");
-    undone.push_str("\x1b[>4;0m"); // and xterm's older modifyOtherKeys
+    undone.push_str(&given_back());
     undone
+}
+
+/// Everything the program in the session switched on, switched back off: the
+/// private modes a reattach replays, the extended-keys protocols, and the
+/// cursor shape.
+///
+/// Exactly the set [`crate::node::events::Scanner::replay`] answers for, and
+/// that pairing is the whole point of it. A replay says what is *on* and has no
+/// way to say what was turned off, so it can only be trusted about a terminal
+/// that has just been put back to nothing. Both callers need that. A hop hands
+/// the terminal to a session that never asked for any of this; a screen the
+/// client asked for is answering for a stretch where the session was not being
+/// painted at all, and a mode switched off in that stretch has no other way of
+/// ever reaching the terminal. That one showed up as a program leaving the
+/// terminal reporting key releases at the shell that followed it: the pop was
+/// dropped under the popup, and every keystroke after it typed `[103;1:3u`
+/// into whatever was running.
+///
+/// The kitty count is the whole stack, because the pushing was the program's
+/// and there is no telling how deep it went; popping past the bottom does
+/// nothing. The set that follows is for a program that changed the flags
+/// without pushing, which the pops cannot undo.
+fn given_back() -> String {
+    let mut off = String::new();
+    off.push_str("\x1b[0 q"); // the cursor shape this terminal defaults to
+    for mode in crate::node::events::REPLAYED_MODES {
+        let _ = write!(off, "\x1b[?{mode}l");
+    }
+    off.push_str("\x1b[<16u\x1b[=0;1u");
+    off.push_str("\x1b[>4;0m"); // and xterm's older modifyOtherKeys
+    off
 }
 
 /// Sent before every attach, because the terminal is changing hands there
@@ -308,13 +323,21 @@ pub async fn run(
     target: &str,
     mode: Mode,
     notice: Option<&str>,
+    popup: PopupFeed<'_>,
 ) -> Result<(Outcome, Option<String>)> {
+    let PopupFeed {
+        rows,
+        group,
+        asks,
+        fresh,
+    } = popup;
     let watching = session.read_only;
     let mut status = Status::new(target);
     if watching {
         status = status.watching();
     }
     status.set_mode(mode);
+    status.set_group(group);
     if let Some(notice) = notice {
         status.set_notice(notice);
     }
@@ -339,8 +362,13 @@ pub async fn run(
             host: host_of(target),
             called: &mut called,
         },
-        screen,
-        on_alternate,
+        Painting {
+            screen,
+            on_alternate,
+            rows,
+            asks,
+            fresh,
+        },
     )
     .await?;
     let renamed = called != session_of(target);
@@ -379,12 +407,74 @@ fn host_of(target: &str) -> Option<&str> {
 /// hints have it back. Long enough to read without looking for it.
 const NOTICE_FOR: Duration = Duration::from_secs(5);
 
+/// How often the view moves under a drag held against its edge.
+///
+/// How far it moves each time is [`scroll::step`], which ramps; this is the
+/// clock both are spent against. Twenty a second, because every one of them
+/// repaints the window, and a frame rate past what the eye reads as smooth is
+/// bytes over ssh with nothing to show for them. Speed is worth having in the
+/// step instead, where it costs a bigger jump and not another screenful.
+const CHASE_EVERY: Duration = Duration::from_millis(50);
+
+/// Ask the node for the session's screen, and note that it owes an erased,
+/// homed one to paint it onto.
+///
+/// One call because they are one act. A dump starts painting wherever the
+/// cursor is and never erases, so a screen asked for and painted where it fell
+/// walks its own first rows off the top of the terminal, one `\r\n` at a time:
+/// a full-screen program leaves the cursor at the bottom on its way out, and
+/// what came back was the last lines of the session sitting under a blank half.
+/// These were two statements once, at four call sites, and the one place the
+/// second was missing showed nothing until somebody quit a pager.
+async fn ask_for_the_screen(writer: &mut SessionWriter, owed: &mut usize) -> Result<()> {
+    writer.resync().await?;
+    *owed += 1;
+    Ok(())
+}
+
+/// What the client says to take the mouse: report buttons and the moves made
+/// with one held, in the SGR spelling.
+///
+/// `?1002h` is what makes a drag visible. `?1000h` alone reports a press and a
+/// release and nothing between them, which is enough for a wheel and not enough
+/// for a selection: the terminal has stopped selecting by then, so a client
+/// that took the mouse and did not read the moves took the gesture away from
+/// everybody.
+const WHEEL_OURS: &str = "\x1b[?1000h\x1b[?1002h\x1b[?1006h";
+
+/// And to give it back. In the other order, so nothing is left reporting in a
+/// spelling that is no longer switched on.
+const WHEEL_THEIRS: &str = "\x1b[?1006l\x1b[?1002l\x1b[?1000l";
+
+/// What the row says about a copy that just happened.
+///
+/// Worth saying because there is nothing else to see: the highlight was already
+/// there, the clipboard is somewhere else, and a terminal that refuses OSC 52
+/// refuses it in silence. The count rather than the text, since the text is on
+/// the screen two rows up.
+fn copied_says(text: &str) -> String {
+    match text.lines().count() {
+        0 | 1 => "copied".to_string(),
+        lines => format!("copied {lines} lines"),
+    }
+}
+
 /// Take the wheel, or give it back.
 ///
-/// When that is, and why it is so rarely, is [`wheel_is_ours`]. The arrow
-/// keys a terminal would make of a notch with nobody reporting are not this
-/// function's problem: alternate scroll is off for the whole run of
-/// attaches, in [`crate::client::screen`].
+/// When that is, and when it is not, is [`wheel_is_ours`]. The arrow keys a
+/// terminal would make of a notch with nobody reporting are not this function's
+/// problem: alternate scroll is off for the whole run of attaches, in
+/// [`crate::client::screen`].
+///
+/// What *is* its problem is that this state lives in two places, here and in
+/// the terminal, and only one of them is ours to read. [`given_back`] switches
+/// off every mode a session can ask for, and the mouse is one of those, so a
+/// screen painted while the client held the wheel took the wheel with it and
+/// this function had nothing to say about it: `wheel` still said ours, the
+/// terminal had stopped reporting, and the first notch after a popup went back
+/// to doing whatever the terminal does with one. So that path re-asserts
+/// [`WHEEL_OURS`] by hand rather than clearing the flag and waiting for the
+/// next frame, which would leave a window with the same silence in it.
 async fn own_the_wheel(
     stdout: &mut Stdout,
     keys: &mut KeyFilter,
@@ -396,14 +486,9 @@ async fn own_the_wheel(
     }
     *wheel = ours;
     keys.set_wheel(ours);
-    let sequence = if ours {
-        "\x1b[?1000h\x1b[?1006h" // report buttons, in the SGR spelling
-    } else {
-        // Off in the other order, so nothing is left reporting in a
-        // spelling that is no longer switched on.
-        "\x1b[?1006l\x1b[?1000l"
-    };
-    stdout.write_all(sequence.as_bytes()).await?;
+    stdout
+        .write_all(if ours { WHEEL_OURS } else { WHEEL_THEIRS }.as_bytes())
+        .await?;
     stdout.flush().await?;
     Ok(())
 }
@@ -447,6 +532,149 @@ fn keyboard() -> mpsc::Receiver<Vec<u8>> {
     keys
 }
 
+/// Put the popup on the screen, or take the mark row back to saying what it
+/// says without one.
+///
+/// One write, so there is never a frame with half a box on it, and the mark row
+/// last: it is the thing that says the client has the keyboard, and it must not
+/// be painted over by the box it is telling you about.
+///
+/// A window with no room for a box gets nothing back from [`Picker::draw`], and
+/// the mark row takes the job over ([`Popped::Cramped`]). Without that, control
+/// mode on a short terminal was a keyboard the client had taken and a tab that
+/// changed nothing on the screen.
+async fn draw_popup(
+    stdout: &mut tokio::io::Stdout,
+    popup: &mut Option<Popup>,
+    status: &mut Status,
+    restate: &mut bool,
+) -> Result<()> {
+    let Some(popup) = popup else {
+        return Ok(());
+    };
+    let size = terminal_size();
+    let box_drawn = popup.picker.draw(size);
+    status.set_popup(if box_drawn.is_empty() {
+        Popped::Cramped(popup.line())
+    } else {
+        Popped::Drawn
+    });
+    let drawn = format!("{box_drawn}{}", status.repaint(size));
+    stdout.write_all(drawn.as_bytes()).await?;
+    stdout.flush().await?;
+    *restate = false;
+    Ok(())
+}
+
+/// Everything the popup needs, which the caller owns and this half does not:
+/// the rows, the narrowing they were built under, and the two ends of asking
+/// for them again.
+pub struct PopupFeed<'a> {
+    pub rows: Rows,
+    pub group: Option<&'a str>,
+    pub asks: mpsc::Sender<()>,
+    pub fresh: tokio::sync::watch::Receiver<Rows>,
+}
+
+/// What the pump paints on and what it paints there, which travel together
+/// because the screen mode decides how all three are used.
+struct Painting {
+    screen: Screen,
+    /// Whether the session has the terminal on a full-screen program's own
+    /// screen, shared with the teardown and the panic hook.
+    on_alternate: Arc<AtomicBool>,
+    /// The rows the popup opens with.
+    rows: Rows,
+    /// Say the word and the caller goes and asks the machines what they are
+    /// running again, answering on `fresh`.
+    ///
+    /// A press is the only thing that ever asks, here as everywhere else: the
+    /// popup opens on whatever was true a moment ago and is corrected when the
+    /// answer lands, rather than sitting on a machine that is asleep. The one
+    /// that found nowhere to go asks too, or the first fruitless press would be
+    /// the last one that ever asked.
+    asks: mpsc::Sender<()>,
+    /// Rows as of the last answer. Swapped in under the highlight by id, so a
+    /// listing landing under an open popup does not slide it onto a different
+    /// session.
+    fresh: tokio::sync::watch::Receiver<Rows>,
+}
+
+/// The popup on the screen, and what the list in it is for.
+///
+/// Two verbs over one widget, and which list you entered from is what says
+/// which: no row in either means two things, which is what an earlier shape of
+/// this got wrong.
+struct Popup {
+    picker: Picker,
+    what: Showing,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Showing {
+    /// The sessions you can reach. Enter attaches.
+    Sessions,
+    /// Groups, to put the session on `row` into. Enter assigns.
+    Moving { row: usize },
+    /// Groups, to narrow to. Enter narrows.
+    Narrowing,
+}
+
+const SESSION_HINTS: &str = "⏎ go  r name  m group  g show  n new  d detach";
+const MOVE_HINTS: &str = "⏎ move   n new group   esc";
+const NARROW_HINTS: &str = "⏎ show   esc";
+
+impl Popup {
+    fn sessions(rows: &Rows) -> Self {
+        Self {
+            picker: Picker::new("sessions", SESSION_HINTS, rows.sessions.clone(), rows.at),
+            what: Showing::Sessions,
+        }
+    }
+
+    /// The whole popup in one line, for a window with no room to draw the box.
+    ///
+    /// The title and the highlight, which is what the box says that this row
+    /// cannot work out for itself: which list is open, and which row Enter
+    /// would take.
+    fn line(&self) -> String {
+        match self.picker.chosen() {
+            Some(row) => format!("{}: {}", self.picker.title(), row.label),
+            // A list with nothing in it still has to say which list it is, or
+            // the row goes blank in a mode that is still holding the keyboard.
+            None => format!("{}: none", self.picker.title()),
+        }
+    }
+
+    /// The mode this list is read in. The session list is control mode itself;
+    /// the two group lists are their own, because the session keys must not
+    /// reach them. Anything that has to put the keyboard back where it was
+    /// asks here rather than assuming, since which list is up decides it.
+    fn mode(&self) -> Mode {
+        match self.what {
+            Showing::Sessions => Mode::Control,
+            Showing::Moving { .. } | Showing::Narrowing => Mode::Picking,
+        }
+    }
+
+    /// The session row the popup is acting on, if it is on one.
+    ///
+    /// Narrowing, it is on none: the highlighted row there is a *group*, and
+    /// its id indexes the groups. Answered with that id, `n` in the group list
+    /// put whatever session happened to sit at that index in `Listed::at` into
+    /// the new group, silently and on whatever machine it was on, because the
+    /// write succeeded and there was nothing to say. `n` is live in both lists
+    /// only because they share one key table; it is advertised in neither
+    /// list's hints but the move list's.
+    fn subject(&self) -> Option<usize> {
+        match self.what {
+            Showing::Moving { row } => Some(row),
+            Showing::Sessions => self.picker.chosen().map(|row| row.id),
+            Showing::Narrowing => None,
+        }
+    }
+}
+
 /// The name in `naming` is written back when a rename lands: the mark row
 /// is not the only thing that has to follow it.
 async fn pump(
@@ -455,9 +683,15 @@ async fn pump(
     mut status: Status,
     mode: Mode,
     naming: Naming<'_>,
-    screen: Screen,
-    on_alternate: Arc<AtomicBool>,
+    painting: Painting,
 ) -> Result<Outcome> {
+    let Painting {
+        screen,
+        on_alternate,
+        mut rows,
+        asks,
+        mut fresh,
+    } = painting;
     let watching = session.read_only;
     let takes_pastes = session.paste;
     let scrolls = session.scroll;
@@ -477,9 +711,20 @@ async fn pump(
     // has the lines in its own buffer and its own wheel is better than
     // anything here.
     keys.set_scroll(screen.mode().owns_the_screen());
+    // The wheel is a stricter question than the key, and asked for rather than
+    // assumed: taking the mouse off the terminal costs it the bare-drag
+    // selection, which nothing here can give back. So it wants somebody to have
+    // said `mm config mouse client`, and a notch to have somewhere to go once
+    // they have. A host that cannot answer for a window gets a sentence on the
+    // row when the key is pressed, and keeps its wheel either way.
+    let history =
+        scrolls && screen.mode().owns_the_screen() && Settings::or_default().mouse == Mouse::Client;
     let mut output = Filter::new(screen);
     // The view over the session's history, while it is up.
     let mut scrolling: Option<Scrollback> = None;
+    // The popup control mode puts on the screen, while it is up, and which of
+    // the two lists it is showing.
+    let mut popup: Option<Popup> = None;
     // Whether the client has mouse tracking on for itself, which it does
     // only while there is a history to look at and the session has asked
     // for no reports of its own.
@@ -490,6 +735,15 @@ async fn pump(
     // Whether the frame that repaints the screen on attach has been and
     // gone. Everything after it is the session speaking for itself.
     let mut painted = false;
+    // Whether this attach still owes the popup its opening.
+    //
+    // Arriving in control mode is arriving with the popup up, since that is
+    // what control mode looks like: an attach that started there and drew
+    // nothing was a client holding the keyboard with nothing on the screen
+    // saying so. It cannot be drawn until the repaint has been, though, because
+    // that frame is a screen dump and paints by absolute coordinates from the
+    // top, straight over anything already there.
+    let mut greet = mode == Mode::Control;
     // Screens still owed for a resize, and so still to be painted onto one
     // wiped first. Counted rather than flagged because a drag across the
     // desktop asks more than once before the first answer arrives.
@@ -500,6 +754,10 @@ async fn pump(
     let mut notice_until: Option<tokio::time::Instant> = status
         .has_notice()
         .then(|| tokio::time::Instant::now() + NOTICE_FOR);
+    // When the view next moves under a drag held against its edge, while one
+    // is being held. Kept here rather than worked out per pass, or a session
+    // printing steadily would push the moment away forever.
+    let mut chase_at: Option<tokio::time::Instant> = None;
     // Notifications for the terminal, waiting for a safe moment to be
     // written, and the rule for which of them get one.
     let mut pending = String::new();
@@ -511,7 +769,15 @@ async fn pump(
                 let Some(typed) = typed else {
                     return Ok(Outcome::Detached);
                 };
-                let keystrokes = keys.filter(&typed);
+                // Round the chunk until it is used up. Only a popup move hands
+                // any of it back (see `Keystrokes::rest`), and it has to:
+                // two writes a moment apart arrive as one read, so `tab` then
+                // `Enter` is a single chunk and stopping at the move would
+                // throw away the key that commits.
+                let mut chunk = typed;
+                'chunk: loop {
+                let keystrokes = keys.filter(&chunk);
+                chunk = keystrokes.rest.clone();
                 // A viewer's keystrokes go nowhere. The node drops them anyway,
                 // which is what makes the promise worth anything; not sending
                 // them keeps a held key off the wire and out of the session's
@@ -519,9 +785,20 @@ async fn pump(
                 if !keystrokes.forward.is_empty() && !watching {
                     writer.send_input(&keystrokes.forward).await?;
                 }
-                if keystrokes.mode != status.mode() {
+                let was = status.mode();
+                if keystrokes.mode != was {
                     status.set_mode(keystrokes.mode);
                     restate = true;
+                }
+                // The mode key on its own, which is what control mode looks
+                // like: the popup is the mode rather than something the mode
+                // can show, so it goes up on the way in and not on the first
+                // key after it. Asked for again in the same breath, because a
+                // press is the only thing that ever asks.
+                if keystrokes.mode == Mode::Control && was != Mode::Control && popup.is_none() {
+                    let _ = asks.try_send(());
+                    popup = Some(Popup::sessions(&rows));
+                    draw_popup(&mut stdout, &mut popup, &mut status, &mut restate).await?;
                 }
                 settle(&mut stdout, &output, &status, &mut pending, &mut restate).await?;
                 match keystrokes.action {
@@ -550,6 +827,171 @@ async fn pump(
                         writer.detach().await?;
                         return Ok(Outcome::New);
                     }
+                    // The popup, which is what control mode looks like. Moving
+                    // the highlight is local: walking three sessions used to be
+                    // three detaches and three reattaches over ssh just to see
+                    // what each one was, and is now one, on the Enter.
+                    // Closing is the teardown below, which every other way out
+                    // of the mode goes through too. Nothing to do here but stay
+                    // out of its way: opening a popup to close it would put the
+                    // box back on the screen.
+                    // Esc out of a group list is out of that list and not out
+                    // of the popup: it was opened over the session list, and
+                    // both lists' hints say so. The session picker was
+                    // replaced rather than stacked under, so coming back is
+                    // building it again, on the row the gesture started from
+                    // where there was one. Out of the session list it is the
+                    // teardown below, like every other way of closing the box.
+                    Some(Action::Pick(Pick::Cancel)) => {
+                        if let Some(up) = popup.as_mut()
+                            && up.what != Showing::Sessions
+                        {
+                            let was = match up.what {
+                                Showing::Moving { row } => Some(row),
+                                _ => None,
+                            };
+                            *up = Popup::sessions(&rows);
+                            if let Some(row) = was {
+                                up.picker.point_at(row);
+                            }
+                            draw_popup(&mut stdout, &mut popup, &mut status, &mut restate).await?;
+                        }
+                    }
+                    Some(Action::Pick(pick)) => {
+                        // Every press asks, whether or not it moved anywhere.
+                        // Asking only after a landing meant the first press
+                        // that found nothing was the last one that ever asked,
+                        // so a machine with one session on it when the run
+                        // started stayed that way as far as this was concerned.
+                        let _ = asks.try_send(());
+                        let up = popup.get_or_insert_with(|| Popup::sessions(&rows));
+                        match pick {
+                            Pick::Up => up.picker.up(),
+                            Pick::Down => up.picker.down(),
+                            Pick::NextGroup => up.picker.next_heading(true),
+                            Pick::PreviousGroup => up.picker.next_heading(false),
+                            // Off to the group list, over the session list
+                            // rather than instead of it: Esc there comes back
+                            // to where the gesture started.
+                            Pick::Move | Pick::Groups => {
+                                let Some(row) = up.picker.chosen().map(|row| row.id) else {
+                                    // No row to act on, and the mode has
+                                    // already moved: `KeyFilter::after` reads
+                                    // the key, not what this arm decides about
+                                    // it, so leaving here without putting it
+                                    // back left the group table over the
+                                    // session list. Same shape as the bug
+                                    // `Popup::mode` was added for.
+                                    let back = up.mode();
+                                    keys.set_mode(back);
+                                    status.set_mode(back);
+                                    restate = true;
+                                    continue;
+                                };
+                                let (title, hints, what) = if pick == Pick::Move {
+                                    let name = up
+                                        .picker
+                                        .chosen()
+                                        .map(|row| row.label.clone())
+                                        .unwrap_or_default();
+                                    (
+                                        format!("move \"{name}\" to"),
+                                        MOVE_HINTS,
+                                        Showing::Moving { row },
+                                    )
+                                } else {
+                                    ("groups".to_string(), NARROW_HINTS, Showing::Narrowing)
+                                };
+                                *up = Popup {
+                                    picker: Picker::new(title, hints, rows.groups.clone(), 0),
+                                    what,
+                                };
+                                keys.set_mode(Mode::Picking);
+                                status.set_mode(Mode::Picking);
+                            }
+                            Pick::Go => {
+                                let chosen = up.picker.chosen().map(|row| row.id);
+                                let what = up.what;
+                                let subject = up.subject();
+                                let Some(chosen) = chosen else { continue };
+                                status.set_popup(Popped::None);
+                                writer.detach().await?;
+                                return Ok(match (what, subject) {
+                                    (Showing::Sessions, _) => {
+                                        Outcome::Chose(Chose::Go(chosen))
+                                    }
+                                    (Showing::Moving { .. }, Some(session)) => {
+                                        Outcome::Chose(Chose::Move { session, group: chosen })
+                                    }
+                                    (Showing::Moving { .. }, None) => Outcome::Detached,
+                                    (Showing::Narrowing, _) => {
+                                        Outcome::Chose(Chose::Focus(chosen))
+                                    }
+                                });
+                            }
+                            // Taken off the screen by the teardown below,
+                            // which every other way out of the mode goes
+                            // through too. Unreachable: matched above.
+                            Pick::Cancel => {}
+                        }
+                        draw_popup(&mut stdout, &mut popup, &mut status, &mut restate).await?;
+                    }
+                    // Naming a group, at the prompt the rename and the search
+                    // already share. Enter creates it and puts the session in
+                    // it, necessarily: a group is a set of live sessions, so an
+                    // empty one cannot exist.
+                    // A new group is a session put in one, since a group with
+                    // nothing in it cannot exist. So a list with no session
+                    // under the highlight has nothing to name, and the prompt
+                    // is refused rather than opened: at the Enter a name has
+                    // been typed and refusing it there throws the typing away.
+                    Some(Action::GroupName(Rename::Open))
+                        if popup.as_ref().is_none_or(|up| up.subject().is_none()) =>
+                    {
+                        keys.stop_typing();
+                        // And back to the mode the key arrived in, which
+                        // `KeyFilter::after` has already left at `Mode::Rename`
+                        // for a prompt that is not going to open. A mode with
+                        // no prompt behind it falls through to the session
+                        // table, so the group list was left on the screen with
+                        // `m`, `d` and `n` live over it: `m` there reads a
+                        // group row as a session, which is the thing refusing
+                        // this key exists to stop.
+                        let back = popup.as_ref().map_or(Mode::Focus, Popup::mode);
+                        keys.set_mode(back);
+                        status.set_mode(back);
+                        status.set_grouping(None);
+                        status.set_notice("no session here to put in a group");
+                        notice_until = Some(tokio::time::Instant::now() + NOTICE_FOR);
+                        restate = true;
+                        draw_popup(&mut stdout, &mut popup, &mut status, &mut restate).await?;
+                    }
+                    Some(Action::GroupName(step)) => {
+                        match step {
+                            Rename::Open | Rename::Typed => {
+                                status.set_grouping(keys.wanted_group());
+                            }
+                            Rename::Cancel => status.set_grouping(None),
+                            Rename::Run => {
+                                let name = keys.wanted_group().unwrap_or_default();
+                                keys.stop_typing();
+                                status.set_grouping(None);
+                                let session = popup.as_ref().and_then(Popup::subject);
+                                if let Some(session) = session
+                                    && !name.trim().is_empty()
+                                {
+                                    status.set_popup(Popped::None);
+                                    writer.detach().await?;
+                                    return Ok(Outcome::Chose(Chose::NewGroup {
+                                        session,
+                                        name,
+                                    }));
+                                }
+                            }
+                        }
+                        restate = true;
+                        draw_popup(&mut stdout, &mut popup, &mut status, &mut restate).await?;
+                    }
                     // A host from before the view existed answers for no
                     // window, so there is nothing to open. Said on the row
                     // rather than swallowed, because a key that does
@@ -575,8 +1017,7 @@ async fn pump(
                     Some(Action::Scroll(Scroll::Leave)) => {
                         scrolling = None;
                         status.set_scrolled(None);
-                        writer.resync().await?;
-                        owed += 1;
+                        ask_for_the_screen(&mut writer, &mut owed).await?;
                         restate = true;
                     }
                     // Typing, and what typing turns into. The needle lives
@@ -642,17 +1083,130 @@ async fn pump(
                             // without holding a borrow of it.
                             Scroll::Leave => {}
                         }
-                        let wanted = view.wanted();
-                        let painted = view.paint();
-                        status.set_scrolled(Some(view.offset()));
+                        // Scrolled all the way back down, which is somebody
+                        // arriving at the live screen rather than asking to
+                        // look at a window that happens to sit on it. The view
+                        // is a picture of where the session was, so sitting in
+                        // it at the bottom is the one place it says nothing the
+                        // session would not say better, and leaving costs an
+                        // Esc nobody thinks to press. Only on the way down:
+                        // opening the view is a move up made from the bottom,
+                        // and a history shorter than the screen never leaves
+                        // it, so reading this off the offset alone would open
+                        // the view and shut it in the same notch.
+                        let landed = view.at_bottom()
+                            && matches!(
+                                motion,
+                                Scroll::Down(_) | Scroll::PageDown | Scroll::Bottom
+                            );
+                        if landed {
+                            scrolling = None;
+                            status.set_scrolled(None);
+                            keys.set_mode(Mode::Focus);
+                            status.set_mode(Mode::Focus);
+                            ask_for_the_screen(&mut writer, &mut owed).await?;
+                            restate = true;
+                            settle(&mut stdout, &output, &status, &mut pending, &mut restate)
+                                .await?;
+                        } else {
+                            let wanted = view.wanted();
+                            let painted = view.paint();
+                            status.set_scrolled(Some(view.offset()));
+                            if let Some(request) = wanted {
+                                writer.view(&request).await?;
+                            }
+                            stdout.write_all(painted.as_bytes()).await?;
+                            stdout
+                                .write_all(status.repaint(terminal_size()).as_bytes())
+                                .await?;
+                            stdout.flush().await?;
+                        }
+                    }
+                    // A drag, which only means anything where there is a view
+                    // to drag over. On a host too old for one the client never
+                    // took the mouse in the first place, so this cannot arrive;
+                    // the arm is here because the reports and the window are
+                    // switched on by the same flag and nothing should depend on
+                    // remembering that.
+                    Some(Action::Select(_)) if !scrolls => {
+                        keys.set_mode(Mode::Focus);
+                        status.set_mode(Mode::Focus);
+                    }
+                    Some(Action::Select(what)) => {
+                        let view = scrolling
+                            .get_or_insert_with(|| Scrollback::new(terminal_size()));
+                        match what {
+                            Select::From(at) => view.select_from(at),
+                            Select::To(at) => view.select_to(at),
+                            Select::Word(at) => view.select_word(at),
+                            Select::Line(at) => view.select_line(at),
+                            // Letting go changes nothing about what is
+                            // selected. It is the moment the selection becomes
+                            // worth having, which is a different thing, and
+                            // the moment the hand stops asking for the view.
+                            Select::Done => view.let_go(),
+                        }
+                        let copied = match what {
+                            Select::Done => view.copied(),
+                            _ => None,
+                        };
+                        // A gesture that is over, made on the live screen: the
+                        // press opened the view under it and there is nothing
+                        // left down here to look at. Whether it copied anything
+                        // or not, since the two ways it ends are a click that
+                        // selected nothing and a drag that has been taken, and
+                        // both are somebody done with the mouse.
+                        //
+                        // Leaving somebody in a paused picture of the session
+                        // they were looking at is what makes the gesture read
+                        // as a client that has died: the session goes on
+                        // running and stops being painted, and the keys they
+                        // type next go to the view rather than to the shell,
+                        // with only an Esc nobody thinks to press to get out of
+                        // it. Scrolled back, the same release is somebody
+                        // taking a line out of the history they are reading,
+                        // and there the view is the point and stays.
+                        //
+                        // A copy still owed is neither, and waits: the block it
+                        // needs is on its way, and `Update::View` finishes it.
+                        let done = matches!(what, Select::Done)
+                            && view.at_bottom()
+                            && (copied.is_some() || !view.selecting());
+                        let wanted = if done { None } else { view.wanted() };
+                        let painted = if done { String::new() } else { view.paint() };
+                        let offset = view.offset();
+                        // A drag that has reached an edge and stayed there
+                        // reports nothing more, so from here the view moves on
+                        // a clock of its own.
+                        chase_at = (!done && view.chasing())
+                            .then(|| tokio::time::Instant::now() + CHASE_EVERY);
                         if let Some(request) = wanted {
                             writer.view(&request).await?;
                         }
-                        stdout.write_all(painted.as_bytes()).await?;
-                        stdout
-                            .write_all(status.repaint(terminal_size()).as_bytes())
-                            .await?;
-                        stdout.flush().await?;
+                        if let Some(text) = &copied {
+                            stdout
+                                .write_all(clipboard::to_terminal(text).as_bytes())
+                                .await?;
+                            status.set_notice(&copied_says(text));
+                            notice_until = Some(tokio::time::Instant::now() + NOTICE_FOR);
+                        }
+                        if done {
+                            scrolling = None;
+                            status.set_scrolled(None);
+                            keys.set_mode(Mode::Focus);
+                            status.set_mode(Mode::Focus);
+                            ask_for_the_screen(&mut writer, &mut owed).await?;
+                            restate = true;
+                            settle(&mut stdout, &output, &status, &mut pending, &mut restate)
+                                .await?;
+                        } else {
+                            status.set_scrolled(Some(offset));
+                            stdout.write_all(painted.as_bytes()).await?;
+                            stdout
+                                .write_all(status.repaint(terminal_size()).as_bytes())
+                                .await?;
+                            stdout.flush().await?;
+                        }
                     }
                     // The same shape as a search, and the same reason for
                     // it: the name lives in the key filter until Enter, so
@@ -683,10 +1237,49 @@ async fn pump(
                                 let wanted = keys.wanted_name().unwrap_or_default();
                                 keys.stop_typing();
                                 status.set_renaming(None);
-                                // Nothing is said here: the row keeps
-                                // naming the session what it is still
-                                // called until the host says otherwise.
-                                writer.rename(&wanted).await?;
+                                // The row the popup is on, which may not be the
+                                // session at the other end of this stream, and
+                                // `tag::RENAME` renames that one by design. So
+                                // it goes back to the caller, which can reach
+                                // the machine holding it.
+                                match popup.as_ref() {
+                                    // A popup is up, so it names the row, and a
+                                    // list with no session under the highlight
+                                    // names nothing: this is the one place the
+                                    // two meanings of "no session" have to stay
+                                    // apart, or a prompt opened over the group
+                                    // list would rename the session at the
+                                    // other end of the stream instead.
+                                    Some(up) => match up.subject() {
+                                        Some(session) if !wanted.trim().is_empty() => {
+                                            status.set_popup(Popped::None);
+                                            writer.detach().await?;
+                                            return Ok(Outcome::Chose(Chose::Named {
+                                                session,
+                                                to: wanted,
+                                            }));
+                                        }
+                                        // Typed at a list with nothing under
+                                        // the highlight, which is a name typed
+                                        // for nothing. Said, because the box
+                                        // closes on its own here and a name
+                                        // that went nowhere in silence reads as
+                                        // a rename that worked.
+                                        None => {
+                                            status.set_notice("no session here to rename");
+                                            notice_until =
+                                                Some(tokio::time::Instant::now() + NOTICE_FOR);
+                                        }
+                                        Some(_) => {}
+                                    },
+                                    // No popup, so this is a client driving the
+                                    // prompt without one: the session at the
+                                    // other end of the stream is the only one
+                                    // it could mean. Nothing is said here, the
+                                    // row keeps the old name until the host
+                                    // answers.
+                                    None => writer.rename(&wanted).await?,
+                                }
                             }
                         }
                         // Through `settle` rather than written on the spot,
@@ -723,7 +1316,7 @@ async fn pump(
                         // switch swallowed while it ran is only now
                         // answerable.
                         if output.take_switched() {
-                            writer.resync().await?;
+                            ask_for_the_screen(&mut writer, &mut owed).await?;
                         }
                         // The same discipline as everywhere else: never
                         // into the middle of a sequence the session is
@@ -740,11 +1333,57 @@ async fn pump(
                     }
                     None => {}
                 }
-                // The view has just opened or just closed, and the wheel
-                // goes with it: the terminal has the mouse back the moment
-                // there is a live session to select on.
-                let ours = wheel_is_ours(scrolling.is_some(), output.session_mouse());
+                // A mode that is no longer one of the popup's is a popup that
+                // has to come off the screen, whichever key did it. Keyed off
+                // the mode rather than off an action, because most of the ways
+                // out are not actions at all: an unbound key, a mistyped mode
+                // key, an Esc. The client has no copy of what the box covered,
+                // so the node's model is the only place it still exists and it
+                // is painted back the way a resize is, which is the same trip
+                // leaving the view already makes.
+                // `Mode::Rename` keeps it: both prompts opened from the popup
+                // are a step of a gesture that started there, and the row being
+                // named or grouped is the highlighted one. Taking the box away
+                // under the prompt would leave nothing saying which.
+                if popup.is_some()
+                    && !matches!(
+                        status.mode(),
+                        Mode::Control | Mode::Picking | Mode::Rename
+                    )
+                {
+                    popup = None;
+                    status.set_popup(Popped::None);
+                    ask_for_the_screen(&mut writer, &mut owed).await?;
+                    restate = true;
+                    settle(&mut stdout, &output, &status, &mut pending, &mut restate).await?;
+                }
+                // The session may have asked for the mouse, or given it back,
+                // and the wheel goes with that: a program that wants reports
+                // gets every one of them, the wheel included.
+                let ours = wheel_is_ours(history, output.session_mouse());
                 own_the_wheel(&mut stdout, &mut keys, &mut wheel, ours).await?;
+                if chunk.is_empty() {
+                    break 'chunk;
+                }
+                }
+            }
+            // A listing has landed. Swapped in under the highlight rather than
+            // reopening the popup, so a session ending three rows up does not
+            // move what Enter would take.
+            landed = fresh.changed() => {
+                if landed.is_err() {
+                    continue;
+                }
+                rows = fresh.borrow_and_update().clone();
+                if let Some(up) = popup.as_mut() {
+                    if up.what == Showing::Sessions {
+                        up.picker.replace(rows.sessions.clone(), rows.at);
+                    } else {
+                        // A group list has no such row: `at` is a session's.
+                        up.picker.replace(rows.groups.clone(), 0);
+                    }
+                    draw_popup(&mut stdout, &mut popup, &mut status, &mut restate).await?;
+                }
             }
             update = reader.next() => match update? {
                 Update::Output(bytes) => {
@@ -760,18 +1399,26 @@ async fn pump(
                     }
                     let bytes = output.feed(&bytes);
                     // Fed to the filter either way, so its parser stays in
-                    // step with the byte stream, but not written while the
-                    // view is up: the screen is showing the history, and
-                    // the session painting over it is what leaving the view
-                    // asks the node to undo.
-                    if scrolling.is_none() {
+                    // step with the byte stream, but not written while
+                    // something of the client's owns the screen. The view is
+                    // showing history; the box is drawn over the session and
+                    // has no way to stay on top of it, since a line printed
+                    // scrolls the screen and takes the rows of the box already
+                    // drawn up with it. Redrawing after every chunk leaves one
+                    // copy of the box per line printed: a terminal composes
+                    // nothing, and the client is not the emulator here, so the
+                    // only surface either of these can own is the whole one.
+                    // The session goes on running behind both, and both are put
+                    // back by the resync that closing them asks for, so what
+                    // pauses is the picture and never the program.
+                    if scrolling.is_none() && popup.is_none() {
                         stdout.write_all(&bytes).await?;
                     }
                     on_alternate.store(output.on_alternate(), Ordering::Relaxed);
                     // The session may have just asked for the mouse, or
                     // given it back. Only between sequences, like the mark.
                     if output.at_boundary() {
-                        let ours = wheel_is_ours(scrolling.is_some(), output.session_mouse());
+                        let ours = wheel_is_ours(history, output.session_mouse());
                         own_the_wheel(&mut stdout, &mut keys, &mut wheel, ours).await?;
                     }
                     // A screen switch went no further than this client, so
@@ -784,7 +1431,7 @@ async fn pump(
                     // never fires: the terminal made the switch itself and
                     // kept both screens.
                     if output.take_switched() && painted {
-                        writer.resync().await?;
+                        ask_for_the_screen(&mut writer, &mut owed).await?;
                     }
                     painted = true;
                     // Only between sequences: a repaint written into the
@@ -794,16 +1441,49 @@ async fn pump(
                         restate |= output.take_dirty();
                     }
                     settle(&mut stdout, &output, &status, &mut pending, &mut restate).await?;
+                    // The screen is up, so the box has something to sit on. The
+                    // rows are the ones the caller handed over, which it built
+                    // after whatever brought us back here, so this opens on
+                    // what is true rather than asking and waiting.
+                    if std::mem::take(&mut greet) {
+                        // And ask, the same as the key that opens one does. The
+                        // rows handed over are whatever the caller knew, which
+                        // after a slow fan-out is nothing at all: opening on
+                        // them without asking left an empty box that only the
+                        // next keypress would fill, and an empty box is one
+                        // there is nothing obvious to press in.
+                        let _ = asks.try_send(());
+                        popup = Some(Popup::sessions(&rows));
+                        draw_popup(&mut stdout, &mut popup, &mut status, &mut restate).await?;
+                    }
                 }
                 // The screen we asked for. Its own switches are how a dump
                 // paints both buffers, so they are swallowed and dropped
                 // rather than answered with another request.
                 Update::Screen(bytes) => {
+                    // Not onto an open box: this is a whole screen and would
+                    // take it with it. Closing the box asks for another, so
+                    // what is dropped here is painted a moment later anyway.
+                    let ours = popup.is_none();
                     if owed > 0 {
                         owed -= 1;
-                        stdout.write_all(REGROWN.as_bytes()).await?;
+                        if ours {
+                            // What the dump replays is what the program has
+                            // on, so what it turned off since goes off here:
+                            // see `given_back`.
+                            stdout.write_all(given_back().as_bytes()).await?;
+                            // Which includes the mouse, and the client's hold
+                            // on it is not the session's to lose.
+                            if wheel {
+                                stdout.write_all(WHEEL_OURS.as_bytes()).await?;
+                            }
+                            stdout.write_all(REGROWN.as_bytes()).await?;
+                        }
                     }
-                    stdout.write_all(&output.feed(&bytes)).await?;
+                    let bytes = output.feed(&bytes);
+                    if ours {
+                        stdout.write_all(&bytes).await?;
+                    }
                     on_alternate.store(output.on_alternate(), Ordering::Relaxed);
                     output.take_switched();
                     output.take_dirty();
@@ -844,14 +1524,53 @@ async fn pump(
                 // the session again, and painting lines over it would be a
                 // window nobody is looking at.
                 Update::View(window) => {
+                    // The copy a release could not be answered out of an empty
+                    // block, and whether the gesture it belongs to is over.
+                    let mut copied = None;
+                    let mut done = false;
                     if let Some(view) = scrolling.as_mut() {
                         view.take(window);
-                        status.set_scrolled(Some(view.offset()));
-                        stdout.write_all(view.paint().as_bytes()).await?;
+                        copied = view.owed_copy();
+                        done = copied.is_some() && view.at_bottom();
+                        // The block was asked for around where the window was
+                        // before the host said how much history there is, so a
+                        // move made before the first answer may have been
+                        // brought back inside it and left the block covering
+                        // somewhere else. Asking again is a no-op when it does
+                        // cover, which is every case but that one.
+                        if !done
+                            && let Some(request) = view.wanted()
+                        {
+                            writer.view(&request).await?;
+                        }
+                        if !done {
+                            status.set_scrolled(Some(view.offset()));
+                            stdout.write_all(view.paint().as_bytes()).await?;
+                            stdout
+                                .write_all(status.repaint(terminal_size()).as_bytes())
+                                .await?;
+                            stdout.flush().await?;
+                        }
+                    }
+                    if let Some(text) = &copied {
                         stdout
-                            .write_all(status.repaint(terminal_size()).as_bytes())
+                            .write_all(clipboard::to_terminal(text).as_bytes())
                             .await?;
-                        stdout.flush().await?;
+                        status.set_notice(&copied_says(text));
+                        notice_until = Some(tokio::time::Instant::now() + NOTICE_FOR);
+                    }
+                    // The drag was over before its lines arrived, so this is
+                    // where it ends: the same handing back of the screen the
+                    // release would have done had it been able to answer.
+                    if done {
+                        scrolling = None;
+                        status.set_scrolled(None);
+                        keys.set_mode(Mode::Focus);
+                        status.set_mode(Mode::Focus);
+                        ask_for_the_screen(&mut writer, &mut owed).await?;
+                        restate = true;
+                        settle(&mut stdout, &output, &status, &mut pending, &mut restate)
+                            .await?;
                     }
                 }
                 // What the session is called now. The mark row is the only
@@ -917,8 +1636,75 @@ async fn pump(
                     stdout.flush().await?;
                     continue;
                 }
-                writer.resync().await?;
-                owed += 1;
+                // And a popup is a surface of ours too, so it is drawn again at
+                // the new geometry rather than left where it was: the screen
+                // asked for below is dropped while a box is up, so nothing else
+                // was going to touch it.
+                //
+                // Onto an erased screen, which is the half `Picker::cleared`
+                // cannot do: it blanks the rows the box gives up, in the
+                // columns the *new* box sits at, on the stated assumption that
+                // a resize repaints everything. A resize is also the one thing
+                // that moves the box sideways, so a narrower window left the
+                // old box's right edge standing in a column the new one never
+                // writes. Everything on this screen is at the old geometry
+                // anyway, and what is under the box is put back by the resync
+                // that closing it asks for.
+                if popup.is_some() {
+                    stdout.write_all(REGROWN.as_bytes()).await?;
+                    draw_popup(&mut stdout, &mut popup, &mut status, &mut restate).await?;
+                    stdout.write_all(status.repaint(size).as_bytes()).await?;
+                    stdout.flush().await?;
+                    continue;
+                }
+                ask_for_the_screen(&mut writer, &mut owed).await?;
+            }
+            // A drag is being held against the top or bottom of the window,
+            // which is a hand asking for the lines past it. The pointer is
+            // holding still, so the terminal has nothing more to say about it
+            // and the view has to move itself.
+            _ = expire(chase_at) => {
+                chase_at = None;
+                let Some(view) = scrolling.as_mut() else { continue };
+                match view.chase() {
+                    Chased::Moved => {
+                        let wanted = view.wanted();
+                        let painted = view.paint();
+                        let offset = view.offset();
+                        if let Some(request) = wanted {
+                            writer.view(&request).await?;
+                        }
+                        status.set_scrolled(Some(offset));
+                        stdout.write_all(painted.as_bytes()).await?;
+                        stdout.write_all(status.repaint(terminal_size()).as_bytes()).await?;
+                        stdout.flush().await?;
+                        chase_at = Some(tokio::time::Instant::now() + CHASE_EVERY);
+                    }
+                    // The oldest line there is, or the live screen. Nothing to
+                    // say: the view is against the end of what exists and it
+                    // is showing that.
+                    Chased::Stopped => {}
+                    Chased::Full => {
+                        // The move that hit the limit still moved: it is walked
+                        // back to what a copy can carry, not undone, so the
+                        // window and the highlight are both a step from what
+                        // was last painted. Nothing else is going to paint
+                        // them, since the hand is holding still and there are
+                        // no more reports coming, and the notice would then be
+                        // describing a screen showing something else.
+                        let painted = view.paint();
+                        status.set_scrolled(Some(view.offset()));
+                        stdout.write_all(painted.as_bytes()).await?;
+                        status.set_notice(&format!(
+                            "{} lines is as much as one copy takes",
+                            scroll::COPY_LINES
+                        ));
+                        notice_until = Some(tokio::time::Instant::now() + NOTICE_FOR);
+                        restate = true;
+                        settle(&mut stdout, &output, &status, &mut pending, &mut restate)
+                            .await?;
+                    }
+                }
             }
             // A notice the client put on the row has been up long enough.
             _ = expire(notice_until) => {
@@ -1114,7 +1900,69 @@ async fn paste(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::client::picker::Row;
     use crate::settings::Screen;
+
+    /// A window with no room for a box leaves the mark row to say what the
+    /// popup would have: which list is open, and which row Enter would take.
+    #[test]
+    fn a_popup_with_no_room_to_draw_says_itself_in_one_line() {
+        let rows = Rows {
+            sessions: vec![Row::new(0, "build"), Row::new(1, "api")],
+            groups: Vec::new(),
+            at: 1,
+        };
+        assert_eq!(Popup::sessions(&rows).line(), "sessions: api");
+    }
+
+    /// An empty list still has to name itself. Saying nothing there would be a
+    /// blank row in a mode that is still holding the keyboard, which is the
+    /// thing this row exists to stop.
+    #[test]
+    fn a_list_with_nothing_in_it_still_names_itself() {
+        assert_eq!(Popup::sessions(&Rows::default()).line(), "sessions: none");
+    }
+
+    /// The group list is about where you are looking, not about a session, so
+    /// nothing that acts on a session may read a row of it as one. Its ids
+    /// index the groups; handed back as a session, `n` there put whatever
+    /// happened to sit at that index in the session list into the new group,
+    /// on whatever machine it was on, and said nothing because the write
+    /// worked.
+    #[test]
+    fn the_group_list_has_no_session_under_its_highlight() {
+        let rows = Rows {
+            sessions: vec![Row::new(0, "build"), Row::new(1, "api")],
+            groups: vec![Row::new(0, "pi"), Row::new(1, "web")],
+            at: 1,
+        };
+        let sessions = Popup::sessions(&rows);
+        assert_eq!(sessions.subject(), Some(1), "the highlighted session");
+
+        let narrowing = Popup {
+            picker: Picker::new("groups", NARROW_HINTS, rows.groups.clone(), 0),
+            what: Showing::Narrowing,
+        };
+        assert_eq!(narrowing.subject(), None);
+
+        // Moving is the one that carries a session across from the other list,
+        // which is why it holds the row rather than reading it off the picker.
+        let moving = Popup {
+            picker: Picker::new("move", MOVE_HINTS, rows.groups, 0),
+            what: Showing::Moving { row: 1 },
+        };
+        assert_eq!(moving.subject(), Some(1));
+
+        // And each list says which mode it is read in, because refusing a key
+        // has to put the keyboard back where it came from: `KeyFilter::after`
+        // has already moved it to `Mode::Rename` for a prompt that is not going
+        // to open, and a mode with no prompt behind it falls through to the
+        // session table, which over the group list is `m` reading a group row
+        // as a session.
+        assert_eq!(sessions.mode(), Mode::Control);
+        assert_eq!(narrowing.mode(), Mode::Picking);
+        assert_eq!(moving.mode(), Mode::Picking);
+    }
 
     /// A mode the node turns back on for a session, and the client forgets to
     /// turn off, is left on in the shell. Focus reporting was the one that got
@@ -1203,6 +2051,46 @@ mod tests {
                 "hopping leaves {sequence:?} unsent"
             );
         }
+    }
+
+    /// A screen the client asked for is painted over a terminal put back to
+    /// nothing, because the replay riding with it says what the program has on
+    /// and can say nothing about what it turned off. Without this, a program
+    /// that popped the keyboard protocol while the popup was up left the
+    /// terminal reporting key releases at the shell that followed it.
+    #[cfg(feature = "desktop")]
+    #[test]
+    fn a_screen_the_client_asked_for_is_painted_over_the_modes_switched_off() {
+        let off = given_back();
+        for mode in crate::node::events::REPLAYED_MODES {
+            assert!(
+                off.contains(&format!("\x1b[?{mode}l")),
+                "a dump would replay private mode {mode} onto one already on"
+            );
+        }
+        for sequence in ["\x1b[<16u", "\x1b[=0;1u", "\x1b[>4;0m", "\x1b[0 q"] {
+            assert!(off.contains(sequence), "{sequence:?} is never sent");
+        }
+        // The pair the whole thing rests on: a hop undoes the same set, so
+        // neither can grow a member the other has not heard of.
+        assert!(undone().contains(&off));
+    }
+
+    /// And the reason that set cannot be written on its own: the client's hold
+    /// on the mouse is spelt in the same modes a session asks for, so a screen
+    /// painted while it held the wheel handed the wheel back without saying so.
+    /// Everything after the first popup then scrolled the terminal instead.
+    #[cfg(feature = "desktop")]
+    #[test]
+    fn switching_the_modes_off_switches_the_clients_own_mouse_off_too() {
+        let off = given_back();
+        assert!(
+            WHEEL_OURS
+                .split("\x1b[")
+                .filter(|mode| !mode.is_empty())
+                .all(|mode| off.contains(&format!("\x1b[{}l", mode.trim_end_matches('h')))),
+            "the wheel would survive `given_back` and need no re-asserting"
+        );
     }
 
     /// A hop is a detach for the session being left, but not for the terminal:

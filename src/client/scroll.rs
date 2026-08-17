@@ -5,23 +5,30 @@
 //! its own buffer and its own wheel scrolls them, which is better than anything
 //! here; this is what the other mode has instead.
 //!
-//! Deliberately not tmux's copy mode. There is no selection and no yank: the
-//! terminal's own selection works on whatever the view is showing, which is
-//! what copying a line you scrolled to actually needs. What is left is moving a
-//! window over the node's ten thousand lines, which is arithmetic and string
-//! building, and is all here so it can be tested without a terminal.
+//! Moving a window over the node's ten thousand lines, which is arithmetic and
+//! string building, and is all here so it can be tested without a terminal.
 //!
-//! The one thing that gets in the way of that selection is the wheel, since a
-//! terminal reporting the mouse to us is a terminal not selecting with it. So
-//! the reports are asked for only while this view is up (`attach::wheel_is_ours`),
-//! which is where the wheel is the gesture and elsewhere the drag is; and inside
-//! the view a drag needs the modifier terminals give for exactly this, shift
-//! almost everywhere and option in iTerm2.
+//! It selects and copies as well, which it was written not to do. The reasoning
+//! against was that the terminal's own selection works on whatever the view is
+//! showing, so a copy mode would be a second answer to a question already
+//! answered. That holds only while the terminal still has the mouse, and with
+//! `mouse = client` it does not: reporting the wheel to us is the same request
+//! that stops a bare drag selecting. So taking the mouse and doing nothing with
+//! the drag left the gesture reaching nobody, which is the state the wheel was
+//! in before it was read here. Selection is the client's wherever the mouse is,
+//! and the terminal's wherever it is not.
+//!
+//! It stays a long way from tmux's copy mode all the same. There is no keyboard
+//! selection, no marks and no registers: what is here is what a hand with a
+//! mouse does, because a hand with a keyboard has the search, and the one thing
+//! it produces goes to the system clipboard rather than to somewhere only
+//! manymux can paste from.
 //!
 //! The window moves locally inside a block that has already arrived, and a
 //! block is a few screenfuls. A request per wheel notch would be a round trip
 //! over ssh per wheel notch, on machines that are usually two hops away.
 
+use crate::client::attach::Spot;
 use crate::client::status::session_size;
 use crate::proto::{Found, Size, View as Window, ViewRequest};
 
@@ -33,13 +40,41 @@ const BLOCK: u64 = 3;
 /// and three lines is what everything else moves for one.
 pub const WHEEL: u64 = 3;
 
+/// Lines one copy can be made of, which is as many as one block can hold.
+///
+/// A selection used to be at most a screenful, because the only way to reach
+/// a line was to be looking at it; a drag that scrolls the view under itself
+/// has no such bound, and the text of one is built out of a single block
+/// ([`Scrollback::holds`]). A block arrives in one frame, so something has to
+/// say how big it may get, and it is easier to answer here than to find out
+/// from the far end that it was too much. Two thousand lines is a minute and a
+/// half of holding the pointer at the edge, and around a quarter of a megabyte
+/// of text.
+pub const COPY_LINES: u64 = 2000;
+
 /// A window over the session's history, and the block of it we hold.
 pub struct Scrollback {
     /// Lines back from the newest line that the bottom of the window sits at.
     /// Zero is the live screen's last line, which is where the view opens.
     offset: u64,
     /// Lines in the whole buffer, screen included, as the host last said.
+    ///
+    /// Meaningless until [`Self::answered`], and zero until then, which is why
+    /// that flag exists rather than a `None` here: every use of this is
+    /// arithmetic, and an `Option` in the middle of it would be unwrapped to
+    /// zero at each one and mean nothing.
     total: u64,
+    /// Whether the host has answered once, and so whether `total` is worth
+    /// clamping against.
+    ///
+    /// The view opens before anything has been asked for, so the first move
+    /// back is made against a total of zero. Clamped against that it is thrown
+    /// away, which nobody noticed while the view was opened by a key that only
+    /// opened it: the first thing that moved was the second thing you pressed.
+    /// The wheel opens it and moves it in one gesture, so the lost move is the
+    /// first notch, and a wheel whose first notch does nothing reads as a wheel
+    /// that does not work.
+    answered: bool,
     /// What we have: where its bottom sits, and its lines, oldest first.
     block: Option<Block>,
     /// The last thing asked for, so a window the host cannot fill any better
@@ -48,9 +83,136 @@ pub struct Scrollback {
     asked: Option<ViewRequest>,
     /// Rows the session's part of the screen has, which is what a page is.
     rows: u16,
+    /// Columns it has, which is where a highlight has to stop.
+    ///
+    /// A row is as wide as the screen and no wider: a highlight padded past
+    /// that wraps onto the row below and takes the picture with it, since what
+    /// wrapped is written before the rows under it and there is nothing to say
+    /// it happened.
+    cols: u16,
     /// The last search: what was looked for, where it was found, and which of
     /// those the view is sitting on.
     search: Option<Search>,
+    /// What is selected, while anything is.
+    selection: Option<Selection>,
+    /// Where a drag is being held, while it is being held against an edge of
+    /// the window, which is a drag asking for the view to move under it.
+    ///
+    /// The spot rather than a direction, because the view moving is what makes
+    /// the row under the pointer a different line: the same spot read again
+    /// against the new offset is where the drag has got to.
+    chasing: Option<Spot>,
+    /// Moves the chase in hand has made, which is what it speeds up with.
+    chased: u64,
+    /// A copy asked for before the lines to make it out of had arrived.
+    ///
+    /// A hand moving quickly presses, drags and lets go inside one read, which
+    /// is one pass through the client and no time at all for the block the
+    /// press asked for to come back. The cells are the screen's and are known
+    /// throughout; what was written on them is on the machine at the other end.
+    /// So the copy waits for the answer already on its way, rather than being
+    /// answered out of an empty block, which put one blank line per line
+    /// dragged over on the clipboard and said `copied 3 lines` while doing it.
+    owed: bool,
+    /// What each row was last painted with, so a frame writes only the rows
+    /// that changed.
+    ///
+    /// A drag reports a cell at a time and every report moves the highlight by
+    /// a row or less, so repainting the window per report wrote a screenful to
+    /// say a hundred bytes: a short drag came to fifty kilobytes, and on a
+    /// window twice the size it is four times that. Nothing else paints over
+    /// the view while it is up, which is what makes remembering safe: session
+    /// output is held while a surface of the client's owns the screen, and the
+    /// mark row is not one of these rows.
+    ///
+    /// A row nothing is known about is `None` rather than an empty string, and
+    /// the two are not the same thing: the first frame of a view opened over a
+    /// short buffer has blank rows at the top, and those have to be written to
+    /// erase the session showing through underneath them.
+    painted: Vec<Option<String>>,
+}
+
+/// A selection, in the buffer's own coordinates rather than the screen's, so
+/// that scrolling under it moves what is highlighted rather than what is
+/// selected. A drag that runs off the top of the window is still a drag.
+#[derive(Debug, Clone, Copy)]
+struct Selection {
+    /// Where the button went down, which stays put.
+    anchor: Cell,
+    /// Where it is now, which is what the drag moves.
+    head: Cell,
+    /// Whether somebody asked for this outright, by clicking twice or three
+    /// times, rather than dragging it out. It decides what a release does with
+    /// a selection one cell wide: dragged, that is a click that never moved.
+    whole: bool,
+}
+
+/// One cell of the buffer: a line counted back from the newest the way
+/// [`Scrollback::offset`] is, and a column counted from zero.
+///
+/// Lines count backwards and columns forwards, so the pair does not order
+/// itself the way reading does. [`Selection::ends`] is the one place that is
+/// worked out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Cell {
+    line: u64,
+    col: u16,
+}
+
+/// What a tick of a drag held against an edge did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Chased {
+    /// The view moved a line, and the selection grew by one.
+    Moved,
+    /// There is nothing further that way, so the chase is over until the hand
+    /// moves again.
+    Stopped,
+    /// The selection is as long as one copy can carry ([`COPY_LINES`]), so it
+    /// stopped growing. Worth saying out loud: a view that stopped moving
+    /// under a hand still asking it to reads as one that stopped working.
+    Full,
+}
+
+/// Chase moves between one rung of the ramp and the next, and the rung it
+/// stops climbing at. With [`terminal::CHASE_EVERY`] behind them these are the
+/// speed: a line a move to start with, a dozen of them from two seconds in.
+///
+/// The rungs are what get taller rather than the clock getting faster, since a
+/// move costs a repaint of the window whatever it covers: at the top of the
+/// ramp that is a screenful every two frames instead of forty frames a second
+/// to say the same thing.
+///
+/// [`terminal::CHASE_EVERY`]: crate::client::attach::terminal
+const FASTER_EVERY: u64 = 4;
+const FASTEST: u64 = 12;
+
+/// Lines one move of a chase covers, by how many it has already made.
+///
+/// A hand held at the edge is asking for two different things at two different
+/// moments: the line just above the window, which wants one line at a time and
+/// the chance to let go on it, and everything back to where a build started,
+/// which at one line a move is a wait with nothing to do in it. Everything else
+/// with an edge to drag past reads the two apart from how far past the edge the
+/// pointer went, which is the one thing a terminal will not say: it clamps what
+/// it reports to the window it has. So the ramp is on how long the hand has
+/// been holding, which is the other thing it is telling us.
+fn step(chased: u64) -> u64 {
+    (1 + chased / FASTER_EVERY).min(FASTEST)
+}
+
+impl Selection {
+    /// The two ends in reading order: where the selected text starts, and where
+    /// it ends. A drag upwards selects the same cells as the same drag
+    /// downwards, which is what every selection anywhere does.
+    fn ends(&self) -> (Cell, Cell) {
+        let (a, b) = (self.anchor, self.head);
+        // A greater line offset is further back, so it reads first.
+        if a.line > b.line || (a.line == b.line && a.col <= b.col) {
+            (a, b)
+        } else {
+            (b, a)
+        }
+    }
 }
 
 struct Search {
@@ -98,10 +260,17 @@ impl Scrollback {
         Self {
             offset: 0,
             total: 0,
+            answered: false,
             block: None,
             asked: None,
             rows: session_size(size).rows,
+            cols: session_size(size).cols,
             search: None,
+            selection: None,
+            chasing: None,
+            chased: 0,
+            owed: false,
+            painted: Vec::new(),
         }
     }
 
@@ -178,6 +347,10 @@ impl Scrollback {
 
     pub fn resize(&mut self, size: Size) {
         self.rows = session_size(size).rows;
+        self.cols = session_size(size).cols;
+        // Every row is somewhere else now, so what was painted where says
+        // nothing about what is there.
+        self.painted.clear();
     }
 
     /// How far back the view is, for the row at the bottom of the screen.
@@ -214,8 +387,23 @@ impl Scrollback {
     /// the window's top edge cannot go past the oldest line, or a screenful of
     /// blank would sit above lines that do exist.
     pub fn up(&mut self, lines: u64) {
+        // Nothing to clamp against yet, so the move stands and the request
+        // built from it asks for the block around where it landed. `take` does
+        // the clamping when the answer says how much history there is, which
+        // is the same clamp a move made later gets and one round trip earlier
+        // than owing it to a second one.
+        if !self.answered {
+            // Saturating, because `top` parks the view at the far end before
+            // there is a far end to park it at: `g` and then anything that
+            // moves back, inside the round trip to the node, is an add to
+            // `u64::MAX`. Which is the panic in a debug build and, worse, the
+            // wrap in a release one, where the oldest line there is becomes two
+            // lines above the live screen.
+            self.offset = self.offset.saturating_add(lines);
+            return;
+        }
         let furthest = self.total.saturating_sub(self.page());
-        self.offset = (self.offset + lines).min(furthest);
+        self.offset = self.offset.saturating_add(lines).min(furthest);
     }
 
     pub fn down(&mut self, lines: u64) {
@@ -231,7 +419,14 @@ impl Scrollback {
     }
 
     /// The oldest line the host still has.
+    ///
+    /// As far back as there is, which before the first answer is as far back as
+    /// there could be: `take` brings it to whatever turned out to exist.
     pub fn top(&mut self) {
+        if !self.answered {
+            self.offset = u64::MAX;
+            return;
+        }
         self.offset = self.total.saturating_sub(self.page());
     }
 
@@ -253,9 +448,25 @@ impl Scrollback {
         // Half a block below the window, so scrolling back down is local too,
         // and the rest above it, which is the way it is about to go.
         let below = (span - self.page()) / 2;
+        let mut from = self.offset.saturating_sub(below);
+        // Saturating because the view can be as far back as it likes before
+        // the first answer says how far back there is (see `up`).
+        let mut top = from.saturating_add(span);
+        // A selection can be longer than the window, since a drag held at an
+        // edge scrolls the view under itself. Its text is built out of one
+        // block (`holds`), so the block is stretched over it rather than the
+        // copy being answered out of lines that are not here. Only when the
+        // window has left the block anyway: the ends of a selection cannot
+        // leave a block the window is still inside, since the end that moves
+        // is the one under the pointer.
+        if let Some(selection) = self.selection {
+            let (first, last) = selection.ends();
+            from = from.min(last.line);
+            top = top.max(first.line.saturating_add(1));
+        }
         let request = ViewRequest {
-            from: self.offset.saturating_sub(below),
-            lines: u32::try_from(span).unwrap_or(u32::MAX),
+            from,
+            lines: u32::try_from((top - from).min(COPY_LINES + span)).unwrap_or(u32::MAX),
         };
         // The same request twice means the answer to the first one was all
         // there is, and asking again would only get it again, forever.
@@ -269,6 +480,7 @@ impl Scrollback {
     /// Take a block the host sent, and learn from it where the ends are.
     pub fn take(&mut self, window: Window) {
         self.total = window.total;
+        self.answered = true;
         // A buffer that trimmed under the request, or one shorter than a
         // screen: keep the window inside what exists.
         let furthest = self.total.saturating_sub(self.page());
@@ -279,32 +491,564 @@ impl Scrollback {
         });
     }
 
-    /// The screen as it should now look: every row of the session's part of it,
-    /// erased first, with the cursor left where nothing will type over it.
+    /// Where a cell of the screen sits in the buffer.
     ///
-    /// Blank while the first block is still on its way, because painting the
-    /// live screen underneath a half-drawn view reads as a bug rather than a
-    /// wait.
-    pub fn paint(&self) -> String {
+    /// The bottom row of the window is wherever the view is, and the rows above
+    /// it are the lines behind it, so this is the one place the screen's
+    /// coordinates and the buffer's meet. Both are the terminal's: a row and a
+    /// column counting from one.
+    /// Saturating, like everything else that reads the offset: `top` parks it
+    /// at `u64::MAX` until the host says where the far end is, so `g` and then
+    /// a click, inside one round trip, is an add to that. What the click lands
+    /// on is nothing anybody pointed at either way, since the screen in that
+    /// window is still the one painted before the jump; a line no block will
+    /// ever hold is the honest answer, and `holds` turns it into a copy of
+    /// nothing rather than a copy of the wrong thing.
+    fn cell(&self, spot: Spot) -> Cell {
         let rows = self.page();
-        let mut out = String::from("\x1b[0m\x1b[H\x1b[2J");
-        if !self.covered() {
-            return out;
+        let row = u64::from(spot.row).clamp(1, rows);
+        Cell {
+            line: self.offset.saturating_add(rows - row),
+            col: spot.col.saturating_sub(1).min(self.cols.saturating_sub(1)),
         }
-        let Some(block) = &self.block else {
-            return out;
+    }
+
+    /// Start a selection where the button went down, dropping whatever was
+    /// selected before.
+    pub fn select_from(&mut self, spot: Spot) {
+        let at = self.cell(spot);
+        self.stop_chasing();
+        self.selection = Some(Selection {
+            anchor: at,
+            head: at,
+            whole: false,
+        });
+    }
+
+    /// Drag it to here. Nothing at all if no button ever went down, which is a
+    /// report arriving out of order rather than a gesture.
+    pub fn select_to(&mut self, spot: Spot) {
+        let at = self.cell(spot);
+        if self.at_an_edge(spot) {
+            self.chasing = Some(spot);
+        } else {
+            self.stop_chasing();
+        }
+        if let Some(selection) = &mut self.selection {
+            selection.head = at;
+        }
+    }
+
+    /// Whether a drag has reached the top or bottom of the window, which is a
+    /// hand asking for the lines past it.
+    ///
+    /// The rows either end rather than only what is beyond them: a terminal
+    /// clamps the coordinates it reports to the window it has, so a pointer
+    /// dragged off the bottom of the screen reports the last row it can and
+    /// then says nothing more at all. An edge that only counted what is past
+    /// it would be an edge nothing ever reached.
+    fn at_an_edge(&self, spot: Spot) -> bool {
+        spot.row <= 1 || u64::from(spot.row) >= self.page()
+    }
+
+    /// Whether a drag is being held against an edge, and so whether the view
+    /// owes it a move.
+    pub fn chasing(&self) -> bool {
+        self.chasing.is_some()
+    }
+
+    /// Let go of the button. What is selected is untouched; what ends is the
+    /// hand's claim on the view.
+    pub fn let_go(&mut self) {
+        self.stop_chasing();
+    }
+
+    /// The hand is no longer asking for the view, whichever way it stopped.
+    /// The count goes with it, so the next chase starts slow again.
+    fn stop_chasing(&mut self) {
+        self.chasing = None;
+        self.chased = 0;
+    }
+
+    /// Move the view the way a drag held at an edge is pointing, and take the
+    /// lines that uncovers into the selection.
+    ///
+    /// On a clock rather than on the reports, because a hand holding still at
+    /// the edge of the window is a hand the terminal has nothing to say about:
+    /// the drag would stop at the last row somebody could see, which is the one
+    /// row they can already reach.
+    pub fn chase(&mut self) -> Chased {
+        let Some(spot) = self.chasing else {
+            return Chased::Stopped;
         };
+        self.chased += 1;
+        let step = step(self.chased);
+        let was = self.offset;
+        if spot.row <= 1 {
+            self.up(step);
+        } else {
+            self.down(step);
+        }
+        if self.offset == was {
+            // The oldest line there is, or the live screen: nothing that way.
+            self.stop_chasing();
+            return Chased::Stopped;
+        }
+        self.select_to(spot);
+        let over = self.spans().saturating_sub(COPY_LINES);
+        if over > 0 {
+            // Give back the lines that would have made it too long to copy. A
+            // selection that grew past what one block holds is one that copies
+            // nothing, and stopping where it can still be taken is the only
+            // answer that keeps the gesture worth making.
+            if spot.row <= 1 {
+                self.down(over);
+            } else {
+                self.up(over);
+            }
+            self.select_to(spot);
+            self.stop_chasing();
+            return Chased::Full;
+        }
+        Chased::Moved
+    }
+
+    /// Lines the selection covers, both ends included.
+    fn spans(&self) -> u64 {
+        self.selection.map_or(0, |selection| {
+            let (first, last) = selection.ends();
+            // Saturating for the same reason `cell` is: an end anchored while
+            // the view was parked at the far end it had not yet been told
+            // about is a line number nothing can be added to.
+            (first.line - last.line).saturating_add(1)
+        })
+    }
+
+    /// Take the word under a second click, in the sense a terminal means:
+    /// letters and digits, and the punctuation that holds a path or a URL
+    /// together, so that double-clicking `src/client/scroll.rs` takes all of
+    /// it rather than three letters of it.
+    pub fn select_word(&mut self, spot: Spot) {
+        let at = self.cell(spot);
+        self.chasing = None;
+        let Some(line) = self.line(at.line) else {
+            return self.select_from(spot);
+        };
+        let text: Vec<char> = plain(line, 0, u16::MAX).chars().collect();
+        let col = usize::from(at.col);
+        if text.get(col).is_none_or(|c| !in_a_word(*c)) {
+            return self.select_from(spot);
+        }
+        let start = text[..col]
+            .iter()
+            .rposition(|c| !in_a_word(*c))
+            .map_or(0, |before| before + 1);
+        let end = text[col..]
+            .iter()
+            .position(|c| !in_a_word(*c))
+            .map_or(text.len(), |after| col + after)
+            - 1;
+        self.selection = Some(Selection {
+            anchor: Cell {
+                line: at.line,
+                col: column(start),
+            },
+            head: Cell {
+                line: at.line,
+                col: column(end),
+            },
+            whole: true,
+        });
+    }
+
+    /// And the whole line under a third, to the end of what is on it: the
+    /// blanks past that are the screen rather than the text.
+    pub fn select_line(&mut self, spot: Spot) {
+        let at = self.cell(spot);
+        self.chasing = None;
+        let end = self.line(at.line).map_or(0, |line| {
+            plain(line, 0, u16::MAX).trim_end().chars().count()
+        });
+        self.selection = Some(Selection {
+            anchor: Cell {
+                line: at.line,
+                col: 0,
+            },
+            head: Cell {
+                line: at.line,
+                col: column(end.saturating_sub(1)),
+            },
+            whole: true,
+        });
+    }
+
+    /// What letting go of the button has to copy, if it has anything.
+    ///
+    /// A click that never became a drag selects the one cell under it, and
+    /// copying a character every time somebody clicks in the window is worse
+    /// than doing nothing: it throws away whatever was on the clipboard, which
+    /// is often the thing they were about to paste. So a one-cell selection is
+    /// read as a click and dropped, unless it is a word or a line that came out
+    /// one cell wide, which is a gesture somebody made twice.
+    /// Whether anything is selected, which is what the highlight on the screen
+    /// is showing.
+    pub fn selecting(&self) -> bool {
+        self.selection.is_some()
+    }
+
+    pub fn copied(&mut self) -> Option<String> {
+        let selection = self.selection?;
+        if !selection.whole && selection.anchor == selection.head {
+            self.selection = None;
+            return None;
+        }
+        if !self.holds(&selection) {
+            self.owed = true;
+            return None;
+        }
+        self.selected()
+    }
+
+    /// The copy that was waiting for its lines, now that a block has arrived.
+    ///
+    /// Answered once and then forgotten, whatever the block turned out to hold.
+    /// The block on its way is the one the press asked for, so a block that
+    /// does not cover the selection is a selection nothing later will cover
+    /// either, and a request left standing would put a copy nobody asked for on
+    /// the clipboard the next time the view moved.
+    pub fn owed_copy(&mut self) -> Option<String> {
+        if !std::mem::take(&mut self.owed) {
+            return None;
+        }
+        let selection = self.selection?;
+        if !self.holds(&selection) {
+            return None;
+        }
+        self.selected()
+    }
+
+    /// Whether the block in hand has the lines a selection was made on, which
+    /// is what saying anything at all about its text needs.
+    fn holds(&self, selection: &Selection) -> bool {
+        let Some(block) = &self.block else {
+            return false;
+        };
+        let (first, last) = selection.ends();
+        // `first` is the further back of the two, so between them they are the
+        // ends of the range, and everything in it is a line of the same block.
+        first.line < block.top() && last.line >= block.from
+    }
+
+    /// The selected text, with the pen sequences taken out and the trailing
+    /// blanks of each line with them: a line of a terminal is as wide as the
+    /// screen and what was typed on it is not.
+    pub fn selected(&self) -> Option<String> {
+        let (first, last) = self.selection?.ends();
+        let mut out = String::new();
+        let mut line = first.line;
+        loop {
+            let text = self.line(line).unwrap_or("");
+            let from = if line == first.line { first.col } else { 0 };
+            let to = if line == last.line {
+                last.col.saturating_add(1)
+            } else {
+                u16::MAX
+            };
+            out.push_str(plain(text, from, to).trim_end());
+            if line == last.line || line == 0 {
+                break;
+            }
+            out.push('\n');
+            line -= 1;
+        }
+        (!out.is_empty()).then_some(out)
+    }
+
+    /// One line of the block, by how far back from the newest it is, and
+    /// nothing at all for a line the block does not reach.
+    ///
+    /// The window arithmetic saturates at both ends, so an offset outside the
+    /// block comes back with the nearest line rather than with nothing. That is
+    /// what a window wants, where the clamp is the view arriving at the top of
+    /// the buffer, and the opposite of what a selection wants, where it is a
+    /// line nobody pointed at being copied.
+    fn line(&self, offset: u64) -> Option<&str> {
+        let block = self.block.as_ref()?;
+        if offset < block.from || offset >= block.top() {
+            return None;
+        }
+        block.window(offset, 1).first().map(String::as_str)
+    }
+
+    /// Which columns of the line at `offset` are selected, if any of them are.
+    ///
+    /// A line that the selection runs off the end of is selected to the edge of
+    /// the screen and not one cell further: this is what is about to be drawn,
+    /// and a row drawn wider than the screen wraps onto the row beneath it.
+    fn selected_on(&self, offset: u64) -> Option<(u16, u16)> {
+        let (first, last) = self.selection?.ends();
+        if offset > first.line || offset < last.line {
+            return None;
+        }
+        let from = if offset == first.line { first.col } else { 0 };
+        let to = if offset == last.line {
+            last.col.saturating_add(1)
+        } else {
+            self.cols
+        };
+        (from < to).then_some((from, to.min(self.cols)))
+    }
+
+    /// The screen as it should now look: the rows of the session's part of it
+    /// that are not already showing what they should, each clearing what was on
+    /// it as it is written.
+    ///
+    /// Row by row rather than an erase and a repaint. The erase left the screen
+    /// blank for as long as it took the lines after it to be drawn, which at
+    /// one notch is nothing and at a wheel being spun is a flicker on every
+    /// frame. Writing each row over the one before it never shows an empty
+    /// screen, and clearing to the end of each line is what keeps a long line
+    /// from showing through under a shorter one that replaced it.
+    ///
+    /// And only the rows that changed, which is what makes a drag smooth: a
+    /// pointer moving reports every cell it crosses, and each report moves the
+    /// highlight by a row or less. Writing the window per report is a screenful
+    /// of bytes to say a hundred, and enough of them arrive per second that the
+    /// terminal is doing the painting rather than the hand doing the dragging.
+    ///
+    /// Nothing at all while the first block is on its way, rather than a blank
+    /// screen: what is up is the session, one frame more of it is no lie, and
+    /// blanking the screen to wait is the flicker again with nothing to show
+    /// for it.
+    pub fn paint(&mut self) -> String {
+        let Some(wanted) = self.rows_now() else {
+            return String::new();
+        };
+        if self.painted.len() != wanted.len() {
+            self.painted = vec![None; wanted.len()];
+        }
+        let mut out = String::new();
+        for (i, line) in wanted.into_iter().enumerate() {
+            if self.painted[i].as_deref() == Some(line.as_str()) {
+                continue;
+            }
+            // The pen goes back to default per row: the line about to be
+            // written sets its own colours, and the clear that precedes it
+            // would otherwise clear to whatever the line above left set.
+            out.push_str(&format!("\x1b[{};1H\x1b[0m\x1b[K", i + 1));
+            out.push_str(&line);
+            self.painted[i] = Some(line);
+        }
+        out
+    }
+
+    /// What every row of the window should have on it, top row first, with the
+    /// highlight already drawn in. Nothing while there is no block to draw it
+    /// from.
+    fn rows_now(&self) -> Option<Vec<String>> {
+        let block = self.block.as_ref()?;
+        if !self.covered() {
+            return None;
+        }
+        let rows = self.page();
         let lines = block.window(self.offset, rows);
         // A window at the very top of a short buffer has fewer lines than the
         // screen has rows, and they go at the bottom of it: the oldest line
         // sits where it would have been had you scrolled to it.
         let blank = rows.saturating_sub(lines.len() as u64);
-        for (row, line) in lines.iter().enumerate() {
-            let row = blank + row as u64 + 1;
-            out.push_str(&format!("\x1b[{row};1H\x1b[0m{line}"));
-        }
-        out
+        Some(
+            (1..=rows)
+                .map(|row| {
+                    if row <= blank {
+                        return String::new();
+                    }
+                    let line = &lines[(row - blank - 1) as usize];
+                    match self.selected_on(self.offset + (rows - row)) {
+                        Some((from, to)) => highlighted(line, from, to),
+                        None => line.clone(),
+                    }
+                })
+                .collect(),
+        )
     }
+}
+
+/// Whether a character is part of what a double click takes.
+///
+/// Wider than a word, because what people double click in a terminal is a path,
+/// a flag or a URL as often as it is a word, and taking three letters out of
+/// the middle of one is a gesture that has to be repaired by hand.
+fn in_a_word(c: char) -> bool {
+    c.is_alphanumeric() || "_-./+@:~=".contains(c)
+}
+
+fn column(at: usize) -> u16 {
+    u16::try_from(at).unwrap_or(u16::MAX)
+}
+
+/// Walk a rendered line and hand back the text of the cells from `from` up to
+/// but not including `to`.
+///
+/// A line arrives with the pen sequences that coloured it (`node::history`
+/// writes them in), so the columns a hand pointed at are not byte offsets and
+/// not character offsets either. The sequences go by without counting, which is
+/// the whole of the difference.
+///
+/// Columns are counted in characters, as everything else in this client counts
+/// them (`status::columns`): a double-width character throws the count off by
+/// one, which costs a selection a cell at the end of a line of CJK and nothing
+/// anywhere else.
+fn plain(line: &str, from: u16, to: u16) -> String {
+    let mut out = String::new();
+    walk(line, |piece| {
+        if let Piece::Char(c, col) = piece
+            && col >= from
+            && col < to
+        {
+            out.push(c);
+        }
+    });
+    out
+}
+
+/// What a selected cell is painted with: one colour for every selected cell,
+/// whatever the program had drawn there.
+///
+/// A colour of its own rather than reverse video, which is what this was and
+/// which cannot say what it means. Reverse is not a colour, it is *swap the two
+/// this cell already has*, so a selection over coloured text takes the text's
+/// colour as its background and comes out a patchwork: teal behind a path,
+/// white behind the words either side of it, one selection in three colours.
+/// And over a run the program itself drew reversed, which is how `pi` draws the
+/// message you typed, swapping again lands back where it started and the
+/// selection is invisible.
+///
+/// It starts with a reset for the same reason: bold, underline and the
+/// program's own reverse are all attributes of the cell underneath, and a
+/// selection that kept them would be showing the thing it is drawn over. Which
+/// is why the pair is spelt out rather than left to the terminal's own
+/// selection colour, that being something no escape sequence can ask for: a
+/// near-white on a near-black is the one thing that reads the same on a light
+/// terminal and a dark one.
+const SELECTED: &str = "\x1b[0;48;5;253;38;5;235m";
+
+/// The same walk, with the selected cells painted in [`SELECTED`] and the
+/// line's own pen put back after them.
+///
+/// The pen is *accumulated* rather than reissued as it arrives: what a cell
+/// looks like is every SGR sequence before it on the line, so the way back to
+/// the line's own colours after a highlight is a reset and then all of them
+/// again. Inside the highlight they are held rather than written, or the
+/// colours of the text would show through the thing covering it.
+///
+/// `to` is a column of the screen and never a stand-in for the end of the line:
+/// what this writes goes onto a row that is only so wide, and cells written
+/// past that wrap onto the row below. [`Scrollback::selected_on`] is where that
+/// is made true.
+fn highlighted(line: &str, from: u16, to: u16) -> String {
+    let mut out = String::new();
+    // The line's own pen as it stands at this point in the walk.
+    let mut pen = String::new();
+    let mut inside = false;
+    let end = walk(line, |piece| match piece {
+        Piece::Pen(seq) => {
+            pen.push_str(seq);
+            if !inside {
+                out.push_str(seq);
+            }
+        }
+        Piece::Char(c, col) => {
+            let wanted = col >= from && col < to;
+            if wanted && !inside {
+                out.push_str(SELECTED);
+            } else if !wanted && inside {
+                out.push_str("\x1b[0m");
+                out.push_str(&pen);
+            }
+            inside = wanted;
+            out.push(c);
+        }
+    });
+    // A selection that runs past the end of the text takes the blanks with it,
+    // or a dragged-over empty line would show nothing at all and a multi-line
+    // selection would come apart at every short line in it.
+    if to > end {
+        // The cells between the end of the text and where the selection starts
+        // are neither text nor selected, and something has to be written over
+        // them or the highlight begins at the wrong column: on a line shorter
+        // than `from`, and on an empty one that is column zero.
+        let gap = from.saturating_sub(end);
+        out.push_str(&" ".repeat(usize::from(gap)));
+        if !inside {
+            out.push_str(SELECTED);
+        }
+        out.push_str(&" ".repeat(usize::from(to.saturating_sub(end.max(from)))));
+        inside = true;
+    }
+    if inside {
+        out.push_str("\x1b[0m");
+        out.push_str(&pen);
+    }
+    out
+}
+
+/// A rendered line comes in two kinds of piece.
+enum Piece<'a> {
+    /// A character that takes a cell, and the column it takes.
+    Char(char, u16),
+    /// A sequence that takes none: the pen the line was written with.
+    Pen(&'a str),
+}
+
+/// Hand a line to `each` a piece at a time, and answer with the column it ends
+/// at.
+///
+/// The reason this exists at all is that a line arrives coloured, so a column
+/// is neither a byte offset into it nor a character offset: the pen sequences
+/// sit between the cells and take none. One walk answers both callers because
+/// they differ only in what they do with the pieces.
+fn walk(line: &str, mut each: impl FnMut(Piece<'_>)) -> u16 {
+    let mut col = 0u16;
+    let mut chars = line.char_indices().peekable();
+    while let Some((at, c)) = chars.next() {
+        if c != '\x1b' {
+            each(Piece::Char(c, col));
+            col = col.saturating_add(1);
+            continue;
+        }
+        // A control sequence runs to a byte in `@` to `~` and an OSC to a bell
+        // or a backslash. Anything else an escape starts is two characters.
+        let mut end = at + c.len_utf8();
+        match chars.peek().map(|(_, c)| *c) {
+            Some('[') => {
+                chars.next();
+                end += 1;
+                for (at, c) in chars.by_ref() {
+                    end = at + c.len_utf8();
+                    if ('\x40'..='\x7e').contains(&c) {
+                        break;
+                    }
+                }
+            }
+            Some(']') => {
+                chars.next();
+                end += 1;
+                for (at, c) in chars.by_ref() {
+                    end = at + c.len_utf8();
+                    if c == '\x07' || c == '\\' {
+                        break;
+                    }
+                }
+            }
+            Some(next) => {
+                chars.next();
+                end += next.len_utf8();
+            }
+            None => {}
+        }
+        each(Piece::Pen(&line[at..end]));
+    }
+    col
 }
 
 #[cfg(test)]
@@ -343,6 +1087,72 @@ mod tests {
         let view = Scrollback::new(SIZE);
         assert_eq!(view.offset(), 0);
         assert!(view.at_bottom());
+    }
+
+    /// The bug the wheel found: the view opens on the first notch, so the move
+    /// that opened it is made before the host has said how much history there
+    /// is. Clamped against a total of zero it was thrown away, and the first
+    /// notch of the gesture did nothing at all.
+    #[test]
+    fn the_move_that_opened_the_view_is_not_lost_to_a_total_nobody_knows_yet() {
+        let mut view = Scrollback::new(SIZE);
+        view.up(WHEEL);
+        answer(&mut view, 100);
+        assert_eq!(view.offset(), 3, "the notch that opened the view moved it");
+    }
+
+    /// `g` before the first answer parks the view at a far end nobody has
+    /// named yet, and anything that moves back from there is an add to
+    /// `u64::MAX`: a panic in a debug build, and in a release one the oldest
+    /// line there is turning into two lines above the live screen. Both ends of
+    /// the gesture happen inside one round trip to the node, so it is a key
+    /// sequence rather than a race.
+    #[test]
+    fn moving_back_from_the_far_end_before_it_is_known_stays_at_the_end() {
+        let mut view = Scrollback::new(SIZE);
+        view.top();
+        view.up(WHEEL);
+        view.page_up();
+        answer(&mut view, 100);
+        assert_eq!(view.offset(), 100 - 24, "still the oldest line there is");
+    }
+
+    /// And the same parked offset reaches every other piece of arithmetic in
+    /// here through `cell`, which is where the mouse comes in: `g` and then a
+    /// click, or a drag, or a double click, inside that same round trip.
+    /// Saturating leaves a selection on lines no block will ever hold, which
+    /// `holds` reads as a copy of nothing rather than a copy of the wrong
+    /// place.
+    #[test]
+    fn pointing_at_the_screen_before_the_far_end_is_known_copies_nothing() {
+        let mut view = Scrollback::new(SIZE);
+        view.top();
+        view.select_from(at(24, 1));
+        view.select_to(at(1, 4));
+        view.select_word(at(12, 2));
+        view.select_line(at(12, 2));
+        // The request built from it is the other half: a selection anchored out
+        // there must not overflow the block arithmetic either.
+        let _ = view.wanted();
+        assert_eq!(view.copied(), None, "nothing here to copy");
+    }
+
+    /// And it is still a move, so what exists still bounds it: a hand that
+    /// spun the wheel into a session with barely any history lands on the
+    /// oldest line rather than past it.
+    #[test]
+    fn an_opening_move_past_the_end_is_brought_back_when_the_answer_lands() {
+        let mut view = Scrollback::new(SIZE);
+        view.up(10_000);
+        answer(&mut view, 100);
+        assert_eq!(view.offset(), 100 - 24);
+
+        // `g` before the first answer means the same thing, and cannot say so
+        // in lines because it does not yet know how many there are.
+        let mut view = Scrollback::new(SIZE);
+        view.top();
+        answer(&mut view, 100);
+        assert_eq!(view.offset(), 100 - 24);
     }
 
     #[test]
@@ -451,11 +1261,19 @@ mod tests {
         let mut view = view(100);
         view.up(1);
         let painted = view.paint();
-        assert!(painted.starts_with("\x1b[0m\x1b[H\x1b[2J"), "{painted:?}");
+        // No screen-wide erase: each row clears itself as it is written, so
+        // there is never a frame with an empty screen in it.
+        assert!(!painted.contains("\x1b[2J"), "{painted:?}");
         // The window ends one line back from the newest, so its last line is
         // line 98 of 0..100, and it goes on the last row the session has.
-        assert!(painted.contains("\x1b[24;1H\x1b[0mline 98"), "{painted:?}");
-        assert!(painted.contains("\x1b[1;1H\x1b[0mline 75"), "{painted:?}");
+        assert!(
+            painted.contains("\x1b[24;1H\x1b[0m\x1b[Kline 98"),
+            "{painted:?}"
+        );
+        assert!(
+            painted.contains("\x1b[1;1H\x1b[0m\x1b[Kline 75"),
+            "{painted:?}"
+        );
         assert!(!painted.contains("line 99"), "{painted:?}");
     }
 
@@ -463,10 +1281,23 @@ mod tests {
     /// on the first rows, and what there is belongs at the bottom.
     #[test]
     fn a_short_buffer_paints_against_the_bottom_of_the_screen() {
-        let view = view(3);
+        let mut view = view(3);
         let painted = view.paint();
-        assert!(painted.contains("\x1b[22;1H\x1b[0mline 0"), "{painted:?}");
-        assert!(painted.contains("\x1b[24;1H\x1b[0mline 2"), "{painted:?}");
+        assert!(
+            painted.contains("\x1b[22;1H\x1b[0m\x1b[Kline 0"),
+            "{painted:?}"
+        );
+        assert!(
+            painted.contains("\x1b[24;1H\x1b[0m\x1b[Kline 2"),
+            "{painted:?}"
+        );
+        // And the rows above them are cleared rather than left holding
+        // whatever the last window put there, which is the job the erase this
+        // no longer does used to do.
+        assert!(
+            painted.contains("\x1b[1;1H\x1b[0m\x1b[K\x1b["),
+            "{painted:?}"
+        );
     }
 
     /// The window is only ever asked for inside the block, but it is asked for
@@ -541,11 +1372,460 @@ mod tests {
         assert!(!view.step(true));
     }
 
-    /// Until the first block lands there is nothing to draw, and drawing the
-    /// live screen instead would read as the key not having worked.
+    /// Until the first block lands there is nothing to draw, so nothing is
+    /// drawn: the session is on the screen and one frame more of it is no lie,
+    /// where blanking the screen to wait is a flicker with nothing to show for
+    /// it. The block is a round trip away and paints over it when it lands.
     #[test]
-    fn a_view_with_nothing_in_it_yet_paints_an_empty_screen() {
-        let view = Scrollback::new(SIZE);
-        assert_eq!(view.paint(), "\x1b[0m\x1b[H\x1b[2J");
+    fn a_view_with_nothing_in_it_yet_leaves_the_screen_alone() {
+        let mut view = Scrollback::new(SIZE);
+        assert_eq!(view.paint(), "");
+    }
+
+    /// The terminal counts from one, and the bottom row of the window is
+    /// wherever the view is sitting.
+    fn at(row: u16, col: u16) -> Spot {
+        Spot { row, col }
+    }
+
+    /// A drag along one line takes the cells between its ends, which is what
+    /// every selection anywhere does.
+    #[test]
+    fn a_drag_takes_the_cells_it_was_dragged_over() {
+        let mut view = view(100);
+        // The bottom row shows line 99 of 0..100, `line 99` being 7 cells.
+        view.select_from(at(24, 1));
+        view.select_to(at(24, 4));
+        assert_eq!(view.copied().as_deref(), Some("line"));
+    }
+
+    /// Backwards is the same selection. A hand that started at the end of what
+    /// it wanted did not want the other end of the line.
+    #[test]
+    fn a_drag_the_other_way_takes_the_same_cells() {
+        let mut view = view(100);
+        view.select_from(at(24, 4));
+        view.select_to(at(24, 1));
+        assert_eq!(view.copied().as_deref(), Some("line"));
+    }
+
+    /// Down the screen it takes whole lines between the ends, and the trailing
+    /// blanks of each go: a line of a terminal is as wide as the screen, and
+    /// what was typed on it is not.
+    #[test]
+    fn a_drag_down_the_screen_takes_whole_lines_between_its_ends() {
+        let mut view = view(100);
+        view.select_from(at(22, 6));
+        view.select_to(at(24, 6));
+        assert_eq!(view.copied().as_deref(), Some("97\nline 98\nline 9"));
+    }
+
+    /// A click is not a selection. Copying the one cell under it would replace
+    /// whatever was on the clipboard, which is often the thing about to be
+    /// pasted.
+    #[test]
+    fn a_click_that_never_moved_copies_nothing() {
+        let mut view = view(100);
+        view.select_from(at(24, 3));
+        assert_eq!(view.copied(), None);
+        assert!(!view.selecting(), "and the highlight goes with it");
+    }
+
+    /// A second click takes the word under it, and a word here is what a hand
+    /// in a terminal points at: a path, a flag or a URL, not three letters out
+    /// of the middle of one.
+    #[test]
+    fn a_second_click_takes_the_word_under_it() {
+        let mut view = Scrollback::new(SIZE);
+        view.take(Window {
+            from: 0,
+            total: 1,
+            lines: vec!["cd src/client/scroll.rs and go".to_string()],
+        });
+        view.select_word(at(24, 6));
+        assert_eq!(view.copied().as_deref(), Some("src/client/scroll.rs"));
+
+        // On a blank, there is no word to take and nothing is selected.
+        view.select_word(at(24, 3));
+        assert_eq!(view.copied(), None);
+    }
+
+    /// And a third takes the line, to the end of what is on it.
+    #[test]
+    fn a_third_click_takes_the_line() {
+        let mut view = Scrollback::new(SIZE);
+        view.take(Window {
+            from: 0,
+            total: 1,
+            lines: vec!["cd src and go".to_string()],
+        });
+        view.select_line(at(24, 6));
+        assert_eq!(view.copied().as_deref(), Some("cd src and go"));
+    }
+
+    /// The selection is kept in the buffer's coordinates, so scrolling moves
+    /// the highlight rather than what is selected. A drag that ran off the top
+    /// of the window is still a drag.
+    #[test]
+    fn scrolling_under_a_selection_does_not_change_what_is_selected() {
+        let mut view = view(100);
+        view.select_from(at(24, 1));
+        view.select_to(at(24, 4));
+        view.page_up();
+        answer(&mut view, 100);
+        assert_eq!(view.copied().as_deref(), Some("line"));
+    }
+
+    /// A drag held at the top row reaches the lines above it: the view moves
+    /// back a line and the line that uncovers joins the selection. Without it
+    /// a selection could never be longer than what was already on the screen,
+    /// which is the one thing the history is there for.
+    #[test]
+    fn a_drag_held_at_the_top_of_the_window_reaches_the_lines_above_it() {
+        let mut view = view(100);
+        view.select_from(at(24, 1));
+        view.select_to(at(1, 1));
+        assert!(view.chasing(), "a drag at the top row asks for the view");
+        assert_eq!(view.chase(), Chased::Moved);
+        assert_eq!(view.offset(), 1);
+        answer(&mut view, 100);
+        let copied = view.copied().unwrap();
+        assert_eq!(copied.lines().next(), Some("line 75"));
+        assert_eq!(copied.lines().count(), 25, "a screenful and the one chased");
+    }
+
+    /// And at the bottom row it goes the other way, which is only somewhere to
+    /// go while the view is scrolled back.
+    #[test]
+    fn a_drag_held_at_the_bottom_of_the_window_goes_the_other_way() {
+        let mut view = view(100);
+        view.up(10);
+        answer(&mut view, 100);
+        view.select_from(at(1, 1));
+        view.select_to(at(24, 1));
+        assert_eq!(view.chase(), Chased::Moved);
+        assert_eq!(view.offset(), 9);
+    }
+
+    /// The live screen is as far forward as there is, and the oldest line as
+    /// far back. A chase with nowhere to go stops asking rather than ticking
+    /// against the end of the buffer for as long as the button is held.
+    #[test]
+    fn a_chase_with_nowhere_to_go_stops() {
+        let mut live = view(100);
+        live.select_from(at(1, 1));
+        live.select_to(at(24, 1));
+        assert_eq!(live.chase(), Chased::Stopped);
+        assert_eq!(live.offset(), 0);
+        assert!(!live.chasing());
+
+        let mut oldest = view(30);
+        oldest.top();
+        oldest.select_from(at(24, 1));
+        oldest.select_to(at(1, 1));
+        assert_eq!(oldest.chase(), Chased::Stopped);
+        assert_eq!(oldest.offset(), 30 - 24);
+    }
+
+    /// A hand that moved back off the edge is done asking, and so is one that
+    /// let go. The second is the one that matters: a chase that outlived the
+    /// button would go on scrolling the view under a selection nobody is
+    /// making any more.
+    #[test]
+    fn a_chase_ends_with_the_gesture_that_started_it() {
+        let mut view = view(100);
+        view.select_from(at(24, 1));
+        view.select_to(at(1, 1));
+        assert!(view.chasing());
+        view.select_to(at(12, 1));
+        assert!(!view.chasing(), "back inside the window");
+
+        view.select_to(at(1, 1));
+        assert!(view.chasing());
+        view.let_go();
+        assert!(!view.chasing(), "the button came up");
+        assert_eq!(view.chase(), Chased::Stopped);
+    }
+
+    /// A chase starts at a line a move and speeds up while it is held. The
+    /// first move is the one that has to be small: reaching for the line just
+    /// above the window is the common gesture, and a chase that opened at full
+    /// speed would take a screenful before the hand could let go of it.
+    #[test]
+    fn a_chase_starts_slow_and_speeds_up_while_it_is_held() {
+        assert_eq!(step(1), 1);
+        assert_eq!(step(FASTER_EVERY), 2);
+        assert_eq!(step(FASTER_EVERY * FASTEST), FASTEST, "and stops there");
+        assert_eq!(step(10_000), FASTEST);
+
+        let mut view = view(1000);
+        view.select_from(at(24, 1));
+        view.select_to(at(1, 1));
+        for _ in 0..FASTER_EVERY {
+            assert_eq!(view.chase(), Chased::Moved);
+            answer(&mut view, 1000);
+        }
+        assert_eq!(
+            view.offset(),
+            FASTER_EVERY - 1 + 2,
+            "a line each until the rung, then two"
+        );
+    }
+
+    /// Letting go and starting again starts slow again, or a second drag
+    /// somewhere else would open at whatever speed the first one worked up to.
+    #[test]
+    fn a_chase_that_ended_starts_over() {
+        let mut view = view(1000);
+        view.select_from(at(24, 1));
+        view.select_to(at(1, 1));
+        for _ in 0..FASTER_EVERY * 4 {
+            view.chase();
+            answer(&mut view, 1000);
+        }
+        assert!(
+            view.chase() == Chased::Moved && view.offset() > 24,
+            "well into it"
+        );
+
+        view.let_go();
+        view.select_from(at(24, 1));
+        view.select_to(at(1, 1));
+        let was = view.offset();
+        assert_eq!(view.chase(), Chased::Moved);
+        assert_eq!(view.offset() - was, 1);
+    }
+
+    /// The block stretches over a selection longer than the window, or the
+    /// copy would be made out of lines that are not here and come back short.
+    #[test]
+    fn a_selection_longer_than_the_window_is_still_all_in_one_block() {
+        let mut view = view(1000);
+        view.select_from(at(24, 1));
+        view.select_to(at(1, 1));
+        while view.offset() < 100 {
+            assert_eq!(view.chase(), Chased::Moved);
+            answer(&mut view, 1000);
+        }
+        let reached = view.offset();
+        let copied = view.copied().unwrap();
+        assert_eq!(
+            copied.lines().count(),
+            reached as usize + 24,
+            "the screenful and everything chased past it"
+        );
+        assert_eq!(
+            copied.lines().next(),
+            Some(&*format!("line {}", 976 - reached))
+        );
+    }
+
+    /// And it stops growing where one block stops being able to hold it. A
+    /// selection that outgrew what a copy can carry is one that copies
+    /// nothing, so the chase ends there and says so.
+    #[test]
+    fn a_selection_stops_growing_at_what_a_copy_can_carry() {
+        let mut view = view(5000);
+        view.select_from(at(24, 1));
+        view.select_to(at(1, 1));
+        let mut moved = 0;
+        let ended = loop {
+            match view.chase() {
+                Chased::Moved => {
+                    moved += 1;
+                    answer(&mut view, 5000);
+                }
+                ended => break ended,
+            }
+        };
+        assert_eq!(ended, Chased::Full);
+        assert!(
+            moved < COPY_LINES - 24,
+            "and it got there in fewer moves than lines, having sped up: {moved}"
+        );
+        assert!(!view.chasing());
+        // The block the last move asked for stops where the selection did, so
+        // the copy is one line past it: the release asks again, which is the
+        // same round trip a copy made before its lines arrived waits out.
+        answer(&mut view, 5000);
+        assert_eq!(
+            view.copied().unwrap().lines().count(),
+            COPY_LINES as usize,
+            "and what it stopped at is still copyable"
+        );
+    }
+
+    /// The highlight is one colour over whatever was there, and the line's own
+    /// pen is put back after it: what comes back off the wire is coloured text,
+    /// and a copy mode that dropped the colours would repaint the screen in
+    /// white on the way past.
+    #[test]
+    fn the_highlight_covers_the_colours_and_puts_them_back() {
+        let coloured = "\x1b[31mred\x1b[0m plain";
+        let painted = highlighted(coloured, 0, 3);
+        assert!(painted.starts_with("\x1b[31m"), "{painted:?}");
+        assert_eq!(plain(&painted, 0, u16::MAX), "red plain");
+        // The selected cells are the selection's colour, and what follows is
+        // the pen the line had by then, reissued from a clean slate.
+        assert!(
+            painted.contains(&format!("{SELECTED}red\x1b[0m")),
+            "{painted:?}"
+        );
+        assert!(painted.ends_with("\x1b[31m\x1b[0m plain"), "{painted:?}");
+    }
+
+    /// Reverse video cannot say "selected": it swaps the two colours a cell
+    /// already has, so over a run the program drew reversed itself, which is
+    /// how `pi` draws the message you typed, swapping again lands back where it
+    /// started and the selection is invisible. Every selected cell is painted
+    /// the same whatever was under it.
+    #[test]
+    fn a_highlight_over_reversed_text_is_still_visible() {
+        let painted = highlighted("\x1b[7mtyped\x1b[27m out", 0, 5);
+        // The selection's own colours are the last thing written before the
+        // cells, and they open with a reset, so the program's reverse is off
+        // under them however it got there.
+        assert!(painted.contains(&format!("{SELECTED}typed")), "{painted:?}");
+        assert!(SELECTED.starts_with("\x1b[0;"), "{SELECTED:?}");
+        // And it comes back for what was not selected.
+        assert!(
+            painted.ends_with("\x1b[0m\x1b[7m\x1b[27m out"),
+            "{painted:?}"
+        );
+    }
+
+    /// The columns a hand points at are cells, and a coloured line has more
+    /// bytes than cells. Counting either of the other two would take the wrong
+    /// text off every line a program coloured.
+    #[test]
+    fn columns_are_cells_and_not_bytes() {
+        let line = "\x1b[1;32mok\x1b[0m: done";
+        assert_eq!(plain(line, 0, 2), "ok");
+        assert_eq!(plain(line, 4, 8), "done");
+        assert_eq!(plain(line, 0, u16::MAX), "ok: done");
+    }
+
+    /// A selection that runs past the end of a short line takes the blanks with
+    /// it, or a block dragged down the screen would come apart at every line
+    /// shorter than the one above it.
+    #[test]
+    fn a_highlight_past_the_end_of_a_line_covers_the_rest_of_the_row() {
+        let painted = highlighted("ab", 0, 6);
+        assert!(painted.starts_with(&format!("{SELECTED}ab")), "{painted:?}");
+        assert!(painted.ends_with("    \x1b[0m"), "{painted:?}");
+    }
+
+    /// A hand moving quickly presses, drags and lets go inside one read, which
+    /// is one pass through the client and no time at all for the block the
+    /// press asked for to arrive. Answered out of what is there, the copy is a
+    /// blank line per line dragged over.
+    #[test]
+    fn a_copy_asked_for_before_its_lines_arrived_waits_for_them() {
+        let mut view = Scrollback::new(SIZE);
+        view.select_from(at(24, 1));
+        view.select_to(at(24, 4));
+        assert_eq!(view.copied(), None, "nothing to copy out of yet");
+        assert!(view.selecting(), "and the gesture is not over");
+
+        answer(&mut view, 100);
+        assert_eq!(view.owed_copy().as_deref(), Some("line"));
+    }
+
+    /// Owed once. The block that arrives is the answer to the request the press
+    /// made, so one that does not cover the selection is one nothing later will
+    /// cover either, and a copy still owed would land on the clipboard the next
+    /// time the view moved.
+    #[test]
+    fn a_copy_that_was_owed_is_answered_once() {
+        let mut view = Scrollback::new(SIZE);
+        view.select_from(at(24, 1));
+        view.select_to(at(24, 4));
+        view.copied();
+        answer(&mut view, 100);
+        assert!(view.owed_copy().is_some());
+        assert_eq!(view.owed_copy(), None);
+    }
+
+    /// Nothing is owed by a copy that could be made on the spot, or letting go
+    /// twice would copy twice.
+    #[test]
+    fn a_copy_that_could_be_made_owes_nothing() {
+        let mut view = view(100);
+        view.select_from(at(24, 1));
+        view.select_to(at(24, 4));
+        assert_eq!(view.copied().as_deref(), Some("line"));
+        assert_eq!(view.owed_copy(), None);
+    }
+
+    /// A drag reports every cell it crosses and each report moves the highlight
+    /// by a row or less. Painting the window per report writes a screenful to
+    /// say a hundred bytes, which is what a drag that stutters is made of.
+    #[test]
+    fn a_frame_paints_the_rows_that_changed_and_no_others() {
+        let mut view = view(100);
+        assert!(
+            view.paint().contains("line 99"),
+            "the first frame is all of it"
+        );
+        assert_eq!(view.paint(), "", "and the second says nothing");
+
+        view.select_from(at(24, 1));
+        view.select_to(at(24, 4));
+        let painted = view.paint();
+        assert!(painted.contains(SELECTED), "{painted:?}");
+        assert_eq!(painted.matches("\x1b[K").count(), 1, "one row: {painted:?}");
+    }
+
+    /// A row is as wide as the screen. Padded past that, the cells wrap onto
+    /// the row below and the one after it: a selection over a blank line put a
+    /// thousand cells of reverse video on the screen, which on a wide window is
+    /// six rows of white with the text that was under them gone. Only the rows
+    /// that changed are painted, so nothing comes back to tidy that up.
+    #[test]
+    fn a_highlight_stops_at_the_edge_of_the_screen() {
+        let mut view = view(100);
+        // Two rows, so the upper one is selected to the end of the line.
+        view.select_from(at(23, 3));
+        view.select_to(at(24, 5));
+        let painted = view.paint();
+        let widest = painted
+            .split("\x1b[K")
+            .map(|row| plain(row, 0, u16::MAX).chars().count())
+            .max()
+            .unwrap_or(0);
+        assert!(
+            widest <= usize::from(SIZE.cols),
+            "{widest} cells: {painted:?}"
+        );
+    }
+
+    /// And it starts at the column the hand pointed at. On a line shorter than
+    /// that column, the cells in between are the ones nobody selected, so the
+    /// highlight on an empty row began at column zero and ran the width of the
+    /// screen.
+    #[test]
+    fn a_highlight_past_a_short_line_starts_where_the_selection_does() {
+        let painted = highlighted("ab", 5, 9);
+        assert!(
+            painted.starts_with(&format!("ab   {SELECTED}")),
+            "{painted:?}"
+        );
+        assert!(painted.ends_with("    \x1b[0m"), "{painted:?}");
+        assert_eq!(plain(&painted, 0, u16::MAX).chars().count(), 9);
+    }
+
+    /// A row nothing has been painted to is not a row painted blank. The first
+    /// frame of a view opened over a buffer shorter than the screen has blank
+    /// rows at the top, and the session is showing through underneath them.
+    #[test]
+    fn the_blank_rows_of_a_short_buffer_are_painted_the_first_time() {
+        let mut view = view(3);
+        let painted = view.paint();
+        assert_eq!(
+            painted.matches("\x1b[K").count(),
+            24,
+            "every row of the window: {painted:?}"
+        );
+        assert_eq!(view.paint(), "");
     }
 }

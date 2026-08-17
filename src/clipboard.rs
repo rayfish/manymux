@@ -351,6 +351,51 @@ fn install(program: &str) -> &'static str {
     }
 }
 
+/// Text put on the clipboard of the terminal showing this, over OSC 52.
+///
+/// The other direction from everything above, and it cannot use any of it: the
+/// programs up there talk to the clipboard of the machine the client is running
+/// on, which is the right one when a person is sitting at that machine and the
+/// wrong one whenever they are not. Somebody ssh'd into a box and running `mm`
+/// there would be copying to a clipboard nobody can paste from. The terminal
+/// always belongs to the person, so the copy goes to the terminal and the
+/// terminal decides.
+///
+/// Deciding is what most of them do: this is a program on the far end of a pipe
+/// asking to write your clipboard, so terminals ship with it off (iTerm2:
+/// Settings > General > Selection). There is nothing to check and nothing that
+/// comes back, so a refusal is silent, and the only honest answer is to say in
+/// the docs where the switch is.
+pub fn to_terminal(text: &str) -> String {
+    format!("\x1b]52;c;{}\x07", base64(text.as_bytes()))
+}
+
+/// Base64, because OSC 52 takes nothing else.
+///
+/// Twenty lines rather than a dependency, for the same reason the rest of this
+/// module shells out rather than linking a clipboard library: this is the whole
+/// of what would be used, and it has not changed since 1987.
+fn base64(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let mut block = [0u8; 3];
+        block[..chunk.len()].copy_from_slice(chunk);
+        let bits = u32::from_be_bytes([0, block[0], block[1], block[2]]);
+        for i in 0..4 {
+            // The last block is padded with `=` for the bytes that were not
+            // there, which is what tells a decoder how long it was.
+            if i > chunk.len() {
+                out.push('=');
+                continue;
+            }
+            let sextet = (bits >> (18 - 6 * i)) & 0b11_1111;
+            out.push(char::from(ALPHABET[sextet as usize]));
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -497,6 +542,31 @@ mod tests {
         assert_eq!(mb(2 * 1024 * 1024), "2.0 MB");
         assert_eq!(mb(40 * 1024), "40 KB");
         assert_eq!(mb(16 << 20), "16.0 MB");
+    }
+
+    /// Against the vectors in RFC 4648, since the padding is the half that is
+    /// easy to get wrong and a terminal answers a bad encoding with silence.
+    #[test]
+    fn base64_encodes_what_rfc_4648_says_it_does() {
+        for (plain, encoded) in [
+            ("", ""),
+            ("f", "Zg=="),
+            ("fo", "Zm8="),
+            ("foo", "Zm9v"),
+            ("foob", "Zm9vYg=="),
+            ("fooba", "Zm9vYmE="),
+            ("foobar", "Zm9vYmFy"),
+        ] {
+            assert_eq!(base64(plain.as_bytes()), encoded, "{plain:?}");
+        }
+        // And something with bytes above ASCII in it, since a selection is
+        // whatever was on the screen.
+        assert_eq!(base64("café".as_bytes()), "Y2Fmw6k=");
+    }
+
+    #[test]
+    fn a_copy_goes_to_the_terminal_as_an_osc_52() {
+        assert_eq!(to_terminal("foo"), "\x1b]52;c;Zm9v\x07");
     }
 
     #[test]

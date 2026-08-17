@@ -26,6 +26,7 @@ use clap_complete::engine::{
 use clap_complete::{CompleteEnv, Shell};
 
 use manymux::client::Stream;
+use manymux::client::groups::Groups;
 use manymux::hosts::{Hosts, LOCAL, is_this_machine};
 use manymux::proto::{Request, Response, SessionInfo};
 
@@ -110,6 +111,18 @@ pub fn hosts_or_local() -> ArgValueCompleter {
     })
 }
 
+/// Group names, for `mm group`.
+///
+/// A local file read, so this starts no node, installs nothing and waits on no
+/// ssh, which is the rule every completer here is held to.
+pub fn group_names() -> ArgValueCompleter {
+    ArgValueCompleter::new(|current: &OsStr| candidates(prefixed(current, groups())))
+}
+
+fn groups() -> Vec<String> {
+    Groups::load().map(|held| held.names()).unwrap_or_default()
+}
+
 /// Machines being watched, for `rm`. Not this one: it is not on the list.
 pub fn watched_hosts() -> ArgValueCompleter {
     ArgValueCompleter::new(|current: &OsStr| candidates(prefixed(current, watched())))
@@ -187,6 +200,17 @@ fn target_candidates(current: &OsStr) -> Vec<CompletionCandidate> {
     let Some(current) = current.to_str() else {
         return Vec::new();
     };
+    // `@`: a group, which is a local file read. Offered only behind the sigil,
+    // so an ordinary session completion is exactly what it always was, and
+    // answered without asking any machine anything.
+    if current.starts_with('@') {
+        return described(
+            groups()
+                .into_iter()
+                .map(|name| (format!("@{name}"), String::new()))
+                .filter(|(target, _)| target.starts_with(current)),
+        );
+    }
     let socket = socket();
 
     // `host/`: they have said which machine, so go and ask it, and only it.

@@ -318,18 +318,38 @@ region, and a terminal that throws away what scrolls out of one keeps nothing.
 iTerm2 keeps it. If yours does not, `--screen alternate` is the way back.
 
 On the alternate screen the terminal has no scrollback to offer, so manymux
-shows you its own. `Ctrl-] [` opens it; the wheel, `pgup`/`pgdn`, `g` and `G`
-move it, `esc` goes back to the live session.
+shows you its own. `Ctrl-] [` opens it, `pgup`/`pgdn`, `g` and `G` move it, and
+`esc` goes back to the live session.
 
-The mouse is your terminal's the rest of the time, so dragging selects and
-copies exactly as it does anywhere else, with no modifier held. That is why the
-wheel does not open the view: reporting the wheel to manymux is the same thing
-as taking the drag away from the terminal, and copying a line off the screen is
-worth more than one gesture fewer. It also means the wheel does nothing while
-the view is closed, since a terminal on its alternate screen would otherwise
-turn a notch into arrow keys aimed at whatever the session is running. Nothing
-here is taken from a program that asked for the mouse itself: Claude Code, vim
-and htop keep every report, wheel and drag alike.
+The mouse is your terminal's, so dragging selects and copies exactly as it does
+anywhere else, with no modifier held. That is why the wheel does not open the
+view: reading the wheel means asking the terminal to report the mouse, and a
+terminal reporting the mouse is not selecting with it. If you would rather
+scroll with the wheel than select with a bare drag, ask for it:
+
+```bash
+mm config mouse client
+```
+
+Then the mouse is manymux's for the whole attach. A notch opens the view and
+moves it, and a drag selects: press, drag, let go, and what you dragged over is
+on your clipboard. Double click takes the word under it, which counts a path or
+a URL as one word, and triple click takes the line. Hold the drag against the
+top or bottom of the window and the view moves under it, a line at a time to
+begin with and faster the longer you hold, so a selection is not limited to
+what happens to be on the screen. Letting go at the
+live screen gives it straight back, so the session never appears to stop;
+scrolled back, the highlight stays where you left it and so does the view.
+
+The copy goes to your terminal over OSC 52, which most terminals refuse until
+you say otherwise (iTerm2: Settings > General > Selection). Without that the
+highlight works and nothing lands on the clipboard, and there is no way for
+manymux to tell.
+
+Nothing here is taken from a program that asked for the mouse itself: Claude
+Code, vim and htop keep every report, wheel and drag alike, under either
+setting. Inside one of those, selecting is that program's business exactly as
+it is over plain ssh.
 
 `Ctrl-] /` searches everything the session has printed, all ten thousand lines
 of it. `n` walks back through the matches and `N` comes back towards the live
@@ -413,7 +433,7 @@ mm view <target> [--screen ...]      watch a session without typing into it
 mm kill <target>                     SIGHUP a session's process group
 mm rename <target> <name>            give a session a different name
 mm add <host> | hosts | rm <host>    which machines to list and watch
-mm config [key] [value]              show or change a setting: notify, screen
+mm config [key] [value]              show or change a setting: notify, screen, mouse
 mm update [--check] [--nightly]      replace this binary with the published one
 mm start | stop | restart [--force]  this machine's node: up, down, and again
 mm service install|uninstall         run the node at boot

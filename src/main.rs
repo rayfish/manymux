@@ -1,23 +1,27 @@
 use std::collections::HashSet;
 use std::fmt::{self, Display, Formatter};
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use anyhow::{Result, bail};
+use anyhow::{Result, anyhow, bail};
 use clap::{Parser, Subcommand, ValueHint};
 use clap_complete::Shell;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::task::JoinHandle;
 use tracing::debug;
 
-use manymux::client::attach::{self, Mode, Outcome, Wait};
+use manymux::client::attach::{self, Chose, Mode, Motion, Outcome, Rows, Wait};
+use manymux::client::groups::Groups;
+use manymux::client::picker::Row;
 use manymux::client::switch::{Cycle, Located};
 use manymux::client::{Attached, Stream};
 use manymux::hosts::{Hosts, is_this_machine, this_machine};
+use manymux::lock::held as held_lock;
 use manymux::node::{Config, Node};
-use manymux::proto::{Request, Response, SpawnSpec};
+use manymux::proto::{HostedSession, Request, Response, SpawnSpec};
 use manymux::settings::{Screen, Settings};
 use manymux::update::Channel;
 use manymux::{config, log, style, term};
@@ -147,6 +151,22 @@ enum Command {
         name: String,
     },
 
+    /// Put a session in a group, or take it out of one.
+    ///
+    /// A group is a subset of sessions you can narrow the client to, and it
+    /// spans machines. It lives here rather than at the node, so it works
+    /// against a machine running any build of mm. With no name, the session is
+    /// taken out of whatever it is in.
+    Group {
+        #[arg(add = complete::targets())]
+        target: String,
+        /// The group. Omit to ungroup.
+        #[arg(add = complete::group_names())]
+        name: Option<String>,
+    },
+    /// List the groups and what is in them.
+    Groups,
+
     /// Put mm on a machine you can ssh into, by running the installer there.
     ///
     /// Nothing needs this: naming a machine that has no mm offers to do it.
@@ -173,7 +193,7 @@ enum Command {
     /// desktop notification a watching node raises, and the one an attached
     /// terminal is asked to show.
     Config {
-        /// `notify` or `screen`. Left out, every setting is listed.
+        /// `notify`, `screen` or `mouse`. Left out, every setting is listed.
         #[arg(add = complete::settings())]
         key: Option<String>,
         /// What to set it to. Left out, the setting is printed rather than
@@ -398,6 +418,48 @@ async fn run(cli: Cli) -> Result<u8> {
                     to: name,
                 })
                 .await?;
+            Ok(OK)
+        }
+
+        Command::Group { target, name } => {
+            let at = locate(&socket, &target, Bare::Session).await?;
+            // The pid and the start time are what membership is keyed on, and
+            // only the machine holding the session knows them.
+            let sessions = sessions_on(&socket, &at.host).await?;
+            let session = sessions
+                .iter()
+                .find(|s| s.name == at.session)
+                .ok_or_else(|| anyhow!("no session named {} on {}", at.session, at.host))?;
+            let mut groups = Groups::load()?;
+            match &name {
+                Some(name) => {
+                    groups.assign(name, &at.host, session)?;
+                }
+                None => groups.clear(&at.host, session),
+            }
+            groups.save()?;
+            Ok(OK)
+        }
+
+        Command::Groups => {
+            let listing = everywhere(&socket).await?;
+            let mut groups = Groups::load()?;
+            // The listing is the only thing that says which sessions are still
+            // running, so this is where the file gets tidied.
+            groups.prune(&listing.answering(), &listing.sessions);
+            groups.save()?;
+            for (name, count) in groups.tally(&listing.sessions) {
+                println!(
+                    "{} {}",
+                    style::bold(&name),
+                    style::faint(&format!("({count})"))
+                );
+                for hosted in &listing.sessions {
+                    if groups.group_of(&hosted.host, &hosted.session) == Some(name.as_str()) {
+                        println!("  {}", qualified(&hosted.host, &hosted.session.name));
+                    }
+                }
+            }
             Ok(OK)
         }
 
@@ -767,10 +829,20 @@ async fn list(socket: &Path, host: Option<String>) -> Result<u8> {
         None => everywhere(socket).await?,
     };
 
+    // The listing is the only thing that says which sessions are still running,
+    // so this is where the group file gets tidied. Only the machines that
+    // answered count: one that is asleep has said nothing about its sessions.
+    let mut groups = Groups::load().unwrap_or_default();
+    groups.prune(&listing.answering(), &listing.sessions);
+    let _ = groups.save();
+
     let rows: Vec<_> = listing
         .sessions
         .into_iter()
         .map(|hosted| term::SessionRow {
+            group: groups
+                .group_of(&hosted.host, &hosted.session)
+                .map(str::to_string),
             host: hosted.host,
             session: hosted.session,
         })
@@ -817,6 +889,20 @@ async fn do_attach(
     // Asked for before the first attach, so the first switch key has something
     // to go on.
     let mut listing = Some(spawn_listing(socket));
+    // What the machines last said, kept for the pids a group is keyed on.
+    let mut snapshot = Snapshot::default();
+    let mut groups = Groups::load().unwrap_or_default();
+    // Landing in a session that is in a group is landing in that work, so the
+    // switch keys should walk that work. Read once here rather than derived
+    // from the current session, because widening out of a group you are still
+    // sitting in has to be possible.
+    let mut settled = false;
+    // Where the listing task leaves its answer, so the ids the popup hands back
+    // are looked up in the rows it was actually showing.
+    let latest: Arc<Mutex<Option<Listed>>> = Arc::new(Mutex::new(None));
+    // What the popup's lister last found, for the loop to take back: it hands
+    // its own pending listing over, so the answer arrives there and not here.
+    let seen: Arc<Mutex<Option<Snapshot>>> = Arc::new(Mutex::new(None));
 
     let mut held = attach::hold(screen)?;
     let mut mode = Mode::Focus;
@@ -848,7 +934,8 @@ async fn do_attach(
         } else {
             0
         };
-        let session = match attach_to(socket, &target, history, watching).await {
+        let session = match reaching(attach_to(socket, &target, history, watching), attached).await
+        {
             Ok(session) => session,
             // The way back out of a session that ended is gone too, and there
             // is nothing further back than the one you came from. So the run
@@ -894,9 +981,123 @@ async fn do_attach(
         // Landed, so the exit that sent us here is somebody else's news now:
         // the next one to report is whatever this session does.
         ended = None;
+        // And the hop is over. What the flag above buys is one arm: a hop onto
+        // a session the listing was stale about, which is a thing that is true
+        // for exactly as long as the attach it describes has not happened.
+        // Left set, it was still set an hour later when the node holding the
+        // session restarted, and the drop that came back as `Missed::Gone` was
+        // read as that stale listing: the cycle forgot a live entry and the run
+        // walked back to the session the command line named, which is the one
+        // thing the arm below is written to stop.
+        hopped = false;
 
-        let (outcome, renamed) =
-            attach::run(&mut held, session, &where_, mode, notice.take().as_deref()).await?;
+        // Before the rows are built, because the popup is drawn from them and
+        // it opens on a keystroke inside the attach, where there is no asking
+        // anything. The wait is the same half second the switch keys allow and
+        // for the same reason: what is already known stands rather than being
+        // waited on, since a machine that is asleep must not hold up a screen.
+        take_listing(&mut listing, &mut cycle, &mut snapshot, &mut groups).await;
+        // Narrowing to the group of the session you arrived in, which is a
+        // thing to decide on the way in and never afterwards. It used to wait
+        // for a listing that said anything, and on a fleet slower than
+        // `LISTING_WAIT` the first of those lands well after the run has
+        // started: the block then fired on whatever session you were on by
+        // then, so putting a session in a group silently narrowed the run to
+        // it. Not knowing is an answer here, and the answer is to narrow to
+        // nothing.
+        if !settled {
+            settled = true;
+            if let Some(info) = snapshot.info(cycle.current()) {
+                let group = groups
+                    .group_of(&cycle.current().host, info)
+                    .map(str::to_string);
+                cycle.focus(group);
+            }
+        }
+        let listed = Listed::new(&snapshot, &groups, &cycle);
+        // The popup's way of asking what the machines are running, since the
+        // attach owns this task for as long as it lasts and cannot go and look
+        // itself. Groups and the narrowing cannot change under it: every way of
+        // changing either ends the attach, which is what makes a snapshot of
+        // them safe to hand over.
+        let (asks, mut wanted) = tokio::sync::mpsc::channel::<()>(1);
+        let (answered, fresh) = tokio::sync::watch::channel(listed.rows.clone());
+        let lister = {
+            let socket = socket.to_path_buf();
+            let groups = groups.clone();
+            let focus = cycle.focused().map(str::to_string);
+            let current = cycle.current().clone();
+            let latest = Arc::clone(&latest);
+            let seen = Arc::clone(&seen);
+            // The listing already out there, handed over rather than left to
+            // finish into a variable nobody reads again until the attach ends.
+            // `take_listing` gives one half a second and no more, so on a fleet
+            // where a fan-out takes longer this is *always* still running when
+            // the popup opens, and the popup then started a second one from
+            // scratch: two ssh commands per host for one keypress, and an empty
+            // box for as long as the second took.
+            let mut running = listing.take();
+            tokio::spawn(async move {
+                while wanted.recv().await.is_some() {
+                    let listing = match running.take() {
+                        Some(task) => match task.await {
+                            Ok(snapshot) => Ok(snapshot),
+                            Err(_) => continue,
+                        },
+                        None => everywhere(&socket).await.map(|listing| Snapshot {
+                            answered: listing.answering(),
+                            sessions: listing.sessions,
+                        }),
+                    };
+                    let Ok(snapshot) = listing else { continue };
+                    if snapshot.is_empty() {
+                        continue;
+                    }
+                    let listed = Listed::of(&snapshot, &groups, focus.as_deref(), &current);
+                    // Kept where the caller can read it once the attach ends:
+                    // the ids the popup hands back are this listing's, and
+                    // looking them up in the one it opened with would name the
+                    // wrong session.
+                    *held_lock(&latest) = Some(listed.clone());
+                    // And the snapshot behind them, because the loop's own copy
+                    // is now the older of the two: it gave up waiting on the
+                    // listing this task went on to collect.
+                    *held_lock(&seen) = Some(snapshot);
+                    if answered.send(listed.rows).is_err() {
+                        return;
+                    }
+                }
+            })
+        };
+        let (outcome, renamed) = attach::run(
+            &mut held,
+            session,
+            &where_,
+            mode,
+            notice.take().as_deref(),
+            attach::PopupFeed {
+                rows: listed.rows.clone(),
+                group: cycle.focused(),
+                asks,
+                fresh,
+            },
+        )
+        .await?;
+        lister.abort();
+        // The rows the ids in `outcome` belong to: the last answer if one
+        // landed while the popup was up, else the ones it opened with.
+        let listed = held_lock(&latest).take().unwrap_or(listed);
+        // And what those rows were built from, which the loop gave up waiting
+        // for and the popup went on to collect. Without taking it back, a fleet
+        // slower than `LISTING_WAIT` never fills this in at all: every attach
+        // hands its pending listing to the popup, so nothing is ever left for
+        // `take_listing` to find.
+        if let Some(fresher) = held_lock(&seen).take() {
+            groups.prune(&fresher.answered, &fresher.sessions);
+            let _ = groups.save();
+            snapshot = fresher;
+            cycle.refresh(entries(&snapshot, &groups));
+        }
         // Renamed from inside, so the name this run has been using is nobody's
         // now: the cycle would hop to a session that is not there, and the line
         // printed on the way out would name it too.
@@ -905,8 +1106,91 @@ async fn do_attach(
             cycle.renamed(&name);
         }
         match outcome {
+            // Everything the popup chose, in its own row ids. The lookups are
+            // here because this is the half that knows what a row means: the
+            // popup is handed rows and hands back ids, and never learns what a
+            // host, a group or a pid is.
+            Outcome::Chose(chose) => {
+                hopped = false;
+                // Back to the list, because that is where the gesture was made
+                // and none of these is a gesture that goes anywhere: grouping a
+                // session, naming one, narrowing to a group all leave you
+                // exactly where you were, and dropping into the session
+                // afterwards throws away the place you were working from. Enter
+                // on a session is the one that means go, and it is the one that
+                // sets this back to `Focus` below.
+                mode = Mode::Control;
+                match chose {
+                    // A hop like any other, so the way back is recorded the
+                    // same way and `Motion::Last` reaches it.
+                    Chose::Go(row) => {
+                        // The one that goes somewhere, and so the one that
+                        // leaves you in the session rather than over it.
+                        mode = Mode::Focus;
+                        if let Some(there) = listed.at.get(row)
+                            && *there != target
+                        {
+                            cycle.moved_to(there.clone());
+                            hopped = true;
+                        }
+                    }
+                    // Narrowing. You move only when the session you are in is
+                    // not in the group you just chose, since widening or
+                    // choosing the group you are already in should leave you
+                    // where you are.
+                    Chose::Focus(row) => {
+                        let group = listed.groups.get(row).cloned().flatten();
+                        cycle.focus(group);
+                        if let Some(next) = cycle.step(Motion::Next)
+                            && !cycle.holds(&target)
+                        {
+                            cycle.moved_to(next);
+                            hopped = true;
+                        }
+                    }
+                    // A local file write and a redraw: nothing detaches for
+                    // this, which is why `m` acts on the highlighted row rather
+                    // than the session you are attached to.
+                    Chose::Move { session, group } => {
+                        let group = listed.groups.get(group).cloned().flatten();
+                        notice = regroup(socket, &listed, session, group, &mut groups)
+                            .await
+                            .err()
+                            .map(|e| format!("{e:#}"));
+                        cycle.refresh(entries(&snapshot, &groups));
+                    }
+                    Chose::NewGroup { session, name } => {
+                        notice = regroup(socket, &listed, session, Some(name), &mut groups)
+                            .await
+                            .err()
+                            .map(|e| format!("{e:#}"));
+                        cycle.refresh(entries(&snapshot, &groups));
+                    }
+                    // The row may not be the session at the other end of the
+                    // attach stream, and `tag::RENAME` renames that one by
+                    // design, so this goes over a connection to its machine.
+                    Chose::Named { session, to } => {
+                        let at = listed.at.get(session);
+                        let pid = at.and_then(|at| snapshot.info(at)).map(|i| i.pid);
+                        match rename_at(socket, at, pid.unwrap_or_default(), &to).await {
+                            Ok(name) => {
+                                if let Some(at) = at
+                                    && *at == target
+                                {
+                                    where_ = qualified(&at.host, &name);
+                                    cycle.renamed(&name);
+                                }
+                            }
+                            Err(e) => notice = Some(format!("{e:#}")),
+                        }
+                    }
+                }
+                // Whatever it was, what the machines are running may have moved
+                // under it, and a press is the only thing that ever asks.
+                listing = Some(spawn_listing(socket));
+            }
             Outcome::Switch(motion) => {
-                take_listing(&mut listing, &mut cycle).await;
+                take_listing(&mut listing, &mut cycle, &mut snapshot, &mut groups).await;
                 hopped = false;
                 if let Some(next) = cycle.step(motion) {
                     cycle.moved_to(next);
@@ -1007,7 +1291,7 @@ async fn do_attach(
             println!("[disconnected from {where_}]");
             Ok(FAILED)
         }
-        Outcome::Switch(_) | Outcome::New => {
+        Outcome::Switch(_) | Outcome::New | Outcome::Chose(_) => {
             unreachable!("switches never leave the loop above")
         }
     }
@@ -1093,6 +1377,54 @@ impl Display for Missed {
     }
 }
 
+/// How long one attempt at getting back is given before it counts as a
+/// failure.
+///
+/// There has to be a number here, because the one thing an attempt cannot be
+/// given is forever. ssh's own `ConnectTimeout` is about reaching a machine,
+/// and the way this hangs is a step further in: `ControlMaster=auto` puts every
+/// command on one shared connection, and connecting to a control socket has no
+/// deadline of any kind. A master whose network went takes everything
+/// multiplexed onto it with it, which is a whole terminal sitting on
+/// `reconnecting` with a row that has stopped counting and a Ctrl-C nobody is
+/// reading, until the master times out on its own schedule or somebody works
+/// out what a control socket is. Two clients on one master hang and then come
+/// back together, which is the shape of it from outside.
+///
+/// Ten seconds because it is the wrong side of every honest reattach and the
+/// right side of nobody's patience: a handshake onto a machine that is there
+/// takes under a second, and a retry costs a line on the row rather than
+/// anything real.
+const REACH_FOR: Duration = Duration::from_secs(10);
+
+/// One attempt at reaching a session, with a deadline on it once this run has
+/// been attached to something.
+///
+/// Not before that. The first attach of a run is a command somebody typed, and
+/// it is allowed to take as long as it takes: a cold ssh, a node being started,
+/// an install being offered and answered. What is bounded is a reconnect, which
+/// nobody asked for and which has somewhere to go when it fails, namely round
+/// the loop to a row that counts down and reads the keyboard.
+///
+/// Dropping the attempt is what stops it: `ssh::spawn` sets `kill_on_drop`, so
+/// the ssh that was hanging goes with the future rather than being left to
+/// hold the master open behind us.
+async fn reaching(
+    attempt: impl Future<Output = Result<Attached, Missed>>,
+    bounded: bool,
+) -> Result<Attached, Missed> {
+    if !bounded {
+        return attempt.await;
+    }
+    match tokio::time::timeout(REACH_FOR, attempt).await {
+        Ok(reached) => reached,
+        Err(_) => Err(Missed::Unreachable(anyhow!(
+            "no answer in {}s",
+            REACH_FOR.as_secs()
+        ))),
+    }
+}
+
 /// Open a stream to wherever a session is, and attach to it.
 async fn attach_to(
     socket: &Path,
@@ -1134,37 +1466,323 @@ async fn start_beside(socket: &Path, host: &str) -> Result<String> {
     Ok(name)
 }
 
+/// What every machine said it was running, and which machines said anything.
+///
+/// The whole `SessionInfo` rather than a name, because group membership is
+/// keyed on the pid and the start time and the popup draws titles, idle times
+/// and bells from it. The hosts that answered come with it because pruning a
+/// group must consider only those: a machine that is asleep has said nothing
+/// about its sessions, and reading that silence as "they ended" would empty its
+/// groups while you were away from it.
+#[derive(Default)]
+struct Snapshot {
+    sessions: Vec<manymux::proto::HostedSession>,
+    /// Which machines said so, this one included: it is what pruning is
+    /// allowed to act on, and it is `Listing::answering` rather than
+    /// `Listing::reached`, which leaves this machine out for a different
+    /// question entirely.
+    answered: Vec<String>,
+}
+
+impl Snapshot {
+    /// What a machine said about one session, for the pid a group is keyed on.
+    fn info(&self, at: &Located) -> Option<&manymux::proto::SessionInfo> {
+        self.sessions
+            .iter()
+            .find(|hosted| hosted.host == at.host && hosted.session.name == at.session)
+            .map(|hosted| &hosted.session)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.sessions.is_empty()
+    }
+}
+
+/// The popup's rows, and what each row id means.
+///
+/// The ids are indices into the two `Vec`s beside the rows, so the half of the
+/// client that draws the popup never learns what a host, a group or a pid is:
+/// it hands back an id and this looks it up. Built together and replaced
+/// together, or an id would index the wrong session.
+#[derive(Clone, Default)]
+struct Listed {
+    rows: Rows,
+    /// One per session row, in the same order.
+    at: Vec<Located>,
+    /// One per group row. The first is `None`, which is "everything" when you
+    /// are narrowing and "no group" when you are moving a session.
+    groups: Vec<Option<String>>,
+}
+
+impl Listed {
+    /// A tree two deep: a heading per machine, the groups on that machine under
+    /// it with their sessions inside, and whatever is in no group last.
+    ///
+    /// Within every run the order is the listing's, which is oldest first and
+    /// never by name, for the reason every other listing has it: a name moves
+    /// under a rename and the rows would shuffle beneath a hand walking them.
+    /// A group's place is where its oldest session falls, which rests on the
+    /// same thing.
+    ///
+    /// Narrowed to the focused group when there is one, because that is what
+    /// every other way of moving around is narrowed to.
+    fn new(snapshot: &Snapshot, groups: &Groups, cycle: &Cycle) -> Self {
+        Self::of(snapshot, groups, cycle.focused(), cycle.current())
+    }
+
+    /// The same, from the two things about the cycle that matter, so a task
+    /// with no cycle of its own can build these while an attach is up.
+    fn of(snapshot: &Snapshot, groups: &Groups, focus: Option<&str>, current: &Located) -> Self {
+        let mut rows = Vec::new();
+        let mut at = Vec::new();
+        // Every session that is going to be drawn, each beside the group it is
+        // in, still in the order the listing arrived: by machine, then oldest
+        // first. Which makes each machine's sessions a run, and the run is what
+        // the tree is built out of.
+        let showing: Vec<(&HostedSession, Option<&str>)> = snapshot
+            .sessions
+            .iter()
+            .map(|hosted| (hosted, groups.group_of(&hosted.host, &hosted.session)))
+            .filter(|(_, group)| focus.is_none_or(|focus| *group == Some(focus)))
+            .collect();
+
+        // The groups first, each one whole. A group spans machines, so it is
+        // the machines that break up under it and not the other way round:
+        // nested the other way, the one thing a group is for, seeing a piece of
+        // work in one place, was the one thing the list would not show.
+        //
+        // In the order their first session appears, which is by machine and
+        // then oldest first, so a group's place moves only when the oldest
+        // session in it ends. Ordering by name would shuffle the list under a
+        // rename, which is what every listing here is written to avoid.
+        let mut drawn: Vec<&str> = Vec::new();
+        for (_, group) in &showing {
+            let Some(group) = *group else { continue };
+            if drawn.contains(&group) {
+                continue;
+            }
+            drawn.push(group);
+            rows.push(Row::heading(format!("@{group}")));
+            // The machine on a line of its own rather than in front of every
+            // name. `host/name` is how a session is addressed, so it was the
+            // obvious label, but a real host name is most of the column: with
+            // `dev.box.ray/` in front of it there was no room left to tell
+            // `rayfish-iroh-dev` from `rayfish-iroh-debug`, and which session
+            // it is is the one thing the row exists to say.
+            let mut machine: Option<&str> = None;
+            for (hosted, _) in showing.iter().filter(|(_, g)| *g == Some(group)) {
+                if machine != Some(hosted.host.as_str()) {
+                    machine = Some(&hosted.host);
+                    rows.push(Row::heading(&hosted.host).indent(1));
+                }
+                Self::session(&mut rows, &mut at, hosted, current, 2);
+            }
+        }
+
+        // Then whatever is in no group, under the machine it is on, which is
+        // the only thing left to gather it by. No heading says "no group": that
+        // would name the one thing a group is not, and with the groups above it
+        // the rest of the list needs no introduction.
+        let mut machine: Option<&str> = None;
+        for (hosted, group) in &showing {
+            if group.is_some() {
+                continue;
+            }
+            if machine != Some(hosted.host.as_str()) {
+                machine = Some(&hosted.host);
+                rows.push(Row::heading(&hosted.host));
+            }
+            Self::session(&mut rows, &mut at, hosted, current, 1);
+        }
+        let landed = current.clone();
+        let on = at.iter().position(|there| *there == landed).unwrap_or(0);
+        let highlight = rows
+            .iter()
+            .position(|row| !row.heading && row.id == on)
+            .unwrap_or(0);
+
+        // The first row is "everything" or "no group" depending on which verb
+        // opened the list, which is why it carries no name.
+        let mut group_rows = vec![Row::new(0, "(none)")];
+        let mut names: Vec<Option<String>> = vec![None];
+        let held = groups.tally(&snapshot.sessions);
+        for (name, count) in held {
+            let mark = if focus == Some(name.as_str()) {
+                "●"
+            } else {
+                ""
+            };
+            group_rows.push(
+                // Spelt the way it is typed and the way the session list
+                // heads it, so the same thing is not two things across two
+                // lists one key apart.
+                Row::new(names.len(), format!("@{name}"))
+                    .detail(count.to_string())
+                    .note(mark),
+            );
+            names.push(Some(name));
+        }
+
+        Self {
+            rows: Rows {
+                sessions: rows,
+                groups: group_rows,
+                at: highlight,
+            },
+            at,
+            groups: names,
+        }
+    }
+
+    /// One session row, and the address that goes with it.
+    ///
+    /// The two are pushed together and never apart: the row's id is its index
+    /// in `at`, which is how the popup can hand back a row without ever being
+    /// told what a machine is.
+    fn session(
+        rows: &mut Vec<Row>,
+        at: &mut Vec<Located>,
+        hosted: &HostedSession,
+        current: &Located,
+        indent: u16,
+    ) {
+        let here = *current == Located::new(&hosted.host, &hosted.session.name);
+        let mut note = term::duration(hosted.session.idle);
+        if hosted.session.bells > 0 {
+            note = format!("{note} *");
+        }
+        if here {
+            note = "●".to_string();
+        }
+        rows.push(
+            // The name alone: whatever heading gathered it, machine included,
+            // is a line above it.
+            Row::new(at.len(), &hosted.session.name)
+                .detail(&hosted.session.title)
+                .note(note)
+                .indent(indent),
+        );
+        at.push(Located::new(&hosted.host, &hosted.session.name));
+    }
+}
+
+/// Put the session on `row` in a group, or take it out of one.
+///
+/// The pid and the start time membership is keyed on come from the snapshot the
+/// popup was drawn from, and that snapshot can be a few seconds old. One
+/// `sessions_on` to the machine holding it refreshes them first, because a
+/// stale pid puts the wrong session in a group, which is worse than a round
+/// trip on a key nobody presses in a hurry.
+async fn regroup(
+    socket: &Path,
+    listed: &Listed,
+    row: usize,
+    group: Option<String>,
+    groups: &mut Groups,
+) -> Result<()> {
+    let at = listed
+        .at
+        .get(row)
+        .ok_or_else(|| anyhow!("that session is no longer listed"))?;
+    let sessions = sessions_on(socket, &at.host).await?;
+    let session = sessions
+        .iter()
+        .find(|s| s.name == at.session)
+        .ok_or_else(|| anyhow!("{} is no longer running", at.session))?;
+    match &group {
+        Some(name) => {
+            groups.assign(name, &at.host, session)?;
+        }
+        None => groups.clear(&at.host, session),
+    }
+    groups.save()
+}
+
+/// Rename the session on a popup row, wherever it is running, and answer with
+/// the name that stuck.
+///
+/// `Request::Rename` answers `Ok` and throws that name away, and it cannot be
+/// made to say more without a node old enough to be out there failing to
+/// decode it. So the session is looked up again afterwards by the one thing a
+/// rename does not move: its pid. What was typed and what it ended up called
+/// are not always the same string, since the node sanitises it, and the mark
+/// row is about to draw one of them.
+async fn rename_at(socket: &Path, at: Option<&Located>, pid: u32, to: &str) -> Result<String> {
+    let at = at.ok_or_else(|| anyhow!("that session is no longer listed"))?;
+    open(socket, &at.host)
+        .await?
+        .call(&Request::Rename {
+            name: at.session.clone(),
+            to: to.to_string(),
+        })
+        .await?;
+    let sessions = sessions_on(socket, &at.host).await?;
+    Ok(sessions
+        .iter()
+        .find(|s| s.pid == pid)
+        .map(|s| s.name.clone())
+        .unwrap_or_else(|| to.to_string()))
+}
+
+/// The listing as the cycle wants it: an address, and the group it is in.
+fn entries(snapshot: &Snapshot, groups: &Groups) -> Vec<manymux::client::switch::Entry> {
+    snapshot
+        .sessions
+        .iter()
+        .map(|hosted| {
+            manymux::client::switch::Entry::new(
+                Located::new(&hosted.host, &hosted.session.name),
+                groups
+                    .group_of(&hosted.host, &hosted.session)
+                    .map(str::to_string),
+            )
+        })
+        .collect()
+}
+
 /// Ask every machine what it is running, off to one side, so that no keystroke
 /// waits on ssh.
-fn spawn_listing(socket: &Path) -> JoinHandle<Vec<Located>> {
+fn spawn_listing(socket: &Path) -> JoinHandle<Snapshot> {
     let socket = socket.to_path_buf();
     tokio::spawn(async move {
         match everywhere(&socket).await {
-            Ok(listing) => listing
-                .sessions
-                .into_iter()
-                .map(|hosted| Located::new(hosted.host, hosted.session.name))
-                .collect(),
+            Ok(listing) => Snapshot {
+                answered: listing.answering(),
+                sessions: listing.sessions,
+            },
             Err(e) => {
                 debug!("could not list sessions for the switch keys: {e:#}");
-                Vec::new()
+                Snapshot::default()
             }
         }
     })
 }
 
-/// Hand the cycle the listing, if one has arrived or arrives shortly.
+/// Hand the cycle the listing, if one has arrived or arrives shortly, and keep
+/// it for the popup to draw from.
 ///
 /// What is already known stands rather than being replaced by nothing, and a
 /// listing still out there asking is left running rather than thrown away.
-async fn take_listing(pending: &mut Option<JoinHandle<Vec<Located>>>, cycle: &mut Cycle) {
+///
+/// This is also where the group file gets tidied: the listing is the only thing
+/// that says which sessions are still running, and only the machines that
+/// answered count towards it.
+async fn take_listing(
+    pending: &mut Option<JoinHandle<Snapshot>>,
+    cycle: &mut Cycle,
+    snapshot: &mut Snapshot,
+    groups: &mut Groups,
+) {
     let Some(mut task) = pending.take() else {
         return;
     };
     match tokio::time::timeout(LISTING_WAIT, &mut task).await {
-        Ok(Ok(sessions)) => {
-            if !sessions.is_empty() {
-                cycle.refresh(sessions);
+        Ok(Ok(landed)) => {
+            if !landed.is_empty() {
+                groups.prune(&landed.answered, &landed.sessions);
+                let _ = groups.save();
+                *snapshot = landed;
+                cycle.refresh(entries(snapshot, groups));
             }
         }
         Ok(Err(e)) => debug!("the listing task did not finish: {e}"),
@@ -1192,4 +1810,38 @@ fn current_dir() -> Option<String> {
     std::env::current_dir()
         .ok()
         .map(|p| p.to_string_lossy().into_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An attempt that never answers, which is what a client multiplexed onto
+    /// a dead ssh master is: nothing fails, nothing times out, and the row
+    /// stops counting because the loop never comes back round to it.
+    async fn never() -> Result<Attached, Missed> {
+        std::future::pending().await
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_reconnect_that_never_answers_is_a_failed_attempt() {
+        // tokio's clock, not the wall's: this test spends no real time at all.
+        let at = tokio::time::Instant::now();
+        let missed = reaching(never(), true).await;
+        assert!(matches!(missed, Err(Missed::Unreachable(_))));
+        assert!(at.elapsed() >= REACH_FOR, "it waited {:?}", at.elapsed());
+    }
+
+    /// The first attach of a run is a command somebody typed: a cold ssh, a
+    /// node being started and an install being answered are all allowed to
+    /// take longer than a reconnect is.
+    #[tokio::test(start_paused = true)]
+    async fn the_first_attach_of_a_run_is_given_as_long_as_it_takes() {
+        assert!(
+            tokio::time::timeout(REACH_FOR * 10, reaching(never(), false))
+                .await
+                .is_err(),
+            "the first attach was cut short"
+        );
+    }
 }

@@ -127,6 +127,9 @@ const CTRL: u8 = 4;
 const LOCKS: u8 = 64 | 128;
 
 const PRESS: u8 = 1;
+/// What a terminal reports for a key being held down long enough to repeat.
+/// A keystroke like any other: holding a key is how anybody walks a long list.
+const REPEAT: u8 = 2;
 
 /// The key codes control mode and the prompts read. No letters: one typed
 /// without modifiers still arrives as itself, whatever protocol is on.
@@ -154,7 +157,7 @@ impl Encoded {
     /// the middle is.
     fn parse(input: &[u8]) -> Option<Self> {
         let rest = input.strip_prefix(b"\x1b[")?;
-        let end = rest.iter().position(|b| (0x40..=0x7e).contains(b))?;
+        let end = rest.iter().position(|b| final_byte(*b))?;
         let mut fields = std::str::from_utf8(&rest[..end]).ok()?.split(';');
         let mut shifted = None;
         let (code, mods, event) = match rest[end] {
@@ -197,6 +200,17 @@ impl Encoded {
         MODIFIER_KEYS.contains(&self.code)
     }
 
+    /// Whether the key is down: pressed, or held long enough to be repeating.
+    ///
+    /// Both count, and only letting go does not. Under the protocols that
+    /// report event types at all, a held key stops sending the plain byte over
+    /// and over and sends repeats instead, so dropping them meant that holding
+    /// tab in the list moved the highlight exactly once, but only while a
+    /// program like `pi` had the terminal in that mode.
+    fn down(&self) -> bool {
+        self.event == PRESS || self.event == REPEAT
+    }
+
     /// The byte this key stands for at a prompt, if it is one of the few that
     /// mean anything there.
     ///
@@ -206,7 +220,7 @@ impl Encoded {
     /// else a program's mode brings with it (releases, modifiers, the arrows,
     /// the mode key itself) is not text and stands for nothing.
     fn typed(&self) -> Option<u8> {
-        if self.event != PRESS {
+        if !self.down() {
             return None;
         }
         match self.code {
@@ -248,10 +262,10 @@ impl Encoded {
     /// than guessed at further: the client's keys read their own case (`h` and
     /// `H`), and a layout it cannot see is not worth more than that.
     fn text(&self) -> Option<char> {
-        // Letting go of a key types nothing, and neither does holding it down
-        // long enough to repeat: a mode that reports both would otherwise type
-        // a character two and three times over.
-        if self.event != PRESS || self.mods & !(SHIFT | LOCKS) != 0 {
+        // Letting go of a key types nothing. Holding one down does, over and
+        // over, which is what holding a key has always meant and what a
+        // terminal not in one of these modes does by sending the byte again.
+        if !self.down() || self.mods & !(SHIFT | LOCKS) != 0 {
             return None;
         }
         let shift = self.mods & SHIFT != 0;
@@ -289,7 +303,7 @@ fn sequence(input: &[u8]) -> Option<usize> {
     match rest.first()? {
         // A control sequence, which runs to its final byte.
         b'[' => {
-            let end = rest[1..].iter().position(|b| (0x40..=0x7e).contains(b))?;
+            let end = rest[1..].iter().position(|b| final_byte(*b))?;
             Some(3 + end)
         }
         // SS3, which is one byte and is how a terminal in application-keypad
@@ -346,11 +360,40 @@ pub enum Motion {
     PreviousHost,
 }
 
+/// What a key did to a popup.
+///
+/// Where the highlight is and what it lands on is [`super::super::picker`]'s;
+/// this only says which way, the same split [`Scroll`] uses for the view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pick {
+    Up,
+    Down,
+    /// The next machine in the list, and the one before: a bigger step of the
+    /// same gesture, now that there is a list to see it in.
+    NextGroup,
+    PreviousGroup,
+    /// Enter: go to the highlighted session, or take the highlighted group.
+    Go,
+    /// `m`: move the highlighted session into a group, which opens the group
+    /// list over this one.
+    Move,
+    /// `g`: narrow to a group, which opens the same list for the other verb.
+    Groups,
+    /// Esc: close, changing nothing.
+    Cancel,
+}
+
 /// What a key pressed in switch mode asks for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
     Detach,
     Switch(Motion),
+    /// Something happened to the popup control mode puts on the screen.
+    Pick(Pick),
+    /// The same four states as a rename, for the prompt that names a new group.
+    /// A third prompt rather than a third editor: the typing is identical and
+    /// only the action carrying it says which prompt it happened at.
+    GroupName(Rename),
     /// Start a session on the machine this one is on, and go and sit in it.
     /// Where that is and what it gets called is the caller's, for the same
     /// reason a switch is: this half of the client knows nothing about hosts.
@@ -362,6 +405,10 @@ pub enum Action {
     /// Move the view over the session's history, or open or close it. Where it
     /// is and what it shows is [`super::scroll`]'s; this only says which way.
     Scroll(Scroll),
+    /// Something happened to the selection being dragged out in the view.
+    /// Where the cells are and what text they hold is [`super::scroll`]'s, the
+    /// same as everything else about that window.
+    Select(Select),
     /// Something happened to the search. The text being typed lives in the key
     /// filter, since that is what a keyboard mode is; everything done with it
     /// is the caller's.
@@ -420,6 +467,28 @@ pub enum Scroll {
     Leave,
 }
 
+/// A drag, in the four things a hand does with a mouse.
+///
+/// Selecting happens in the view and nowhere else, so a press on the live
+/// screen opens it first: that is where the client holds the lines and paints
+/// every row itself, and it is the only surface here whose picture stands
+/// still. On the live screen the node holds the screen and the client is a pipe
+/// between it and the terminal, with no cells of its own to reverse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Select {
+    /// The button went down here: a selection starts, and anything selected
+    /// before it goes.
+    From(Spot),
+    /// Dragged to here with the button still down.
+    To(Spot),
+    /// Let go. What is selected is what gets copied.
+    Done,
+    /// A second click in the same place, which takes the word under it.
+    Word(Spot),
+    /// And a third, which takes the whole line.
+    Line(Spot),
+}
+
 /// Which of the client's two modes the keyboard is in.
 ///
 /// Modal like vim, and for the same reason: the keys that drive the client are
@@ -441,6 +510,12 @@ pub enum Mode {
     /// keyboard here is neither the session's nor doing control keys: every
     /// letter is text, and the row is the only place it shows.
     Rename,
+    /// A group is being chosen, from the list drawn over the session list.
+    ///
+    /// Its own mode because the keys that act on a session mean nothing here:
+    /// `m` from inside this would be moving a move, and `d` would detach out
+    /// of a gesture halfway through.
+    Picking,
 }
 
 /// One mouse report, in the SGR spelling (`CSI < button ; col ; row M`).
@@ -453,31 +528,54 @@ pub enum Mode {
 struct Report {
     len: usize,
     button: u8,
-    /// A press. Releases end in `m` and are dropped: the wheel has no release,
-    /// and a click's two halves would move the view twice.
+    /// A press. A release ends in `m` instead, and for the wheel there is no
+    /// such thing: a notch is one report and reading its halves would move the
+    /// view twice.
     press: bool,
+    /// The pointer moved with a button held, which is what a drag is made of
+    /// and what `?1002h` adds to `?1000h`.
+    motion: bool,
+    /// Where on the screen, in cells, counting from one.
+    at: Spot,
 }
 
-/// Buttons 64 and 65, once the modifier bits (shift 4, meta 8, ctrl 16) are
-/// taken off. 66 and 67 are the horizontal wheel, which has nowhere to go here.
+/// Buttons 64 and 65, once the modifier bits (shift 4, meta 8, ctrl 16) and the
+/// motion bit are taken off. 66 and 67 are the horizontal wheel, which has
+/// nowhere to go here.
 const WHEEL_UP: u8 = 64;
 const WHEEL_DOWN: u8 = 65;
+/// The button a selection is made with. The other two are swallowed: the client
+/// asked for these reports and the session did not, so there is nowhere to
+/// forward them to.
+const LEFT: u8 = 0;
 const MODIFIERS: u8 = 4 | 8 | 16;
+/// Motion, reported with whichever button is down.
+const MOTION: u8 = 32;
+
+/// A cell on the screen, counting from one, the way a terminal reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Spot {
+    pub col: u16,
+    pub row: u16,
+}
 
 impl Report {
     fn parse(input: &[u8]) -> Option<Self> {
         let rest = input.strip_prefix(b"\x1b[<")?;
         let end = rest.iter().position(|b| matches!(b, b'M' | b'm'))?;
-        let button = std::str::from_utf8(&rest[..end])
-            .ok()?
-            .split(';')
-            .next()?
-            .parse::<u16>()
-            .ok()?;
+        let mut fields = std::str::from_utf8(&rest[..end]).ok()?.split(';');
+        let button = fields.next()?.parse::<u16>().ok()?;
+        let button = u8::try_from(button).ok()?;
+        // A report with no coordinates is not one. They are the whole of what a
+        // drag says, and a zero would be a cell that does not exist.
+        let col = fields.next()?.parse::<u16>().ok()?;
+        let row = fields.next()?.parse::<u16>().ok()?;
         Some(Self {
             len: 3 + end + 1,
-            button: u8::try_from(button).ok()? & !MODIFIERS,
+            button: button & !(MODIFIERS | MOTION),
             press: rest[end] == b'M',
+            motion: button & MOTION != 0,
+            at: Spot { col, row },
         })
     }
 
@@ -494,23 +592,39 @@ impl Report {
 /// Whether the wheel is the client's to read, or the terminal's to do what it
 /// likes with.
 ///
-/// Only while the view is up. Reporting the mouse is what stops a drag from
-/// selecting, so a client that holds it for the whole attach is one you cannot
-/// copy a line out of without a modifier held down; and with the view closed
-/// there is nothing here for a notch to move anyway. What the view is open on
-/// has already been decided by then: it opens only on a screen the client owns
-/// and a host new enough to answer for a window.
+/// The terminal's unless somebody asked for it here (`mm config mouse client`),
+/// and then only where there is a history of our own to move: a screen the
+/// client owns, and a host new enough to answer for a window. Both of those
+/// arrive inside `history`, along with the setting, since a wheel with nowhere
+/// to go and a wheel nobody asked for come to the same thing.
 ///
-/// Never while the session has asked for reports of its own, which is both
-/// halves of the same rule: two readers on one wheel, and a client that turned
-/// tracking on would turn it off again on the way out of the view, leaving a
-/// program that asked for the mouse without one.
+/// Taking it is the whole attach or none of it. It was once held only while the
+/// view was already up, on the reasoning that a wheel is worth less than a drag,
+/// which left the wheel doing nothing at all for the rest of the attach: the
+/// client's screen is the terminal's alternate one, where the terminal has no
+/// scrollback to offer, and [`crate::client::screen::Alternate`] switches
+/// alternate scroll off besides, so a notch reached nobody. A key that only
+/// works after you have pressed another key is not the gesture anybody reaches
+/// for.
+///
+/// What taking it costs is the terminal's own selection, which a terminal stops
+/// doing with a bare drag the moment somebody is reporting the mouse. Selection
+/// moves under a modifier the terminal chooses, which may not be there at all,
+/// and that is what settles the default rather than any weighing up of the two
+/// gestures: a wheel that does nothing here is what plain ssh does and there is
+/// a key on the hints row saying so, while a drag that stopped selecting is
+/// this having quietly taken something away, with nothing to press instead.
+///
+/// Never while the session has asked for reports of its own, which is the half
+/// of the old rule that stays: two readers on one wheel, and a program that
+/// asked for the mouse must keep every report, including the wheel it draws its
+/// own scrolling from.
 ///
 /// Desktop-only, like the terminal it is a rule about: a mobile app has no
 /// wheel to route and its own idea of what a drag is.
 #[cfg(feature = "desktop")]
-pub(super) fn wheel_is_ours(view_open: bool, session_mouse: bool) -> bool {
-    view_open && !session_mouse
+pub(super) fn wheel_is_ours(history: bool, session_mouse: bool) -> bool {
+    history && !session_mouse
 }
 
 /// Shift-Tab, spelt the way a terminal sends it when nothing has asked for a
@@ -519,17 +633,33 @@ pub(super) fn wheel_is_ours(view_open: bool, session_mouse: bool) -> bool {
 /// sent of its own accord.
 const SHIFT_TAB: &[u8] = b"\x1b[Z";
 
-/// The keys that move the view, in the spellings terminals send them in.
+/// The keys that move a popup's highlight, each in the plain spelling a
+/// terminal sends it in when nothing has asked for a longer one.
 ///
-/// Matched before the bytes are looked at one at a time, so that the escape
-/// starting each of them is not mistaken for the bare Esc that leaves.
+/// Matched through [`Special`], which reads the longer spellings back to these,
+/// and matched before the bytes are looked at one at a time, for the same reason
+/// [`VIEW_KEYS`] is: read a byte at a time the Esc starting `\x1b[A` is the Esc
+/// that closes the popup, so reaching for a cursor key would shut the list.
+const PICK_KEYS: &[(&[u8], Pick)] = &[
+    (b"\x1b[A", Pick::Up),
+    (b"\x1b[B", Pick::Down),
+    // Shift-Tab, which is spelt like a report and pressed like a key. Here
+    // rather than only in the control-mode match, so it moves the group list
+    // too: read a byte at a time there, its Esc is the Esc that closes.
+    (SHIFT_TAB, Pick::Up),
+];
+
+/// The keys that move the view, each in the plain spelling a terminal sends it
+/// in when nothing has asked for a longer one.
+///
+/// Read through [`Special`] and matched before the bytes are looked at one at a
+/// time, so that the escape starting each of them is not mistaken for the bare
+/// Esc that leaves.
 const VIEW_KEYS: &[(&[u8], Scroll)] = &[
     (b"\x1b[5~", Scroll::PageUp),
     (b"\x1b[6~", Scroll::PageDown),
     (b"\x1b[A", Scroll::Up(1)),
     (b"\x1b[B", Scroll::Down(1)),
-    (b"\x1bOA", Scroll::Up(1)), // the application-keypad spellings, which a
-    (b"\x1bOB", Scroll::Down(1)), // program may have left the terminal in
     (b"\x1b[H", Scroll::Top),
     (b"\x1b[1~", Scroll::Top),
     (b"\x1b[7~", Scroll::Top),
@@ -537,6 +667,82 @@ const VIEW_KEYS: &[(&[u8], Scroll)] = &[
     (b"\x1b[4~", Scroll::Bottom),
     (b"\x1b[8~", Scroll::Bottom),
 ];
+
+/// A key that types nothing, as a terminal spells it, with everything an
+/// extended-keys mode adds to the spelling taken back off.
+///
+/// The arrows and the paging keys are the keys [`Encoded`] cannot speak for:
+/// they are escape sequences rather than bytes, and they end in a letter or a
+/// `~` rather than the `u` that protocol uses. So they are matched against the
+/// tables above, and matching the plain spelling alone missed exactly what
+/// [`Encoded::down`] once missed. A terminal asked to report event types stops
+/// resending `\x1b[A` for a held arrow and sends `\x1b[1;1:2A`, so holding one
+/// in the popup moved the highlight once and stopped, but only while a program
+/// like `pi` had the terminal in that mode: the same hand on the same key
+/// worked in every other session.
+///
+/// Modifiers are read off and then ignored. Ctrl-Up in a list is a hand
+/// reaching for up, and there is nothing else here for it to mean.
+struct Special {
+    /// How many bytes of the input the sequence took.
+    len: usize,
+    /// The number in front, which names the key in the `~` spellings and is 1
+    /// for the ones a final letter names.
+    number: u32,
+    /// The final byte: `A` for up, `~` for the numbered keys.
+    ends: u8,
+    /// 1 press, 2 repeat, 3 release, as [`Encoded`] reads it.
+    event: u8,
+}
+
+impl Special {
+    /// Read one such key off the front of `input`, if what is there is one.
+    fn parse(input: &[u8]) -> Option<Self> {
+        // SS3, which is how a terminal in application-keypad mode spells the
+        // arrows. It carries no parameters at all, so there is nothing an
+        // extended mode could have added to it.
+        if let Some(rest) = input.strip_prefix(b"\x1bO") {
+            let ends = *rest.first()?;
+            return final_byte(ends).then_some(Self {
+                len: 3,
+                number: 1,
+                ends,
+                event: PRESS,
+            });
+        }
+        let rest = input.strip_prefix(b"\x1b[")?;
+        let end = rest.iter().position(|b| final_byte(*b))?;
+        let mut fields = std::str::from_utf8(&rest[..end]).ok()?.split(';');
+        // An absent number is 1, which is what the protocol says a missing
+        // parameter means and what makes `\x1b[A` and `\x1b[1;5A` one key.
+        let number = match fields.next() {
+            None | Some("") => 1,
+            Some(field) => number(field)?,
+        };
+        let (_, event) = modifiers(fields.next());
+        Some(Self {
+            len: 2 + end + 1,
+            number,
+            ends: rest[end],
+            event,
+        })
+    }
+
+    /// Whether this is the key `plain` names, held down rather than let go of.
+    fn is(&self, plain: &[u8]) -> bool {
+        let Some(named) = Self::parse(plain) else {
+            return false;
+        };
+        (self.event == PRESS || self.event == REPEAT)
+            && self.number == named.number
+            && self.ends == named.ends
+    }
+}
+
+/// Whether this byte ends a control sequence.
+fn final_byte(b: u8) -> bool {
+    (0x40..=0x7e).contains(&b)
+}
 
 /// Watches the keystroke stream for the key that changes mode, and reads the
 /// keys that follow it.
@@ -580,6 +786,11 @@ pub struct KeyFilter {
     /// takes nothing from the session, and dropping the ones that are not the
     /// wheel keeps a stray click from typing into a shell.
     wheel: bool,
+    /// The last press: where, when, and how many have landed there in a row.
+    ///
+    /// A double click is a fact about the hand and the clock rather than about
+    /// the screen, so it is counted here and the view is told what it means.
+    clicked: Option<(Spot, Instant, u8)>,
     /// What is being typed at a prompt, while one is open, and which prompt
     /// it is.
     ///
@@ -607,18 +818,46 @@ enum Prompting {
     Find,
     /// The session's title.
     Rename,
+    /// A group to put the highlighted session in.
+    Group,
 }
 
 impl Prompting {
-    /// The same four things happen at either prompt; which action carries them
-    /// is all that differs, so the pair is named at the one place it matters.
+    /// The same four things happen at every prompt; which action carries them
+    /// is all that differs, so the set is named at the one place it matters.
     fn action(self, find: Find, rename: Rename) -> Action {
         match self {
             Prompting::Find => Action::Find(find),
             Prompting::Rename => Action::Rename(rename),
+            Prompting::Group => Action::GroupName(rename),
         }
     }
 }
+
+/// What is left of a chunk once an action has been taken out of it.
+///
+/// Only a popup move gives any of it back. See [`Keystrokes::rest`].
+fn rest_after(action: Action, left: &[u8]) -> Vec<u8> {
+    match action {
+        Action::Pick(Pick::Up | Pick::Down | Pick::NextGroup | Pick::PreviousGroup) => {
+            left.to_vec()
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// How far a wheel report moves the view, signed, for adding up a spin.
+fn lines(scroll: Scroll) -> i64 {
+    match scroll {
+        Scroll::Up(lines) => lines as i64,
+        Scroll::Down(lines) => -(lines as i64),
+        _ => 0,
+    }
+}
+
+/// How long after a click a second one in the same place is a double rather
+/// than two singles. What every toolkit uses, give or take.
+const CLICK_AGAIN: Duration = Duration::from_millis(400);
 
 /// Take the last character off a line being typed, if there is one.
 ///
@@ -676,6 +915,17 @@ pub struct Keystrokes {
     pub action: Option<Action>,
     /// The mode the client is in now, for the row at the bottom of the screen.
     pub mode: Mode,
+    /// What was left of the chunk, for the two things you do carry on through:
+    /// moving a popup's highlight, and anything the mouse did.
+    ///
+    /// Everything else ends the chunk it was found in, because nobody types
+    /// through a detach or a switch. A highlight move is not like those: two
+    /// writes a moment apart arrive as one read, so `tab` then `Enter` is one
+    /// chunk, and dropping the rest there loses the keystroke that commits. The
+    /// mouse is the same the whole time rather than now and then, since one
+    /// gesture is many reports and they arrive together.
+    /// Empty for every other action, which keeps that rule where it was.
+    pub rest: Vec<u8>,
 }
 
 impl KeyFilter {
@@ -688,6 +938,7 @@ impl KeyFilter {
             spelling: vec![prefix],
             scroll: false,
             wheel: false,
+            clicked: None,
             prompt: None,
         }
     }
@@ -700,6 +951,11 @@ impl KeyFilter {
     /// What is being typed at the rename prompt, if that is the one open.
     pub fn wanted_name(&self) -> Option<String> {
         self.typed(Prompting::Rename)
+    }
+
+    /// What is being typed at the new-group prompt, if that is the one open.
+    pub fn wanted_group(&self) -> Option<String> {
+        self.typed(Prompting::Group)
     }
 
     fn typed(&self, what: Prompting) -> Option<String> {
@@ -729,7 +985,12 @@ impl KeyFilter {
 
     /// Where an action leaves the keyboard. A switch stays in control mode, so
     /// the next key carries on walking without a mode key of its own.
-    fn after(action: Action) -> Mode {
+    /// `now` is the mode the key arrived in, because one action's answer
+    /// depends on it: moving a highlight stays in whichever list is showing.
+    /// Reading it as control mode meant the key after a move in the group list
+    /// was read with the session list's table, where `m` moves and `d`
+    /// detaches, which is the whole reason that mode is separate.
+    fn after(action: Action, now: Mode) -> Mode {
         match action {
             // A new session is a fresh shell waiting to be typed into, which
             // is why it is the one key here that does not leave the mode on:
@@ -737,6 +998,22 @@ impl KeyFilter {
             // a command.
             Action::Detach | Action::Paste | Action::New => Mode::Focus,
             Action::Switch(_) => Mode::Control,
+            // The popup stays up while the highlight is moving, and both ways
+            // out of it go back to the session.
+            Action::Pick(Pick::Go) => Mode::Focus,
+            // Except that a group list was opened *over* the session list, so
+            // the way out of one is back to the other: the hints on both of
+            // them say `esc` and mean it. Told apart by the mode the key
+            // arrived in, which is what the group lists have of their own.
+            Action::Pick(Pick::Cancel) if now == Mode::Picking => Mode::Control,
+            Action::Pick(Pick::Cancel) => Mode::Focus,
+            Action::Pick(Pick::Move | Pick::Groups) => Mode::Picking,
+            Action::Pick(_) => now,
+            // Back to the group list rather than to the session: naming a group
+            // was one step of choosing one, and the list it was chosen from is
+            // still what you are looking at.
+            Action::GroupName(Rename::Run | Rename::Cancel) => Mode::Picking,
+            Action::GroupName(_) => Mode::Rename,
             Action::Scroll(Scroll::Leave) => Mode::Focus,
             // Every other move keeps the view up, wherever it was opened from:
             // a wheel notch in focus mode opens it and stays.
@@ -745,6 +1022,10 @@ impl KeyFilter {
             // and leaves you there. Cancelling the prompt is cancelling the
             // prompt, not leaving.
             Action::Find(_) => Mode::Scroll,
+            // And so is a drag: the press that starts one opens the view under
+            // it, and letting go leaves you looking at what you selected rather
+            // than back in a session that has moved on underneath.
+            Action::Select(_) => Mode::Scroll,
             // The rename prompt is its own mode, and the only ways out of it
             // are sending the name and giving up on it.
             Action::Rename(Rename::Run | Rename::Cancel) => Mode::Focus,
@@ -770,14 +1051,26 @@ impl KeyFilter {
             // than a letter each beside them: one gesture with a direction is
             // less to remember than two keys, and it leaves the letters for
             // the things done to a session rather than the moves between them.
-            b'\t' => Action::Switch(Motion::Next),
+            //
+            // They move the highlight rather than hopping outright, now that
+            // there is a list to move it in. Walking three sessions used to be
+            // three detaches and three reattaches, over ssh, to see what each
+            // one was; it is now one, on the Enter that commits.
+            b'\t' | b'j' | b'J' => Action::Pick(Pick::Down),
+            b'k' | b'K' => Action::Pick(Pick::Up),
+            b'\r' | b'\n' => Action::Pick(Pick::Go),
+            // Move the highlighted session into a group, and narrow to one.
+            // Two verbs, and which list you came from is what says which:
+            // no row in either means two things.
+            b'm' | b'M' => Action::Pick(Pick::Move),
+            b'g' => Action::Pick(Pick::Groups),
             b'l' | b'L' => Action::Switch(Motion::Last),
             b'n' | b'N' => Action::New,
             // The one key that reads its own case, because shift already means
             // backwards here: `H` is to `h` what shift-tab is to tab, rather
             // than a second letter to remember.
-            b'h' => Action::Switch(Motion::NextHost),
-            b'H' => Action::Switch(Motion::PreviousHost),
+            b'h' => Action::Pick(Pick::NextGroup),
+            b'H' => Action::Pick(Pick::PreviousGroup),
             // Only where there is a history to look at. Elsewhere they are
             // unbound keys, and the session gets them.
             SCROLL_KEY if self.scroll => Action::Scroll(Scroll::Up(0)),
@@ -793,6 +1086,34 @@ impl KeyFilter {
             _ => return None,
         };
         Some(action)
+    }
+
+    /// The same, for the group list drawn over the session list.
+    ///
+    /// A table of its own rather than a subset of [`Self::controlling`]: the
+    /// keys that act on a session have nothing to act on here, and letting one
+    /// through would run it against whatever was highlighted behind this list.
+    /// Everything not here does nothing, the same as in the view: a hand
+    /// landing on the keyboard must not close a gesture halfway through.
+    fn picking(&self, b: u8) -> Option<Action> {
+        let pick = match b {
+            // The same gesture as in the session list: one key with a
+            // direction, rather than a second pair of keys to learn for a list
+            // that behaves identically.
+            b'\t' => Pick::Down,
+            b'j' | b'J' => Pick::Down,
+            b'k' | b'K' => Pick::Up,
+            b'\r' | b'\n' => Pick::Go,
+            b'q' | 0x1b => Pick::Cancel,
+            b if b == self.prefix => Pick::Cancel,
+            // A group that does not exist yet, named at the prompt. It assigns
+            // as well as creates, necessarily: a group is a set of live
+            // sessions, so an empty one cannot exist and creating one is the
+            // same act as putting the first session in it.
+            b'n' | b'N' => return Some(Action::GroupName(Rename::Open)),
+            _ => return None,
+        };
+        Some(Action::Pick(pick))
     }
 
     /// The same, for the keys that move the view. The search keys come first,
@@ -822,6 +1143,71 @@ impl KeyFilter {
         Some(Action::Scroll(scroll))
     }
 
+    /// What the mouse just did, out of however many reports of it are in this
+    /// chunk.
+    ///
+    /// Every report is swallowed whether or not it means anything here: the
+    /// client asked the terminal for them and the session did not, so a click
+    /// forwarded on would be typed into whatever is running.
+    ///
+    /// Both kinds coalesce, and for the same reason. A hand spinning the wheel
+    /// and a hand dragging both send several reports before the client is next
+    /// read, and answering only the first would leave the rest to be read as
+    /// keystrokes and the screen a gesture behind the hand. A wheel adds its
+    /// notches up; a drag has no sum, only a latest, so the ones behind it are
+    /// dropped. Neither runs past a report of the other kind, which is why the
+    /// remainder goes back through [`rest_after`]: a drag and the release that
+    /// ends it arrive as one chunk more often than not.
+    fn mousing(&mut self, input: &[u8], i: &mut usize, now: Instant) -> Option<Action> {
+        let first = Report::parse(&input[*i..])?;
+        *i += first.len;
+        if let Some(scroll) = first.scroll() {
+            let mut net = lines(scroll);
+            while let Some(next) = Report::parse(&input[*i..]) {
+                let Some(scroll) = next.scroll() else { break };
+                *i += next.len;
+                net += lines(scroll);
+            }
+            return match net {
+                0 => None,
+                net if net > 0 => Some(Action::Scroll(Scroll::Up(net as u64))),
+                net => Some(Action::Scroll(Scroll::Down(net.unsigned_abs()))),
+            };
+        }
+        if first.button != LEFT {
+            return None;
+        }
+        if first.motion {
+            let mut at = first.at;
+            while let Some(next) = Report::parse(&input[*i..]) {
+                if !next.motion || next.button != LEFT {
+                    break;
+                }
+                *i += next.len;
+                at = next.at;
+            }
+            return Some(Action::Select(Select::To(at)));
+        }
+        if !first.press {
+            return Some(Action::Select(Select::Done));
+        }
+        // A press, and the second and third in the same place mean more than
+        // the first. Counted here rather than in the view because it is a fact
+        // about the hand and the clock, and the view knows about neither.
+        let clicks = match self.clicked {
+            Some((was, at, clicks)) if was == first.at && now.duration_since(at) < CLICK_AGAIN => {
+                clicks.saturating_add(1)
+            }
+            _ => 1,
+        };
+        self.clicked = Some((first.at, now, clicks));
+        Some(Action::Select(match clicks {
+            1 => Select::From(first.at),
+            2 => Select::Word(first.at),
+            _ => Select::Line(first.at),
+        }))
+    }
+
     /// Open the prompt an action asks for, if it asks for one. The tables above
     /// say what a key means and do nothing, so that they can be asked from
     /// either spelling; this is the one thing that has to happen either way.
@@ -829,6 +1215,7 @@ impl KeyFilter {
         match action {
             Action::Find(Find::Open) => self.open(Prompting::Find),
             Action::Rename(Rename::Open) => self.open(Prompting::Rename),
+            Action::GroupName(Rename::Open) => self.open(Prompting::Group),
             _ => {}
         }
     }
@@ -877,11 +1264,12 @@ impl KeyFilter {
             // each of them.
             if self.prompt.is_some() {
                 let action = self.typing(&input[i..]);
-                self.mode = Self::after(action);
+                self.mode = Self::after(action, self.mode);
                 return Keystrokes {
                     forward,
                     action: Some(action),
                     mode: self.mode,
+                    rest: Vec::new(),
                 };
             }
             // The wheel, while it is the client's. Every report is swallowed,
@@ -889,51 +1277,55 @@ impl KeyFilter {
             // terminal for them, the session did not, and forwarding a click
             // it never asked to hear about would type into whatever is
             // running.
-            if self.wheel
-                && let Some(report) = Report::parse(&input[i..])
-            {
-                // Every report in the chunk, not just this one. A hand moving
-                // the wheel sends several before the client is next read, and
-                // stopping at the first would leave the rest to be read as
-                // keystrokes and the view a notch behind the hand.
-                let mut net = 0i64;
-                let mut report = Some(report);
-                while let Some(this) = report {
-                    i += this.len;
-                    net += match this.scroll() {
-                        Some(Scroll::Up(lines)) => lines as i64,
-                        Some(Scroll::Down(lines)) => -(lines as i64),
-                        _ => 0,
-                    };
-                    report = Report::parse(&input[i..]);
-                }
-                let scroll = match net {
-                    0 => continue,
-                    net if net > 0 => Scroll::Up(net as u64),
-                    net => Scroll::Down(net.unsigned_abs()),
+            if self.wheel && Report::parse(&input[i..]).is_some() {
+                let Some(action) = self.mousing(input, &mut i, now) else {
+                    continue;
                 };
-                let action = Action::Scroll(scroll);
-                self.mode = Self::after(action);
+                self.mode = Self::after(action, self.mode);
                 return Keystrokes {
                     forward,
                     action: Some(action),
                     mode: self.mode,
+                    // Whatever is left of the chunk, always: a hand does one
+                    // thing at a time and the reports of it arrive together, so
+                    // `mousing` stops at the first report that means something
+                    // else and this is what hands that one on. A spin and the
+                    // click that follows it, or a drag and the release that
+                    // ends it, are one read more often than not.
+                    rest: input[i..].to_vec(),
                 };
             }
             // The keys that drive the view, which are escape sequences of their
             // own and have to be read whole before the escape starting them is
             // taken for the Esc that leaves.
             if self.mode == Mode::Scroll
-                && let Some((_, scroll)) = VIEW_KEYS
-                    .iter()
-                    .find(|(spelling, _)| input[i..].starts_with(spelling))
+                && let Some(key) = Special::parse(&input[i..])
+                && let Some((_, scroll)) = VIEW_KEYS.iter().find(|(plain, _)| key.is(plain))
             {
                 let action = Action::Scroll(*scroll);
-                self.mode = Self::after(action);
+                self.mode = Self::after(action, self.mode);
                 return Keystrokes {
                     forward,
                     action: Some(action),
                     mode: self.mode,
+                    rest: Vec::new(),
+                };
+            }
+            // The same, for the arrows that move a popup's highlight.
+            if matches!(self.mode, Mode::Control | Mode::Picking)
+                && let Some(key) = Special::parse(&input[i..])
+                && let Some((_, pick)) = PICK_KEYS.iter().find(|(plain, _)| key.is(plain))
+            {
+                self.spell(&input[i..i + key.len]);
+                self.pressed = None;
+                i += key.len;
+                let action = Action::Pick(*pick);
+                self.mode = Self::after(action, self.mode);
+                return Keystrokes {
+                    forward,
+                    action: Some(action),
+                    mode: self.mode,
+                    rest: rest_after(action, &input[i..]),
                 };
             }
             // A terminal that a program has put into an extended-keys mode
@@ -944,11 +1336,12 @@ impl KeyFilter {
                 let spelling = &input[i..i + key.len];
                 i += key.len;
                 if let Some(action) = self.encoded(&key, spelling, now, &mut forward) {
-                    self.mode = Self::after(action);
+                    self.mode = Self::after(action, self.mode);
                     return Keystrokes {
                         forward,
                         action: Some(action),
                         mode: self.mode,
+                        rest: rest_after(action, &input[i..]),
                     };
                 }
                 continue;
@@ -971,6 +1364,21 @@ impl KeyFilter {
             }
             let b = input[i];
             i += 1;
+            if self.mode == Mode::Picking {
+                // Same rule as the view: nothing here reaches the session, and
+                // an unbound key does nothing rather than closing the list.
+                let Some(action) = self.picking(b) else {
+                    continue;
+                };
+                self.opening(action);
+                self.mode = Self::after(action, self.mode);
+                return Keystrokes {
+                    forward,
+                    action: Some(action),
+                    mode: self.mode,
+                    rest: rest_after(action, &input[i..]),
+                };
+            }
             if self.mode == Mode::Scroll {
                 // Nothing typed here reaches the session: the screen is showing
                 // its history, and a key meant for the program would land in a
@@ -981,11 +1389,12 @@ impl KeyFilter {
                     continue;
                 };
                 self.opening(action);
-                self.mode = Self::after(action);
+                self.mode = Self::after(action, self.mode);
                 return Keystrokes {
                     forward,
                     action: Some(action),
                     mode: self.mode,
+                    rest: Vec::new(),
                 };
             }
             if self.mode == Mode::Focus {
@@ -1003,6 +1412,7 @@ impl KeyFilter {
                         forward,
                         action: Some(Action::Paste),
                         mode: self.mode,
+                        rest: Vec::new(),
                     };
                 } else {
                     forward.push(b);
@@ -1013,6 +1423,10 @@ impl KeyFilter {
             let action = match b {
                 // First, so that a mode key which is itself one of the keys
                 // below can still be sent through by pressing it twice.
+                // Closes the popup, and sends the byte on when it was pressed
+                // twice quickly. An action rather than a bare mode change,
+                // because the popup has to be taken off the screen and only
+                // the caller can repaint what was under it.
                 b if b == self.prefix => {
                     self.spell(&[b]);
                     if pressed.is_some_and(|at| now.duration_since(at) < LITERAL) {
@@ -1022,15 +1436,15 @@ impl KeyFilter {
                     None
                 }
                 // Shift-Tab, which starts with the same byte as the Esc that
-                // goes back to focus. An Esc with `[Z` behind it in the same
+                // closes the popup. An Esc with `[Z` behind it in the same
                 // read is the key; one at the end of a read is a real Esc.
                 // Split across two reads it reads as an Esc, which costs a trip
                 // back to focus and nothing else.
                 0x1b if input[i..].starts_with(&SHIFT_TAB[1..]) => {
                     i += 2;
-                    Some(Action::Switch(Motion::Previous))
+                    Some(Action::Pick(Pick::Up))
                 }
-                0x1b | b'\r' | b'\n' => {
+                0x1b | b'\n' => {
                     self.mode = Mode::Focus;
                     None
                 }
@@ -1048,13 +1462,15 @@ impl KeyFilter {
                 },
             };
             // Whatever is left of the chunk is dropped: nobody types through a
-            // detach or a switch.
+            // detach or a switch. A popup move is the exception, and hands the
+            // rest back; see `rest_after`.
             if let Some(action) = action {
-                self.mode = Self::after(action);
+                self.mode = Self::after(action, self.mode);
                 return Keystrokes {
                     forward,
                     action: Some(action),
                     mode: self.mode,
+                    rest: rest_after(action, &input[i..]),
                 };
             }
         }
@@ -1062,6 +1478,7 @@ impl KeyFilter {
             forward,
             action: None,
             mode: self.mode,
+            rest: Vec::new(),
         }
     }
 
@@ -1178,12 +1595,14 @@ impl KeyFilter {
             return None;
         }
 
-        // Dropping everything that is not a press is what makes control mode
-        // usable at all once a program has asked for event types: the ctrl you
-        // were holding reports its own release the moment you let go of the
-        // mode key, and reading that as a key would drop you back to focus
-        // before you had typed anything.
-        if key.event != PRESS || key.is_modifier() {
+        // Dropping the releases is what makes control mode usable at all once a
+        // program has asked for event types: the ctrl you were holding reports
+        // its own release the moment you let go of the mode key, and reading
+        // that as a key would drop you back to focus before you had typed
+        // anything. A repeat is not one of those. It is the key still being
+        // held, which is how a long list gets walked, and dropping it meant
+        // holding tab moved the highlight once and then stopped.
+        if !key.down() || key.is_modifier() {
             return None;
         }
         // The key as the byte the ordinary encoding would have sent, so that
@@ -1203,6 +1622,18 @@ impl KeyFilter {
             self.opening(action);
             return Some(action);
         }
+        if self.mode == Mode::Picking {
+            // The same, for the group list, Shift-Tab included: it walks the
+            // list back, and a terminal asked for a protocol that can say which
+            // key was held spells it as tab with shift rather than as `CSI Z`,
+            // where reading the byte behind it walks the list the other way.
+            if key.code == TAB && key.mods & SHIFT != 0 {
+                return Some(Action::Pick(Pick::Up));
+            }
+            let action = byte.and_then(|b| self.picking(b))?;
+            self.opening(action);
+            return Some(action);
+        }
         let pressed = self.pressed.take();
         if key.is(self.prefix) {
             self.spell(spelling);
@@ -1213,8 +1644,8 @@ impl KeyFilter {
             return None;
         }
         match key.code {
-            TAB if key.mods & SHIFT != 0 => return Some(Action::Switch(Motion::Previous)),
-            ESCAPE | ENTER => {
+            TAB if key.mods & SHIFT != 0 => return Some(Action::Pick(Pick::Up)),
+            ESCAPE => {
                 self.mode = Mode::Focus;
                 return None;
             }
@@ -1243,6 +1674,7 @@ mod tests {
             forward: bytes.to_vec(),
             action: None,
             mode: Mode::Focus,
+            rest: Vec::new(),
         }
     }
 
@@ -1253,6 +1685,7 @@ mod tests {
             forward: vec![],
             action: None,
             mode: Mode::Control,
+            rest: Vec::new(),
         }
     }
 
@@ -1262,15 +1695,36 @@ mod tests {
             forward: vec![],
             action: Some(action),
             mode,
+            rest: Vec::new(),
         }
     }
 
     /// The mode key, whatever it is. Named because a control byte in the middle
     /// of a byte string is unreadable.
     const KEY: u8 = DEFAULT_PREFIX;
-    /// The key opens the view and the wheel moves it from there: the client
-    /// asks the terminal for reports only once there is a window for them to
-    /// move, so that the rest of the time a drag is a selection.
+    /// A notch with no view up opens one, which is the whole point of holding
+    /// the wheel for the attach rather than for the view: the gesture everybody
+    /// reaches for first is the wheel, and it cannot open what it is not being
+    /// reported for.
+    #[test]
+    fn a_notch_on_the_live_session_opens_the_view() {
+        let mut f = KeyFilter::new(KEY);
+        f.set_scroll(true);
+        f.set_wheel(true);
+        assert_eq!(f.mode, Mode::Focus, "the view is not up");
+        assert_eq!(
+            f.filter(b"\x1b[<64;10;5M"),
+            Keystrokes {
+                forward: Vec::new(),
+                action: Some(Action::Scroll(Scroll::Up(scroll::WHEEL))),
+                mode: Mode::Scroll,
+                rest: Vec::new(),
+            }
+        );
+    }
+
+    /// And the key still opens it, for a hand that would rather not reach for
+    /// the mouse and for a terminal reporting nothing.
     #[test]
     fn the_wheel_moves_the_view_the_key_opened() {
         let mut f = KeyFilter::new(KEY);
@@ -1283,6 +1737,7 @@ mod tests {
                 forward: Vec::new(),
                 action: Some(Action::Scroll(Scroll::Up(scroll::WHEEL))),
                 mode: Mode::Scroll,
+                rest: Vec::new(),
             }
         );
     }
@@ -1302,6 +1757,7 @@ mod tests {
                 forward: Vec::new(),
                 action: Some(Action::Scroll(Scroll::Up(3 * scroll::WHEEL))),
                 mode: Mode::Scroll,
+                rest: Vec::new(),
             }
         );
 
@@ -1313,35 +1769,164 @@ mod tests {
     }
 
     /// The client asked the terminal for these reports; the session did not.
-    /// Forwarding a click it never asked to hear about would type into it.
+    /// Forwarding one it never asked to hear about would type into it, whether
+    /// or not the client had anything to do with it.
     #[test]
-    fn a_click_the_client_asked_for_is_swallowed_rather_than_forwarded() {
+    fn nothing_the_mouse_does_is_forwarded_to_the_session() {
+        for reports in [
+            &b"\x1b[<0;10;5M"[..],  // a press
+            &b"\x1b[<32;10;5M"[..], // dragged
+            &b"\x1b[<0;10;5m"[..],  // let go
+            &b"\x1b[<1;10;5M"[..],  // the middle button, which means nothing here
+            &b"\x1b[<2;10;5M"[..],  // nor the right
+            &b"\x1b[<64;1;1M"[..],  // and the wheel
+        ] {
+            let mut f = KeyFilter::new(KEY);
+            f.set_scroll(true);
+            f.set_wheel(true);
+            assert!(
+                f.filter(reports).forward.is_empty(),
+                "{}",
+                String::from_utf8_lossy(reports)
+            );
+        }
+    }
+
+    /// The three halves of a drag, in the spelling `?1002h` reports them in.
+    #[test]
+    fn a_drag_is_a_press_a_move_and_a_release() {
         let mut f = KeyFilter::new(KEY);
         f.set_scroll(true);
         f.set_wheel(true);
-        assert_eq!(f.filter(b"\x1b[<0;10;5M\x1b[<0;10;5m"), forwarded(b""));
+        assert_eq!(
+            f.filter(b"\x1b[<0;10;5M").action,
+            Some(Action::Select(Select::From(Spot { col: 10, row: 5 })))
+        );
+        assert_eq!(
+            f.filter(b"\x1b[<32;14;7M").action,
+            Some(Action::Select(Select::To(Spot { col: 14, row: 7 })))
+        );
+        let done = f.filter(b"\x1b[<0;14;7m");
+        assert_eq!(done.action, Some(Action::Select(Select::Done)));
+        assert_eq!(done.mode, Mode::Scroll, "a drag opens the view under it");
     }
 
-    /// The mouse is the terminal's while you are looking at the live session,
-    /// so a drag selects and a double click takes a word, the way they do in
-    /// any other program. A client holding mouse reports for the whole attach
-    /// is a client you cannot copy a line out of without a modifier held, and
-    /// the wheel it holds them for has nothing to scroll until the view is up.
+    /// A hand moving sends a report per cell, and they arrive in one read. Only
+    /// the latest says anything, and the release behind them has to survive the
+    /// chunk: dropped, the button would still be down as far as this is
+    /// concerned.
+    #[test]
+    fn a_dragging_hand_is_read_as_where_it_got_to_and_then_let_go() {
+        let mut f = KeyFilter::new(KEY);
+        f.set_scroll(true);
+        f.set_wheel(true);
+        f.filter(b"\x1b[<0;1;1M");
+        let moved = f.filter(b"\x1b[<32;2;1M\x1b[<32;3;1M\x1b[<32;9;4M\x1b[<0;9;4m");
+        assert_eq!(
+            moved.action,
+            Some(Action::Select(Select::To(Spot { col: 9, row: 4 })))
+        );
+        assert_eq!(
+            f.filter(&moved.rest).action,
+            Some(Action::Select(Select::Done)),
+            "the release was handed back rather than eaten"
+        );
+    }
+
+    /// A wheel spin is still added up, and a report of the other kind ends the
+    /// run rather than being swallowed into it.
+    #[test]
+    fn a_spin_stops_at_the_press_that_follows_it() {
+        let mut f = KeyFilter::new(KEY);
+        f.set_scroll(true);
+        f.set_wheel(true);
+        let spun = f.filter(b"\x1b[<64;1;1M\x1b[<64;1;1M\x1b[<0;3;2M");
+        assert_eq!(
+            spun.action,
+            Some(Action::Scroll(Scroll::Up(2 * scroll::WHEEL)))
+        );
+        assert_eq!(
+            f.filter(&spun.rest).action,
+            Some(Action::Select(Select::From(Spot { col: 3, row: 2 })))
+        );
+    }
+
+    /// Two clicks in the same place inside the window are a double click, and
+    /// three are a triple. Further apart in time, or in place, they are clicks.
+    #[test]
+    fn clicking_twice_takes_a_word_and_three_times_takes_the_line() {
+        let mut f = KeyFilter::new(KEY);
+        f.set_scroll(true);
+        f.set_wheel(true);
+        let at = Instant::now();
+        let spot = Spot { col: 4, row: 2 };
+        assert_eq!(
+            f.filter_at(b"\x1b[<0;4;2M", at).action,
+            Some(Action::Select(Select::From(spot)))
+        );
+        assert_eq!(
+            f.filter_at(b"\x1b[<0;4;2M", at + Duration::from_millis(120))
+                .action,
+            Some(Action::Select(Select::Word(spot)))
+        );
+        assert_eq!(
+            f.filter_at(b"\x1b[<0;4;2M", at + Duration::from_millis(240))
+                .action,
+            Some(Action::Select(Select::Line(spot)))
+        );
+        // A click a second later is a click again, and so is one next door.
+        assert_eq!(
+            f.filter_at(b"\x1b[<0;4;2M", at + Duration::from_secs(1))
+                .action,
+            Some(Action::Select(Select::From(spot)))
+        );
+        assert_eq!(
+            f.filter_at(b"\x1b[<0;9;2M", at + Duration::from_millis(1100))
+                .action,
+            Some(Action::Select(Select::From(Spot { col: 9, row: 2 })))
+        );
+    }
+
+    /// Nothing about the mouse is read while the terminal still has it. Every
+    /// report then is the session's own doing, and reading one would be reading
+    /// input meant for whatever asked for it.
+    #[test]
+    fn the_mouse_says_nothing_here_while_the_session_has_it() {
+        let mut f = KeyFilter::new(KEY);
+        f.set_scroll(true);
+        let dragged = f.filter(b"\x1b[<0;10;5M");
+        assert_eq!(dragged.action, None);
+        assert_eq!(dragged.forward, b"\x1b[<0;10;5M", "and it goes through");
+    }
+
+    /// The wheel is the client's wherever there is a history of our own for a
+    /// notch to move, and for the whole attach rather than only once the view
+    /// is up. The client's screen is the terminal's alternate one, which has no
+    /// scrollback to offer and no alternate scroll either, so a notch that is
+    /// not reported reaches nobody at all.
     #[cfg(feature = "desktop")]
     #[test]
-    fn the_wheel_is_the_clients_only_while_the_view_is_up() {
+    fn the_wheel_is_the_clients_wherever_there_is_a_history_to_move() {
         assert!(wheel_is_ours(true, false));
-        assert!(!wheel_is_ours(false, false), "nothing to scroll yet");
     }
 
-    /// A program that asked for the mouse keeps it, view or no view. Taking it
-    /// would leave two readers on one wheel, and giving it back on the way out
-    /// of the view would switch off tracking the client never switched on.
+    /// Inline, and on a host too old to answer for a window, there is nothing
+    /// here for a notch to move: the terminal keeps the wheel, and with it the
+    /// bare drag that selects.
+    #[cfg(feature = "desktop")]
+    #[test]
+    fn the_terminal_keeps_the_wheel_where_there_is_no_history_of_ours() {
+        assert!(!wheel_is_ours(false, false));
+        assert!(!wheel_is_ours(false, true));
+    }
+
+    /// A program that asked for the mouse keeps it, history or no history.
+    /// Taking it would leave two readers on one wheel, and a full-screen program
+    /// draws its own scrolling from exactly these reports.
     #[cfg(feature = "desktop")]
     #[test]
     fn the_wheel_is_never_taken_from_a_session_that_asked_for_it() {
         assert!(!wheel_is_ours(true, true));
-        assert!(!wheel_is_ours(false, true));
     }
 
     /// While the session has the mouse, every report is its own and the client
@@ -1384,6 +1969,25 @@ mod tests {
         );
     }
 
+    /// The view's keys are read the same way the popup's are, so a held arrow
+    /// keeps moving it and a released one moves nothing. A long build is
+    /// scrolled by holding a key more often than by pressing one.
+    #[test]
+    fn an_arrow_held_down_keeps_moving_the_view() {
+        let mut f = KeyFilter::new(KEY);
+        f.set_scroll(true);
+        f.filter(&[KEY, SCROLL_KEY]);
+        for keys in [&b"\x1b[A"[..], &b"\x1b[1;1:2A"[..], &b"\x1b[1;5A"[..]] {
+            assert_eq!(
+                f.filter(keys),
+                asked(Action::Scroll(Scroll::Up(1)), Mode::Scroll),
+                "{keys:?}"
+            );
+        }
+        assert_eq!(f.filter(b"\x1b[1;1:3A").action, None, "a key let go of");
+        assert_eq!(f.filter(b"\x1b[1;1:3A").mode, Mode::Scroll);
+    }
+
     /// Nothing typed at the view reaches the session: the screen is showing the
     /// history, and a key meant for the program would land somewhere nobody is
     /// looking. An unbound one does nothing rather than dropping out of the
@@ -1399,6 +2003,7 @@ mod tests {
                 forward: Vec::new(),
                 action: None,
                 mode: Mode::Scroll,
+                rest: Vec::new(),
             }
         );
     }
@@ -1647,16 +2252,16 @@ mod tests {
         let mut f = KeyFilter::new(KEY);
         assert_eq!(
             f.filter(b"\x1b[93;5u\x1b[104u"),
-            asked(Action::Switch(Motion::NextHost), Mode::Control)
+            asked(Action::Pick(Pick::NextGroup), Mode::Control)
         );
         assert_eq!(
             f.filter(b"\x1b[104:72;2u"),
-            asked(Action::Switch(Motion::PreviousHost), Mode::Control)
+            asked(Action::Pick(Pick::PreviousGroup), Mode::Control)
         );
         // And where no alternate was asked for, the case is worked out here.
         assert_eq!(
             f.filter(b"\x1b[104;2u"),
-            asked(Action::Switch(Motion::PreviousHost), Mode::Control)
+            asked(Action::Pick(Pick::PreviousGroup), Mode::Control)
         );
         // A chord is still nobody's key but the session's.
         assert_eq!(
@@ -1696,6 +2301,7 @@ mod tests {
                 forward: vec![],
                 action: None,
                 mode: Mode::Scroll,
+                rest: Vec::new(),
             }
         );
         assert_eq!(
@@ -1772,14 +2378,14 @@ mod tests {
     }
 
     /// And Shift-Tab is spelt the same way and is not one of them: it is a key
-    /// somebody pressed, and it walks the sessions backwards.
+    /// somebody pressed, and it walks the list backwards.
     #[test]
     fn shift_tab_is_not_taken_for_a_report() {
         let mut f = KeyFilter::new(KEY);
         f.filter(&[KEY]);
         assert_eq!(
             f.filter(SHIFT_TAB),
-            asked(Action::Switch(Motion::Previous), Mode::Control)
+            asked(Action::Pick(Pick::Up), Mode::Control)
         );
     }
 
@@ -1797,6 +2403,7 @@ mod tests {
                 forward: vec![],
                 action: None,
                 mode: Mode::Scroll,
+                rest: Vec::new(),
             }
         );
     }
@@ -1990,6 +2597,7 @@ mod tests {
                 forward: b"ls".to_vec(),
                 action: Some(Action::Detach),
                 mode: Mode::Focus,
+                rest: Vec::new(),
             }
         );
     }
@@ -2044,6 +2652,42 @@ mod tests {
         assert_eq!(f.filter(b"d"), asked(Action::Detach, Mode::Focus));
     }
 
+    /// Holding a key is how a list of twenty sessions gets walked. Under a
+    /// program that asked for event types the terminal stops repeating the
+    /// plain byte and reports repeats instead, so dropping them meant holding
+    /// tab moved the highlight once and then stopped, and only while such a
+    /// program was running: the same hand on the same key worked everywhere
+    /// else.
+    #[test]
+    fn a_held_key_repeats_in_the_popup() {
+        let mut f = KeyFilter::default();
+        assert_eq!(f.filter(b"\x1b[93;5u"), held());
+        // Tab pressed, then the same tab repeating twice as it is held.
+        for spelling in [&b"\x1b[9;1u"[..], b"\x1b[9;1:2u", b"\x1b[9;1:2u"] {
+            assert_eq!(
+                f.filter(spelling),
+                asked(Action::Pick(Pick::Down), Mode::Control),
+                "{}",
+                String::from_utf8_lossy(spelling)
+            );
+        }
+        // And letting go still says nothing, which is the half that has to
+        // keep working: the ctrl underneath it reports its own release.
+        assert_eq!(f.filter(b"\x1b[9;1:3u"), held());
+    }
+
+    /// The same key held at a prompt types its character again, the way it
+    /// would in any other text field.
+    #[test]
+    fn a_held_key_repeats_at_a_prompt() {
+        let mut f = KeyFilter::default();
+        f.set_scroll(true);
+        f.filter(&[DEFAULT_PREFIX, b'/']);
+        f.filter(b"\x1b[97;1u");
+        f.filter(b"\x1b[97;1:2u");
+        assert_eq!(f.needle().as_deref(), Some("aa"));
+    }
+
     /// A release in focus mode is the session's, and goes to it, unless the
     /// press it belongs to was the client's and never got there.
     #[test]
@@ -2065,7 +2709,7 @@ mod tests {
     fn control_mode_reads_escape_and_shift_tab_in_the_long_spelling() {
         let mut f = KeyFilter::default();
         assert_eq!(f.filter(b"\x1b[93;5u\x1b[9;2u"), {
-            asked(Action::Switch(Motion::Previous), Mode::Control)
+            asked(Action::Pick(Pick::Up), Mode::Control)
         });
         assert_eq!(f.filter(b"\x1b[27u"), forwarded(b""));
         assert_eq!(f.filter(b"ls"), forwarded(b"ls"));
@@ -2089,6 +2733,7 @@ mod tests {
                 forward: b"ls".to_vec(),
                 action: Some(Action::Paste),
                 mode: Mode::Focus,
+                rest: Vec::new(),
             }
         );
         // And what goes back to the session, when the clipboard turns out to
@@ -2177,6 +2822,7 @@ mod tests {
                 forward: b"ls".to_vec(),
                 action: Some(Action::Detach),
                 mode: Mode::Focus,
+                rest: Vec::new(),
             }
         );
         // And the default key is then just an ordinary keystroke again.
@@ -2196,6 +2842,7 @@ mod tests {
                 forward: b"ls".to_vec(),
                 action: Some(Action::Paste),
                 mode: Mode::Focus,
+                rest: Vec::new(),
             }
         );
         // And the keyboard is still in focus afterwards: pasting is not a mode.
@@ -2234,26 +2881,31 @@ mod tests {
                 forward: b"abc".to_vec(),
                 action: Some(Action::Detach),
                 mode: Mode::Focus,
+                rest: Vec::new(),
             }
         );
     }
 
     #[test]
     fn control_mode_stays_on_so_tab_walks_the_list() {
-        // The point of the mode: one key, then as many hops as you like.
+        // The point of the mode: one key, then as many moves as you like. What
+        // moves now is the highlight in the popup rather than the client, so
+        // walking three sessions is one reattach on the Enter instead of three.
         let mut f = KeyFilter::default();
         assert_eq!(
             f.filter(&[KEY, b'\t']),
-            asked(Action::Switch(Motion::Next), Mode::Control)
+            asked(Action::Pick(Pick::Down), Mode::Control)
         );
         assert_eq!(
             f.filter(b"\t"),
-            asked(Action::Switch(Motion::Next), Mode::Control)
+            asked(Action::Pick(Pick::Down), Mode::Control)
         );
         assert_eq!(
             f.filter(SHIFT_TAB),
-            asked(Action::Switch(Motion::Previous), Mode::Control)
+            asked(Action::Pick(Pick::Up), Mode::Control)
         );
+        // `l` is not a move through the list but a jump out of it, so it still
+        // commits: the session you came from may not even be on screen.
         assert_eq!(
             f.filter(b"l"),
             asked(Action::Switch(Motion::Last), Mode::Control)
@@ -2287,19 +2939,23 @@ mod tests {
     fn the_host_keys_move_machine_and_leave_control_mode_on() {
         // The one binding that reads its own case, so both spellings are keys
         // rather than `H` dropping back to focus as an unbound one would.
+        //
+        // A bigger step of the same gesture now that the machines are drawn as
+        // headings in the popup: they move the highlight to the next machine's
+        // first session and commit nothing, which Enter is for.
         let mut f = KeyFilter::default();
         assert_eq!(
             f.filter(&[KEY, b'h']),
-            asked(Action::Switch(Motion::NextHost), Mode::Control)
+            asked(Action::Pick(Pick::NextGroup), Mode::Control)
         );
         assert_eq!(
             f.filter(b"H"),
-            asked(Action::Switch(Motion::PreviousHost), Mode::Control)
+            asked(Action::Pick(Pick::PreviousGroup), Mode::Control)
         );
         // And walking the machine you land on carries on from there.
         assert_eq!(
             f.filter(b"\t"),
-            asked(Action::Switch(Motion::Next), Mode::Control)
+            asked(Action::Pick(Pick::Down), Mode::Control)
         );
     }
 
@@ -2311,7 +2967,7 @@ mod tests {
         let mut f = KeyFilter::default();
         assert_eq!(
             f.filter(&[KEY, b'\t']),
-            asked(Action::Switch(Motion::Next), Mode::Control)
+            asked(Action::Pick(Pick::Down), Mode::Control)
         );
         assert_eq!(f.filter(&[KEY]), forwarded(b""));
         assert_eq!(f.filter(b"ls"), forwarded(b"ls"));
@@ -2322,33 +2978,37 @@ mod tests {
         let mut f = KeyFilter::default();
         assert_eq!(
             f.filter(&[KEY, b'\t']),
-            asked(Action::Switch(Motion::Next), Mode::Control)
+            asked(Action::Pick(Pick::Down), Mode::Control)
         );
-        // The first goes back to focus, the second starts a fresh mode key, and
+        // The first closes the popup, the second starts a fresh mode key, and
         // the third is the one that goes through.
         assert_eq!(f.filter(&[KEY, KEY, KEY]), forwarded(&[KEY]));
         assert_eq!(f.filter(b"x"), forwarded(b"x"));
     }
 
     #[test]
-    fn shift_tab_goes_back_and_a_bare_escape_returns_to_focus() {
+    fn shift_tab_goes_back_and_a_bare_escape_closes_the_popup() {
         let mut f = KeyFilter::default();
         assert_eq!(
             f.filter(&[KEY, 0x1b, b'[', b'Z']),
-            asked(Action::Switch(Motion::Previous), Mode::Control)
+            asked(Action::Pick(Pick::Up), Mode::Control)
         );
-        // An Esc with nothing behind it in the same read is a real Esc, and
-        // typing carries on into the session.
+        // An Esc with nothing behind it in the same read is a real Esc: back to
+        // focus, which is also what takes the popup off the screen, and typing
+        // carries on into the session.
         assert_eq!(f.filter(b"\x1b"), forwarded(b""));
         assert_eq!(f.filter(b"ls"), forwarded(b"ls"));
     }
 
     #[test]
-    fn enter_returns_to_focus_without_reaching_the_session() {
-        // Swallowed rather than forwarded: coming back to focus must not also
-        // submit whatever is sitting at the prompt.
+    fn enter_takes_the_highlighted_row_without_reaching_the_session() {
+        // Swallowed rather than forwarded: choosing a row must not also submit
+        // whatever is sitting at the prompt behind the popup.
         let mut f = KeyFilter::default();
-        assert_eq!(f.filter(&[KEY, b'\r']), forwarded(b""));
+        assert_eq!(
+            f.filter(&[KEY, b'\r']),
+            asked(Action::Pick(Pick::Go), Mode::Focus)
+        );
         assert_eq!(f.filter(b"x"), forwarded(b"x"));
     }
 
@@ -2358,9 +3018,205 @@ mod tests {
         // silently eaten while the mode sat there unnoticed.
         let mut f = KeyFilter::default();
         assert_eq!(
-            f.filter(&[KEY, b'g', b'i', b't']),
-            forwarded(&[KEY, b'g', b'i', b't'])
+            f.filter(&[KEY, b'v', b'i', b'm']),
+            forwarded(&[KEY, b'v', b'i', b'm'])
         );
+    }
+
+    /// A filter already showing the group list, which is where `m` and `g`
+    /// leave it.
+    fn picking() -> KeyFilter {
+        let mut f = KeyFilter::default();
+        assert_eq!(
+            f.filter(&[KEY, b'm']),
+            asked(Action::Pick(Pick::Move), Mode::Picking)
+        );
+        f
+    }
+
+    /// The same gesture as in the session list. Bound in only one of them, the
+    /// group list was a list you could open and not move in, so every Enter
+    /// took the first row.
+    #[test]
+    fn the_group_list_moves_with_the_same_keys_the_session_list_does() {
+        for key in [&b"\t"[..], &b"j"[..]] {
+            let mut f = picking();
+            assert_eq!(
+                f.filter(key),
+                asked(Action::Pick(Pick::Down), Mode::Picking),
+                "{key:?}"
+            );
+        }
+        for key in [SHIFT_TAB, &b"k"[..], &b"\x1b[A"[..]] {
+            let mut f = picking();
+            assert_eq!(
+                f.filter(key),
+                asked(Action::Pick(Pick::Up), Mode::Picking),
+                "{key:?}"
+            );
+        }
+    }
+
+    /// A terminal asked to report event types stops resending the plain
+    /// spelling of a held key, so an arrow held down in the popup arrives once
+    /// and then only as repeats. Dropping those made holding one move the
+    /// highlight exactly once, and only while a program like `pi` had the
+    /// terminal in that mode.
+    #[test]
+    fn an_arrow_held_down_keeps_moving_a_list() {
+        // Press, repeat, repeat, in the spelling those modes use.
+        let held: &[&[u8]] = &[b"\x1b[A", b"\x1b[1;1:2A", b"\x1b[1;1:2A"];
+        for keys in held {
+            let mut f = picking();
+            assert_eq!(
+                f.filter(keys),
+                asked(Action::Pick(Pick::Up), Mode::Picking),
+                "{keys:?}"
+            );
+        }
+        for keys in held {
+            let mut f = KeyFilter::new(KEY);
+            f.filter(&[KEY]);
+            assert_eq!(
+                f.filter(keys),
+                asked(Action::Pick(Pick::Up), Mode::Control),
+                "{keys:?}"
+            );
+        }
+    }
+
+    /// The same key with a modifier held, and the same key spelt the long way
+    /// with no modifier at all: both are somebody reaching for up.
+    #[test]
+    fn an_arrow_spelt_the_long_way_moves_a_list() {
+        for keys in [&b"\x1b[1;5B"[..], &b"\x1b[1;1:1B"[..], &b"\x1bOB"[..]] {
+            let mut f = picking();
+            assert_eq!(
+                f.filter(keys),
+                asked(Action::Pick(Pick::Down), Mode::Picking),
+                "{keys:?}"
+            );
+        }
+    }
+
+    /// Letting go of an arrow is not a keystroke, and it must not be read as
+    /// the Esc it starts with either: that would close the list under the hand
+    /// still holding the key.
+    #[test]
+    fn letting_go_of_an_arrow_moves_nothing_and_closes_nothing() {
+        let mut f = picking();
+        assert_eq!(
+            f.filter(b"\x1b[1;1:3A"),
+            Keystrokes {
+                forward: Vec::new(),
+                action: None,
+                mode: Mode::Picking,
+                rest: Vec::new(),
+            }
+        );
+    }
+
+    /// Shift-Tab spelt the way a terminal in an extended-keys mode spells it,
+    /// which is tab with shift rather than `CSI Z`. Read as the byte behind it
+    /// alone, it walked the list the wrong way.
+    #[test]
+    fn shift_tab_walks_the_group_list_back_in_either_spelling() {
+        for keys in [SHIFT_TAB, &b"\x1b[9;2u"[..]] {
+            let mut f = picking();
+            assert_eq!(
+                f.filter(keys),
+                asked(Action::Pick(Pick::Up), Mode::Picking),
+                "{keys:?}"
+            );
+        }
+    }
+
+    /// Shift-Tab is spelt like a report and pressed like a key, and read a byte
+    /// at a time the Esc it starts with is the Esc that closes the list.
+    #[test]
+    fn shift_tab_does_not_close_the_group_list() {
+        let mut f = picking();
+        assert_ne!(
+            f.filter(SHIFT_TAB),
+            asked(Action::Pick(Pick::Cancel), Mode::Focus)
+        );
+    }
+
+    /// A group list is opened over the session list, so the way out of one is
+    /// back to the other: both lists' hints say `esc` and the popup's own
+    /// comment says it comes back to where the gesture started. It went to
+    /// `Mode::Focus` instead, which closes the box, and the session list cost
+    /// another `Ctrl-]` and a walk back to the row you were on.
+    #[test]
+    fn esc_out_of_a_group_list_goes_back_to_the_session_list() {
+        for key in [&b"\x1b"[..], &b"q"[..]] {
+            assert_eq!(
+                picking().filter(key),
+                asked(Action::Pick(Pick::Cancel), Mode::Control),
+                "{key:?}"
+            );
+        }
+        // And out of the session list it is out of the popup, as it always was.
+        let mut f = KeyFilter::new(DEFAULT_PREFIX);
+        f.set_mode(Mode::Control);
+        assert_eq!(f.filter(b"\x1b").mode, Mode::Focus);
+    }
+
+    /// The keys that act on a session mean nothing while a group is being
+    /// chosen: `m` here would be moving a move, and `d` would detach out of a
+    /// gesture halfway through.
+    #[test]
+    fn the_session_keys_are_unbound_while_a_group_is_being_chosen() {
+        for key in [&b"m"[..], &b"d"[..], &b"["[..], &b"h"[..], &b"l"[..]] {
+            let mut f = picking();
+            let out = f.filter(key);
+            assert_eq!(out.action, None, "{key:?}");
+            assert!(out.forward.is_empty(), "nothing reaches the session");
+            assert_eq!(out.mode, Mode::Picking);
+        }
+    }
+
+    /// Naming a new group is the same editing as the rename and the search, so
+    /// the same prompt answers for it, and it comes back to the list it was
+    /// opened from rather than to the session.
+    #[test]
+    fn naming_a_new_group_types_at_the_shared_prompt() {
+        let mut f = picking();
+        assert_eq!(
+            f.filter(b"n"),
+            asked(Action::GroupName(Rename::Open), Mode::Rename)
+        );
+        assert_eq!(
+            f.filter(b"pi"),
+            asked(Action::GroupName(Rename::Typed), Mode::Rename)
+        );
+        assert_eq!(f.wanted_group().as_deref(), Some("pi"));
+        assert_eq!(
+            f.filter(b"\r"),
+            asked(Action::GroupName(Rename::Run), Mode::Picking)
+        );
+    }
+
+    /// Two writes a moment apart arrive as one read, so `tab` then `Enter` is
+    /// a single chunk. Every other action ends the chunk it was found in; a
+    /// popup move must not, or the key that commits is thrown away.
+    #[test]
+    fn a_move_and_the_key_that_commits_it_survive_arriving_together() {
+        let mut f = KeyFilter::default();
+        let out = f.filter(&[KEY, b'\t', b'\r']);
+        assert_eq!(out.action, Some(Action::Pick(Pick::Down)));
+        assert_eq!(out.rest, b"\r".to_vec(), "the commit is handed back");
+        let out = f.filter(&out.rest);
+        assert_eq!(out.action, Some(Action::Pick(Pick::Go)));
+    }
+
+    /// And nothing else hands anything back: nobody types through a detach.
+    #[test]
+    fn every_other_action_still_ends_the_chunk_it_was_found_in() {
+        let mut f = KeyFilter::default();
+        let out = f.filter(&[KEY, b'd', b'x', b'y']);
+        assert_eq!(out.action, Some(Action::Detach));
+        assert!(out.rest.is_empty());
     }
 
     #[test]
@@ -2383,6 +3239,7 @@ mod tests {
                 forward: vec![],
                 action: None,
                 mode: Mode::Control,
+                rest: Vec::new(),
             }
         );
         assert_eq!(f.filter_at(&[KEY], at + LITERAL), forwarded(b""));
@@ -2401,6 +3258,7 @@ mod tests {
                 forward: vec![],
                 action: None,
                 mode: Mode::Control,
+                rest: Vec::new(),
             }
         );
         assert_eq!(
@@ -2425,6 +3283,7 @@ mod tests {
                 forward: vec![],
                 action: None,
                 mode: Mode::Control,
+                rest: Vec::new(),
             }
         );
         assert_eq!(f.filter(b"d"), asked(Action::Detach, Mode::Focus));

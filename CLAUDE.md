@@ -84,8 +84,11 @@ Three consequences run through the whole codebase and are worth keeping intact:
   of tests are there; `terminal.rs` is raw mode, escape sequences and the pump
   loop, and is desktop-only; `mod.rs` is the vocabulary they share plus
   `collect_until`, the way in for a caller with no terminal.
-  `src/client/status.rs` and `src/client/switch.rs` are terminal-free for the
-  same reason.
+  `src/client/status.rs`, `src/client/switch.rs`, `src/client/picker.rs` and
+  `src/client/groups.rs` are terminal-free for the same reason.
+- `src/client/groups.rs` is `groups.toml`, beside the host list: which sessions
+  you are treating as one piece of work, spanning machines. `src/client/picker.rs`
+  is the list control mode draws, filled with sessions or with groups.
 - `src/main.rs` is the CLI, and the only place that decides local versus remote:
   `open()` picks socket or ssh, `open_or_start()` is for commands that ask a
   machine to hold something new. Beside it and belonging to the binary rather
@@ -183,6 +186,21 @@ Three consequences run through the whole codebase and are worth keeping intact:
   run has been attached to anything at all (`attached` in `do_attach`); only
   the first attach can fail outright, because that one is a command that did
   not work rather than a connection that went.
+- **An attempt to get back has a deadline, because the waiting does not**
+  (`main::REACH_FOR`, ten seconds, applied by `reaching` and only once
+  `attached`). The wait is unbounded on purpose and reads the keyboard
+  throughout; the *attempt* reads nothing, so a try that never returns is a
+  terminal frozen on `reconnecting` with a row that has stopped counting and a
+  Ctrl-C nobody is reading. ssh gets there without any network being down:
+  `ControlMaster=auto` puts every command on one shared connection and
+  connecting to a control socket has no deadline of any kind, so a wedged
+  master hangs each client until it expires on its own schedule. Two clients
+  hanging and coming back together is the shape of it from outside. Dropping
+  the attempt is what ends it, which works because `ssh::spawn` sets
+  `kill_on_drop`: the hung ssh goes with the future instead of being left
+  holding the master. The bound belongs to reconnects alone, since the first
+  attach of a run is a command somebody typed and may legitimately be a cold
+  ssh, a node starting, or an install being answered.
 - **The row is the only thing that moves while a connection is gone, so it has
   to.** Everything above it is the session as it was painted before the drop,
   which is the point; a row written once and left there is a client that has
@@ -216,7 +234,14 @@ Three consequences run through the whole codebase and are worth keeping intact:
   node that answered and has no such session, which is a listing gone stale
   under the switch keys and the one case that forgets the entry and undoes the
   hop. Reading every failure the second way, as this once did, meant a closed
-  lid mid-hop dropped a live session from the cycle and ended the attach.
+  lid mid-hop dropped a live session from the cycle and ended the attach. And
+  `hopped` is true only until the attach it describes happens, so it is cleared
+  on a landing as well as by the outcomes: a stale listing is a thing that can
+  be true of one attempt and not of the run. Left set for the life of the
+  attach, it was still set an hour later when the node restarted, and the
+  `Missed::Gone` that came back was read as that hop going stale: the cycle
+  forgot a live entry and the run walked back to the session the command line
+  named, waiting forever on the one thing this rule exists to stop.
 - **A session that ends hands back the one you came from, and only the session
   you named ends the attach.** `Cycle::fall_back` is the whole decision: a run
   that has hopped has somewhere to go back to and goes there, while a run that
@@ -262,6 +287,220 @@ Three consequences run through the whole codebase and are worth keeping intact:
   lock is one operation going wrong, while poisoning makes every later one panic
   too, so a node whose bookkeeping panicked once would answer nothing about that
   session until somebody restarted it and took the other sessions with it.
+- **A group lives in the client, and is keyed on the pid and the start time.**
+  A node runs the build it started from until `mm restart`, and for a host
+  reached over ssh nothing says it is stale, so a group defined at the node
+  would work on some machines and silently not on others with no way to see
+  which. Defined in `groups.toml` it works the moment one binary is replaced,
+  against a node of any age: nothing about this touches the wire, which is the
+  acceptance test. What it costs is that a group made at your desk is not one
+  your phone sees, and that is the trade rather than an oversight. Membership is
+  `(host, pid, started)` and never the name, because a name is the one thing
+  about a session that moves: keyed by name, a rename would drop a session out
+  of its group, and one typed on another machine would not even be seen.
+  `started` is there for the one case the pid cannot answer, a machine that
+  rebooted and reused the number. Pruning considers only the hosts that
+  *answered* (`Listing::answering`), or a machine that is asleep loses its
+  sessions out of their groups while you are away from it. `answering` and not
+  `reached`, which is the same list with this machine taken out of it because
+  this machine is never watched: fed that one, pruning kept every local member
+  of every group forever, on the machine you actually work on, and nothing
+  showed it because every view of a group counts the sessions the listing knows
+  about and a dead member appears in none of them. Two lists that differ by one
+  entry and answer different questions, so the fix was a second accessor rather
+  than a change to the first. A group is a set of
+  live sessions and nothing else, so the last one ending takes the group with
+  it and `Cycle::refresh` clears a focus that has emptied: left narrowed to
+  nothing, every switch key would do nothing with no way to find out why.
+- **The popup is what control mode looks like, and the two verbs are told apart
+  by which list you came from.** `Ctrl-]` draws the sessions rather than
+  changing a mode nothing shows. Keys about a session act on the highlighted
+  row (Enter, `r`, `m`), keys about you act on the client (`d`, `n`, `[`, `/`,
+  `p`). Enter on a group narrows, `m` then Enter assigns, and no row in either
+  list means two things. `m` acting on the highlighted row rather than on the
+  session you are attached to is what makes grouping possible without hopping:
+  the picker already holds every session's `SessionInfo`, so assigning is a
+  local write and a redraw. `r` is the exception that proves the stream rule:
+  it may name a row that is *not* the session at the other end of the attach
+  stream, and `tag::RENAME` renames that one by design, so it goes back to
+  `main` as a `Request::Rename` to that row's machine.
+- **A row of the group list is not a session, and `Popup::subject` is the one
+  place that may say so.** The ids a picker hands back are indexes into the
+  list it was built from, so a group row's id indexes `Listed::groups` and a
+  session row's indexes `Listed::at`, and the two lists share one key table
+  because they share one mode. Read off the picker whichever list was showing,
+  `n` in the group list therefore put the session that happened to sit at that
+  index into the new group, on whatever machine it was on, and said nothing
+  because the write worked. So `subject` answers `None` while narrowing, and
+  the two prompts ask *whether there is a popup* before they ask it: a `None`
+  from a popup with no session means do nothing, while a `None` because there
+  is no popup at all means the session at the other end of the stream, which is
+  how a client with no list of its own drives a rename. A key with nothing to
+  act on is refused where it is pressed rather than at the Enter, or a name has
+  been typed for nothing.
+- **And a key that is refused puts the keyboard back where it came from**
+  (`Popup::mode`). `KeyFilter::after` moves the mode on the key, not on what
+  the pump decides to do with it, so `n` has already left the filter in
+  `Mode::Rename` by the time the arm refuses to open a prompt. There is no
+  table for `Mode::Rename` — a prompt swallows everything while one is open —
+  so the mode falls through to the session table, and the group list was left
+  on the screen with `d`, `n` and `m` live over it: `d` detached from a list
+  where `d` is not a key, and `m` read a group row as a session, which is the
+  thing refusing the key was for. Which mode to go back to is the list's to
+  say, since the session list is control mode itself and the two group lists
+  are their own.
+- **A group name has to survive being spelled `@name`** (`Groups::assign`).
+  Both characters that spelling is made of were accepted: `@pi` was listed on
+  every screen and reachable from none of them, because `mm a @pi` looks for a
+  group called `pi` and only `@@pi` finds that one, and a `/` parses as a
+  machine and a session. The sigil is taken off rather than refused, since it
+  is how every heading and every target writes the name and typing it back at
+  a prompt asking for one is no mistake; the separator is refused. Sanitised
+  in the one place both ways in pass through, and it answers with the name
+  that stuck for the same reason `Registry::rename` does.
+- **Everything but Enter on a session comes back to the popup.** Grouping a
+  session, naming one, narrowing to a group: none of them is a gesture that goes
+  anywhere, so landing in the session afterwards threw away the list you were
+  working from and made a second move two more keys. They all detach and
+  reattach, because the write is `main`'s to make and this half of the client
+  may not know what a group is, so the way back is `mode`: `Outcome::Chose`
+  leaves it at `Mode::Control` and only `Chose::Go` sets it to `Mode::Focus`.
+  Which needs the other half of it, since control mode *is* the popup: an attach
+  that starts there opens the box itself (`greet` in `pump`), and it has to wait
+  for the frame that repaints on attach, a screen dump painting by absolute
+  coordinates from the top that would go straight over a box drawn before it.
+  The rows it opens on are the caller's, built after the write, so the box shows
+  what just happened without asking anything. Esc is the same argument one level
+  down: a group list is opened *over* the session list, so leaving one goes back
+  to the other rather than out of the popup, which is what both lists' hints say
+  and what the arm that opens them already claimed. It is told apart by the mode
+  the key arrived in, the group lists having one of their own, and coming back
+  means building the session picker again, since opening a group list replaced
+  it rather than stacking over it: `Showing::Moving` carries the row the gesture
+  started on so `Picker::point_at` can put the highlight back there.
+- **The session list leads with the groups, and a machine is what is left.**
+  A group spans machines, so it is the machines that break up under it: nested
+  the other way, the one thing a group is for, seeing a piece of work in one
+  place, was the one thing the list would not show. So the groups come first,
+  each whole and headed `@name` the way it is typed and the way `mm a @pi`
+  spells it, then whatever is in no group under the machine it is on. No
+  heading says "no group": that would name the one thing a group is not.
+  Inside a group every row carries its machine, this one included, because
+  there the machine is what tells two rows apart, and half-qualifying only the
+  far ones leaves the eye working out which kind of row it is looking at. The
+  A machine goes on a line of its own inside a group rather than in front of
+  every name: `host/name` is how a session is addressed and was the obvious
+  label, but a real host name is most of the column, and with `dev.box.ray/` in
+  front of it there was no room left to tell `rayfish-iroh-dev` from
+  `rayfish-iroh-debug`, which is the one thing the row exists to say. So every
+  session sits under a machine either way and a group is a level above that.
+  Sections are ordered by their first session and sessions by `started`, never
+  by name, for the reason every listing here has: a name moves under a rename
+  and the rows would shuffle beneath a hand walking them.
+- **A group heading and a machine heading are the same thing to the picker.**
+  Siblings in the list, skipped the same way, and `h` steps between them
+  without caring which it landed on: with the groups leading, a key that walked
+  only machines would step over most of the screen. So there is one
+  `Row::heading` and the label says which it is. `Row::indent` is left doing
+  nothing but drawing, and it is spent out of the label's own column, or a
+  deeper row would push the detail and the note along and the box would stop
+  reading as columns. The name column takes the widest name in the list between
+  `MIN_LABEL` and `MAX_LABEL`, since how much room a name needs depends on how
+  deep the tree is that day.
+- **A client of ours that owns part of the screen owns all of it, so the
+  session stops being painted while one is up.** The view already did this and
+  the popup now does too: with the session still painting, a box drawn over it
+  was gone within a second, and redrawing the box after every chunk is worse,
+  because a line printed *scrolls the screen* and takes the rows of the box
+  already drawn up with it, leaving one copy of the box per line. There is no
+  third answer. A terminal composes nothing, and the client is not the emulator
+  here: the node holds the screen, which is exactly why tmux can float a popup
+  over live output and this cannot. What pauses is the picture and never the
+  program, since the session runs on and the resync that closing the box asks
+  for paints wherever it has got to.
+- **What the session said while nobody was painting it is not all in the
+  screen, so a dump is painted over a terminal put back to nothing**
+  (`terminal::given_back`, written beside `REGROWN`). A screen is cells plus
+  the replay `node::events` rides with it, and a replay can only say what the
+  program has *on*: a mode it switched **off** while a client surface was up
+  was dropped with the rest of that output and has no other way of ever
+  reaching the terminal. It showed up as the thing that mode is for. A program
+  that pops the kitty keyboard protocol on its way out popped it under an open
+  popup, so the terminal went on reporting key releases at the shell that
+  followed it, and every keystroke typed `[103;1:3u` into whatever was running.
+  So the set the replay answers for is switched off first, which is the same
+  set a hop undoes and the reason the two are one function: neither may grow a
+  member the other has not heard of. What that set costs is the one mode in it
+  that is *ours*: the client's hold on the mouse is spelt `?1000h` like a
+  session's, so a screen painted while it held the wheel gave the wheel back
+  without knowing it, `own_the_wheel` still believing it had it. It is
+  re-asserted by hand beside the erase rather than by clearing the flag and
+  waiting for the next frame, which would leave a window with the same silence
+  in it: a notch in that window reaches the terminal, which on the alternate
+  screen means walking whatever the session is running with arrow keys.
+- **The cells under the box belong to the box, and it clears its own.** The
+  session's screen there was painted over when the popup went up and is put
+  back by the resync closing it asks for, so nothing else is going to: a box
+  that changed shape, which it does the moment the first real listing lands
+  under an open popup, left the top of the old one on the screen framing
+  nothing. `Picker::drawn` remembers the last rectangle and only the rows given
+  up are blanked, never the ones about to be painted, or every keypress would
+  write each cell twice and invite the flicker the view had.
+- **What is drawn to the node is asked for and painted as one act**
+  (`terminal::ask_for_the_screen`). A dump starts painting wherever the cursor
+  is and never erases, so a screen asked for and painted where it fell walks
+  its own first rows off the top, one `\r\n` at a time. The erase and home are
+  `REGROWN`, spent against `owed`. These were two statements at four call
+  sites, and the one place the second was missing showed nothing until a pager
+  exited: `less` leaves the cursor at the bottom, so quitting one gave back the
+  last few lines of the session under a blank half screen.
+- **A window with no room for the box hands the job to the mark row.** Since the
+  popup *is* the mode, a terminal too short to draw one (`Picker::draw` answers
+  nothing) was a client that had taken the keyboard and a `tab` that changed
+  nothing anybody could see. So `Status` has three states rather than two
+  (`Popped`): no popup and the row lists the keys, a popup drawn and the row
+  says nothing about keys because the box already does, or a popup with nowhere
+  to go and the row stands in for it. What it stands in with is the highlight
+  first and the keys after, and the keys are what gets cut when the row runs
+  out: a list whose keys you have to remember still works, and one you cannot
+  see at all does not. The group lists bring their own two keys rather than the
+  session ladder, since `d` there is not a detach.
+- **`Mode::Picking` is a mode because the session keys must not reach it**, and
+  `KeyFilter::after` takes the mode the key arrived in for the same reason: a
+  move that answered `Mode::Control` meant the key after one in the group list
+  was read with the session table, where `m` moves and `d` detaches. Both lists
+  read every key through `Encoded::byte`, and the arrows and Shift-Tab go in
+  `PICK_KEYS` and are matched whole, or the Esc each of them starts with is the
+  Esc that closes the box.
+- **A popup move is the one action you type through.** Everything else ends the
+  chunk it was found in, because nobody types through a detach or a switch. Two
+  writes a moment apart arrive as one read, so `tab` then `Enter` is a single
+  chunk and stopping at the move throws away the key that commits;
+  `Keystrokes::rest` hands the remainder back for moves alone and `pump` rounds
+  the chunk until it is used up.
+- **The popup asks the machines on every press and never waits on them.** It
+  opens on the snapshot the switch keys already keep and is corrected when the
+  answer lands, swapped in by `Picker::replace`, which holds the highlight on
+  the same `Row::id` rather than the same index: a session ending three rows up
+  would otherwise move what Enter takes. Where nothing was highlighted it lands
+  on the caller's row, which is the box that opened on nothing: a fan-out slower
+  than the half second `take_listing` gives it means the *first* popup of a run
+  always opens empty, and falling back to the first row put Enter, the obvious
+  next key, into somebody else's session. The row ids are the caller's, which is
+  what keeps hosts, groups and pids out of this half of the client, and the ids
+  the outcome carries belong to whichever listing was last drawn. Which is also
+  the one thing about them that does not hold up: an id is a position in
+  `Listed::at`, so a listing landing between `m` and the Enter that commits it
+  redeems the id against a table that has renumbered. Freezing the list under a
+  two-key gesture is not enough on its own, since `main` resolves against the
+  newest listing either way; the fix is for the ids to carry which listing they
+  came from, and until they do this is a known hole rather than a solved one.
+- **A group is spelled `@name`, and no bare word is ever guessed at.**
+  `gpu-box/pi` cannot say whether `pi` is a session or a group, and trying one
+  then the other means making a group named after a session silently changes
+  where a command you have typed for weeks goes. `target.rs` has ruled against
+  that twice already, and `mm kill @pi` is refused for the same reason a bare
+  machine name is only accepted for going somewhere.
 - **A tab completion never starts a node, never installs anything, and never
   waits on ssh unless the word already names a machine** (`src/complete.rs`).
   All three are tested.
@@ -333,37 +572,202 @@ Three consequences run through the whole codebase and are worth keeping intact:
   roll, repaint, and getting it wrong paints over the lines it was meant to
   save.
 - **The alternate screen has a view of its own instead** (`src/client/scroll.rs`,
-  `tag::VIEW`, `tag::FIND`). It is not tmux's copy mode and must not become one:
-  no selection and no yank, because the terminal's own selection works on what
-  the view is showing, on the modifier every terminal keeps for it while the
-  wheel is being reported. Lines come a few screenfuls at a time and matches
+  `tag::VIEW`, `tag::FIND`). Lines come a few screenfuls at a time and matches
   all at once, both for the same reason: a wheel notch or an `n` on a machine
   two hops away must not be a round trip. Whether the host can do either rides
   on `Response::Attached { scroll }`, and a host that cannot says so on the mark
   row rather than leaving a key that does nothing.
-- **The mouse is the terminal's except while that view is up**
-  (`attach::wheel_is_ours`). A terminal reporting the mouse to us is a terminal
-  not selecting with it, so a client that held tracking for the whole attach was
-  a client you could not copy a line out of without a modifier held down. The
-  reports are worth that only where the wheel is the gesture, which is the view,
-  and the view is where the key opens it: the wheel cannot open what it is not
-  being reported for. Two things follow. `Alternate::setup` switches alternate
-  scroll off (`?1007s` then `?1007l`, restored with `?1007r`), because with
-  nobody reporting, a notch on the terminal's alternate screen becomes arrow
-  keys and they land in whatever is reading the session's input. And the key has
-  to be on the hints row, since the gesture that used to find it is gone. A
-  session that asked for the mouse itself keeps every report as before: taking
-  it would leave two readers on one wheel, and giving it back on the way out of
-  the view would switch off tracking the client never switched on.
-- **The wheel is the terminal's to route, not ours.** A program that asked for
-  mouse tracking gets SGR reports, one on its own alternate screen without
-  tracking gets the terminal's alternate-scroll arrows, and ordinary output
-  leaves the wheel scrolling the terminal's own scrollback. All three are right
-  only while the session's screen switches and mouse modes reach the terminal,
-  which is what inline allows and what `Filter::owns_the_screen` decides.
-  Nothing in the client reads a wheel event and nothing should: that way lies
-  tmux's copy mode, and between `avt` on the node and the terminal's own
-  scrollback there is nothing left for it to do.
+- **Selecting is the client's wherever the mouse is, and the terminal's
+  wherever it is not.** This rule used to read "not tmux's copy mode and must
+  not become one: no selection and no yank", on the grounds that the terminal's
+  own selection already works on what the view is showing. That holds exactly
+  while the terminal still has the mouse, and `mouse = client` is the request
+  that takes it away: the same `?1000h` that brings the wheel here is what stops
+  a bare drag selecting. So taking the mouse and reading only the wheel left the
+  gesture reaching nobody, which is the state the wheel itself was in before it
+  was read here, and the rule was an argument that had lost its premise. What
+  keeps it from being tmux's copy mode is what is *not* here: no keyboard
+  selection, no marks, no registers, and what comes out goes to the system
+  clipboard over OSC 52 (`clipboard::to_terminal`) rather than somewhere only
+  manymux can paste from. Three things it rests on. `?1002h` goes on beside
+  `?1000h`, since press-and-release says nothing about the moves between them
+  and a drag is nothing else. A selection is held in the buffer's coordinates
+  rather than the screen's, so scrolling moves the highlight and not what is
+  selected. And a press on the live screen opens the view under it, because the
+  view is the only surface here whose picture stands still and the only one
+  whose cells the client actually holds: on the live screen the node holds the
+  screen and the client is a pipe between it and the terminal, with nothing of
+  its own to reverse.
+- **A click is not a selection, and a stray one costs nothing.** One cell under
+  a press that never moved is not what anybody meant to copy, and copying it
+  would throw away what was on the clipboard, which is usually the thing they
+  were about to paste. So `Scrollback::copied` drops a one-cell selection unless
+  it came from a second or third click, where a one-letter word is exactly what
+  was asked for.
+- **A gesture that ends at the bottom hands the screen back, whether it copied
+  anything or not.** The two ways one ends are a click that selected nothing
+  and a drag that has been taken, and both are somebody done with the mouse.
+  What is left otherwise is the view that the press opened: the session goes on
+  running and stops being painted, and the keys typed next go to the view
+  rather than to the shell, so a copy read as a client that had died, with an
+  Esc nobody thinks to press to get out of it. Scrolled back, the same release
+  is somebody taking a line out of the history they are reading, and there the
+  view is the point and stays. A copy still owed is neither and waits, since
+  the lines it needs are on their way.
+- **A copy is owed when the lines to make it out of have not arrived**
+  (`Scrollback::owed_copy`, finished in the `Update::View` arm). A hand moving
+  quickly presses, drags and lets go inside one read, which is one pass through
+  the client and no time at all for the block the press asked for to come back
+  over ssh. The cells are the screen's and are known throughout; what was
+  written on them is on the machine at the other end, so a release answered out
+  of an empty block put one blank line per line dragged over on the clipboard
+  and said `copied 3 lines` while doing it. Owed once and then forgotten: the
+  block on its way is the answer to the request the press made, so one that
+  does not cover the selection is a selection nothing later will cover either,
+  and a copy left owed would land on the clipboard the next time the view
+  moved. `Scrollback::line` answers for lines the block holds and no others for
+  the same reason, the window arithmetic saturating at both ends being what a
+  window wants and the opposite of what a selection wants.
+- **A drag held against an edge moves the view itself, on a clock**
+  (`Scrollback::chase`, `terminal::CHASE_EVERY`). A selection that could only
+  reach what was already painted was one bounded by the window, on the surface
+  whose whole reason for existing is that the window is not all there is. The
+  clock is the part that is not obvious: a hand holding still at the edge is a
+  hand the terminal has nothing to say about, since motion is reported per cell
+  crossed, so a chase driven by the reports stops at the last row somebody
+  could already see. What counts as the edge is the first and last rows rather
+  than anything past them, for the same reason: a terminal clamps the
+  coordinates it reports to the window it has, so a pointer dragged off the
+  bottom reports row twenty-four and then nothing, and an edge that only
+  counted what is beyond it would be one nothing ever reached. The spot is
+  remembered rather than a direction, since the row under the pointer is a
+  different line once the view has moved, and a chase with nowhere left to go
+  stops asking rather than ticking against the end of the buffer for as long as
+  the button is down.
+- **And it speeds up while it is held, because the hand is asking for two
+  different things** (`scroll::step`). The line just above the window wants one
+  line a move and the chance to let go on it; everything back to where a build
+  started wants a great deal more than that, and at one line a move it is a
+  wait with nothing to do in it. Everywhere else with an edge to drag past
+  tells the two apart by how far past the edge the pointer went, which is the
+  one thing a terminal will not say, so the ramp is on how long the hand has
+  held instead. What grows is the step and not the clock: a move costs a
+  repaint of the window whatever distance it covers, so speed bought in the
+  step is free and speed bought in the frame rate is a screenful of bytes over
+  ssh per line. The count resets whenever the chase ends, or a second drag
+  somewhere else would open at whatever speed the first one worked up to.
+- **Which makes a selection longer than a block possible, so the block is
+  stretched over it** (`wanted`, and `COPY_LINES` where that stops). The text
+  of a selection is built out of the one block in hand (`holds`), which was
+  free while a selection was at most a screenful and is not free once a drag
+  can walk the view. Stretching the request rather than asking for the
+  selection's lines at the release is what keeps the block ready before it is
+  needed, and it costs nothing extra to ask for: the ends of a selection cannot
+  leave a block the window is still inside, so the stretch only happens on the
+  request the window was about to make anyway. The cap is there because the
+  answer comes back in one frame, and a chase that ran past it would end in a
+  copy of nothing at all: it is spent on the chase (`Chased::Full`) rather than
+  at the release, where the gesture is over and there is nothing to do about it
+  but say so.
+- **The wheel is the terminal's until somebody asks for it here**
+  (`settings::Mouse`, `mm config mouse client`, reaching `wheel_is_ours` folded
+  into `history`). Reading the wheel means asking the terminal to report the
+  mouse, and a terminal reporting the mouse is not selecting with it: what is
+  taken is not a notch but the bare drag, and it is taken for the whole attach.
+  Selection comes back only under a modifier the *terminal* chooses, no two
+  agree which, and the one in front of somebody may not offer one at all, which
+  is a fact about their terminal that nothing here can see. That asymmetry is
+  what settles the default, rather than any weighing of scrolling against
+  copying: a wheel that does nothing on the alternate screen is what plain ssh
+  and an unconfigured tmux both do, and `Ctrl-] [` is on the hints row saying
+  so, while a drag that stopped selecting is this having quietly taken
+  something away with nothing to press instead. What the setting must not touch
+  is that key, or handing the mouse back would take the history with it.
+- **Taken, it is taken for the whole attach and not just while the view is up.**
+  That was the first shape and it was wrong, because of where the notch went
+  instead: the client's screen *is* the terminal's alternate one, which keeps no
+  scrollback of its own, and `Alternate::setup` switches alternate scroll off
+  besides (`?1007s` then `?1007l`, restored with `?1007r`) so a notch cannot
+  become arrow keys into whatever is reading the session. So a notch reached
+  nobody at all until the view had already been opened by a key, which is a
+  gesture nobody reaches for second. Now the first notch opens the view and
+  moves it, which is what tmux does and what the mode was always shaped for
+  (`KeyFilter::after` has said "a wheel notch in focus mode opens it and stays"
+  since before one could).
+- **A session that asked for the mouse keeps every report, wheel included.**
+  That half of the old rule is untouched and is what the whole thing rests on:
+  two readers on one wheel is one of them reading input meant for the other, and
+  a full-screen program draws its own scrolling from exactly these reports. So
+  `wheel_is_ours` is false while `Filter::session_mouse` is true, and inline it
+  is false always, because there the terminal has the lines in its own buffer
+  and its own wheel is better than anything here. Which is also why `set_wheel`
+  and `set_scroll` are a pair: no history to move is no reason to take the
+  mouse, so a host too old to answer for a window keeps its wheel and gets a
+  sentence on the row when the key is pressed.
+- **The view paints row by row and never erases the screen.** An erase and a
+  repaint leaves the screen blank for as long as the lines after it take to
+  arrive, which at one notch is nothing and at a wheel being spun is a flicker
+  per frame. So every row is written over the one before it with a clear to the
+  end of the line, which is also what keeps a long line from showing through
+  under a shorter one. And a window with no block yet paints *nothing* rather
+  than blanking: the session is on the screen, one frame more of it is no lie,
+  and blanking to wait is the flicker again with nothing to show for it.
+- **A selected cell is painted a colour, and reverse video is not one**
+  (`scroll::SELECTED`). Reverse says *swap the two colours this cell already
+  has*, which is a different answer per cell: over a coloured path it takes the
+  text's colour as the background and one selection comes out a patchwork, and
+  over a run the program drew reversed itself, which is how `pi` draws the
+  message you typed, swapping again lands back where it started and the
+  selection is invisible. So every selected cell gets the same explicit pair,
+  opening with a reset because bold, underline and the program's own reverse
+  all belong to the cell underneath. The pair is spelt out rather than left to
+  the terminal's own selection colour, which no escape sequence can ask for; a
+  near-white on a near-black reads the same on a light terminal and a dark one.
+  What that needs is the other half: the line's pen is *accumulated* through
+  the walk and reissued after a reset when the highlight ends, since what a
+  cell looks like is every SGR before it on the line, and the pens inside the
+  highlight are held rather than written or the text would show through the
+  thing covering it. Ending a highlight with `\x1b[27m`, as this did, turned
+  off a reverse the *program* had asked for and painted the rest of its line
+  wrong.
+- **A highlight stops at the edge of the screen, and starts where the hand
+  pointed.** A selection that runs off the end of a line takes the blanks with
+  it, or a block dragged down the screen comes apart at every short line in it,
+  and both halves of writing those blanks were wrong. Padded to "the end of the
+  line" spelt `u16::MAX` and capped at a thousand, a selection over a blank row
+  put a thousand cells of reverse video on the screen: on a wide window that is
+  six rows of white, wrapped onto the rows below and painted before them, with
+  the text that was under them gone. It used to tidy itself up, since every row
+  was repainted after; now that only the changed rows are, it stays. So
+  `selected_on` clamps to the screen's width, which is why `Scrollback` knows
+  its columns at all. And the cells between the end of a short line and where
+  the selection starts are neither text nor selected, so `highlighted` writes
+  them plain: without them the reverse block began at column zero, which on an
+  empty row is the whole row highlighted from the wrong end.
+- **And only the rows that changed, which is what makes a drag smooth**
+  (`Scrollback::painted`). A pointer moving reports every cell it crosses and
+  each report moves the highlight by a row or less, so painting the window per
+  report writes a screenful to say a hundred bytes: one short drag came to
+  fifty kilobytes, and on a window twice the size it is four times that, which
+  is the terminal doing the painting rather than the hand doing the dragging.
+  Remembering what was painted is safe because nothing else paints over the
+  view while it is up: session output is held while a surface of the client's
+  owns the screen, and the mark row is not one of these rows. What it needs is
+  that a row nothing is known about is not a row painted blank, or the first
+  frame of a view opened over a short buffer would leave the session showing
+  through above it, and that a resize forgets the lot.
+- **The view opens before it knows how much history there is, so the opening
+  move cannot be clamped** (`Scrollback::answered`). `total` is zero until the
+  host answers, and a move back clamped against zero is a move thrown away. It
+  went unnoticed while a key that only opened the view was the way in, since the
+  first thing that moved was the second thing you pressed. The wheel opens and
+  moves in one gesture, so the lost move became the first notch, and a wheel
+  whose first notch does nothing reads as a wheel that does not work. So a move
+  made before the first answer stands, the block is asked for around where it
+  landed, and `take` does the clamping when the answer says what exists, which
+  is one round trip rather than two. `Update::View` asks again after taking one,
+  because a window brought back inside a short history can leave the block
+  covering somewhere else.
 - **A resize is repainted from the node, not left to the session.** Telling the
   node the new size redraws nothing: a shell that printed and went quiet has no
   answer to a SIGWINCH, so the screen keeps the old geometry, marks on rows that
@@ -371,7 +775,12 @@ Three consequences run through the whole codebase and are worth keeping intact:
   (`SessionWriter::resync`) and paints it over an erased, homed screen
   (`terminal::REGROWN`), for the same reason a hop erases. The scrolling region
   goes out first: the dump paints with newlines, and they would scroll against
-  the old fence.
+  the old fence. A popup is repainted here too, and onto the same erased
+  screen: the screen asked for is dropped while a box is up, so nothing else
+  was going to redraw it, and `Picker::cleared` blanks only the rows the box
+  gives up, in the columns the *new* box sits at. A resize is the one thing
+  that moves the box sideways, so a narrower window left the old box's right
+  edge standing in a column the new one never writes.
 - **The mode key has three spellings, not one.** A program that asks for the
   kitty keyboard protocol (`CSI > 7 u`, which `pi` sends on startup) or for
   xterm's `modifyOtherKeys` changes how the *terminal* encodes every chord, so
@@ -392,6 +801,28 @@ Three consequences run through the whole codebase and are worth keeping intact:
   shifted ones arrive as the alternate the terminal reports beside the key,
   which is why `Encoded::text` reads case out of the alternate rather than the
   code.
+- **A key held down is a key still being pressed** (`Encoded::down`). The
+  protocols that report event types stop repeating the plain byte and send
+  repeats instead, so a client that took only presses was one where holding tab
+  walked the list exactly once, and only while a program like `pi` had the
+  terminal in that mode: the same hand on the same key worked everywhere else,
+  which is the kind of difference nobody thinks to report. Releases are still
+  dropped, and that is the half the rule was written for: the ctrl you were
+  holding reports its own release the moment you let go of the mode key.
+- **The keys with no byte behind them are read the same way, through
+  `Special`.** `Encoded` speaks the `u` and `~` spellings and knows nothing of a
+  sequence ending in a letter, so the arrows and the paging keys are matched
+  against `PICK_KEYS` and `VIEW_KEYS` instead. Matching the plain spelling
+  literally, as that once did, missed exactly what `Encoded::down` missed one
+  layer up: a held arrow stops arriving as `\x1b[A` and starts arriving as
+  `\x1b[1;1:2A`, so holding one walked the popup once and stopped, while holding
+  tab beside it worked. So the tables hold the plain spelling alone, `Special`
+  reads every longer one back to it, and the parameters an extended mode adds
+  are read off and dropped: a release moves nothing, and Ctrl-Up in a list is a
+  hand reaching for up. The same protocols respell Shift-Tab as tab with shift,
+  which is a key that means the *opposite* of the byte behind it, so both lists
+  answer for that chord themselves rather than letting `Encoded::byte` walk them
+  forwards.
 - **A mode the client is holding is left by a keystroke and by nothing else.**
   A session that asked for mouse tracking or focus reporting has the terminal
   sending reports whenever the hand or the window moves, and those arrive on the
@@ -476,6 +907,18 @@ Three consequences run through the whole codebase and are worth keeping intact:
   because `SystemTime` has no `Default`, and a host too old to send it ties all
   of its sessions at the epoch, where the name tiebreak leaves them in the order
   they have always been in.
+- **The listing already out there is handed to the popup, not left to finish
+  into a variable nobody reads again.** `take_listing` gives one half a second,
+  so on a fleet where a fan-out takes longer it is *always* still running when
+  the popup opens. The popup used to start a second one from scratch: two ssh
+  commands per host for one keypress, and an empty box for as long as the
+  second took. Now the pending handle moves into the lister task, whose first
+  ask awaits it. Two things follow. The task hands the snapshot back through
+  `seen`, because the loop has given up its own copy and would otherwise never
+  fill one in again. And the narrowing that happens on the way in
+  (`settled`) can no longer wait for a listing that says something: on a slow
+  fleet the first one lands after the run has started, and firing then narrowed
+  the run to whatever group you had just put a session in.
 - **A press is the only thing that asks the machines what they are running, so
   every press has to ask.** Nothing refreshes the switch keys' listing on a
   timer: it is asked for after a key is pressed and read by the next one

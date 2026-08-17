@@ -23,8 +23,11 @@ const RESERVED: u16 = 1;
 /// puts between its columns.
 const GUTTER: u16 = 2;
 
-/// What the keys do, shown while control mode is on. Without it the mode is a
-/// terminal that has stopped taking what you type for no visible reason.
+/// What the keys do, shown while control mode is on and there is no popup to
+/// say it: a window too small to hold a box, which is the only time this row is
+/// all there is. Without it the mode is a terminal that has stopped taking what
+/// you type for no visible reason. The highlight goes in front of them there,
+/// which is [`Popped::Cramped`].
 ///
 /// Cut from the end when the row cannot hold all of it, rather than dropped
 /// whole: the mark takes what it takes, a long target name leaves little
@@ -34,6 +37,7 @@ const GUTTER: u16 = 2;
 const HINTS: &[&str] = &[
     "tab next",
     "s-tab prev",
+    "⏎ go",
     // Early, because it is the only way into the view: the wheel is left to
     // the terminal so that a drag selects, and a key nobody can find is a
     // feature nobody has.
@@ -45,6 +49,14 @@ const HINTS: &[&str] = &[
     "h host",
     "l last",
 ];
+
+/// What the group lists answer to, for the same row when there is no box to
+/// carry their own hints.
+///
+/// All or nothing rather than a ladder, being two keys: `choose` because the
+/// highlight sitting beside it already says which list is open, and there is no
+/// room to say `move` and `show` separately for the sake of a word.
+const PICK_HINTS: &str = "⏎ choose  esc back";
 
 /// What sits between one hint and the next, the same gutter again.
 const HINT_GAP: &str = "  ";
@@ -74,11 +86,36 @@ pub fn session_size(size: Size) -> Size {
     }
 }
 
+/// What the popup is doing to this row.
+///
+/// Three states rather than two, because a popup that could not be drawn is not
+/// the same as no popup: the mode is on, the highlight is moving under every
+/// press, and this row is the only surface left to say so.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub enum Popped {
+    /// None up, so the row says what the keys do itself.
+    #[default]
+    None,
+    /// One up and drawing its own hints inside the box, so this row says
+    /// nothing about keys: two hint lines at once is one too many.
+    Drawn,
+    /// One up with no room to draw. The row stands in for it, and carries which
+    /// list is open and which row the highlight is on.
+    Cramped(String),
+}
+
 /// Sequences that paint the mark and hold the row it lives on.
 pub struct Status {
     target: String,
     /// The mode the row says the keyboard is in.
     mode: Mode,
+    /// What the popup has left this row to do.
+    popped: Popped,
+    /// The group the run is narrowed to, if any. Drawn in front of the target,
+    /// because the row already answers "which session" and this answers "which
+    /// work", and a narrowing you cannot see is a set of switch keys that
+    /// quietly stopped reaching half your sessions.
+    group: Option<String>,
     /// Something the client has to say for itself, which takes the hints' place
     /// while it is up. A paste is the only thing that has anything to say so
     /// far, and it says it here because a full-screen program owns every other
@@ -111,6 +148,8 @@ impl Status {
         Self {
             target: target.to_string(),
             mode: Mode::default(),
+            popped: Popped::None,
+            group: None,
             notice: None,
             scrolled: None,
             prompt: None,
@@ -118,6 +157,16 @@ impl Status {
             watching: false,
             lost: false,
         }
+    }
+
+    /// Say what the popup has left this row to do. The caller repaints.
+    pub fn set_popup(&mut self, popped: Popped) {
+        self.popped = popped;
+    }
+
+    /// Which group the run is narrowed to, or none.
+    pub fn set_group(&mut self, group: Option<&str>) {
+        self.group = group.map(str::to_string);
     }
 
     /// Say that this client cannot type into the session, for as long as it is
@@ -168,6 +217,12 @@ impl Status {
     /// called nothing in particular.
     pub fn set_renaming(&mut self, name: Option<String>) {
         self.prompt = name.map(|text| ("rename ", text));
+    }
+
+    /// And for the prompt that names a group to put the highlighted session
+    /// in, which is the same editing again and a different question.
+    pub fn set_grouping(&mut self, name: Option<String>) {
+        self.prompt = name.map(|text| ("group ", text));
     }
 
     /// Show what the last search found: the needle, and which match of how
@@ -230,7 +285,18 @@ impl Status {
     /// The mark itself, drawn a gutter in from the right end of the reserved
     /// row, with the key hints beside it while control mode is on.
     fn mark(&self, size: Size) -> String {
-        let width = columns(&format!("● {}", self.target));
+        // The group drops first when the row runs out of room: which session
+        // you are in is the thing this row exists to say, and the narrowing is
+        // worth knowing but not worth losing the target over.
+        let mut prefix = match &self.group {
+            Some(group) if !group.is_empty() => format!("{group} · "),
+            _ => String::new(),
+        };
+        let mut width = columns(&format!("● {prefix}{}", self.target));
+        if width + GUTTER > size.cols {
+            prefix.clear();
+            width = columns(&format!("● {}", self.target));
+        }
         // Right-aligned, and dropped rather than wrapped on a terminal too
         // narrow to hold it and its gutter: a wrapped mark would scroll the
         // screen.
@@ -255,9 +321,11 @@ impl Status {
             (true, _, _) => style::amber("○"),
             (false, true, _) => style::faint("◦"),
             (false, false, Mode::Focus) => style::green("●"),
-            (false, false, Mode::Control | Mode::Scroll | Mode::Rename) => style::amber("○"),
+            (false, false, Mode::Control | Mode::Picking | Mode::Scroll | Mode::Rename) => {
+                style::amber("○")
+            }
         };
-        let name = style::faint(&self.target);
+        let name = style::faint(&format!("{prefix}{}", self.target));
         format!(
             "\x1b[{row};1H\x1b[2K{hint}\x1b[{row};{column}H{dot} {name}",
             row = size.rows,
@@ -297,24 +365,64 @@ impl Status {
             // cannot say: it is showing lines that look exactly like the ones
             // the session printed a moment ago.
             (None, Some(scrolled), _) => (scrolled.as_str(), style::amber as fn(&str) -> String),
-            // The one thing on this row that can be shortened to fit, and is.
-            (None, None, Mode::Control) => {
-                let hints = hints(size.cols.saturating_sub(1 + mark + GUTTER));
-                return if hints.is_empty() {
+            // The popup's job, on a window with no room for a popup. Control
+            // mode draws its own hints inside the box when there is one, and
+            // two hint lines at once is one too many, so this arm is reached
+            // only where the box could not be drawn at all.
+            (None, None, mode @ (Mode::Control | Mode::Picking))
+                if self.popped != Popped::Drawn =>
+            {
+                let room = size.cols.saturating_sub(1 + mark + GUTTER);
+                let text = self.without_a_box(mode, room);
+                return if text.is_empty() {
                     String::new()
                 } else {
-                    style::faint(&hints)
+                    style::faint(&text)
                 };
             }
             // Rename is here for the sake of the match: that mode is never on
             // without a prompt, which was answered above.
-            (None, None, Mode::Focus | Mode::Scroll | Mode::Rename) => return String::new(),
+            (
+                None,
+                None,
+                Mode::Control | Mode::Picking | Mode::Focus | Mode::Scroll | Mode::Rename,
+            ) => return String::new(),
         };
         // A blank column between the two, so they never run together.
         if columns(text) + 1 + mark + GUTTER > size.cols {
             return String::new();
         }
         styled(text)
+    }
+
+    /// The row standing in for a popup there was no room to draw: the highlight
+    /// first, then as many keys as fit beside it.
+    ///
+    /// The highlight leads because it is the thing moving under the hand. A tab
+    /// that walks a list nobody can see is a key that has stopped working as far
+    /// as anyone watching can tell, and on a window this small there is no other
+    /// surface to say otherwise on.
+    fn without_a_box(&self, mode: Mode, room: u16) -> String {
+        let Popped::Cramped(showing) = &self.popped else {
+            return hints(room);
+        };
+        // The keys go before the highlight does: a list you cannot see at all
+        // is worse than one whose keys you have to remember.
+        if columns(showing) > room {
+            return String::new();
+        }
+        let left = room.saturating_sub(columns(showing) + columns(HINT_GAP));
+        let keys = match mode {
+            Mode::Picking if columns(PICK_HINTS) <= left => PICK_HINTS.to_string(),
+            Mode::Picking => String::new(),
+            // The session list's keys are this row's own ladder, cut from the
+            // end the way it always cuts them.
+            _ => hints(left),
+        };
+        if keys.is_empty() {
+            return showing.clone();
+        }
+        format!("{showing}{HINT_GAP}{keys}")
     }
 
     /// `mm ` in front of a title, or in front of the target when the session has
@@ -1158,9 +1266,9 @@ mod tests {
         assert!(painted.contains("\x1b[24;70H"), "{painted:?}");
     }
 
-    /// The wheel no longer opens the view, because the mouse is the terminal's
-    /// while the session is live so that a drag can select. That leaves the key
-    /// as the only way in, and a way in nobody can see is no way in.
+    /// The wheel opens the view too, but the key is the way in for a hand that
+    /// would rather not reach for the mouse, and the only one on a session that
+    /// asked for the mouse itself. A way in nobody can see is no way in.
     #[test]
     fn the_hints_offer_the_key_that_opens_the_view() {
         let mut status = Status::new("srv/zsh");
@@ -1232,6 +1340,70 @@ mod tests {
         assert!(painted.contains("srv/build"), "{painted:?}");
         assert!(!painted.contains("srv/zsh"), "{painted:?}");
         assert_eq!(status.retitle(), "\x1b]0;mm srv/build\x07");
+    }
+
+    /// The bug this was written for: control mode is the popup, so a window
+    /// with no room to draw one was a client that had taken the keyboard and a
+    /// tab that changed nothing anybody could see. The row is the only surface
+    /// left, and the highlight is the thing that moves.
+    #[test]
+    fn a_window_too_small_for_the_popup_says_which_row_the_highlight_is_on() {
+        let mut status = Status::new("srv/zsh");
+        status.set_mode(Mode::Control);
+        status.set_popup(Popped::Cramped("sessions: build".to_string()));
+        let painted = status.repaint(Size::new(80, 24));
+        assert!(painted.contains("sessions: build"), "{painted:?}");
+        // And the keys after it, in the room the highlight leaves.
+        assert!(painted.contains("tab next"), "{painted:?}");
+        assert!(painted.contains("\x1b[24;70H"), "{painted:?}");
+    }
+
+    /// The box carries its own hints, and two hint lines at once is one too
+    /// many. Nothing about the popup reaches this row while there is one.
+    #[test]
+    fn a_popup_that_drew_leaves_this_row_out_of_it() {
+        let mut status = Status::new("srv/zsh");
+        status.set_mode(Mode::Control);
+        status.set_popup(Popped::Drawn);
+        let painted = status.repaint(Size::new(80, 24));
+        assert!(!painted.contains("tab next"), "{painted:?}");
+        // The mark is the row's own and stays where it always is.
+        assert!(painted.contains("\x1b[24;70H"), "{painted:?}");
+    }
+
+    /// The group list answers to different keys, and saying `d detach` over one
+    /// would be naming a key that does something else there. Which list it is
+    /// comes from the highlight beside them, so the keys can stay short enough
+    /// to fit whole.
+    #[test]
+    fn the_group_list_gets_its_own_keys_rather_than_the_session_ladder() {
+        let mut status = Status::new("srv/zsh");
+        status.set_mode(Mode::Picking);
+        status.set_popup(Popped::Cramped("move \"build\" to: pi".to_string()));
+        let painted = status.repaint(Size::new(80, 24));
+        assert!(painted.contains("move \"build\" to: pi"), "{painted:?}");
+        assert!(painted.contains("⏎ choose"), "{painted:?}");
+        assert!(painted.contains("esc back"), "{painted:?}");
+        assert!(!painted.contains("d detach"), "{painted:?}");
+    }
+
+    /// The keys give way before the highlight does: a list whose keys you have
+    /// to remember still works, and one you cannot see at all does not.
+    #[test]
+    fn the_highlight_is_the_last_thing_the_row_gives_up() {
+        let mut status = Status::new("srv/zsh");
+        status.set_mode(Mode::Control);
+        status.set_popup(Popped::Cramped("sessions: build".to_string()));
+
+        let narrow = status.repaint(Size::new(30, 24));
+        assert!(narrow.contains("sessions: build"), "{narrow:?}");
+        assert!(!narrow.contains("tab next"), "{narrow:?}");
+
+        // And where even that will not fit, the mark wins, the same as every
+        // other thing that shares this row with it.
+        let narrower = status.repaint(Size::new(19, 24));
+        assert!(!narrower.contains("sessions"), "{narrower:?}");
+        assert!(narrower.contains("\x1b[24;9H"), "{narrower:?}");
     }
 
     /// One prompt slot, so opening one takes the other's place rather than

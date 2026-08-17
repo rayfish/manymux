@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use crate::config;
 
 /// Every key `mm config` takes, in the order it lists them.
-pub const KEYS: &[&str] = &["notify", "screen"];
+pub const KEYS: &[&str] = &["notify", "screen", "mouse"];
 
 /// Whose screen an attached client paints on.
 ///
@@ -47,6 +47,44 @@ impl Screen {
     }
 }
 
+/// Who the mouse belongs to while a client is attached on a screen it owns.
+///
+/// `terminal` leaves it alone, so a drag selects the way it always did and the
+/// scroll key is the way into the history. `client` asks the terminal to report
+/// buttons instead, so a wheel notch opens the view and moves it, at the price
+/// of the bare drag: a terminal reporting the mouse is not selecting with it,
+/// and selection moves under a modifier that is the terminal's to choose
+/// (Option in iTerm2, Shift in most others) and may not be there at all.
+///
+/// The terminal's by default, because the two ways of being wrong are not the
+/// same size. A wheel that does nothing on the alternate screen is what plain
+/// ssh and an unconfigured tmux both do, and there is a key on the hints row
+/// saying what to press instead; a drag that stops selecting is this taking
+/// away something the terminal was doing a moment ago, with nothing on the
+/// screen to say so and no substitute for it. Scrolling has another gesture
+/// and copying a line does not.
+///
+/// Which of the two is right is a fact about the terminal you are sitting at
+/// rather than about one attach, which is why this is a setting and not a flag.
+/// It says nothing about a session that asked for reports of its own: those are
+/// the program's either way.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Mouse {
+    #[default]
+    Terminal,
+    Client,
+}
+
+impl Mouse {
+    fn word(self) -> &'static str {
+        match self {
+            Mouse::Client => "client",
+            Mouse::Terminal => "terminal",
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
 pub struct Settings {
     /// Whether anything may interrupt you: desktop notifications from the
@@ -56,6 +94,9 @@ pub struct Settings {
     /// Whose screen an attached client paints on.
     #[serde(default)]
     pub screen: Screen,
+    /// Who the mouse belongs to while one is attached.
+    #[serde(default)]
+    pub mouse: Mouse,
 }
 
 fn on() -> bool {
@@ -67,6 +108,7 @@ impl Default for Settings {
         Self {
             notify: true,
             screen: Screen::default(),
+            mouse: Mouse::default(),
         }
     }
 }
@@ -105,6 +147,7 @@ impl Settings {
         match key {
             "notify" => Ok(word(self.notify).to_string()),
             "screen" => Ok(self.screen.word().to_string()),
+            "mouse" => Ok(self.mouse.word().to_string()),
             _ => bail!("no setting called `{key}`; known settings: {}", list()),
         }
     }
@@ -113,6 +156,7 @@ impl Settings {
         match key {
             "notify" => self.notify = flag(key, value)?,
             "screen" => self.screen = screen(key, value)?,
+            "mouse" => self.mouse = mouse(key, value)?,
             _ => bail!("no setting called `{key}`; known settings: {}", list()),
         }
         Ok(())
@@ -150,6 +194,7 @@ pub fn values(key: &str) -> &'static [&'static str] {
     match key {
         "notify" => &["on", "off"],
         "screen" => &["alternate", "inline"],
+        "mouse" => &["terminal", "client"],
         _ => &[],
     }
 }
@@ -160,6 +205,15 @@ fn screen(key: &str, value: &str) -> Result<Screen> {
         "alternate" | "alt" => Ok(Screen::Alternate),
         "inline" => Ok(Screen::Inline),
         other => bail!("`{key}` is alternate or inline, not {other:?}"),
+    }
+}
+
+/// Read the mouse setting the way a person writes one.
+fn mouse(key: &str, value: &str) -> Result<Mouse> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "client" | "mm" => Ok(Mouse::Client),
+        "terminal" | "term" => Ok(Mouse::Terminal),
+        other => bail!("`{key}` is client or terminal, not {other:?}"),
     }
 }
 
@@ -233,8 +287,24 @@ mod tests {
             all,
             vec![
                 ("notify", "on".to_string()),
-                ("screen", "alternate".to_string())
+                ("screen", "alternate".to_string()),
+                ("mouse", "terminal".to_string())
             ]
         );
+    }
+
+    #[test]
+    fn the_mouse_is_the_terminals_until_it_is_asked_for() {
+        let mut settings = Settings::default();
+        assert_eq!(settings.get("mouse").unwrap(), "terminal");
+
+        for client in ["client", "CLIENT", " mm "] {
+            settings.set("mouse", client).unwrap();
+            assert_eq!(settings.get("mouse").unwrap(), "client", "{client:?}");
+        }
+        settings.set("mouse", "terminal").unwrap();
+        assert_eq!(settings.mouse, Mouse::Terminal);
+
+        assert!(settings.set("mouse", "off").is_err());
     }
 }

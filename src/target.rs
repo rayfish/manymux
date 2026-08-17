@@ -18,8 +18,9 @@ use tokio::time::timeout;
 use tracing::debug;
 
 use manymux::client::Stream;
+use manymux::client::groups::Groups;
 use manymux::client::switch::Located;
-use manymux::hosts::{Hosts, LOCAL, Target, is_this_machine, this_machine};
+use manymux::hosts::{Hosts, LOCAL, Named, Target, is_this_machine, this_machine};
 use manymux::proto::{HostedSession, Request, Response, SessionInfo};
 
 use crate::open;
@@ -64,12 +65,23 @@ impl Listing {
     /// resubscribe to any it had given up on. This machine is not one of them:
     /// it is never watched, being where the watching happens.
     pub(crate) fn reached(&self) -> Vec<String> {
-        let mut hosts: Vec<String> = self
-            .answered
-            .iter()
-            .filter(|host| !is_this_machine(host))
-            .cloned()
-            .collect();
+        let mut hosts = self.answering();
+        hosts.retain(|host| !is_this_machine(host));
+        hosts
+    }
+
+    /// Every machine that answered, this one included.
+    ///
+    /// Which is what pruning a group wants and [`Self::reached`] is not: that
+    /// one leaves this machine out because this machine is never watched, and
+    /// pruning fed the same list kept every local member of every group
+    /// forever. A group that had ended on the machine you actually work on
+    /// stayed in `groups.toml`, and its name stayed in the completions, with
+    /// nothing on any screen to say so: every view of a group counts the
+    /// sessions the listing knows about, so a dead member is invisible in all
+    /// of them.
+    pub(crate) fn answering(&self) -> Vec<String> {
+        let mut hosts = self.answered.clone();
         hosts.sort();
         hosts.dedup();
         hosts
@@ -198,19 +210,45 @@ pub(crate) enum Bare {
 /// wherever you left it without having to remember which machine that was.
 pub(crate) async fn locate(socket: &Path, target: &str, bare: Bare) -> Result<Located> {
     let target = Target::parse(target)?;
-    if let Some(host) = target.host {
+
+    // A group names more than one session, and `mm kill` and `mm rename` act on
+    // exactly one and cannot be undone. Refused for the same reason a bare
+    // machine name is only accepted for going somewhere.
+    let group = target
+        .session
+        .group()
+        .or_else(|| target.host.as_ref().and_then(Named::group));
+    if let Some(group) = group {
+        if bare == Bare::Session {
+            bail!("{group} is a group, which names more than one session; name the one you mean");
+        }
+        // The listing has to be fetched whatever else is known: a group spans
+        // machines, so there is no telling which ones it is on without asking.
+        let listing = everywhere(socket).await?;
+        note_reached(socket, listing.reached()).await;
+        let groups = Groups::load()?;
+        let (host, name) = match (&target.host, &target.session) {
+            (Some(Named::Session(host)), Named::Group(_)) => (Some(host.as_str()), None),
+            (Some(Named::Group(_)), Named::Session(name)) => (None, Some(name.as_str())),
+            _ => (None, None),
+        };
+        return in_group(&groups, &listing.sessions, group, host, name);
+    }
+
+    let wanted = target.session.name().to_string();
+    if let Some(Named::Session(host)) = target.host {
         return Ok(Located {
             host,
-            session: target.session,
+            session: wanted,
         });
     }
 
     // Nearly always here, and asking is one round trip on a local socket.
     let here = sessions_on(socket, LOCAL).await.unwrap_or_default();
-    if here.iter().any(|session| session.name == target.session) {
+    if here.iter().any(|session| session.name == wanted) {
         return Ok(Located {
             host: this_machine().to_string(),
-            session: target.session,
+            session: wanted,
         });
     }
 
@@ -218,7 +256,7 @@ pub(crate) async fn locate(socket: &Path, target: &str, bare: Bare) -> Result<Lo
     let mut hosts: Vec<String> = listing
         .sessions
         .iter()
-        .filter(|hosted| hosted.session.name == target.session)
+        .filter(|hosted| hosted.session.name == wanted)
         .map(|hosted| hosted.host.clone())
         .collect();
     hosts.dedup();
@@ -226,20 +264,57 @@ pub(crate) async fn locate(socket: &Path, target: &str, bare: Bare) -> Result<Lo
     match hosts.len() {
         1 => Ok(Located {
             host: hosts.remove(0),
-            session: target.session,
+            session: wanted,
         }),
-        0 if bare == Bare::OrMachine && names_a_machine(&target.session) => {
-            on_that_machine(&listing, &target.session)
+        0 if bare == Bare::OrMachine && names_a_machine(&wanted) => {
+            on_that_machine(&listing, &wanted)
         }
-        0 => bail!("no session named {}; see `mm ls`", target.session),
+        0 => bail!("no session named {wanted}; see `mm ls`"),
         // Two machines can each have a `build`. Say which, rather than guessing.
         _ => bail!(
-            "{} is on more than one machine ({}); say which, like `{}/{}`",
-            target.session,
+            "{wanted} is on more than one machine ({}); say which, like `{}/{wanted}`",
             hosts.join(", "),
             hosts[0],
-            target.session
         ),
+    }
+}
+
+/// A session inside a group, optionally narrowed to one machine or one name.
+///
+/// The listing arrives ordered by machine and then by when each session was
+/// opened, so the first row that matches is the oldest one in the group, which
+/// is the same rule the host keys land by: first as `mm ls` prints it.
+fn in_group(
+    groups: &Groups,
+    listing: &[HostedSession],
+    group: &str,
+    host: Option<&str>,
+    name: Option<&str>,
+) -> Result<Located> {
+    let found = listing.iter().find(|hosted| {
+        groups.group_of(&hosted.host, &hosted.session) == Some(group)
+            && host.is_none_or(|want| hosted.host == want)
+            && name.is_none_or(|want| hosted.session.name == want)
+    });
+    if let Some(hosted) = found {
+        return Ok(Located::new(&hosted.host, &hosted.session.name));
+    }
+
+    // Which of the two ways it missed, since they want different answers: a
+    // group nobody is running is a name to correct, while a session that is
+    // simply not in one is a session you reach without naming the group.
+    let live = groups.tally(listing);
+    if !live.iter().any(|(g, _)| g == group) {
+        let names: Vec<&str> = live.iter().map(|(g, _)| g.as_str()).collect();
+        if names.is_empty() {
+            bail!("no group named {group}; see `mm groups`");
+        }
+        bail!("no group named {group}; there is {}", names.join(", "));
+    }
+    match (host, name) {
+        (Some(host), _) => bail!("nothing from {group} is running on {host}"),
+        (_, Some(name)) => bail!("no session named {name} in {group}"),
+        _ => bail!("no group named {group}; see `mm groups`"),
     }
 }
 
@@ -359,5 +434,116 @@ mod tests {
         listing.add("asleep", Err(anyhow!("no answer in 5s")));
 
         assert_eq!(listing.reached(), vec!["api", "gpu-box"]);
+    }
+
+    /// And what a group is pruned against, which is the same list with this
+    /// machine back in it. Fed `reached`, pruning kept every local member of
+    /// every group forever: this machine is never in that list, and a member
+    /// whose machine did not answer is a member nothing has been said about.
+    #[test]
+    fn pruning_counts_this_machine_among_the_ones_that_answered() {
+        let mut listing = Listing::default();
+        listing.add(this_machine(), Ok(vec![session("here")]));
+        listing.add("gpu-box", Ok(vec![session("build")]));
+        listing.add("asleep", Err(anyhow!("no answer in 5s")));
+
+        let answering = listing.answering();
+        assert!(answering.contains(&this_machine().to_string()));
+        assert!(answering.contains(&"gpu-box".to_string()));
+        assert!(!answering.contains(&"asleep".to_string()));
+    }
+
+    fn at(name: &str, pid: u32, started: u64) -> SessionInfo {
+        SessionInfo {
+            pid,
+            started: std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(started),
+            ..session(name)
+        }
+    }
+
+    /// Two machines, one group across both, and a `build` on each so that
+    /// narrowing by name has something to get wrong.
+    fn world() -> (Groups, Vec<HostedSession>) {
+        let build = at("build", 1, 1000);
+        let api = at("api", 2, 1001);
+        let train = at("train", 3, 1002);
+        let other = at("build", 4, 1003);
+        let mut groups = Groups::default();
+        groups.assign("pi", "box", &build).unwrap();
+        groups.assign("pi", "gpu-box", &train).unwrap();
+        let listing = vec![
+            HostedSession {
+                host: "box".into(),
+                session: build,
+            },
+            HostedSession {
+                host: "box".into(),
+                session: api,
+            },
+            HostedSession {
+                host: "gpu-box".into(),
+                session: train,
+            },
+            HostedSession {
+                host: "gpu-box".into(),
+                session: other,
+            },
+        ];
+        (groups, listing)
+    }
+
+    /// The oldest session in the group, which is the rule the host keys land
+    /// by: first as `mm ls` prints it, rather than a second rule to learn.
+    #[test]
+    fn a_group_lands_on_the_oldest_session_in_it() {
+        let (groups, listing) = world();
+        let found = in_group(&groups, &listing, "pi", None, None).unwrap();
+        assert_eq!(found, Located::new("box", "build"));
+    }
+
+    #[test]
+    fn a_group_narrowed_to_a_machine_stays_on_it() {
+        let (groups, listing) = world();
+        let found = in_group(&groups, &listing, "pi", Some("gpu-box"), None).unwrap();
+        assert_eq!(found, Located::new("gpu-box", "train"));
+    }
+
+    /// Both machines have a `build`; only one of them is in `pi`.
+    #[test]
+    fn a_group_picks_the_session_of_that_name_that_is_in_it() {
+        let (groups, listing) = world();
+        let found = in_group(&groups, &listing, "pi", None, Some("build")).unwrap();
+        assert_eq!(found, Located::new("box", "build"));
+    }
+
+    #[test]
+    fn a_group_nobody_is_running_says_which_ones_exist() {
+        let (groups, listing) = world();
+        let said = format!(
+            "{:#}",
+            in_group(&groups, &listing, "nope", None, None).unwrap_err()
+        );
+        assert!(said.contains("no group named nope"), "{said}");
+        assert!(said.contains("pi"), "{said}");
+    }
+
+    #[test]
+    fn a_session_that_is_not_in_the_group_is_not_found_through_it() {
+        let (groups, listing) = world();
+        let said = format!(
+            "{:#}",
+            in_group(&groups, &listing, "pi", None, Some("api")).unwrap_err()
+        );
+        assert!(said.contains("no session named api in pi"), "{said}");
+    }
+
+    #[test]
+    fn a_group_with_nothing_on_the_machine_named_says_so() {
+        let (groups, listing) = world();
+        let said = format!(
+            "{:#}",
+            in_group(&groups, &listing, "pi", Some("far"), None).unwrap_err()
+        );
+        assert!(said.contains("nothing from pi is running on far"), "{said}");
     }
 }
