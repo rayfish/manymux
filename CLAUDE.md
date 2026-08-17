@@ -563,6 +563,35 @@ Three consequences run through the whole codebase and are worth keeping intact:
   moved. `Scrollback::line` answers for lines the block holds and no others for
   the same reason, the window arithmetic saturating at both ends being what a
   window wants and the opposite of what a selection wants.
+- **A drag held against an edge moves the view itself, on a clock**
+  (`Scrollback::chase`, `terminal::CHASE_EVERY`). A selection that could only
+  reach what was already painted was one bounded by the window, on the surface
+  whose whole reason for existing is that the window is not all there is. The
+  clock is the part that is not obvious: a hand holding still at the edge is a
+  hand the terminal has nothing to say about, since motion is reported per cell
+  crossed, so a chase driven by the reports stops at the last row somebody
+  could already see. What counts as the edge is the first and last rows rather
+  than anything past them, for the same reason: a terminal clamps the
+  coordinates it reports to the window it has, so a pointer dragged off the
+  bottom reports row twenty-four and then nothing, and an edge that only
+  counted what is beyond it would be one nothing ever reached. The spot is
+  remembered rather than a direction, since the row under the pointer is a
+  different line once the view has moved, and a chase with nowhere left to go
+  stops asking rather than ticking against the end of the buffer for as long as
+  the button is down.
+- **Which makes a selection longer than a block possible, so the block is
+  stretched over it** (`wanted`, and `COPY_LINES` where that stops). The text
+  of a selection is built out of the one block in hand (`holds`), which was
+  free while a selection was at most a screenful and is not free once a drag
+  can walk the view. Stretching the request rather than asking for the
+  selection's lines at the release is what keeps the block ready before it is
+  needed, and it costs nothing extra to ask for: the ends of a selection cannot
+  leave a block the window is still inside, so the stretch only happens on the
+  request the window was about to make anyway. The cap is there because the
+  answer comes back in one frame, and a chase that ran past it would end in a
+  copy of nothing at all: it is spent on the chase (`Chased::Full`) rather than
+  at the release, where the gesture is over and there is nothing to do about it
+  but say so.
 - **The wheel is the terminal's until somebody asks for it here**
   (`settings::Mouse`, `mm config mouse client`, reaching `wheel_is_ours` folded
   into `history`). Reading the wheel means asking the terminal to report the

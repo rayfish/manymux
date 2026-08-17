@@ -40,6 +40,18 @@ const BLOCK: u64 = 3;
 /// and three lines is what everything else moves for one.
 pub const WHEEL: u64 = 3;
 
+/// Lines one copy can be made of, which is as many as one block can hold.
+///
+/// A selection used to be at most a screenful, because the only way to reach
+/// a line was to be looking at it; a drag that scrolls the view under itself
+/// has no such bound, and the text of one is built out of a single block
+/// ([`Scrollback::holds`]). A block arrives in one frame, so something has to
+/// say how big it may get, and it is easier to answer here than to find out
+/// from the far end that it was too much. Two thousand lines is a minute and a
+/// half of holding the pointer at the edge, and around a quarter of a megabyte
+/// of text.
+pub const COPY_LINES: u64 = 2000;
+
 /// A window over the session's history, and the block of it we hold.
 pub struct Scrollback {
     /// Lines back from the newest line that the bottom of the window sits at.
@@ -83,6 +95,13 @@ pub struct Scrollback {
     search: Option<Search>,
     /// What is selected, while anything is.
     selection: Option<Selection>,
+    /// Where a drag is being held, while it is being held against an edge of
+    /// the window, which is a drag asking for the view to move under it.
+    ///
+    /// The spot rather than a direction, because the view moving is what makes
+    /// the row under the pointer a different line: the same spot read again
+    /// against the new offset is where the drag has got to.
+    chasing: Option<Spot>,
     /// A copy asked for before the lines to make it out of had arrived.
     ///
     /// A hand moving quickly presses, drags and lets go inside one read, which
@@ -136,6 +155,20 @@ struct Selection {
 struct Cell {
     line: u64,
     col: u16,
+}
+
+/// What a tick of a drag held against an edge did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Chased {
+    /// The view moved a line, and the selection grew by one.
+    Moved,
+    /// There is nothing further that way, so the chase is over until the hand
+    /// moves again.
+    Stopped,
+    /// The selection is as long as one copy can carry ([`COPY_LINES`]), so it
+    /// stopped growing. Worth saying out loud: a view that stopped moving
+    /// under a hand still asking it to reads as one that stopped working.
+    Full,
 }
 
 impl Selection {
@@ -205,6 +238,7 @@ impl Scrollback {
             cols: session_size(size).cols,
             search: None,
             selection: None,
+            chasing: None,
             owed: false,
             painted: Vec::new(),
         }
@@ -378,9 +412,25 @@ impl Scrollback {
         // Half a block below the window, so scrolling back down is local too,
         // and the rest above it, which is the way it is about to go.
         let below = (span - self.page()) / 2;
+        let mut from = self.offset.saturating_sub(below);
+        // Saturating because the view can be as far back as it likes before
+        // the first answer says how far back there is (see `up`).
+        let mut top = from.saturating_add(span);
+        // A selection can be longer than the window, since a drag held at an
+        // edge scrolls the view under itself. Its text is built out of one
+        // block (`holds`), so the block is stretched over it rather than the
+        // copy being answered out of lines that are not here. Only when the
+        // window has left the block anyway: the ends of a selection cannot
+        // leave a block the window is still inside, since the end that moves
+        // is the one under the pointer.
+        if let Some(selection) = self.selection {
+            let (first, last) = selection.ends();
+            from = from.min(last.line);
+            top = top.max(first.line + 1);
+        }
         let request = ViewRequest {
-            from: self.offset.saturating_sub(below),
-            lines: u32::try_from(span).unwrap_or(u32::MAX),
+            from,
+            lines: u32::try_from((top - from).min(COPY_LINES + span)).unwrap_or(u32::MAX),
         };
         // The same request twice means the answer to the first one was all
         // there is, and asking again would only get it again, forever.
@@ -424,6 +474,7 @@ impl Scrollback {
     /// selected before.
     pub fn select_from(&mut self, spot: Spot) {
         let at = self.cell(spot);
+        self.chasing = None;
         self.selection = Some(Selection {
             anchor: at,
             head: at,
@@ -435,9 +486,78 @@ impl Scrollback {
     /// report arriving out of order rather than a gesture.
     pub fn select_to(&mut self, spot: Spot) {
         let at = self.cell(spot);
+        self.chasing = self.at_an_edge(spot).then_some(spot);
         if let Some(selection) = &mut self.selection {
             selection.head = at;
         }
+    }
+
+    /// Whether a drag has reached the top or bottom of the window, which is a
+    /// hand asking for the lines past it.
+    ///
+    /// The rows either end rather than only what is beyond them: a terminal
+    /// clamps the coordinates it reports to the window it has, so a pointer
+    /// dragged off the bottom of the screen reports the last row it can and
+    /// then says nothing more at all. An edge that only counted what is past
+    /// it would be an edge nothing ever reached.
+    fn at_an_edge(&self, spot: Spot) -> bool {
+        spot.row <= 1 || u64::from(spot.row) >= self.page()
+    }
+
+    /// Whether a drag is being held against an edge, and so whether the view
+    /// owes it a move.
+    pub fn chasing(&self) -> bool {
+        self.chasing.is_some()
+    }
+
+    /// Let go of the button. What is selected is untouched; what ends is the
+    /// hand's claim on the view.
+    pub fn let_go(&mut self) {
+        self.chasing = None;
+    }
+
+    /// Move the view a line the way a drag held at an edge is pointing, and
+    /// take the line that uncovers into the selection.
+    ///
+    /// On a clock rather than on the reports, because a hand holding still at
+    /// the edge of the window is a hand the terminal has nothing to say about:
+    /// the drag would stop at the last row somebody could see, which is the one
+    /// row they can already reach.
+    pub fn chase(&mut self) -> Chased {
+        let Some(spot) = self.chasing else {
+            return Chased::Stopped;
+        };
+        let was = self.offset;
+        if spot.row <= 1 {
+            self.up(1);
+        } else {
+            self.down(1);
+        }
+        if self.offset == was {
+            // The oldest line there is, or the live screen: nothing that way.
+            self.chasing = None;
+            return Chased::Stopped;
+        }
+        self.select_to(spot);
+        if self.spans() > COPY_LINES {
+            // Put back the line that would have made it too long to copy. A
+            // selection that grew past what one block holds is one that copies
+            // nothing, and stopping where it can still be taken is the only
+            // answer that keeps the gesture worth making.
+            self.offset = was;
+            self.select_to(spot);
+            self.chasing = None;
+            return Chased::Full;
+        }
+        Chased::Moved
+    }
+
+    /// Lines the selection covers, both ends included.
+    fn spans(&self) -> u64 {
+        self.selection.map_or(0, |selection| {
+            let (first, last) = selection.ends();
+            first.line - last.line + 1
+        })
     }
 
     /// Take the word under a second click, in the sense a terminal means:
@@ -446,6 +566,7 @@ impl Scrollback {
     /// it rather than three letters of it.
     pub fn select_word(&mut self, spot: Spot) {
         let at = self.cell(spot);
+        self.chasing = None;
         let Some(line) = self.line(at.line) else {
             return self.select_from(spot);
         };
@@ -480,6 +601,7 @@ impl Scrollback {
     /// blanks past that are the screen rather than the text.
     pub fn select_line(&mut self, spot: Spot) {
         let at = self.cell(spot);
+        self.chasing = None;
         let end = self.line(at.line).map_or(0, |line| {
             plain(line, 0, u16::MAX).trim_end().chars().count()
         });
@@ -1252,6 +1374,126 @@ mod tests {
         view.page_up();
         answer(&mut view, 100);
         assert_eq!(view.copied().as_deref(), Some("line"));
+    }
+
+    /// A drag held at the top row reaches the lines above it: the view moves
+    /// back a line and the line that uncovers joins the selection. Without it
+    /// a selection could never be longer than what was already on the screen,
+    /// which is the one thing the history is there for.
+    #[test]
+    fn a_drag_held_at_the_top_of_the_window_reaches_the_lines_above_it() {
+        let mut view = view(100);
+        view.select_from(at(24, 1));
+        view.select_to(at(1, 1));
+        assert!(view.chasing(), "a drag at the top row asks for the view");
+        assert_eq!(view.chase(), Chased::Moved);
+        assert_eq!(view.offset(), 1);
+        answer(&mut view, 100);
+        let copied = view.copied().unwrap();
+        assert_eq!(copied.lines().next(), Some("line 75"));
+        assert_eq!(copied.lines().count(), 25, "a screenful and the one chased");
+    }
+
+    /// And at the bottom row it goes the other way, which is only somewhere to
+    /// go while the view is scrolled back.
+    #[test]
+    fn a_drag_held_at_the_bottom_of_the_window_goes_the_other_way() {
+        let mut view = view(100);
+        view.up(10);
+        answer(&mut view, 100);
+        view.select_from(at(1, 1));
+        view.select_to(at(24, 1));
+        assert_eq!(view.chase(), Chased::Moved);
+        assert_eq!(view.offset(), 9);
+    }
+
+    /// The live screen is as far forward as there is, and the oldest line as
+    /// far back. A chase with nowhere to go stops asking rather than ticking
+    /// against the end of the buffer for as long as the button is held.
+    #[test]
+    fn a_chase_with_nowhere_to_go_stops() {
+        let mut live = view(100);
+        live.select_from(at(1, 1));
+        live.select_to(at(24, 1));
+        assert_eq!(live.chase(), Chased::Stopped);
+        assert_eq!(live.offset(), 0);
+        assert!(!live.chasing());
+
+        let mut oldest = view(30);
+        oldest.top();
+        oldest.select_from(at(24, 1));
+        oldest.select_to(at(1, 1));
+        assert_eq!(oldest.chase(), Chased::Stopped);
+        assert_eq!(oldest.offset(), 30 - 24);
+    }
+
+    /// A hand that moved back off the edge is done asking, and so is one that
+    /// let go. The second is the one that matters: a chase that outlived the
+    /// button would go on scrolling the view under a selection nobody is
+    /// making any more.
+    #[test]
+    fn a_chase_ends_with_the_gesture_that_started_it() {
+        let mut view = view(100);
+        view.select_from(at(24, 1));
+        view.select_to(at(1, 1));
+        assert!(view.chasing());
+        view.select_to(at(12, 1));
+        assert!(!view.chasing(), "back inside the window");
+
+        view.select_to(at(1, 1));
+        assert!(view.chasing());
+        view.let_go();
+        assert!(!view.chasing(), "the button came up");
+        assert_eq!(view.chase(), Chased::Stopped);
+    }
+
+    /// The block stretches over a selection longer than the window, or the
+    /// copy would be made out of lines that are not here and come back short.
+    #[test]
+    fn a_selection_longer_than_the_window_is_still_all_in_one_block() {
+        let mut view = view(1000);
+        view.select_from(at(24, 1));
+        view.select_to(at(1, 1));
+        for _ in 0..100 {
+            assert_eq!(view.chase(), Chased::Moved);
+            answer(&mut view, 1000);
+        }
+        assert_eq!(view.offset(), 100);
+        let copied = view.copied().unwrap();
+        assert_eq!(copied.lines().count(), 124, "the screenful and the hundred");
+        assert_eq!(copied.lines().next(), Some("line 876"));
+    }
+
+    /// And it stops growing where one block stops being able to hold it. A
+    /// selection that outgrew what a copy can carry is one that copies
+    /// nothing, so the chase ends there and says so.
+    #[test]
+    fn a_selection_stops_growing_at_what_a_copy_can_carry() {
+        let mut view = view(5000);
+        view.select_from(at(24, 1));
+        view.select_to(at(1, 1));
+        let mut moved = 0;
+        let ended = loop {
+            match view.chase() {
+                Chased::Moved => {
+                    moved += 1;
+                    answer(&mut view, 5000);
+                }
+                ended => break ended,
+            }
+        };
+        assert_eq!(ended, Chased::Full);
+        assert_eq!(
+            moved,
+            COPY_LINES - 24,
+            "a screenful of it was already there"
+        );
+        assert!(!view.chasing());
+        assert_eq!(
+            view.copied().unwrap().lines().count(),
+            COPY_LINES as usize,
+            "and what it stopped at is still copyable"
+        );
     }
 
     /// The highlight is one colour over whatever was there, and the line's own

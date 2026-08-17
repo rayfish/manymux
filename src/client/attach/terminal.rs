@@ -21,7 +21,7 @@ use super::keys::wheel_is_ours;
 use super::{Action, Chose, Find, KeyFilter, Mode, Outcome, Pick, Rename, Rows, Scroll, Select};
 use crate::client::picker::Picker;
 use crate::client::screen::ScreenMode;
-use crate::client::scroll::Scrollback;
+use crate::client::scroll::{self, Chased, Scrollback};
 use crate::client::status::{self, Filter, Popped, Status};
 use crate::client::{Attached, SessionHalves, SessionReader, SessionWriter, Update};
 use crate::clipboard;
@@ -407,6 +407,15 @@ fn host_of(target: &str) -> Option<&str> {
 /// hints have it back. Long enough to read without looking for it.
 const NOTICE_FOR: Duration = Duration::from_secs(5);
 
+/// How often the view moves a line under a drag held against its edge.
+///
+/// A screenful in about a second and a half: fast enough that reaching for the
+/// line above the window is a gesture rather than a wait, slow enough to let go
+/// on the line you meant. Every one of these repaints the window, which is why
+/// it is a line at a time and not three: a notch is a hand asking for a jump
+/// and this is a hand asking to keep going.
+const CHASE_EVERY: Duration = Duration::from_millis(60);
+
 /// Ask the node for the session's screen, and note that it owes an erased,
 /// homed one to paint it onto.
 ///
@@ -725,6 +734,10 @@ async fn pump(
     let mut notice_until: Option<tokio::time::Instant> = status
         .has_notice()
         .then(|| tokio::time::Instant::now() + NOTICE_FOR);
+    // When the view next moves under a drag held against its edge, while one
+    // is being held. Kept here rather than worked out per pass, or a session
+    // printing steadily would push the moment away forever.
+    let mut chase_at: Option<tokio::time::Instant> = None;
     // Notifications for the terminal, waiting for a safe moment to be
     // written, and the rule for which of them get one.
     let mut pending = String::new();
@@ -1051,8 +1064,9 @@ async fn pump(
                             Select::Line(at) => view.select_line(at),
                             // Letting go changes nothing about what is
                             // selected. It is the moment the selection becomes
-                            // worth having, which is a different thing.
-                            Select::Done => {}
+                            // worth having, which is a different thing, and
+                            // the moment the hand stops asking for the view.
+                            Select::Done => view.let_go(),
                         }
                         let copied = match what {
                             Select::Done => view.copied(),
@@ -1083,6 +1097,11 @@ async fn pump(
                         let wanted = if done { None } else { view.wanted() };
                         let painted = if done { String::new() } else { view.paint() };
                         let offset = view.offset();
+                        // A drag that has reached an edge and stayed there
+                        // reports nothing more, so from here the view moves on
+                        // a clock of its own.
+                        chase_at = (!done && view.chasing())
+                            .then(|| tokio::time::Instant::now() + CHASE_EVERY);
                         if let Some(request) = wanted {
                             writer.view(&request).await?;
                         }
@@ -1519,6 +1538,43 @@ async fn pump(
                     continue;
                 }
                 ask_for_the_screen(&mut writer, &mut owed).await?;
+            }
+            // A drag is being held against the top or bottom of the window,
+            // which is a hand asking for the lines past it. The pointer is
+            // holding still, so the terminal has nothing more to say about it
+            // and the view has to move itself.
+            _ = expire(chase_at) => {
+                chase_at = None;
+                let Some(view) = scrolling.as_mut() else { continue };
+                match view.chase() {
+                    Chased::Moved => {
+                        let wanted = view.wanted();
+                        let painted = view.paint();
+                        let offset = view.offset();
+                        if let Some(request) = wanted {
+                            writer.view(&request).await?;
+                        }
+                        status.set_scrolled(Some(offset));
+                        stdout.write_all(painted.as_bytes()).await?;
+                        stdout.write_all(status.repaint(terminal_size()).as_bytes()).await?;
+                        stdout.flush().await?;
+                        chase_at = Some(tokio::time::Instant::now() + CHASE_EVERY);
+                    }
+                    // The oldest line there is, or the live screen. Nothing to
+                    // say: the view is against the end of what exists and it
+                    // is showing that.
+                    Chased::Stopped => {}
+                    Chased::Full => {
+                        status.set_notice(&format!(
+                            "{} lines is as much as one copy takes",
+                            scroll::COPY_LINES
+                        ));
+                        notice_until = Some(tokio::time::Instant::now() + NOTICE_FOR);
+                        restate = true;
+                        settle(&mut stdout, &output, &status, &mut pending, &mut restate)
+                            .await?;
+                    }
+                }
             }
             // A notice the client put on the row has been up long enough.
             _ = expire(notice_until) => {
