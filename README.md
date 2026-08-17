@@ -120,8 +120,8 @@ Copying out of a session is your terminal's job, over OSC 52, which manymux
 passes through untouched. Most terminals refuse clipboard writes until you say
 otherwise (iTerm2: Settings > General > Selection; Terminal.app has no OSC 52 at
 all). A session is drawn on a screen of its own by default, so mouse selection
-covers what is on screen and not what has scrolled past it, and it wants your
-terminal's selection modifier held. See [Scrollback](#scrollback) for both.
+covers what is on screen and not what has scrolled past it. See
+[Scrollback](#scrollback) for the other way round.
 
 Targets are `host/name` for another machine and a bare `name` for this one. A
 bare name is looked for here first, then across every machine, so this finds the
@@ -318,22 +318,26 @@ region, and a terminal that throws away what scrolls out of one keeps nothing.
 iTerm2 keeps it. If yours does not, `--screen alternate` is the way back.
 
 On the alternate screen the terminal has no scrollback to offer, so manymux
-shows you its own. The wheel opens it and moves it, and so do `Ctrl-] [`,
-`pgup`/`pgdn`, `g` and `G`; `esc` goes back to the live session.
+shows you its own. `Ctrl-] [` opens it, `pgup`/`pgdn`, `g` and `G` move it, and
+`esc` goes back to the live session.
 
-Reading the wheel means asking the terminal to report the mouse, which is the
-same thing as taking the bare drag away from it. Selection is still there under
-the modifier every terminal keeps for exactly this (Option in iTerm2, Shift in
-most others), which is where tmux has had it for twenty years. If yours has no
-such modifier, or you would rather have the drag than the wheel, hand it back:
+The mouse is your terminal's, so dragging selects and copies exactly as it does
+anywhere else, with no modifier held. That is why the wheel does not open the
+view: reading the wheel means asking the terminal to report the mouse, and a
+terminal reporting the mouse is not selecting with it. If you would rather
+scroll with the wheel than select with a bare drag, ask for it:
 
 ```bash
-mm config mouse terminal
+mm config mouse client
 ```
 
-The keys still open the view, and the wheel goes back to doing whatever your
-terminal does with it. Nothing here is taken from a program that asked for the
-mouse itself: Claude Code, vim and htop keep every report, wheel and drag alike.
+Then a notch opens the view and moves it, the way tmux does, and selection
+moves under whichever modifier your terminal keeps for it (Option in iTerm2,
+Shift in most others). Some do not offer one, which is why this is a setting.
+
+Nothing here is taken from a program that asked for the mouse itself: Claude
+Code, vim and htop keep every report, wheel and drag alike, under either
+setting.
 
 `Ctrl-] /` searches everything the session has printed, all ten thousand lines
 of it. `n` walks back through the matches and `N` comes back towards the live

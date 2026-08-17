@@ -650,12 +650,12 @@ async fn pump(
     // has the lines in its own buffer and its own wheel is better than
     // anything here.
     keys.set_scroll(screen.mode().owns_the_screen());
-    // The wheel is a stricter question than the key: taking the mouse off the
-    // terminal costs it the bare-drag selection, so it is worth doing only
-    // where a notch has somewhere to go. A host that cannot answer for a window
-    // gets a sentence on the row when the key is pressed, and keeps its wheel.
-    // The last word is the person sitting at the terminal, whose one may not
-    // give selection back under a modifier the way most do.
+    // The wheel is a stricter question than the key, and asked for rather than
+    // assumed: taking the mouse off the terminal costs it the bare-drag
+    // selection, which nothing here can give back. So it wants somebody to have
+    // said `mm config mouse client`, and a notch to have somewhere to go once
+    // they have. A host that cannot answer for a window gets a sentence on the
+    // row when the key is pressed, and keeps its wheel either way.
     let history =
         scrolls && screen.mode().owns_the_screen() && Settings::or_default().mouse == Mouse::Client;
     let mut output = Filter::new(screen);

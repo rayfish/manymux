@@ -543,26 +543,28 @@ impl Report {
 /// Whether the wheel is the client's to read, or the terminal's to do what it
 /// likes with.
 ///
-/// For the whole attach, wherever there is a history of our own to move:
-/// a screen the client owns, and a host new enough to answer for a window.
-/// This used to be only while the view was already up, which left the wheel
-/// doing nothing at all for the rest of the attach: the client's screen is the
-/// terminal's alternate one, where the terminal has no scrollback to offer, and
-/// [`crate::client::screen::Alternate`] switches alternate scroll off besides,
-/// so a notch reached nobody. A program that repaints in place on the primary
-/// screen and asks for no mouse of its own, which `pi` is, was unscrollable by
-/// the gesture everyone reaches for first.
+/// The terminal's unless somebody asked for it here (`mm config mouse client`),
+/// and then only where there is a history of our own to move: a screen the
+/// client owns, and a host new enough to answer for a window. Both of those
+/// arrive inside `history`, along with the setting, since a wheel with nowhere
+/// to go and a wheel nobody asked for come to the same thing.
 ///
-/// What it costs is the terminal's own selection, which a terminal stops doing
-/// with a bare drag the moment somebody is reporting the mouse. Every terminal
-/// keeps it under a modifier, which is where tmux has had it for twenty years,
-/// and it is the smaller loss by default: a session you cannot scroll is one you
-/// cannot read, while a selection you cannot make without holding shift is one
-/// you can still make. Which modifier, and whether it works at all, is the
-/// terminal's business and not ours, so the trade is the person's to refuse:
-/// `mm config mouse terminal` leaves the mouse alone and the scroll key is then
-/// the only way in. That arrives here inside `history`, since a wheel with
-/// nowhere to go and a wheel somebody wants back come to the same thing.
+/// Taking it is the whole attach or none of it. It was once held only while the
+/// view was already up, on the reasoning that a wheel is worth less than a drag,
+/// which left the wheel doing nothing at all for the rest of the attach: the
+/// client's screen is the terminal's alternate one, where the terminal has no
+/// scrollback to offer, and [`crate::client::screen::Alternate`] switches
+/// alternate scroll off besides, so a notch reached nobody. A key that only
+/// works after you have pressed another key is not the gesture anybody reaches
+/// for.
+///
+/// What taking it costs is the terminal's own selection, which a terminal stops
+/// doing with a bare drag the moment somebody is reporting the mouse. Selection
+/// moves under a modifier the terminal chooses, which may not be there at all,
+/// and that is what settles the default rather than any weighing up of the two
+/// gestures: a wheel that does nothing here is what plain ssh does and there is
+/// a key on the hints row saying so, while a drag that stopped selecting is
+/// this having quietly taken something away, with nothing to press instead.
 ///
 /// Never while the session has asked for reports of its own, which is the half
 /// of the old rule that stays: two readers on one wheel, and a program that

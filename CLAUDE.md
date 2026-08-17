@@ -493,36 +493,31 @@ Three consequences run through the whole codebase and are worth keeping intact:
   two hops away must not be a round trip. Whether the host can do either rides
   on `Response::Attached { scroll }`, and a host that cannot says so on the mark
   row rather than leaving a key that does nothing.
-- **The wheel is ours wherever we have a history for it to move**
-  (`attach::wheel_is_ours`), which on the alternate screen is the whole attach.
-  This was once the other way round, held only while the view was already up, on
-  the reasoning that a terminal reporting the mouse is a terminal not selecting
-  with it. What that missed is where the notch went instead: the client's screen
-  *is* the terminal's alternate one, which keeps no scrollback of its own, and
-  `Alternate::setup` switches alternate scroll off besides (`?1007s` then
-  `?1007l`, restored with `?1007r`) so a notch cannot become arrow keys into
-  whatever is reading the session. So a notch reached nobody at all, and the
-  common case is worse than it sounds: a program that repaints in place on the
-  primary screen and asks for no mouse of its own, which `pi` is, could not be
-  scrolled by the gesture everyone reaches for first. Now the first notch opens
-  the view and moves it, which is what tmux does and what the mode was always
-  shaped for (`KeyFilter::after` has said "a wheel notch in focus mode opens it
-  and stays" since before one could). The cost is the bare drag that selects,
-  which every terminal keeps under a modifier: a session you cannot scroll is
-  one you cannot read, and a selection needing shift is one you can still make.
-  The key stays on the hints row, for a hand that would rather not reach for the
-  mouse.
-- **Which modifier gives the drag back is the terminal's business, so the trade
-  is the person's to refuse** (`settings::Mouse`, `mm config mouse terminal`).
-  Every terminal keeps selection under *some* modifier and no two agree which,
-  and the one in front of somebody may not do it at all: that is a fact about
-  their terminal, which nothing here can see and no amount of reasoning about
-  what the wheel is worth can answer. So `mouse` is a setting rather than a
-  flag, since it is a fact about the terminal you sit at rather than about one
-  attach, and it arrives at `wheel_is_ours` folded into `history`: a wheel with
-  nowhere to go and a wheel somebody wants back are the same thing to everything
-  downstream. What it must not touch is the key, which still opens the view, or
-  giving the mouse back would take the history with it.
+- **The wheel is the terminal's until somebody asks for it here**
+  (`settings::Mouse`, `mm config mouse client`, reaching `wheel_is_ours` folded
+  into `history`). Reading the wheel means asking the terminal to report the
+  mouse, and a terminal reporting the mouse is not selecting with it: what is
+  taken is not a notch but the bare drag, and it is taken for the whole attach.
+  Selection comes back only under a modifier the *terminal* chooses, no two
+  agree which, and the one in front of somebody may not offer one at all, which
+  is a fact about their terminal that nothing here can see. That asymmetry is
+  what settles the default, rather than any weighing of scrolling against
+  copying: a wheel that does nothing on the alternate screen is what plain ssh
+  and an unconfigured tmux both do, and `Ctrl-] [` is on the hints row saying
+  so, while a drag that stopped selecting is this having quietly taken
+  something away with nothing to press instead. What the setting must not touch
+  is that key, or handing the mouse back would take the history with it.
+- **Taken, it is taken for the whole attach and not just while the view is up.**
+  That was the first shape and it was wrong, because of where the notch went
+  instead: the client's screen *is* the terminal's alternate one, which keeps no
+  scrollback of its own, and `Alternate::setup` switches alternate scroll off
+  besides (`?1007s` then `?1007l`, restored with `?1007r`) so a notch cannot
+  become arrow keys into whatever is reading the session. So a notch reached
+  nobody at all until the view had already been opened by a key, which is a
+  gesture nobody reaches for second. Now the first notch opens the view and
+  moves it, which is what tmux does and what the mode was always shaped for
+  (`KeyFilter::after` has said "a wheel notch in focus mode opens it and stays"
+  since before one could).
 - **A session that asked for the mouse keeps every report, wheel included.**
   That half of the old rule is untouched and is what the whole thing rests on:
   two readers on one wheel is one of them reading input meant for the other, and

@@ -49,12 +49,20 @@ impl Screen {
 
 /// Who the mouse belongs to while a client is attached on a screen it owns.
 ///
-/// `client` asks the terminal to report buttons, so a wheel notch opens the
-/// view and moves it. What that costs is the bare drag: a terminal reporting
-/// the mouse is not selecting with it, and every terminal keeps selection under
-/// a modifier instead (Option in iTerm2, Shift in most others). `terminal`
-/// leaves the mouse alone, so a drag selects the way it always did and the
-/// scroll key is the way into the history.
+/// `terminal` leaves it alone, so a drag selects the way it always did and the
+/// scroll key is the way into the history. `client` asks the terminal to report
+/// buttons instead, so a wheel notch opens the view and moves it, at the price
+/// of the bare drag: a terminal reporting the mouse is not selecting with it,
+/// and selection moves under a modifier that is the terminal's to choose
+/// (Option in iTerm2, Shift in most others) and may not be there at all.
+///
+/// The terminal's by default, because the two ways of being wrong are not the
+/// same size. A wheel that does nothing on the alternate screen is what plain
+/// ssh and an unconfigured tmux both do, and there is a key on the hints row
+/// saying what to press instead; a drag that stops selecting is this taking
+/// away something the terminal was doing a moment ago, with nothing on the
+/// screen to say so and no substitute for it. Scrolling has another gesture
+/// and copying a line does not.
 ///
 /// Which of the two is right is a fact about the terminal you are sitting at
 /// rather than about one attach, which is why this is a setting and not a flag.
@@ -64,8 +72,8 @@ impl Screen {
 #[serde(rename_all = "lowercase")]
 pub enum Mouse {
     #[default]
-    Client,
     Terminal,
+    Client,
 }
 
 impl Mouse {
@@ -186,7 +194,7 @@ pub fn values(key: &str) -> &'static [&'static str] {
     match key {
         "notify" => &["on", "off"],
         "screen" => &["alternate", "inline"],
-        "mouse" => &["client", "terminal"],
+        "mouse" => &["terminal", "client"],
         _ => &[],
     }
 }
@@ -280,22 +288,22 @@ mod tests {
             vec![
                 ("notify", "on".to_string()),
                 ("screen", "alternate".to_string()),
-                ("mouse", "client".to_string())
+                ("mouse", "terminal".to_string())
             ]
         );
     }
 
     #[test]
-    fn the_mouse_is_given_to_one_side_or_the_other() {
+    fn the_mouse_is_the_terminals_until_it_is_asked_for() {
         let mut settings = Settings::default();
-        assert_eq!(settings.get("mouse").unwrap(), "client");
+        assert_eq!(settings.get("mouse").unwrap(), "terminal");
 
-        for terminal in ["terminal", "TERMINAL", " term "] {
-            settings.set("mouse", terminal).unwrap();
-            assert_eq!(settings.get("mouse").unwrap(), "terminal", "{terminal:?}");
+        for client in ["client", "CLIENT", " mm "] {
+            settings.set("mouse", client).unwrap();
+            assert_eq!(settings.get("mouse").unwrap(), "client", "{client:?}");
         }
-        settings.set("mouse", "client").unwrap();
-        assert_eq!(settings.mouse, Mouse::Client);
+        settings.set("mouse", "terminal").unwrap();
+        assert_eq!(settings.mouse, Mouse::Terminal);
 
         assert!(settings.set("mouse", "off").is_err());
     }
