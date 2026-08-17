@@ -360,7 +360,14 @@ Three consequences run through the whole codebase and are worth keeping intact:
   followed it, and every keystroke typed `[103;1:3u` into whatever was running.
   So the set the replay answers for is switched off first, which is the same
   set a hop undoes and the reason the two are one function: neither may grow a
-  member the other has not heard of.
+  member the other has not heard of. What that set costs is the one mode in it
+  that is *ours*: the client's hold on the mouse is spelt `?1000h` like a
+  session's, so a screen painted while it held the wheel gave the wheel back
+  without knowing it, `own_the_wheel` still believing it had it. It is
+  re-asserted by hand beside the erase rather than by clearing the flag and
+  waiting for the next frame, which would leave a window with the same silence
+  in it: a notch in that window reaches the terminal, which on the alternate
+  screen means walking whatever the session is running with arrow keys.
 - **The cells under the box belong to the box, and it clears its own.** The
   session's screen there was painted over when the popup went up and is put
   back by the resync closing it asks for, so nothing else is going to: a box

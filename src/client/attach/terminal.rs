@@ -423,12 +423,30 @@ async fn ask_for_the_screen(writer: &mut SessionWriter, owed: &mut usize) -> Res
     Ok(())
 }
 
+/// What the client says to take the mouse: report buttons, in the SGR
+/// spelling.
+const WHEEL_OURS: &str = "\x1b[?1000h\x1b[?1006h";
+
+/// And to give it back. In the other order, so nothing is left reporting in a
+/// spelling that is no longer switched on.
+const WHEEL_THEIRS: &str = "\x1b[?1006l\x1b[?1000l";
+
 /// Take the wheel, or give it back.
 ///
 /// When that is, and when it is not, is [`wheel_is_ours`]. The arrow keys a
 /// terminal would make of a notch with nobody reporting are not this function's
 /// problem: alternate scroll is off for the whole run of attaches, in
 /// [`crate::client::screen`].
+///
+/// What *is* its problem is that this state lives in two places, here and in
+/// the terminal, and only one of them is ours to read. [`given_back`] switches
+/// off every mode a session can ask for, and the mouse is one of those, so a
+/// screen painted while the client held the wheel took the wheel with it and
+/// this function had nothing to say about it: `wheel` still said ours, the
+/// terminal had stopped reporting, and the first notch after a popup went back
+/// to doing whatever the terminal does with one. So that path re-asserts
+/// [`WHEEL_OURS`] by hand rather than clearing the flag and waiting for the
+/// next frame, which would leave a window with the same silence in it.
 async fn own_the_wheel(
     stdout: &mut Stdout,
     keys: &mut KeyFilter,
@@ -440,14 +458,9 @@ async fn own_the_wheel(
     }
     *wheel = ours;
     keys.set_wheel(ours);
-    let sequence = if ours {
-        "\x1b[?1000h\x1b[?1006h" // report buttons, in the SGR spelling
-    } else {
-        // Off in the other order, so nothing is left reporting in a
-        // spelling that is no longer switched on.
-        "\x1b[?1006l\x1b[?1000l"
-    };
-    stdout.write_all(sequence.as_bytes()).await?;
+    stdout
+        .write_all(if ours { WHEEL_OURS } else { WHEEL_THEIRS }.as_bytes())
+        .await?;
     stdout.flush().await?;
     Ok(())
 }
@@ -1215,6 +1228,11 @@ async fn pump(
                             // on, so what it turned off since goes off here:
                             // see `given_back`.
                             stdout.write_all(given_back().as_bytes()).await?;
+                            // Which includes the mouse, and the client's hold
+                            // on it is not the session's to lose.
+                            if wheel {
+                                stdout.write_all(WHEEL_OURS.as_bytes()).await?;
+                            }
                             stdout.write_all(REGROWN.as_bytes()).await?;
                         }
                     }
@@ -1673,6 +1691,23 @@ mod tests {
         // The pair the whole thing rests on: a hop undoes the same set, so
         // neither can grow a member the other has not heard of.
         assert!(undone().contains(&off));
+    }
+
+    /// And the reason that set cannot be written on its own: the client's hold
+    /// on the mouse is spelt in the same modes a session asks for, so a screen
+    /// painted while it held the wheel handed the wheel back without saying so.
+    /// Everything after the first popup then scrolled the terminal instead.
+    #[cfg(feature = "desktop")]
+    #[test]
+    fn switching_the_modes_off_switches_the_clients_own_mouse_off_too() {
+        let off = given_back();
+        assert!(
+            WHEEL_OURS
+                .split("\x1b[")
+                .filter(|mode| !mode.is_empty())
+                .all(|mode| off.contains(&format!("\x1b[{}l", mode.trim_end_matches('h')))),
+            "the wheel would survive `given_back` and need no re-asserting"
+        );
     }
 
     /// A hop is a detach for the session being left, but not for the terminal:
