@@ -1209,8 +1209,8 @@ async fn save_checkpoint(socket: &Path, host: Option<String>) -> Result<Saved> {
         // save and restore.
         if checkpoint::still_wrapped(&command) {
             give_up(format!(
-                "{} on {} is still inside the shell a restore started it with, \
-                 so it is left out",
+                "{} on {} is still starting up, so it is left out; ask again in \
+                 a moment",
                 hosted.session.name, hosted.host
             ));
             continue;

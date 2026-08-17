@@ -265,6 +265,29 @@ exec env MM_CONFIG_DIR="{dir}/$host" "{mm}" --socket "{dir}/$host.sock" agent
         panic!("{machine}'s node never came up");
     }
 
+    /// Take a checkpoint once every session can be described, and answer with
+    /// what it said.
+    ///
+    /// A session restored a moment ago may still be in its login shell's
+    /// profile, before the `exec` that puts the command in front, and one that
+    /// cannot be described is refused rather than written down wrongly. That
+    /// window is short here and wide enough on a slow runner to catch every
+    /// time, so a test that wants the settled answer waits for it rather than
+    /// asserting on whichever side of the race it landed.
+    fn settled(&self, machine: &str) -> String {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let mut last = String::new();
+        while Instant::now() < deadline {
+            let out = self.run(machine, &["checkpoint", "save"]);
+            if out.status.success() {
+                return String::from_utf8_lossy(&out.stdout).into_owned();
+            }
+            last = String::from_utf8_lossy(&out.stderr).into_owned();
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        panic!("{machine} never settled enough to checkpoint: {last}");
+    }
+
     /// Stop every node this world started.
     fn shut_down(&self) {
         for entry in std::fs::read_dir(&self.dir).into_iter().flatten().flatten() {
@@ -2283,7 +2306,13 @@ fn a_restored_session_comes_back_with_the_name_and_the_directory_it_had() {
     // And the session that came back is the one that was written down: saving
     // again says the same thing, which is what stops a restore burying the
     // command one wrapper deeper every time round.
-    world.ok("laptop", &["checkpoint", "save"]);
+    //
+    // Given a moment first. A spawn goes through a login shell that reads its
+    // profile before it reaches the `exec`, and asked inside that window the
+    // login shell is what holds the terminal, which is a session this refuses
+    // to describe rather than describe wrongly. Short here and long enough on
+    // a slow runner to catch every time, which is how it was found.
+    world.settled("laptop");
     let again = std::fs::read_to_string(world.dir.join("laptop").join("checkpoint.toml")).unwrap();
     let strip = |text: &str| {
         text.lines()

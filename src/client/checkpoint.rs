@@ -458,23 +458,26 @@ fn unwrapped(argv: &[String]) -> &[String] {
     }
 }
 
-/// Whether a wrapper of ours is still somewhere in this argv after everything
-/// above has had a go at reading through it.
+/// Whether a wrapper of ours is still in this command after everything above
+/// has had a go at reading through it.
 ///
-/// The honest answer to a shell that did not get out of the way. `exec` and
-/// `-m` between them should mean the foreground of a restored session is the
-/// program, and [`unwrapped`] catches the plain shape if it is not; what
-/// neither catches is the wrapper buried inside a login shell's `-lc` snippet,
-/// where it arrives already quoted and is not an argv any more. Recorded as it
-/// stands, that is a session whose command gains a shell every time it is
-/// saved and restored, without bound, and it stays wrong for good.
+/// Asked of the *answer*, never of the raw foreground. The plain wrapper shape
+/// carries the marker too and [`unwrapped`] reads straight through it; what is
+/// left here is the shape nothing can read, the wrapper quoted inside a login
+/// shell's own `-lc` snippet, where it is not an argv any more.
 ///
-/// So a caller that sees this writes the session down as one it could not
-/// describe, which is reported and counts against the save. Refusing to
-/// describe a session is a great deal better than describing it wrongly, and
-/// the reasoning that said this could not happen has already been wrong once:
-/// bash `exec`s the wrapper on one machine and not on another, depending on
-/// whether a profile happened to set a trap.
+/// Which is a session still starting up, almost always. The node runs every
+/// spawn through a login shell, and that shell reads its profile before it
+/// reaches the `exec`: ask in that window and the login shell is what holds
+/// the terminal. It is short, and long enough to hit every time on a slow
+/// machine when a save follows a restore immediately, which is how it was
+/// found.
+///
+/// Recorded rather than refused, it would be a session whose command gains a
+/// shell every time it is saved and restored, without bound, and that one does
+/// not come back. So the caller writes it down as one it could not describe,
+/// which is reported and counts against the save, and asking again a moment
+/// later gets the real answer.
 pub fn still_wrapped(argv: &[String]) -> bool {
     argv.iter().any(|word| word.contains(KEEP_THE_SHELL))
 }
