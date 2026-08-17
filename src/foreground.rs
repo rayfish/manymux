@@ -260,11 +260,61 @@ mod tests {
         );
     }
 
+    /// Both halves of an answer come from one process, and this is the rule
+    /// that decides which. Reading the pieces apart from the files means it
+    /// can be asked directly, including with the bytes a far machine sent.
+    #[test]
+    fn which_process_to_describe_is_the_front_one_or_the_leader() {
+        assert_eq!(in_front(100, Some(200)), 200, "something else is in front");
+        assert_eq!(in_front(100, Some(100)), 100, "the leader itself");
+        assert_eq!(in_front(100, Some(-1)), 100, "no controlling terminal");
+        assert_eq!(in_front(100, Some(0)), 100, "no foreground group");
+        assert_eq!(in_front(100, None), 100, "nothing could be read");
+    }
+
+    /// The same rules, over bytes somebody else fetched, which is how a machine
+    /// reached over ssh is described. A drift between this and the reading path
+    /// is a checkpoint that means one thing here and another there.
+    #[test]
+    fn the_rules_apply_to_bytes_from_anywhere() {
+        let raw = Raw {
+            stat: "1234 (zsh) S 1 1234 1234 34816 5678 0".to_string(),
+            cwd: "/home/dario/rayfish".to_string(),
+            cmdline: b"claude\0--continue\0".to_vec(),
+        };
+        assert_eq!(tpgid(&raw.stat), Some(5678));
+        assert_eq!(
+            raw.read(),
+            Foreground {
+                cwd: Some("/home/dario/rayfish".to_string()),
+                argv: vec!["claude".to_string(), "--continue".to_string()],
+            }
+        );
+
+        // And every refusal survives the trip: a deleted directory, an argv
+        // that is not UTF-8, the padding a rewritten process title leaves.
+        assert_eq!(cwd_from("/gone (deleted)"), None);
+        assert_eq!(cwd_from(""), None);
+        assert!(argv_from(b"caf\xe9\0").is_empty(), "not UTF-8, so nothing");
+        assert_eq!(argv_from(b"pi\0\0\0\0"), vec!["pi".to_string()]);
+        assert_eq!(
+            argv_from(b"git\0-m\0\0next\0"),
+            vec![
+                "git".to_string(),
+                "-m".to_string(),
+                String::new(),
+                "next".to_string()
+            ],
+            "an empty word between two others is a real argument"
+        );
+    }
+
     /// The equality that is not a signal. A shell `exec`s its final command,
     /// so a session started with one has the command in the foreground under
     /// the pid the node recorded. An earlier draft read that as "nothing is
     /// running" and threw the command away on every such session.
     #[test]
+    #[cfg(target_os = "linux")]
     fn a_session_whose_command_replaced_its_shell_is_still_running_that_command() {
         let me = std::process::id();
         // The test binary is its own process group leader in the usual case;
@@ -280,6 +330,7 @@ mod tests {
     /// Against the process running this test, so the reading is exercised and
     /// not only the parsing.
     #[test]
+    #[cfg(target_os = "linux")]
     fn the_directory_read_out_of_proc_is_the_one_the_process_is_in() {
         let me = std::process::id();
         let here = std::env::current_dir().unwrap().into_os_string();
@@ -294,6 +345,7 @@ mod tests {
     /// A pid that cannot exist answers blank at every step, because a session
     /// ending between being listed and being read is ordinary.
     #[test]
+    #[cfg(target_os = "linux")]
     fn a_process_that_is_gone_is_a_blank_rather_than_a_failure() {
         assert_eq!(cwd_of(u32::MAX), None);
         assert!(argv_of(u32::MAX).is_empty());
