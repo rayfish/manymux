@@ -10,7 +10,7 @@ use tracing::info;
 
 use super::session::{Session, default_name};
 use crate::lock::held;
-use crate::proto::{EventKind, SessionEvent, SessionInfo, SpawnSpec};
+use crate::proto::{Doing, EventKind, SessionEvent, SessionInfo, SpawnSpec};
 
 /// Events buffered per subscriber. A subscriber that falls this far behind is
 /// missing bells anyway, so it is dropped rather than allowed to hold memory.
@@ -100,6 +100,22 @@ impl Registry {
         // how it keeps the name order it has always had.
         out.sort_by(|a, b| (a.started, &a.name).cmp(&(b.started, &b.name)));
         out
+    }
+
+    /// What every session is working on.
+    ///
+    /// The sessions are taken under the lock and asked outside it, which is
+    /// the one thing that matters here: `Session::doing` reads three files out
+    /// of `/proc` per session, and holding the registry across that would make
+    /// a checkpoint of thirty sessions block every list, spawn and attach on
+    /// the machine for as long as it took. Every other critical section under
+    /// this lock is a few field reads.
+    ///
+    /// Unordered, deliberately. The caller pairs these with a listing by name
+    /// and takes the order from that, which is the order every screen shows.
+    pub fn doing(&self) -> Vec<Doing> {
+        let sessions = self.all();
+        sessions.iter().map(|session| session.doing()).collect()
     }
 
     pub fn kill(&self, name: &str) -> Result<()> {

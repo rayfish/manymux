@@ -403,6 +403,62 @@ Run from a script or over ssh there is nobody to ask, so it says what the
 restart would cost and leaves it. `mm stop` and `mm start` are the same thing in
 halves, for a machine to leave quiet or one to have ready before anything asks.
 
+Waiting for every session to be idle at once is not a thing that happens, so
+the sessions can be written down and started again instead:
+
+```bash
+mm update --keep-sessions
+```
+
+That is three steps in one: what each session is doing goes into
+`checkpoint.toml`, the node restarts, and the sessions are started again where
+they were. A session it could not describe stops the restart rather than being
+quietly dropped, so it never costs work it did not write down; adding `--force`
+says to go ahead and lose those, and says which they are.
+
+**Run it from a shell that is not a session.** A plain `ssh` in is fine; a
+session is not. The restart hangs every session up, and a client typed inside
+one is in that session's process group, so it would be killed halfway through:
+the checkpoint written, the node gone, and nothing left running to put anything
+back. It refuses rather than letting that happen, and says so.
+
+The three by hand, which is what to reach for when only one machine needs it:
+
+```bash
+mm checkpoint save            # every machine, or --host one
+mm checkpoint show            # what is written down; asks no machine anything
+mm checkpoint restore         # start them again; --dry-run to look first
+```
+
+What is recorded is the directory each session was working in and the command
+running in it. A program that knows how to pick up where it left off is asked
+to: `claude` and `pi` both come back with `--continue`, resuming the
+conversation that was open rather than starting a new one. Anything else is run
+again as it was, and a session sitting at a prompt comes back as a login shell
+in the same directory. The file is plain TOML and is meant to be edited before
+you restore it.
+
+Four things worth knowing:
+
+- **Groups belong to the client**, so take the checkpoint from the machine you
+  work at. Membership is keyed on a pid and a restore makes new ones, so the
+  grouping is rebuilt from the file afterwards — and only the machine holding
+  your `groups.toml` knows what it was. Run on the host, `--keep-sessions`
+  brings the sessions back but knows nothing of a grouping made at your desk.
+- **Restoring twice is safe.** A name that is already running is left alone, so
+  a host that put its own sessions back and a client restoring its groups
+  compose: save at your desk, `mm update --keep-sessions` on the box, then
+  `mm checkpoint restore` at your desk to put the groups back.
+- **Reading this needs Linux**, where the directory and the command come out of
+  `/proc`. A machine that cannot say is named rather than guessed at, and its
+  sessions are left out of the file: put back in the wrong directory, a program
+  told to resume picks up somebody else's work.
+- **The first update on a machine cannot be checkpointed remotely.** Asking a
+  node what its sessions are doing is a request it only learned in the build
+  that added this, so a node older than that refuses. On the machine itself
+  there is a way round, and it is the one this takes: the client reads `/proc`
+  directly. Over ssh there is not.
+
 The sessions do go, but they are hung up first and given a couple of seconds,
 so shells write their history and editors write their swap files rather than
 finding the terminal gone mid-write. Whatever is still running when that time
@@ -435,7 +491,9 @@ mm rename <target> <name>            give a session a different name
 mm add <host> | hosts | rm <host>    which machines to list and watch
 mm config [key] [value]              show or change a setting: notify, screen, mouse
 mm update [--check] [--nightly]      replace this binary with the published one
+mm checkpoint save|show|restore      write down what every session is doing
 mm start | stop | restart [--force]  this machine's node: up, down, and again
+      restart|update --keep-sessions write a checkpoint and put them back after
 mm service install|uninstall         run the node at boot
 mm completions [shell] [--install]   tab completion, with your session names in it
 ```

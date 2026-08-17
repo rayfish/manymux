@@ -20,7 +20,7 @@ use tracing::{debug, warn};
 use super::events::{Event, Scanner, Utf8Decoder};
 use crate::lock::held;
 use crate::proto::{
-    EventKind, Found, SessionEvent, SessionInfo, Size, SpawnSpec, View, ViewRequest,
+    Doing, EventKind, Found, SessionEvent, SessionInfo, Size, SpawnSpec, View, ViewRequest,
 };
 use crate::user;
 
@@ -513,6 +513,22 @@ impl Session {
             started: self.started,
         }
     }
+
+    /// Where this session is and what is running in it, for a checkpoint.
+    ///
+    /// Apart from [`Self::info`] and off the listing path on purpose: this
+    /// walks `/proc` per session, and a listing is asked for on every keypress
+    /// the popup takes. It also touches no lock, since none of it is ours to
+    /// know: the answer comes from the operating system.
+    pub fn doing(&self) -> Doing {
+        let front = crate::foreground::of(self.pid);
+        Doing {
+            name: self.name(),
+            pid: self.pid,
+            cwd: front.cwd,
+            foreground: front.argv,
+        }
+    }
 }
 
 /// What to exec, and what to call it in a listing. The two differ because a
@@ -532,14 +548,19 @@ struct Launch {
 /// programs worth running.
 fn launch(spec: &SpawnSpec) -> Launch {
     let shell = user::shell();
+    // A caller that says what this is called is answering for the row in a
+    // listing, which is not always the command: a restored session runs a
+    // wrapper, and naming the wrapper describes the machinery rather than the
+    // work.
+    let named = |argv: &[String]| spec.label.clone().unwrap_or_else(|| describe(argv));
     if spec.command.is_empty() {
         return Launch {
-            label: describe(std::slice::from_ref(&shell)),
+            label: named(std::slice::from_ref(&shell)),
             argv: vec![shell, "-l".to_string()],
         };
     }
     Launch {
-        label: describe(&spec.command),
+        label: named(&spec.command),
         argv: vec![shell, "-lc".to_string(), shell_command(&spec.command)],
     }
 }

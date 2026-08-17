@@ -501,6 +501,111 @@ Three consequences run through the whole codebase and are worth keeping intact:
   where a command you have typed for weeks goes. `target.rs` has ruled against
   that twice already, and `mm kill @pi` is refused for the same reason a bare
   machine name is only accepted for going somewhere.
+- **What a session is doing is read from the operating system, and asked for on
+  its own.** `SessionInfo` says what a session was *started* with, which stops
+  being true the moment somebody types in it: the work is whatever they ran and
+  the place is wherever they `cd`ed to, and neither reaches any structure here.
+  So `src/foreground.rs` reads the terminal's foreground process group out of
+  `/proc` (`tpgid`, then that pid's `cmdline` and `cwd`), and it is
+  `Request::Snapshot` rather than fields on the listing for two reasons that
+  point the same way. A listing is asked for on every keypress the popup takes,
+  and this is a walk through `/proc` per session. And a node too old to know
+  the request refuses it and says so, where a defaulted field would have come
+  back empty and been written down as a session sitting at its prompt in its
+  home directory, which is a thing that node never said. Three things the
+  reading itself rests on. `tpgid` is parsed from after the *last* `)`, because
+  the field before it is the program's name in brackets and a program may be
+  called `foo (old)`; counting columns from the left reads a different field
+  for exactly those processes. Empty argv words are dropped and the rest left
+  exactly as they are, because a program that rewrites its process title pads
+  the block it wrote over with NULs, and `pi` does: read literally its argv is
+  `pi` and seventy-five empty arguments, each of which a restore would quote
+  into `''` and hand back. Trimming the words themselves, which an earlier
+  draft did on a misreading of that padding as spaces, would have quietly
+  turned `rg ' foo '` into a different command. And a cwd ending ` (deleted)`
+  is refused rather than used, that being the kernel annotating rather than
+  answering.
+- **An empty foreground is not a prompt, and is never written down as one.**
+  A session sitting at a prompt has its shell in front of it, so it has an
+  argv; empty means the read found nothing to describe. That happens for real:
+  `tpgid` is a process *group* id, and a pipeline whose leader has exited
+  leaves a group whose leader is reaped while the rest runs on, so
+  `/proc/<tpgid>` is gone. A zombie reads the same way. Recorded as a prompt,
+  as this once did, a session running a build came back as an empty shell with
+  nothing anywhere saying so, and `--keep-sessions` counted it as saved. So it
+  is reported and counted against the save the way an unreadable directory is,
+  and the restart it would have authorised is refused.
+- **The foreground pid being the session's own pid means nothing, and which
+  shell it is decides what you are looking at.** bash and zsh `exec` a simple
+  final command, so a session started as `mm new box claude` *is* claude, under
+  the pid the node recorded and with `tpgid` equal to it; the first draft read
+  that equality as "nothing is running" and threw the command away on every
+  session that had one. dash does not exec, measured rather than assumed, and
+  it is `/bin/sh` on Debian, the passwd shell of most deploy accounts, and
+  `user::shell`'s own last resort. There the foreground is `["/bin/sh", "-lc",
+  "claude"]`, so a reader that only looks at `argv[0]` finds `sh`, adds no
+  resume flag, and brings the session back on a fresh conversation without
+  saying anything. So what tells a prompt from a program is the *argv*: a known
+  shell with no `-c` in it is somebody's keyboard, a shell with one is running
+  what follows, and `checkpoint::shell_command` reads that back out when it is
+  a plain command. Only a plain one: the words of `a | b` are not an argv, and
+  quoting them as one execs a program with that name.
+- **A checkpoint is the client's, and the first one on a machine cannot ask the
+  node anything.** `src/client/checkpoint.rs` is `checkpoint.toml` beside the
+  host list: which session was where, running what, in which group. It is here
+  rather than at the node for the reasons a group is, and one more. The group
+  is half of what has to come back and only this end knows it, since membership
+  is keyed on a pid and a restore invents new ones. The resume table grows
+  every few months as another program learns to continue, and defined at the
+  node it would grow only on the machines that had been restarted, which are
+  the ones that did not need it. And the awkward one: the node holding the
+  sessions worth saving is, on any machine, running the build from before this
+  existed, so it refuses the question and the only fix is the restart being
+  avoided. On this machine there is a way round and it is why `foreground` is
+  in the library rather than under `node`: the client is on that machine, so it
+  reads `/proc` itself from the pid the listing has always carried. A machine
+  reached over ssh has no such way round and is named rather than guessed at.
+- **A restored session keeps the shell behind it, and that wrapper must be seen
+  through on the way back in.** The node runs a spawn as `shell -lc <command>`,
+  so a session restored as `claude --continue` *ends when claude exits*, where
+  what was there before was a login shell somebody started claude from. So the
+  captured argv goes to `sh` as positional parameters with the login shell
+  `exec`ed after it (`checkpoint::to_spawn`), which also keeps every quoting
+  question out of the client: `SpawnSpec::command` is joined with a shell
+  quoter at the far end and `"$@"` puts the words back. The letter that is not
+  obvious is the `m` in `sh -mc`. Without job control `sh` forks the command
+  and hands the terminal to nobody, so the foreground of a restored session is
+  the *wrapper*: a second checkpoint writes that down, restoring it wraps it
+  again, and the command sinks a shell deeper every cycle without bound. With
+  it the command gets a process group and the terminal, so `/proc` reports the
+  program and the round trip is a fixed point, which is tested. It is also what
+  makes a Ctrl-C reach the program rather than the thing that started it.
+  `unwrapped` stays for the window before job control has taken effect, and
+  covers it only where the login shell `exec`ed the wrapper: on a shell that
+  did not, the foreground in that window is the login shell's `-lc` with the
+  wrapper inside its snippet, which neither `unwrapped` nor `shell_command`
+  will read. The window is short and the mechanism is what keeps it from
+  mattering, so this is a hole worth knowing about rather than one worth more
+  machinery.
+- **`--keep-sessions` cannot be typed inside a session it is about to end.**
+  The restart hangs every session up, and the client is in the process group of
+  whichever one it was typed in, so it is killed partway through: the
+  checkpoint is written, the node goes, and the restore never runs. Nothing
+  comes back, and the flag that promised it would is the reason nobody was
+  watching. Reproduced before it was guarded. So `ran_from_a_session_here`
+  refuses it and says where to run it instead, and the check is `getsid` of
+  this process against the listing's pids rather than `MM_SESSION`, which is
+  stamped into the environment once at spawn and cannot be reached by a rename.
+  The same comparison is what keeps a save from writing down `mm checkpoint
+  save` as the work of the session it was typed in.
+- **A checkpoint that does not cover everything does not authorise a restart.**
+  `--keep-sessions` answers the question `agreed` asks rather than overriding
+  it: the sessions are not being lost, they are being written down. So a save
+  that could not account for every session stops the restart instead of
+  proceeding on a record with holes in it, and `--force` stays the only way to
+  end sessions on purpose. A session whose directory could not be read is left
+  out of the file rather than written without one, for the same reason: put
+  back in `$HOME`, a program told to resume picks up somebody else's work.
 - **A tab completion never starts a node, never installs anything, and never
   waits on ssh unless the word already names a machine** (`src/complete.rs`).
   All three are tested.

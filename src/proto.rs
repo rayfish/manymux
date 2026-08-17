@@ -218,6 +218,21 @@ pub struct SpawnSpec {
     pub command: Vec<String>,
     pub cwd: Option<String>,
     pub size: Size,
+    /// What to call this in a listing, when the command is not worth showing.
+    ///
+    /// For the one caller whose command is a wrapper rather than the thing
+    /// somebody is running: a restored session runs
+    /// `sh -mc '…' sh claude --continue`, and a row that says so is a row
+    /// about the machinery instead of about the work. Only the fallback title
+    /// is affected, since a program that sets its own is already answering
+    /// this question.
+    ///
+    /// Defaulted, and the one field here where being ignored costs nothing: a
+    /// node too old to know it shows the wrapper, which is a worse-looking row
+    /// and nothing else. Contrast `cwd`, where being ignored would start the
+    /// session in the wrong place.
+    #[serde(default)]
+    pub label: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -284,6 +299,17 @@ pub enum Request {
     /// the answer: nothing older than the build that introduced the request
     /// knows it, so an error means the node is behind.
     Version,
+
+    /// What every session on this machine is working on, for a checkpoint.
+    ///
+    /// A request of its own rather than fields on [`SessionInfo`], for two
+    /// reasons. Every keypress in the popup lists every machine, and reading
+    /// `/proc` once per session on that path is work nobody asked for. And a
+    /// node too old to know this answers with an error naming its version,
+    /// which is the honest answer: a defaulted field would have come back
+    /// empty and been written down as a session that was sitting at its
+    /// prompt in its home directory, which is a thing the node never said.
+    Snapshot,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -349,7 +375,51 @@ pub enum Response {
         version: String,
         build: Option<String>,
     },
+    /// What each session is working on. The answer to [`Request::Snapshot`].
+    ///
+    /// In no particular order: the caller pairs these with a listing by name
+    /// and takes the order from that, which is the order every screen shows.
+    /// Nothing here may be read as saying which session is which.
+    Snapshot(Vec<Doing>),
     Error(String),
+}
+
+/// One session, and what it was doing when a checkpoint was taken.
+///
+/// Everything here describes the *foreground* of the session's terminal rather
+/// than the child the node started, because the child stopped being the whole
+/// story the moment somebody typed in it: what they are in the middle of is
+/// whatever they ran, and where they are is wherever they last `cd`ed to.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct Doing {
+    pub name: String,
+    /// The session leader this answer is about, which is what says the answer
+    /// still describes the session the listing named. A session that ended and
+    /// was replaced by another of the same name between the two questions is
+    /// the one case a name cannot catch, and it would be written down as the
+    /// right name doing the wrong work.
+    pub pid: u32,
+    /// Where the foreground process is, else where the session's leader is.
+    /// `None` where the machine cannot say, which is an answer rather than a
+    /// failure and is the only honest one: a session restored in the wrong
+    /// directory resumes somebody else's conversation.
+    #[serde(default)]
+    pub cwd: Option<String>,
+    /// The argv of whatever holds the terminal, which for a session sitting at
+    /// a prompt is the shell itself. Empty means the machine could not say,
+    /// which is *not* the same as a prompt and is not written down as one: a
+    /// session at a prompt has its shell in front of it and so has an argv.
+    /// Empty happens when the foreground group's leader has been reaped while
+    /// the rest of a pipeline runs on, and when it is a zombie.
+    ///
+    /// Raw, and deliberately not a decision. Whether this is something worth
+    /// starting again, and with what flag, is the client's to work out
+    /// (`client::checkpoint`), for the reason a group is the client's: the
+    /// list of programs that can resume themselves grows every few months, and
+    /// tying it to the node would mean it grew only on the machines that had
+    /// been restarted.
+    #[serde(default)]
+    pub foreground: Vec<String>,
 }
 
 /// A window of a session's history, as a scrolling client asks for it.
@@ -800,6 +870,119 @@ mod tests {
         })
         .unwrap();
         assert_eq!(decode::<Old>(&new).unwrap().name, "api");
+    }
+
+    /// The other half of the rule, and why a checkpoint asks a question of its
+    /// own instead of reading a field off the listing: a node too old to know
+    /// the request cannot decode it, so it answers with an error naming its
+    /// version. That refusal is the answer. A defaulted field would instead
+    /// have come back empty and been written down as a session sitting at its
+    /// prompt in its home directory, which is a thing that node never said.
+    #[test]
+    fn a_node_too_old_to_be_asked_what_it_is_doing_cannot_decode_the_question() {
+        /// `Request` as it was before a checkpoint could be taken.
+        #[derive(Serialize, Deserialize)]
+        enum Old {
+            List,
+            Version,
+        }
+
+        let asked = encode(&Request::Snapshot).unwrap();
+        assert!(
+            decode::<Old>(&asked).is_err(),
+            "an older node has to fail this, or it would answer something else"
+        );
+
+        // The requests it does know are untouched by the new one being added
+        // after them, which is what makes adding a variant safe at all.
+        assert!(matches!(
+            decode::<Request>(&encode(&Old::List).unwrap()).unwrap(),
+            Request::List
+        ));
+        assert!(matches!(
+            decode::<Request>(&encode(&Old::Version).unwrap()).unwrap(),
+            Request::Version
+        ));
+    }
+
+    /// The one field added to an existing message here, and the reason it
+    /// could be: being ignored costs a listing row that names the wrapper
+    /// instead of the command, and nothing else. The rule it is held to is the
+    /// contrast with `cwd`, in the same message, where being ignored would
+    /// start the session somewhere nobody asked for.
+    #[test]
+    fn an_older_node_still_decodes_a_spawn_that_says_what_to_call_it() {
+        /// `SpawnSpec` as it was before a restore had a wrapper to hide.
+        #[derive(Serialize, Deserialize)]
+        struct Old {
+            name: Option<String>,
+            command: Vec<String>,
+            cwd: Option<String>,
+            size: Size,
+        }
+
+        let new = encode(&SpawnSpec {
+            name: Some("build".into()),
+            command: vec!["sh".into(), "-mc".into()],
+            cwd: Some("/tmp".into()),
+            size: Size::new(80, 24),
+            label: Some("claude --continue".into()),
+        })
+        .unwrap();
+        let old: Old = decode(&new).unwrap();
+        assert_eq!(old.name.as_deref(), Some("build"));
+        assert_eq!(
+            old.cwd.as_deref(),
+            Some("/tmp"),
+            "the field that matters is still read by a node that predates the one that does not"
+        );
+
+        // And the other way: this build reading a spawn from a client too old
+        // to say, which is a listing row and nothing else.
+        let from_old = encode(&Old {
+            name: None,
+            command: Vec::new(),
+            cwd: None,
+            size: Size::new(80, 24),
+        })
+        .unwrap();
+        let spec: SpawnSpec = decode(&from_old).unwrap();
+        assert_eq!(
+            spec.label, None,
+            "so the node names it the way it always has"
+        );
+    }
+
+    /// A session at its prompt and a session with something running in it are
+    /// told apart by an empty `foreground`, so both have to survive the trip.
+    #[test]
+    fn a_snapshot_round_trips_with_and_without_something_running() {
+        let doing = vec![
+            Doing {
+                name: "build".into(),
+                pid: 41823,
+                cwd: Some("/home/dario/rayfish/manymux".into()),
+                foreground: vec!["claude".into(), "--resume".into()],
+            },
+            Doing {
+                name: "zsh-2".into(),
+                pid: 41824,
+                cwd: Some("/tmp".into()),
+                foreground: Vec::new(),
+            },
+            Doing {
+                name: "elsewhere".into(),
+                pid: 41825,
+                cwd: None,
+                foreground: Vec::new(),
+            },
+        ];
+
+        let encoded = encode(&Response::Snapshot(doing.clone())).unwrap();
+        let Response::Snapshot(back) = decode::<Response>(&encoded).unwrap() else {
+            panic!("a snapshot should decode as one");
+        };
+        assert_eq!(back, doing);
     }
 
     /// What makes an unanswered version request an answer in itself: a node

@@ -18,6 +18,7 @@ pub const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (", env!("MM_COMM
 
 pub mod client;
 pub mod config;
+pub mod foreground;
 pub mod hosts;
 pub mod lock;
 pub mod notify;

@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt::{self, Display, Formatter};
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -14,14 +14,15 @@ use tokio::task::JoinHandle;
 use tracing::debug;
 
 use manymux::client::attach::{self, Chose, Mode, Motion, Outcome, Rows, Wait};
+use manymux::client::checkpoint::{self, Checkpoint, Kept};
 use manymux::client::groups::Groups;
 use manymux::client::picker::Row;
 use manymux::client::switch::{Cycle, Located};
 use manymux::client::{Attached, Stream};
-use manymux::hosts::{Hosts, is_this_machine, this_machine};
+use manymux::hosts::{Hosts, LOCAL, is_this_machine, this_machine};
 use manymux::lock::held as held_lock;
 use manymux::node::{Config, Node};
-use manymux::proto::{HostedSession, Request, Response, SpawnSpec};
+use manymux::proto::{Doing, HostedSession, Request, Response, SpawnSpec};
 use manymux::settings::{Screen, Settings};
 use manymux::update::Channel;
 use manymux::{config, log, style, term};
@@ -31,7 +32,7 @@ mod completions;
 mod target;
 
 use target::{
-    Bare, Listing, Started, everywhere, locate, note_reached, qualified, sessions_on,
+    Bare, Listing, Started, Unreachable, everywhere, locate, note_reached, qualified, sessions_on,
     where_to_start,
 };
 
@@ -167,6 +168,24 @@ enum Command {
     /// List the groups and what is in them.
     Groups,
 
+    /// Write down what every session is doing, so it can be started again.
+    ///
+    /// The problem it answers: a node keeps executing the build it started
+    /// from, so `mm update` only takes effect when the node restarts, and a
+    /// restart is the end of every session on that machine. `mm checkpoint
+    /// save` records where each session is and what is running in it, and
+    /// `mm checkpoint restore` starts them again afterwards, resuming a
+    /// program that knows how to be resumed rather than starting it fresh.
+    ///
+    /// Take it from the machine you work at rather than from the machine being
+    /// updated, when you can. The sessions come back either way, but which
+    /// group each one was in is known only to the client that holds the
+    /// groups, and that is the one at your desk.
+    Checkpoint {
+        #[command(subcommand)]
+        action: CheckpointAction,
+    },
+
     /// Put mm on a machine you can ssh into, by running the installer there.
     ///
     /// Nothing needs this: naming a machine that has no mm offers to do it.
@@ -211,6 +230,16 @@ enum Command {
         /// Restart the node even though sessions are running. They die with it.
         #[arg(long)]
         force: bool,
+        /// Write a checkpoint first and put the sessions back afterwards.
+        ///
+        /// The same three commands by hand, and worth knowing as three: `mm
+        /// checkpoint save`, the restart, `mm checkpoint restore`. Nothing is
+        /// restarted unless every session was written down, so this never
+        /// costs work it could not record. What it cannot carry is which
+        /// group each session was in, unless this machine is the one holding
+        /// your groups: take the checkpoint from your own machine for that.
+        #[arg(long)]
+        keep_sessions: bool,
         /// Take the rolling nightly build instead of the newest release.
         ///
         /// Not remembered: a plain `mm update` afterwards puts the release
@@ -244,6 +273,10 @@ enum Command {
         /// Restart even though sessions are running. They die with the node.
         #[arg(long)]
         force: bool,
+        /// Write a checkpoint first and put the sessions back afterwards, as
+        /// for `mm update`.
+        #[arg(long)]
+        keep_sessions: bool,
     },
 
     /// Install or remove the background service.
@@ -268,6 +301,36 @@ enum ServiceAction {
     Install,
     /// Stop the service and remove it.
     Uninstall,
+}
+
+#[derive(Subcommand)]
+enum CheckpointAction {
+    /// Write down every session: its name, its group, where it is and what it
+    /// is running.
+    ///
+    /// Replaces whatever was written before. A machine that cannot say where
+    /// its sessions are is named rather than guessed at, and its sessions are
+    /// left out: put back in the wrong directory, a program told to resume
+    /// picks up somebody else's work.
+    Save {
+        /// Only this machine, or only that one.
+        #[arg(long, add = complete::hosts_or_local())]
+        host: Option<String>,
+    },
+    /// Start the saved sessions again, and put them back in their groups.
+    ///
+    /// A name that is already running is left alone, so this is safe to run
+    /// twice and safe to run after the machine put its own sessions back.
+    Restore {
+        /// Only this machine, or only that one.
+        #[arg(long, add = complete::hosts_or_local())]
+        host: Option<String>,
+        /// Say what would be started, without starting it.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Print what is saved, without contacting any machine.
+    Show,
 }
 
 /// Exit codes, as plain numbers rather than `ExitCode`, because the process
@@ -361,6 +424,8 @@ async fn run(cli: Cli) -> Result<u8> {
                 // in the node's own working directory.
                 cwd: is_this_machine(&host).then(current_dir).flatten(),
                 size: attach::session_size(),
+                // The command is the command: nothing here is a wrapper.
+                label: None,
             };
             let mut stream = open_or_start(&socket, &host).await?;
             let Response::Spawned { name } = stream.call(&Request::Spawn(spec)).await? else {
@@ -463,6 +528,16 @@ async fn run(cli: Cli) -> Result<u8> {
             Ok(OK)
         }
 
+        Command::Checkpoint { action } => match action {
+            CheckpointAction::Save { host } => save_checkpoint(&socket, host)
+                .await
+                .map(|saved| saved.code()),
+            CheckpointAction::Restore { host, dry_run } => {
+                restore_checkpoint(&socket, host, dry_run).await
+            }
+            CheckpointAction::Show => show_checkpoint(),
+        },
+
         Command::Add { host } => {
             let mut hosts = Hosts::load()?;
             hosts.add(&host)?;
@@ -529,13 +604,14 @@ async fn run(cli: Cli) -> Result<u8> {
             check,
             force,
             nightly,
+            keep_sessions,
         } => {
             let channel = if nightly {
                 Channel::Nightly
             } else {
                 Channel::Stable
             };
-            update(&socket, check, force, channel).await
+            update(&socket, check, force, keep_sessions, channel).await
         }
 
         Command::Start => {
@@ -553,7 +629,7 @@ async fn run(cli: Cli) -> Result<u8> {
                 println!("no node is running");
                 return Ok(OK);
             };
-            if !agreed(running.sessions, force, "mm stop", "stopping it")? {
+            if !agreed(running.sessions, force, false, "mm stop", "stopping it")? {
                 return Ok(OK);
             }
             manymux::node::stop(&socket).await?;
@@ -561,13 +637,23 @@ async fn run(cli: Cli) -> Result<u8> {
             Ok(OK)
         }
 
-        Command::Restart { force } => {
+        Command::Restart {
+            force,
+            keep_sessions,
+        } => {
             let Some(running) = manymux::update::running(&socket).await else {
                 manymux::node::ensure_running(&socket).await?;
                 println!("{} no node was running; started one", style::green("✓"));
                 return Ok(OK);
             };
-            restart(&socket, running.sessions, force, "mm restart").await
+            restart(
+                &socket,
+                running.sessions,
+                force,
+                keep_sessions,
+                "mm restart",
+            )
+            .await
         }
 
         Command::Service { action } => {
@@ -596,7 +682,13 @@ async fn run(cli: Cli) -> Result<u8> {
 }
 
 /// Replace this binary with the published one, and pick it up.
-async fn update(socket: &Path, check: bool, force: bool, channel: Channel) -> Result<u8> {
+async fn update(
+    socket: &Path,
+    check: bool,
+    force: bool,
+    keep: bool,
+    channel: Channel,
+) -> Result<u8> {
     let available = manymux::update::check(channel).await?;
     if available.is_newer() {
         if check {
@@ -655,20 +747,97 @@ async fn update(socket: &Path, check: bool, force: bool, channel: Channel) -> Re
         );
         return Ok(OK);
     }
-    restart(socket, running.sessions, force, "mm update").await
+    restart(socket, running.sessions, force, keep, "mm update").await
 }
 
 /// Restart the node, unless that would cost sessions the caller has not agreed
 /// to lose. `command` is what to suggest `--force` on, since both `mm update`
 /// and `mm restart` end up here.
-async fn restart(socket: &Path, sessions: usize, force: bool, command: &str) -> Result<u8> {
-    if !agreed(sessions, force, command, "restarting it")? {
+///
+/// `keep` writes a checkpoint first and puts the sessions back afterwards,
+/// which is the same three commands somebody would type. It answers the
+/// question [`agreed`] asks rather than overriding it: the sessions are not
+/// being lost, they are being written down. What it must not do is answer that
+/// question on a checkpoint that did not cover them, so a save that could not
+/// account for every session stops the restart rather than proceeding on a
+/// record with holes in it.
+async fn restart(
+    socket: &Path,
+    sessions: usize,
+    force: bool,
+    keep: bool,
+    command: &str,
+) -> Result<u8> {
+    let putting_back = keep && sessions > 0;
+    if putting_back {
+        if let Some(ours) = ran_from_a_session_here(socket).await {
+            eprintln!(
+                "{} `{command} --keep-sessions` cannot run from inside a session on this \
+                 machine.\n  This was typed in {}, and the restart hangs that session up \
+                 before anything can be put back: the checkpoint would be written and then \
+                 nothing would read it.\n  Run it from a shell that is not a session, such \
+                 as a plain `ssh` in, and everything here comes back.",
+                style::amber("!"),
+                style::bold(&ours)
+            );
+            return Ok(FAILED);
+        }
+        let saved = save_checkpoint(socket, Some(LOCAL.to_string())).await?;
+        // The count that made the question worth asking, against what was
+        // written down: a listing that failed between the two would otherwise
+        // write nothing, report nothing wrong, and authorise the restart.
+        if saved.lost > 0 || saved.written < sessions {
+            let short = format!(
+                "{} of {sessions} session{} written down",
+                saved.written,
+                if sessions == 1 { " was" } else { "s were" }
+            );
+            if !force {
+                eprintln!(
+                    "{} not restarting: {short}.\n  `{command} --force --keep-sessions` \
+                     restarts anyway and puts back what could be saved; `{command} --force` \
+                     restarts and ends them all.",
+                    style::amber("!")
+                );
+                return Ok(FAILED);
+            }
+            // Asked for anyway, so say what it costs rather than saying it is
+            // not happening and then doing it.
+            eprintln!(
+                "{} only {short}; restarting anyway because `--force` was given, so the \
+                 rest end here.",
+                style::amber("!")
+            );
+        }
+    } else if !agreed(sessions, force, true, command, "restarting it")? {
         return Ok(OK);
     }
 
     manymux::node::restart(socket).await?;
     println!("{} restarted the node", style::green("✓"));
+
+    if putting_back {
+        return restore_checkpoint(socket, Some(LOCAL.to_string()), false).await;
+    }
     Ok(OK)
+}
+
+/// The session on this machine that this command was typed in, if it is one.
+///
+/// What makes this worth asking: the restart hangs every session up, and this
+/// process is in the process group of whichever one it is running in, so it is
+/// killed partway through. Reproduced before it was guarded: the checkpoint is
+/// written, the node goes, the client dies with the session, and the restore
+/// never runs. Nothing comes back, and the flag that promised it would is the
+/// reason nobody was watching.
+async fn ran_from_a_session_here(socket: &Path) -> Option<String> {
+    let ours = manymux::foreground::our_session()?;
+    sessions_on(socket, LOCAL)
+        .await
+        .ok()?
+        .into_iter()
+        .find(|session| session.pid == ours)
+        .map(|session| session.name)
 }
 
 /// Whether to go ahead with something that takes running sessions down.
@@ -677,7 +846,13 @@ async fn restart(socket: &Path, sessions: usize, force: bool, command: &str) -> 
 /// goes. Nothing here can tell whether the work in them is finished, so with
 /// someone at the keyboard it asks them, and without one it refuses and says
 /// which flag repeats the command without the question.
-fn agreed(sessions: usize, force: bool, command: &str, doing: &str) -> Result<bool> {
+fn agreed(
+    sessions: usize,
+    force: bool,
+    keepable: bool,
+    command: &str,
+    doing: &str,
+) -> Result<bool> {
     if sessions == 0 || force {
         return Ok(true);
     }
@@ -694,12 +869,32 @@ fn agreed(sessions: usize, force: bool, command: &str, doing: &str) -> Result<bo
         }
         Answer::NobodyThere => {
             println!(
-                "{} {cost}.\n  `{command} --force` to do it anyway, or leave it until they \
+                "{} {cost}.\n{}  `{command} --force` to do it anyway, or leave it until they \
                  are done.",
-                style::amber("!")
+                style::amber("!"),
+                keeping(keepable, command)
             );
             Ok(false)
         }
+    }
+}
+
+/// The line that names the way out of the refusal above, for the two commands
+/// that have one.
+///
+/// `mm stop` does not: it is asking for the node to be gone, and putting the
+/// sessions back would be the opposite of what was typed. A checkpoint can
+/// still be written by hand before it, which is what the shorter line says.
+fn keeping(keepable: bool, command: &str) -> String {
+    if keepable {
+        format!(
+            "  `{command} --keep-sessions` writes down where each session is and starts \
+             them again afterwards.\n"
+        )
+    } else {
+        "  `mm checkpoint save` writes them down first, for `mm checkpoint restore` \
+         afterwards.\n"
+            .to_string()
     }
 }
 
@@ -858,6 +1053,488 @@ async fn list(socket: &Path, host: Option<String>) -> Result<u8> {
         eprintln!("mm: {}: {}", host.host, host.error);
     }
     Ok(if nothing_answered { FAILED } else { OK })
+}
+
+/// What a save managed to write down.
+///
+/// Both numbers, rather than an exit code, because `--keep-sessions` has to
+/// weigh them against something an exit code cannot carry: the count of
+/// sessions that made the restart worth asking about in the first place.
+struct Saved {
+    /// Entries written for the machines this save asked about.
+    written: usize,
+    /// Sessions those machines are running that could not be written down.
+    lost: usize,
+}
+
+impl Saved {
+    fn code(&self) -> u8 {
+        // A checkpoint that quietly covers half of what is running is the thing
+        // to find out about before restarting anything, not after.
+        if self.lost > 0 { FAILED } else { OK }
+    }
+}
+
+/// `mm checkpoint save`: write down what every session is doing.
+///
+/// The order of the two questions matters. The listing comes first and is what
+/// the file is built from, because it is the listing that carries the pid and
+/// the start time a group is keyed on, and its order is the order every screen
+/// shows sessions in. What each session is *doing* is asked separately and
+/// matched back by name.
+async fn save_checkpoint(socket: &Path, host: Option<String>) -> Result<Saved> {
+    let listing = everywhere(socket).await?;
+    let groups = Groups::load().unwrap_or_default();
+    let wanted = |at: &str| host.as_deref().is_none_or(|only| same_machine(only, at));
+
+    // Before anything is written, since a machine named that nothing answers
+    // to is a typo far more often than it is a machine with no sessions, and
+    // reporting it after the file has been rewritten leaves `mm checkpoint
+    // show` calling an untouched file freshly saved.
+    if let Some(only) = &host
+        && !listing.answering().iter().any(|at| same_machine(only, at))
+    {
+        bail!("no machine answering to {only}");
+    }
+
+    let mut doing = HashMap::new();
+    let mut refused = Vec::new();
+    for at in listing.answering() {
+        if !wanted(&at) {
+            continue;
+        }
+        match what_is_doing(socket, &at, &listing).await {
+            Ok(answers) => {
+                doing.extend(
+                    answers
+                        .into_iter()
+                        .map(|d| ((at.clone(), d.name.clone()), d)),
+                );
+            }
+            Err(e) => refused.push(Unreachable {
+                host: at,
+                error: format!("{e:#}"),
+            }),
+        }
+    }
+
+    // The session this command was typed in, which is running this command.
+    // Recorded as it stands, it would come back as `mm checkpoint save`, and a
+    // restore would then rewrite the file it is walking.
+    //
+    // Found by the session leader's pid rather than by `MM_SESSION`: that is
+    // stamped into the environment once at spawn and a rename cannot reach
+    // back into it, so a session renamed since would go unrecognised and
+    // record exactly the thing this is here to avoid.
+    let ours = manymux::foreground::our_session();
+
+    let mut sessions = Vec::new();
+    let mut lost = 0;
+    for hosted in &listing.sessions {
+        if !wanted(&hosted.host) {
+            continue;
+        }
+        let Some(found) = doing.get(&(hosted.host.clone(), hosted.session.name.clone())) else {
+            // Its machine refused the question, and is reported below rather
+            // than once per session on it.
+            if !refused.iter().any(|r| r.host == hosted.host) {
+                eprintln!(
+                    "mm: {} said nothing about {}",
+                    hosted.host, hosted.session.name
+                );
+                lost += 1;
+            }
+            continue;
+        };
+        let Some(cwd) = found.cwd.clone() else {
+            eprintln!(
+                "mm: {} cannot say where {} is, so it is left out",
+                hosted.host, hosted.session.name
+            );
+            lost += 1;
+            continue;
+        };
+        // The session this command was typed in. Its work is this command, and
+        // it will be a prompt in the right place again the moment this returns.
+        let ours_this_one = is_this_machine(&hosted.host) && ours == Some(hosted.session.pid);
+        // Nothing known is never a prompt: a session sitting at one has its
+        // shell in front of it, so the argv holds the shell. Empty means the
+        // read found no process to describe, which happens when the process
+        // group's leader has been reaped while the rest of a pipeline runs on,
+        // or when it is a zombie. Recorded as a prompt, as this once did, a
+        // session running a build comes back as an empty shell and nothing
+        // anywhere says so.
+        let unknown = found.foreground.is_empty() && !ours_this_one;
+        if unknown {
+            eprintln!(
+                "mm: {} cannot say what {} is running, so it is left out",
+                hosted.host, hosted.session.name
+            );
+            lost += 1;
+            continue;
+        }
+        // The pid the machine answered with, against the one the listing gave.
+        // A session that ended and was replaced by another of the same name
+        // between the two questions is one this would otherwise write down
+        // with the wrong work against the right name.
+        if found.pid != hosted.session.pid {
+            eprintln!(
+                "mm: {} changed under the question, so {} is left out",
+                hosted.host, hosted.session.name
+            );
+            lost += 1;
+            continue;
+        }
+        let command = if ours_this_one {
+            Vec::new()
+        } else {
+            checkpoint::resumed(&found.foreground)
+        };
+        sessions.push(Kept {
+            host: hosted.host.clone(),
+            name: hosted.session.name.clone(),
+            cwd,
+            group: groups
+                .group_of(&hosted.host, &hosted.session)
+                .map(str::to_string),
+            command,
+        });
+    }
+
+    warn_about_shared_directories(&sessions);
+
+    let machines = sessions
+        .iter()
+        .map(|kept| kept.host.as_str())
+        .collect::<HashSet<_>>()
+        .len();
+    let written = sessions.len();
+
+    // Only what this save actually learned about is replaced. A machine that
+    // was not asked (`--host` elsewhere, and `--keep-sessions` always narrows
+    // to this one) or that refused the question has said nothing, and reading
+    // that silence as "it has no sessions" would throw away a checkpoint taken
+    // at somebody's desk covering three machines the moment they updated one
+    // of them. The same argument `Groups::prune` makes about a machine that is
+    // asleep, for the same reason.
+    let answered: Vec<String> = listing
+        .answering()
+        .into_iter()
+        .filter(|at| wanted(at) && !refused.iter().any(|r| r.host == *at))
+        .collect();
+    let mut carried_over = Checkpoint::load().unwrap_or_default().sessions;
+    // Compared the way every other host name here is compared, and not as
+    // strings. A file naming this machine `local` — a spelling a restore
+    // accepts and a hand-edited file is likely to use — would otherwise miss
+    // the `devbox` in this list, be carried over, and be written again beside
+    // the fresh entry: one session listed twice, the stale copy holding a
+    // stale directory. The same happens on its own to a machine whose short
+    // hostname changed.
+    carried_over.retain(|kept| !answered.iter().any(|at| same_machine(at, &kept.host)));
+    let carried = carried_over.len();
+    sessions.extend(carried_over);
+
+    Checkpoint {
+        taken: Checkpoint::now(),
+        sessions,
+    }
+    .save()?;
+    if carried > 0 {
+        println!(
+            "  {}",
+            style::faint(&if carried == 1 {
+                "1 session on a machine this did not ask about is still in the file".to_string()
+            } else {
+                format!(
+                    "{carried} sessions on machines this did not ask about are still in the file"
+                )
+            })
+        );
+    }
+
+    for host in &refused {
+        // The node's own complaint, which names the version it is running: a
+        // machine that has never been restarted since this was added is the
+        // ordinary reason, and the one thing it cannot checkpoint is the
+        // restart that would fix it.
+        eprintln!("mm: {}: {}", host.host, host.error);
+        lost += listing
+            .sessions
+            .iter()
+            .filter(|hosted| hosted.host == host.host)
+            .count();
+    }
+    println!(
+        "{} wrote {written} session{} on {machines} machine{} to {}",
+        style::green("✓"),
+        if written == 1 { "" } else { "s" },
+        if machines == 1 { "" } else { "s" },
+        style::bold(&Checkpoint::path().display().to_string())
+    );
+    Ok(Saved { written, lost })
+}
+
+/// Say so when two sessions would resume the same conversation.
+///
+/// `claude --continue` and `pi --continue` pick up the newest session *in the
+/// directory they are run in*, which is the whole of what makes a checkpoint
+/// work without capturing an id. Two sessions on one machine working in one
+/// directory therefore come back on the same conversation, and the second one
+/// to start is the one that loses. Nothing here can tell them apart: neither
+/// program leaves its transcript open, so there is no id to read.
+///
+/// Said at the save rather than at the restore, because the file is editable
+/// and this is the moment somebody can do something about it: naming the
+/// conversation by hand is a one-word change to a line they are being pointed
+/// at. Not an error, since two sessions in one checkout is an ordinary way to
+/// work and usually only one of them is mid-conversation.
+fn warn_about_shared_directories(sessions: &[Kept]) {
+    let mut seen: HashMap<(&str, &str), &Kept> = HashMap::new();
+    for kept in sessions {
+        if !checkpoint::resumes_by_directory(&kept.command) {
+            continue;
+        }
+        let key = (kept.host.as_str(), kept.cwd.as_str());
+        if let Some(first) = seen.get(&key) {
+            eprintln!(
+                "{} {} and {} are both in {}, so both come back on the same \
+                 conversation.\n  Edit {} to name one of them, or leave it: the \
+                 newest wins.",
+                style::amber("!"),
+                style::bold(&first.name),
+                style::bold(&kept.name),
+                kept.cwd,
+                Checkpoint::path().display()
+            );
+        } else {
+            seen.insert(key, kept);
+        }
+    }
+}
+
+/// What every session on one machine is doing.
+///
+/// Two ways to the same answer, and the local one is not an optimisation. A
+/// node only learns to answer `Request::Snapshot` in the build that added it,
+/// so on any machine the *first* checkpoint would be refused by the very node
+/// whose sessions are worth saving, and the only way to fix that is the
+/// restart being avoided. On this machine there is a way round, because the
+/// client is on it: `/proc` is right there, and the pid is in the listing the
+/// node has always given. A machine reached over ssh has no such way round.
+async fn what_is_doing(socket: &Path, host: &str, listing: &Listing) -> Result<Vec<Doing>> {
+    if is_this_machine(host) {
+        return Ok(listing
+            .sessions
+            .iter()
+            .filter(|hosted| hosted.host == host)
+            .map(|hosted| {
+                let front = manymux::foreground::of(hosted.session.pid);
+                Doing {
+                    name: hosted.session.name.clone(),
+                    pid: hosted.session.pid,
+                    cwd: front.cwd,
+                    foreground: front.argv,
+                }
+            })
+            .collect());
+    }
+    match open(socket, host).await?.call(&Request::Snapshot).await? {
+        Response::Snapshot(doing) => Ok(doing),
+        other => bail!("unexpected response to a snapshot: {other:?}"),
+    }
+}
+
+/// `mm checkpoint restore`: start the saved sessions again.
+async fn restore_checkpoint(socket: &Path, host: Option<String>, dry_run: bool) -> Result<u8> {
+    let checkpoint = Checkpoint::load()?;
+    if checkpoint.is_empty() {
+        println!("nothing has been checkpointed; `mm checkpoint save` writes one");
+        return Ok(OK);
+    }
+    let wanted: Vec<&Kept> = checkpoint
+        .sessions
+        .iter()
+        .filter(|kept| {
+            host.as_deref()
+                .is_none_or(|only| same_machine(only, &kept.host))
+        })
+        .collect();
+    if let Some(only) = &host
+        && wanted.is_empty()
+    {
+        // Narrowing to a machine the file says nothing about, which is a typo
+        // far more often than it is a machine that had no sessions. Reported
+        // rather than answered with "put back 0 sessions", which reads as
+        // success.
+        eprintln!("mm: the checkpoint has nothing on {only}");
+        return Ok(FAILED);
+    }
+
+    if dry_run {
+        for kept in &wanted {
+            println!("{}", restoring(kept));
+        }
+        return Ok(OK);
+    }
+
+    // In file order and one at a time, because the start time is stamped at the
+    // spawn: restoring them in the order they were opened in is what puts every
+    // listing's rows back where they were.
+    let mut started = Vec::new();
+    let mut failed = 0;
+    let mut reached = Vec::new();
+    for kept in &wanted {
+        let spawned = spawn_kept(socket, kept).await;
+        match spawned {
+            Ok(Some(name)) => {
+                println!("{} {}", style::green("✓"), restoring(kept));
+                if !is_this_machine(&kept.host) {
+                    reached.push(kept.host.clone());
+                }
+                started.push((kept.host.clone(), name, kept.group.clone()));
+            }
+            // Already running, which is what a restore run twice looks like,
+            // and what a machine that put its own sessions back looks like.
+            Ok(None) => println!(
+                "  {} is already running on {}",
+                style::bold(&kept.name),
+                kept.host
+            ),
+            Err(e) => {
+                eprintln!("mm: {}: {e:#}", qualified(&kept.host, &kept.name));
+                failed += 1;
+            }
+        }
+    }
+
+    reached.sort();
+    reached.dedup();
+    note_reached(socket, reached).await;
+
+    // Only now do the new pids exist, and membership is keyed on them. Only
+    // the sessions this run started: one that was already running carries
+    // whatever group it already has, and a name reused by something unrelated
+    // must not be dragged into a group it was never in.
+    if started.iter().any(|(_, _, group)| group.is_some()) {
+        let listing = everywhere(socket).await?;
+        let mut groups = Groups::load().unwrap_or_default();
+        for (host, name, group) in &started {
+            let (Some(group), Some(hosted)) = (
+                group,
+                listing
+                    .sessions
+                    .iter()
+                    .find(|h| h.host == *host && h.session.name == *name),
+            ) else {
+                continue;
+            };
+            // Reported rather than propagated. The names come out of a file
+            // somebody may have edited, so one that `assign` refuses is one
+            // bad line: raised as an error here it would abandon the loop
+            // after every session had already been started, save no grouping
+            // at all, and fail a command whose sessions are all back.
+            if let Err(e) = groups.assign(group, host, &hosted.session) {
+                eprintln!("mm: {}: {e:#}", qualified(host, name));
+                failed += 1;
+            }
+        }
+        groups.save()?;
+    }
+
+    let machines = started
+        .iter()
+        .map(|(host, _, _)| host.as_str())
+        .collect::<HashSet<_>>()
+        .len();
+    println!(
+        "{} put back {} session{} on {machines} machine{}",
+        style::green("✓"),
+        started.len(),
+        if started.len() == 1 { "" } else { "s" },
+        if machines == 1 { "" } else { "s" }
+    );
+    Ok(if failed > 0 { FAILED } else { OK })
+}
+
+/// Start one saved session, or answer `None` if that name is already running.
+///
+/// The one caller that sends a `cwd` to another machine. `mm new` deliberately
+/// does not, having no idea whether a directory of yours exists there; here the
+/// directory came off that same machine a moment ago and is the whole point.
+async fn spawn_kept(socket: &Path, kept: &Kept) -> Result<Option<String>> {
+    let spec = SpawnSpec {
+        name: Some(kept.name.clone()),
+        command: checkpoint::to_spawn(&kept.command),
+        cwd: Some(kept.cwd.clone()),
+        size: attach::session_size(),
+        // The command as somebody would say it, since the one being run is a
+        // wrapper. Empty for a session that comes back as a prompt, where the
+        // node's own answer is already the right one.
+        label: (!kept.command.is_empty()).then(|| kept.command.join(" ")),
+    };
+    let mut stream = open_or_start(socket, &kept.host).await?;
+    match stream.request(&Request::Spawn(spec)).await? {
+        Response::Spawned { name } => Ok(Some(name)),
+        // The node's way of saying the name is taken. Told apart by asking
+        // rather than by parsing: a listing first would be a second round trip
+        // per machine and still stale by the time the spawn landed.
+        Response::Error(e) if e.contains("already exists") => Ok(None),
+        Response::Error(e) => bail!(e),
+        other => bail!("unexpected response to a spawn: {other:?}"),
+    }
+}
+
+/// One line of what a restore is about to do, or would do.
+fn restoring(kept: &Kept) -> String {
+    let what = if kept.command.is_empty() {
+        "a login shell".to_string()
+    } else {
+        kept.command.join(" ")
+    };
+    let group = kept
+        .group
+        .as_ref()
+        .map(|g| format!(" {}", style::faint(&format!("@{g}"))))
+        .unwrap_or_default();
+    format!(
+        "{}{group} {} {}",
+        style::bold(&qualified(&kept.host, &kept.name)),
+        what,
+        style::faint(&format!("in {}", kept.cwd))
+    )
+}
+
+/// `mm checkpoint show`: what is written down, and nothing else.
+///
+/// Contacts no machine on purpose. This is the one command that still answers
+/// when everything is being restarted, which is exactly when somebody wants to
+/// know what they are about to get back.
+fn show_checkpoint() -> Result<u8> {
+    let checkpoint = Checkpoint::load()?;
+    if checkpoint.is_empty() {
+        println!("nothing has been checkpointed; `mm checkpoint save` writes one");
+        return Ok(OK);
+    }
+    println!(
+        "{}",
+        style::faint(&format!(
+            "{} sessions, saved {} ago",
+            checkpoint.sessions.len(),
+            term::duration(Checkpoint::now().saturating_sub(checkpoint.taken))
+        ))
+    );
+    for kept in &checkpoint.sessions {
+        println!("{}", restoring(kept));
+    }
+    Ok(OK)
+}
+
+/// Whether a machine named on a command line is the one an entry is about.
+///
+/// `local` and this machine's own name are the same machine, which is the rule
+/// every other command follows.
+fn same_machine(named: &str, at: &str) -> bool {
+    named == at || (is_this_machine(named) && is_this_machine(at))
 }
 
 /// How long a switch key waits on a listing that has not landed yet, before
@@ -1458,6 +2135,8 @@ async fn start_beside(socket: &Path, host: &str) -> Result<String> {
         // node's own working directory. The rule `mm new` follows.
         cwd: is_this_machine(host).then(current_dir).flatten(),
         size: attach::session_size(),
+        // A login shell, which the node names for itself.
+        label: None,
     };
     let mut stream = open(socket, host).await?;
     let Response::Spawned { name } = stream.call(&Request::Spawn(spec)).await? else {

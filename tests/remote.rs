@@ -2221,3 +2221,440 @@ fn an_at_sign_completes_group_names_without_asking_any_machine() {
         "{plain:?}"
     );
 }
+
+/// A checkpoint is the answer to the one thing an update cannot do: the node
+/// keeps executing the build it started from, so picking a new one up means
+/// restarting it, and that is the end of every session on the machine.
+///
+/// The directory and the command come out of `/proc`, so the substance of this
+/// is Linux only. What is asserted everywhere is that a machine which cannot
+/// say is named rather than guessed at, which is the whole of the contract on
+/// the other platforms.
+#[test]
+#[cfg(target_os = "linux")]
+fn a_checkpoint_writes_down_where_each_session_is_and_what_it_is_running() {
+    let world = World::new("checkpoint-save");
+
+    world.ok("laptop", &["new", "-d", "-n", "build", "sleep", "60"]);
+    world.wait_for_node("laptop");
+    world.ok("laptop", &["new", "-d", "-n", "idle"]);
+
+    world.ok("laptop", &["checkpoint", "save"]);
+
+    let file = world.dir.join("laptop").join("checkpoint.toml");
+    let written = std::fs::read_to_string(&file).expect("a checkpoint file");
+    assert!(written.contains("build"), "{written}");
+    assert!(written.contains("idle"), "{written}");
+    assert!(
+        written.contains("sleep"),
+        "the command it was running, not the shell that started it: {written}"
+    );
+
+    // A session sitting at a prompt is written down as one, which is an empty
+    // command rather than a shell running a shell.
+    let shown = world.ok("laptop", &["checkpoint", "show"]);
+    assert!(shown.contains("a login shell"), "the bare session: {shown}");
+}
+
+/// The property the whole thing exists for, and the inverse of
+/// `a_restart_replaces_the_node_and_takes_its_sessions_with_it`: what the
+/// restart ends, the checkpoint brings back.
+#[test]
+#[cfg(target_os = "linux")]
+fn a_restored_session_comes_back_with_the_name_and_the_directory_it_had() {
+    let world = World::new("checkpoint-restore");
+
+    world.ok("laptop", &["new", "-d", "-n", "build", "sleep", "60"]);
+    world.wait_for_node("laptop");
+
+    world.ok("laptop", &["checkpoint", "save"]);
+    let saved = std::fs::read_to_string(world.dir.join("laptop").join("checkpoint.toml")).unwrap();
+
+    // The restart is what a checkpoint is for, and it takes the session.
+    world.ok("laptop", &["restart", "--force"]);
+    world.wait_for_node("laptop");
+    let empty = world.ok("laptop", &["ls", "local"]);
+    assert!(!empty.contains("build"), "the restart kept it: {empty}");
+
+    world.ok("laptop", &["checkpoint", "restore"]);
+    let back = world.ok("laptop", &["ls", "local"]);
+    assert!(back.contains("build"), "it did not come back: {back}");
+
+    // And the session that came back is the one that was written down: saving
+    // again says the same thing, which is what stops a restore burying the
+    // command one wrapper deeper every time round.
+    world.ok("laptop", &["checkpoint", "save"]);
+    let again = std::fs::read_to_string(world.dir.join("laptop").join("checkpoint.toml")).unwrap();
+    let strip = |text: &str| {
+        text.lines()
+            .filter(|line| !line.starts_with("taken"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    assert_eq!(
+        strip(&again),
+        strip(&saved),
+        "a checkpoint of a restored session has to be the same checkpoint"
+    );
+}
+
+/// Safe to run twice, which is what makes it safe to run at all: a machine
+/// that put its own sessions back with `--keep-sessions` is the ordinary
+/// reason a name is already taken when your own restore reaches it.
+#[test]
+#[cfg(target_os = "linux")]
+fn a_session_that_is_still_running_is_not_started_twice() {
+    let world = World::new("checkpoint-twice");
+
+    world.ok("laptop", &["new", "-d", "-n", "build", "sleep", "60"]);
+    world.wait_for_node("laptop");
+    world.ok("laptop", &["checkpoint", "save"]);
+
+    // Nothing was restarted, so everything in the checkpoint is still running.
+    let out = world.ok("laptop", &["checkpoint", "restore"]);
+    assert!(
+        out.contains("already running"),
+        "it should say so rather than failing or duplicating: {out}"
+    );
+    assert_eq!(
+        world
+            .ok("laptop", &["ls", "local"])
+            .matches("build")
+            .count(),
+        1,
+        "and there must still be exactly one"
+    );
+}
+
+/// A dry run is the way to look before restoring, so it must not be the way to
+/// restore by accident.
+#[test]
+#[cfg(target_os = "linux")]
+fn a_dry_run_says_what_it_would_start_and_starts_nothing() {
+    let world = World::new("checkpoint-dry");
+
+    world.ok("laptop", &["new", "-d", "-n", "build", "sleep", "60"]);
+    world.wait_for_node("laptop");
+    world.ok("laptop", &["checkpoint", "save"]);
+    world.ok("laptop", &["restart", "--force"]);
+    world.wait_for_node("laptop");
+
+    let would = world.ok("laptop", &["checkpoint", "restore", "--dry-run"]);
+    assert!(
+        would.contains("build"),
+        "it should say what it would do: {would}"
+    );
+    let listed = world.ok("laptop", &["ls", "local"]);
+    assert!(
+        !listed.contains("build"),
+        "a dry run started something: {listed}"
+    );
+}
+
+/// The group is the half of a checkpoint that only a client can carry: it is
+/// keyed on a pid, and a restore invents a new one. Nothing on the wire says
+/// anything about it, so this is one machine putting its own view back.
+#[test]
+#[cfg(target_os = "linux")]
+fn a_group_survives_a_checkpoint_and_a_restart() {
+    let world = World::new("checkpoint-groups");
+
+    world.ok("laptop", &["new", "-d", "-n", "build", "sleep", "60"]);
+    world.wait_for_node("laptop");
+    world.ok("laptop", &["group", "build", "pi"]);
+    assert!(world.ok("laptop", &["groups"]).contains("pi"));
+
+    world.ok("laptop", &["checkpoint", "save"]);
+    world.ok("laptop", &["restart", "--force"]);
+    world.wait_for_node("laptop");
+    // The session is gone, so the group went with it: a group is a set of live
+    // sessions and nothing else.
+    assert!(!world.ok("laptop", &["groups"]).contains("pi"));
+
+    world.ok("laptop", &["checkpoint", "restore"]);
+    let groups = world.ok("laptop", &["groups"]);
+    assert!(
+        groups.contains("pi"),
+        "the group did not come back: {groups}"
+    );
+    assert!(groups.contains("build"), "nor the session in it: {groups}");
+}
+
+/// The one command that does the three steps, and the reason it is worth
+/// having: this is the sequence somebody types when a machine has work on it
+/// and an update waiting.
+#[test]
+#[cfg(target_os = "linux")]
+fn a_restart_that_keeps_sessions_puts_them_back() {
+    let world = World::new("checkpoint-keep");
+
+    world.ok("laptop", &["new", "-d", "-n", "build", "sleep", "60"]);
+    world.wait_for_node("laptop");
+
+    // Without it, a restart with nobody at the keyboard refuses and names both
+    // ways out rather than quietly ending the session.
+    let refused = world.ok("laptop", &["restart"]);
+    assert!(refused.contains("1 running session"), "{refused}");
+    assert!(
+        refused.contains("--keep-sessions"),
+        "the refusal should name the way out: {refused}"
+    );
+
+    let kept = world.ok("laptop", &["restart", "--keep-sessions"]);
+    assert!(kept.contains("restarted the node"), "{kept}");
+    world.wait_for_node("laptop");
+
+    let back = world.ok("laptop", &["ls", "local"]);
+    assert!(back.contains("build"), "it did not come back: {back}");
+}
+
+/// A checkpoint spans machines the way a listing does, and can be narrowed to
+/// one. The narrowing matters because `--keep-sessions` uses it: the machine
+/// being restarted is the only one whose sessions are about to end.
+#[test]
+#[cfg(target_os = "linux")]
+fn a_checkpoint_covers_every_machine_and_can_be_narrowed_to_one() {
+    let world = World::new("checkpoint-hosts");
+
+    world.ok("laptop", &["new", "-d", "-n", "here", "sleep", "60"]);
+    world.wait_for_node("laptop");
+    world.ok(
+        "laptop",
+        &["new", "-d", "-n", "there", "gpu-box", "sleep", "60"],
+    );
+
+    world.ok("laptop", &["checkpoint", "save"]);
+    let both = world.ok("laptop", &["checkpoint", "show"]);
+    assert!(both.contains("here"), "{both}");
+    assert!(both.contains("gpu-box/there"), "{both}");
+
+    // Something new on the far machine, which a narrowed save must not see:
+    // narrowing is about which machines are *asked*, and asking one is the
+    // whole point when the other is asleep or slow.
+    world.ok(
+        "laptop",
+        &["new", "-d", "-n", "later", "gpu-box", "sleep", "60"],
+    );
+    world.ok("laptop", &["checkpoint", "save", "--host", "local"]);
+    let one = world.ok("laptop", &["checkpoint", "show"]);
+    assert!(one.contains("here"), "this machine was asked: {one}");
+    assert!(
+        !one.contains("later"),
+        "the other machine was not asked, so this is unknown to it: {one}"
+    );
+    assert!(
+        one.contains("gpu-box/there"),
+        "but what was already known about it is kept: {one}"
+    );
+}
+
+/// Nothing saved is not an error, and neither is asking about it. This is the
+/// one checkpoint command that still answers while everything is restarting,
+/// which is exactly when somebody wants to know what they are getting back.
+#[test]
+fn showing_a_checkpoint_that_was_never_taken_says_so_rather_than_failing() {
+    let world = World::new("checkpoint-empty");
+
+    let shown = world.ok("laptop", &["checkpoint", "show"]);
+    assert!(shown.contains("nothing has been checkpointed"), "{shown}");
+
+    let restored = world.ok("laptop", &["checkpoint", "restore"]);
+    assert!(
+        restored.contains("nothing has been checkpointed"),
+        "{restored}"
+    );
+}
+
+/// A narrowed save must not throw away what is known about the other
+/// machines. `--keep-sessions` always narrows to the machine being restarted,
+/// so without this, updating your laptop would silently drop the checkpoint
+/// you had just taken of three machines. The same argument pruning a group
+/// makes about a machine that is asleep: silence is not "it has nothing".
+#[test]
+#[cfg(target_os = "linux")]
+fn saving_one_machine_keeps_what_is_known_about_the_others() {
+    let world = World::new("checkpoint-narrow");
+
+    world.ok("laptop", &["new", "-d", "-n", "here", "sleep", "60"]);
+    world.wait_for_node("laptop");
+    world.ok(
+        "laptop",
+        &["new", "-d", "-n", "there", "gpu-box", "sleep", "60"],
+    );
+
+    world.ok("laptop", &["checkpoint", "save"]);
+    let both = world.ok("laptop", &["checkpoint", "show"]);
+    assert!(both.contains("here") && both.contains("there"), "{both}");
+
+    // Narrowed to this machine, which is what `--keep-sessions` does.
+    world.ok("laptop", &["checkpoint", "save", "--host", "local"]);
+    let after = world.ok("laptop", &["checkpoint", "show"]);
+    assert!(
+        after.contains("here"),
+        "this machine, freshly asked: {after}"
+    );
+    assert!(
+        after.contains("there"),
+        "and the other machine, carried over rather than forgotten: {after}"
+    );
+}
+
+/// The other half of that: a machine that *was* asked and has nothing to say
+/// has genuinely lost its sessions, so its entries go. Otherwise a checkpoint
+/// would only ever grow, and restoring it would keep trying to start sessions
+/// that ended weeks ago.
+#[test]
+#[cfg(target_os = "linux")]
+fn a_machine_that_answers_with_nothing_loses_its_entries() {
+    let world = World::new("checkpoint-emptied");
+
+    world.ok("laptop", &["new", "-d", "-n", "here", "sleep", "60"]);
+    world.wait_for_node("laptop");
+    world.ok("laptop", &["checkpoint", "save"]);
+    assert!(world.ok("laptop", &["checkpoint", "show"]).contains("here"));
+
+    world.ok("laptop", &["kill", "here"]);
+    world.ok("laptop", &["checkpoint", "save"]);
+    let after = world.ok("laptop", &["checkpoint", "show"]);
+    assert!(
+        !after.contains("here"),
+        "the session ended, so it is not waiting to be restored: {after}"
+    );
+}
+
+/// The restart hangs every session up, and a client typed inside one is in
+/// that session's process group, so it is killed partway through: the
+/// checkpoint is written, the node goes, and the restore never runs. Nothing
+/// comes back, and the flag that promised it would is the reason nobody was
+/// watching. Reproduced before it was guarded, which is why the guard is a
+/// refusal rather than a warning.
+#[test]
+#[cfg(target_os = "linux")]
+fn keeping_sessions_is_refused_from_inside_a_session_it_would_end() {
+    let world = World::new("checkpoint-inside");
+
+    world.ok("laptop", &["new", "-d", "-n", "victim", "sleep", "60"]);
+    world.wait_for_node("laptop");
+
+    // A session that runs the command from inside itself, which is where
+    // somebody sitting at that machine would naturally type it.
+    let script = world.dir.join("drive.sh");
+    let out = world.dir.join("drive.out");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nMM_CONFIG_DIR={config} {mm} --socket {socket} restart \
+             --keep-sessions > {out} 2>&1\necho \"exit=$?\" >> {out}\nsleep 60\n",
+            config = world.dir.join("laptop").display(),
+            mm = MM,
+            socket = world.socket("laptop").display(),
+            out = out.display(),
+        ),
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    world.ok(
+        "laptop",
+        &["new", "-d", "-n", "driver", script.to_str().unwrap()],
+    );
+
+    // It has to finish, which is the point: unguarded it was killed here.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while Instant::now() < deadline {
+        if std::fs::read_to_string(&out).is_ok_and(|said| said.contains("exit=")) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let said = std::fs::read_to_string(&out).unwrap_or_default();
+    assert!(
+        said.contains("exit="),
+        "the command was killed rather than answering: {said:?}"
+    );
+    assert!(
+        said.contains("cannot run from inside a session"),
+        "it should say why, and where to run it instead: {said:?}"
+    );
+
+    // And nothing was restarted, so the session it would have ended is still
+    // running: a refusal that had already killed things would be no refusal.
+    let listed = world.ok("laptop", &["ls", "local"]);
+    assert!(
+        listed.contains("victim"),
+        "the refusal cost a session anyway: {listed}"
+    );
+}
+
+/// A session whose foreground cannot be described is left out and counted
+/// against the save, rather than written down as sitting at a prompt.
+///
+/// `tpgid` is a process *group* id, so a pipeline whose leader has exited
+/// leaves a group whose leader is reaped while the rest of it runs on: there
+/// is no `/proc/<tpgid>` to read. Recorded as a prompt, as this once did, a
+/// session running a build comes back as an empty shell with nothing anywhere
+/// saying so, and `--keep-sessions` counts it as saved and restarts.
+#[test]
+#[cfg(target_os = "linux")]
+fn a_session_that_cannot_be_described_stops_the_restart_rather_than_being_lost() {
+    let world = World::new("checkpoint-undescribable");
+
+    world.ok("laptop", &["new", "-d", "-n", "plain", "sleep", "60"]);
+    world.wait_for_node("laptop");
+    // The group leader exits and the rest keeps running.
+    world.ok(
+        "laptop",
+        &[
+            "new",
+            "-d",
+            "-n",
+            "pipe",
+            "bash",
+            "-mc",
+            "sleep 0.2 | sleep 60; sleep 60",
+        ],
+    );
+    std::thread::sleep(Duration::from_secs(2));
+
+    let saved = world.run("laptop", &["checkpoint", "save"]);
+    let said = String::from_utf8_lossy(&saved.stderr).to_string();
+    assert!(
+        said.contains("cannot say what pipe is running"),
+        "it has to say which session it could not describe: {said}"
+    );
+    assert!(
+        !saved.status.success(),
+        "and a save with a hole in it fails"
+    );
+
+    // And the restart that checkpoint would have authorised is refused, with
+    // both sessions still running afterwards.
+    let refused = world.run("laptop", &["restart", "--keep-sessions"]);
+    let told = String::from_utf8_lossy(&refused.stderr).to_string();
+    assert!(told.contains("not restarting"), "{told}");
+    let listed = world.ok("laptop", &["ls", "local"]);
+    assert!(
+        listed.contains("plain") && listed.contains("pipe"),
+        "{listed}"
+    );
+}
+
+/// Naming a machine nothing answers to is a typo far more often than it is a
+/// machine with no sessions, and it must not rewrite the file on the way to
+/// saying so: a checkpoint reported as freshly saved that is actually
+/// untouched is worse than an error.
+#[test]
+fn saving_a_machine_that_does_not_answer_says_so_and_writes_nothing() {
+    let world = World::new("checkpoint-typo");
+
+    world.ok("laptop", &["new", "-d", "-n", "here", "sleep", "60"]);
+    world.wait_for_node("laptop");
+    world.ok("laptop", &["checkpoint", "save"]);
+    let before = std::fs::read_to_string(world.dir.join("laptop").join("checkpoint.toml")).unwrap();
+
+    let out = world.run("laptop", &["checkpoint", "save", "--host", "nosuchbox"]);
+    assert!(!out.status.success(), "a typo is not a success");
+    let after = std::fs::read_to_string(world.dir.join("laptop").join("checkpoint.toml")).unwrap();
+    assert_eq!(before, after, "and it left the checkpoint alone");
+}

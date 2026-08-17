@@ -7,6 +7,7 @@
 //! mobile app rendering the session with its own terminal widget is another.
 
 pub mod attach;
+pub mod checkpoint;
 pub mod groups;
 pub mod picker;
 pub mod screen;
