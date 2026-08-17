@@ -56,6 +56,11 @@ pub struct Resumable {
     /// beside one of these is arguing with a choice somebody already made, and
     /// these programs reject the combination rather than pick a winner.
     pub already: &'static [&'static str],
+    /// The ones out of [`already`](Self::already) that take the conversation as
+    /// an argument, and open a chooser when they are not given one. Bare, such
+    /// a flag has not answered the question, it has asked it, and a restore has
+    /// nobody to ask.
+    pub picks: &'static [&'static str],
     /// Runs that are not a conversation and have nothing to continue. Named
     /// rather than guessed at from the shape, since the same position takes an
     /// opening prompt.
@@ -81,6 +86,7 @@ const RESUMED: &[Resumable] = &[
             "--from-pr",
             "--teleport",
         ],
+        picks: &["--resume", "-r"],
         subcommands: &[
             "mcp",
             "config",
@@ -104,6 +110,7 @@ const RESUMED: &[Resumable] = &[
             "--session-id",
             "--fork",
         ],
+        picks: &["--resume", "-r"],
         subcommands: &[
             "install",
             "remove",
@@ -248,12 +255,78 @@ pub fn resumed(foreground: &[String]) -> Vec<String> {
         return Vec::new();
     }
     if let Some(resumable) = resumable(&argv)
-        && !already_resuming(resumable, &argv)
         && !a_subcommand(resumable, &argv)
     {
-        argv.push(resumable.flag.to_string());
+        match resuming(resumable, &argv) {
+            Resuming::Named => {}
+            Resuming::Fresh => argv.push(resumable.flag.to_string()),
+            Resuming::Chosen(at) => {
+                argv.remove(at);
+                argv.push(resumable.flag.to_string());
+            }
+        }
     }
     argv
+}
+
+/// What an argv says about picking a conversation up.
+enum Resuming {
+    /// It says which one, so nothing here may argue with it.
+    Named,
+    /// It asks for one to be chosen by hand, at the word given. A restore has
+    /// nobody to ask, so this is taken out and replaced.
+    Chosen(usize),
+    /// It says nothing, so the flag is added.
+    Fresh,
+}
+
+/// Which of those three an argv is.
+///
+/// The distinction that matters is between a flag that answers "which
+/// conversation" and one that asks it. `claude --resume 7f3a…` has answered,
+/// and `--continue` beside it is a second answer to a settled question, which
+/// claude rejects rather than picking between; that is what [`Resumable::already`]
+/// is for and it was found in a real session on the first machine this was
+/// pointed at. But `claude --resume` on its own has answered nothing: it opens
+/// a chooser and waits for somebody to walk it. Restored as it stands, the
+/// session comes back sitting at that menu, having resumed nothing, which is
+/// the one outcome a checkpoint exists to avoid — and it comes back that way
+/// silently, since a menu on the screen looks like a program that started.
+///
+/// So a bare picker flag is dropped and the resume-the-newest flag put in its
+/// place. That is the same thing the person meant: they were resuming the
+/// conversation in this directory, and `--continue` is how to say so without a
+/// keyboard. It is a rewrite of what was captured rather than a faithful
+/// record, which the rest of this module refuses to do, and it earns the
+/// exception by being the only case where running the command as captured
+/// cannot do what the command was doing.
+///
+/// A flag is matched whole or up to its `=`, so `--session-id=abc` counts and a
+/// hypothetical `--continue-on-error` does not. A picker flag counts as having
+/// been given a conversation when it was spelled with an `=` or the next word
+/// is not another flag.
+fn resuming(resumable: &Resumable, argv: &[String]) -> Resuming {
+    let mut chooser = None;
+    for (at, arg) in argv.iter().enumerate().skip(1) {
+        let (name, valued) = match arg.split_once('=') {
+            Some((name, _)) => (name, true),
+            None => (arg.as_str(), false),
+        };
+        if !resumable.already.contains(&name) {
+            continue;
+        }
+        if !resumable.picks.contains(&name) {
+            return Resuming::Named;
+        }
+        // Its argument is optional, so what decides is whether it was given
+        // one. A flag after it is the next option rather than a conversation.
+        let told_which = valued || argv.get(at + 1).is_some_and(|next| !next.starts_with('-'));
+        if told_which {
+            return Resuming::Named;
+        }
+        chooser = Some(at);
+    }
+    chooser.map_or(Resuming::Fresh, Resuming::Chosen)
 }
 
 /// Whether this run is one of the program's subcommands rather than a
@@ -269,22 +342,6 @@ pub fn resumed(foreground: &[String]) -> Vec<String> {
 fn a_subcommand(resumable: &Resumable, argv: &[String]) -> bool {
     argv.get(1)
         .is_some_and(|arg| resumable.subcommands.contains(&arg.as_str()))
-}
-
-/// Whether this argv already says which conversation to pick up.
-///
-/// Not just the flag about to be added: somebody running `claude --resume` has
-/// already chosen, and `--resume --continue` is two answers to one question,
-/// which claude rejects rather than picking between. Found in a real session
-/// on the first machine this was pointed at.
-///
-/// A flag is matched whole or up to its `=`, so `--session-id=abc` counts and a
-/// hypothetical `--continue-on-error` does not.
-fn already_resuming(resumable: &Resumable, argv: &[String]) -> bool {
-    argv[1..].iter().any(|arg| {
-        let name = arg.split_once('=').map_or(arg.as_str(), |(name, _)| name);
-        resumable.already.contains(&name)
-    })
 }
 
 /// Whether this argv is a shell waiting for somebody to type, rather than
@@ -615,21 +672,13 @@ mod tests {
         );
     }
 
-    /// Somebody who chose which conversation to pick up has already answered
+    /// Somebody who said which conversation to pick up has already answered
     /// the question, and the two answers do not combine: claude rejects
-    /// `--resume --continue` rather than preferring one. Found in a real
-    /// session on the first machine this was pointed at, which had been
-    /// started with `--resume`.
+    /// `--resume <id> --continue` rather than preferring one. Found in a real
+    /// session on the first machine this was pointed at.
     #[test]
     fn a_session_already_told_which_conversation_to_pick_up_is_left_alone() {
-        for chosen in [
-            "--resume",
-            "-r",
-            "-c",
-            "--session-id",
-            "--from-pr",
-            "--teleport",
-        ] {
+        for chosen in ["-c", "--session-id", "--from-pr", "--teleport"] {
             let started = argv(&["claude", "--dangerously-skip-permissions", chosen]);
             assert_eq!(
                 resumed(&started),
@@ -638,15 +687,68 @@ mod tests {
             );
         }
 
-        // Spelled with an `=`, which is the same flag.
-        let with_value = argv(&["pi", "--session=abc123"]);
-        assert_eq!(resumed(&with_value), with_value);
+        // The picker flags, given the conversation they take.
+        for named in [
+            argv(&["claude", "--resume", "7f3a-9c21"]),
+            argv(&["claude", "--resume=7f3a-9c21"]),
+            argv(&["claude", "-r", "7f3a-9c21"]),
+            argv(&["pi", "--session=abc123"]),
+        ] {
+            assert_eq!(resumed(&named), named, "{named:?} names one already");
+        }
 
         // And a flag that merely starts the same way is not that flag.
         assert_eq!(
             resumed(&argv(&["claude", "--continue-on-error"])),
             argv(&["claude", "--continue-on-error", "--continue"])
         );
+    }
+
+    /// A bare `--resume` opens a chooser and waits for somebody to walk it,
+    /// which is the opposite of what a restore needs: nobody is watching, so
+    /// the session comes back sitting at a menu having resumed nothing, and it
+    /// looks from outside exactly like a program that started.
+    ///
+    /// What that person meant is the conversation in this directory, and
+    /// `--continue` is how to say so without a keyboard. So the chooser is
+    /// taken out and replaced. This is the one place the module rewrites what
+    /// it captured, and it earns it: running the command as captured cannot do
+    /// what the command was doing.
+    #[test]
+    fn a_resume_with_nothing_to_resume_becomes_a_continue() {
+        assert_eq!(
+            resumed(&argv(&[
+                "claude",
+                "--dangerously-skip-permissions",
+                "--resume"
+            ])),
+            argv(&["claude", "--dangerously-skip-permissions", "--continue"]),
+            "the real session that prompted this"
+        );
+
+        for bare in ["--resume", "-r"] {
+            assert_eq!(
+                resumed(&argv(&["claude", bare])),
+                argv(&["claude", "--continue"]),
+                "{bare} on its own asks the question rather than answering it"
+            );
+            assert_eq!(resumed(&argv(&["pi", bare])), argv(&["pi", "--continue"]));
+        }
+
+        // The word after it is another option, so it still names nothing.
+        assert_eq!(
+            resumed(&argv(&[
+                "claude",
+                "--resume",
+                "--dangerously-skip-permissions"
+            ])),
+            argv(&["claude", "--dangerously-skip-permissions", "--continue"])
+        );
+
+        // And what comes back is a fixed point: checkpointing a restored
+        // session must not walk the flags around again.
+        let once = resumed(&argv(&["claude", "--resume"]));
+        assert_eq!(resumed(&once), once);
     }
 
     /// A subcommand is not a conversation, and the flag added to one is
@@ -784,8 +886,8 @@ mod tests {
             argv(&["claude", "--dangerously-skip-permissions", "--continue"])
         );
         // And one already told which conversation to pick up is still left be.
-        let chosen = argv(&["/bin/sh", "-lc", "claude --resume"]);
-        assert_eq!(resumed(&chosen), argv(&["claude", "--resume"]));
+        let chosen = argv(&["/bin/sh", "-lc", "claude --resume 7f3a"]);
+        assert_eq!(resumed(&chosen), argv(&["claude", "--resume", "7f3a"]));
 
         // A login shell with no command is still a prompt.
         assert!(resumed(&argv(&["/bin/sh", "-l"])).is_empty());

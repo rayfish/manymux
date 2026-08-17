@@ -438,6 +438,12 @@ again as it was, and a session sitting at a prompt comes back as a login shell
 in the same directory. The file is plain TOML and is meant to be edited before
 you restore it.
 
+One that was already resuming keeps whichever conversation it named, so
+`claude --resume 7f3a…` comes back on that one. A bare `--resume` is the
+exception: it opens a chooser and waits for somebody to walk it, which a
+restore has nobody to do, so it is written down as `--continue` instead and the
+session comes back on the conversation that was open in that directory.
+
 `show` and `restore --dry-run` put the line each session will actually be
 started with under it, since what runs is the captured command inside a wrapper
 that keeps the login shell behind it:
