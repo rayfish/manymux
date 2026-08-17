@@ -462,7 +462,7 @@ impl Scrollback {
         if let Some(selection) = self.selection {
             let (first, last) = selection.ends();
             from = from.min(last.line);
-            top = top.max(first.line + 1);
+            top = top.max(first.line.saturating_add(1));
         }
         let request = ViewRequest {
             from,
@@ -497,11 +497,18 @@ impl Scrollback {
     /// it are the lines behind it, so this is the one place the screen's
     /// coordinates and the buffer's meet. Both are the terminal's: a row and a
     /// column counting from one.
+    /// Saturating, like everything else that reads the offset: `top` parks it
+    /// at `u64::MAX` until the host says where the far end is, so `g` and then
+    /// a click, inside one round trip, is an add to that. What the click lands
+    /// on is nothing anybody pointed at either way, since the screen in that
+    /// window is still the one painted before the jump; a line no block will
+    /// ever hold is the honest answer, and `holds` turns it into a copy of
+    /// nothing rather than a copy of the wrong thing.
     fn cell(&self, spot: Spot) -> Cell {
         let rows = self.page();
         let row = u64::from(spot.row).clamp(1, rows);
         Cell {
-            line: self.offset + (rows - row),
+            line: self.offset.saturating_add(rows - row),
             col: spot.col.saturating_sub(1).min(self.cols.saturating_sub(1)),
         }
     }
@@ -610,7 +617,10 @@ impl Scrollback {
     fn spans(&self) -> u64 {
         self.selection.map_or(0, |selection| {
             let (first, last) = selection.ends();
-            first.line - last.line + 1
+            // Saturating for the same reason `cell` is: an end anchored while
+            // the view was parked at the far end it had not yet been told
+            // about is a line number nothing can be added to.
+            (first.line - last.line).saturating_add(1)
         })
     }
 
@@ -1105,6 +1115,26 @@ mod tests {
         view.page_up();
         answer(&mut view, 100);
         assert_eq!(view.offset(), 100 - 24, "still the oldest line there is");
+    }
+
+    /// And the same parked offset reaches every other piece of arithmetic in
+    /// here through `cell`, which is where the mouse comes in: `g` and then a
+    /// click, or a drag, or a double click, inside that same round trip.
+    /// Saturating leaves a selection on lines no block will ever hold, which
+    /// `holds` reads as a copy of nothing rather than a copy of the wrong
+    /// place.
+    #[test]
+    fn pointing_at_the_screen_before_the_far_end_is_known_copies_nothing() {
+        let mut view = Scrollback::new(SIZE);
+        view.top();
+        view.select_from(at(24, 1));
+        view.select_to(at(1, 4));
+        view.select_word(at(12, 2));
+        view.select_line(at(12, 2));
+        // The request built from it is the other half: a selection anchored out
+        // there must not overflow the block arithmetic either.
+        let _ = view.wanted();
+        assert_eq!(view.copied(), None, "nothing here to copy");
     }
 
     /// And it is still a move, so what exists still bounds it: a hand that

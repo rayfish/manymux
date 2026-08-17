@@ -331,6 +331,26 @@ Three consequences run through the whole codebase and are worth keeping intact:
   how a client with no list of its own drives a rename. A key with nothing to
   act on is refused where it is pressed rather than at the Enter, or a name has
   been typed for nothing.
+- **And a key that is refused puts the keyboard back where it came from**
+  (`Popup::mode`). `KeyFilter::after` moves the mode on the key, not on what
+  the pump decides to do with it, so `n` has already left the filter in
+  `Mode::Rename` by the time the arm refuses to open a prompt. There is no
+  table for `Mode::Rename` — a prompt swallows everything while one is open —
+  so the mode falls through to the session table, and the group list was left
+  on the screen with `d`, `n` and `m` live over it: `d` detached from a list
+  where `d` is not a key, and `m` read a group row as a session, which is the
+  thing refusing the key was for. Which mode to go back to is the list's to
+  say, since the session list is control mode itself and the two group lists
+  are their own.
+- **A group name has to survive being spelled `@name`** (`Groups::assign`).
+  Both characters that spelling is made of were accepted: `@pi` was listed on
+  every screen and reachable from none of them, because `mm a @pi` looks for a
+  group called `pi` and only `@@pi` finds that one, and a `/` parses as a
+  machine and a session. The sigil is taken off rather than refused, since it
+  is how every heading and every target writes the name and typing it back at
+  a prompt asking for one is no mistake; the separator is refused. Sanitised
+  in the one place both ways in pass through, and it answers with the name
+  that stuck for the same reason `Registry::rename` does.
 - **Everything but Enter on a session comes back to the popup.** Grouping a
   session, naming one, narrowing to a group: none of them is a gesture that goes
   anywhere, so landing in the session afterwards threw away the list you were

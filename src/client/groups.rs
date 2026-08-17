@@ -27,7 +27,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::time::UNIX_EPOCH;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::config;
@@ -104,14 +104,39 @@ impl Groups {
             .map(|(name, _)| name.as_str())
     }
 
-    /// Move a session into a group, out of whatever it was in.
-    pub fn assign(&mut self, group: &str, host: &str, session: &SessionInfo) {
+    /// Move a session into a group, out of whatever it was in, and answer with
+    /// the name that stuck.
+    ///
+    /// The name is what `@name` has to spell, so the two characters that
+    /// spelling is made of cannot be in it. A group called `@pi` was listed on
+    /// every screen and reachable from none of them, since `mm a @pi` looks for
+    /// a group called `pi` and only `@@pi` finds it; one with a `/` in it is
+    /// read as a machine and a session. A leading `@` is taken off rather than
+    /// refused, because `@pi` is how the headings and every target spell it and
+    /// typing that back at a prompt asking for a name is the obvious thing to
+    /// do. It answers with the name for the same reason `Registry::rename`
+    /// does: what was typed and what it ended up called are not always the same
+    /// string.
+    pub fn assign(&mut self, group: &str, host: &str, session: &SessionInfo) -> Result<String> {
+        let name = group
+            .trim()
+            .strip_prefix('@')
+            .unwrap_or(group.trim())
+            .trim();
+        if name.is_empty() {
+            bail!("a group needs a name");
+        }
+        if name.contains('/') {
+            bail!("a group name cannot hold a `/`: that is how a machine is spelled");
+        }
+        let name = name.to_string();
         self.clear(host, session);
         self.groups
-            .entry(group.to_string())
+            .entry(name.clone())
             .or_default()
             .members
             .insert(Member::of(host, session));
+        Ok(name)
     }
 
     pub fn clear(&mut self, host: &str, session: &SessionInfo) {
@@ -126,8 +151,10 @@ impl Groups {
     ///
     /// A machine that is asleep has said nothing about its sessions, and
     /// reading that silence as "they ended" would empty its groups while you
-    /// were away from it. `Listing::reached()` is kept apart from the sessions
-    /// for exactly this.
+    /// were away from it. `Listing::answering()` is kept apart from the
+    /// sessions for exactly this, and it is that one rather than
+    /// `Listing::reached()`, which leaves this machine out because this machine
+    /// is never watched: fed that, every local member was kept forever.
     pub fn prune(&mut self, reached: &[String], listing: &[HostedSession]) {
         let live: BTreeSet<Member> = listing
             .iter()
@@ -199,12 +226,37 @@ mod tests {
         }
     }
 
+    /// A group name has to survive being spelled `@name`, and the two
+    /// characters that spelling is made of were both accepted: `@pi` came out
+    /// listed on every screen and reachable from none of them, since `mm a @pi`
+    /// looks for a group called `pi`.
+    #[test]
+    fn a_group_name_cannot_hold_the_sigil_or_the_separator() {
+        let build = session("build", 41823, 1000);
+
+        // The sigil is taken off rather than refused: it is how every screen
+        // and every target spells the name, so typing it back is no mistake.
+        let mut groups = Groups::default();
+        assert_eq!(groups.assign("@pi", "box", &build).unwrap(), "pi");
+        assert_eq!(groups.group_of("box", &build), Some("pi"));
+        assert_eq!(groups.assign("  pi  ", "box", &build).unwrap(), "pi");
+
+        // The separator cannot be, since it is how a machine is spelled.
+        let mut groups = Groups::default();
+        assert!(groups.assign("a/b", "box", &build).is_err());
+        assert!(groups.assign("@", "box", &build).is_err());
+        assert!(groups.assign("   ", "box", &build).is_err());
+        assert!(groups.names().is_empty(), "and nothing was written");
+    }
+
     /// The whole reason membership is not keyed on the name: a rename moves the
     /// name and must not move the session out of its group.
     #[test]
     fn a_rename_leaves_a_session_in_its_group() {
         let mut groups = Groups::default();
-        groups.assign("pi", "box", &session("build", 41823, 1000));
+        groups
+            .assign("pi", "box", &session("build", 41823, 1000))
+            .unwrap();
         assert_eq!(
             groups.group_of("box", &session("nightly", 41823, 1000)),
             Some("pi")
@@ -215,8 +267,8 @@ mod tests {
     fn a_session_is_in_at_most_one_group() {
         let mut groups = Groups::default();
         let s = session("build", 41823, 1000);
-        groups.assign("pi", "box", &s);
-        groups.assign("manymux", "box", &s);
+        groups.assign("pi", "box", &s).unwrap();
+        groups.assign("manymux", "box", &s).unwrap();
         assert_eq!(groups.group_of("box", &s), Some("manymux"));
         assert_eq!(
             groups.tally(&[hosted("box", s)]),
@@ -228,7 +280,7 @@ mod tests {
     fn clearing_takes_a_session_out_of_whatever_it_was_in() {
         let mut groups = Groups::default();
         let s = session("build", 41823, 1000);
-        groups.assign("pi", "box", &s);
+        groups.assign("pi", "box", &s).unwrap();
         groups.clear("box", &s);
         assert_eq!(groups.group_of("box", &s), None);
     }
@@ -238,7 +290,9 @@ mod tests {
     #[test]
     fn a_reused_pid_after_a_reboot_is_not_the_same_session() {
         let mut groups = Groups::default();
-        groups.assign("pi", "box", &session("build", 41823, 1000));
+        groups
+            .assign("pi", "box", &session("build", 41823, 1000))
+            .unwrap();
         assert_eq!(groups.group_of("box", &session("other", 41823, 9999)), None);
     }
 
@@ -247,7 +301,9 @@ mod tests {
     #[test]
     fn a_host_too_old_to_stamp_a_start_time_identifies_by_pid_alone() {
         let mut groups = Groups::default();
-        groups.assign("old", "box", &session("build", 7, 0));
+        groups
+            .assign("old", "box", &session("build", 7, 0))
+            .unwrap();
         assert_eq!(
             groups.group_of("box", &session("renamed", 7, 0)),
             Some("old")
@@ -259,8 +315,8 @@ mod tests {
         let mut groups = Groups::default();
         let gone = session("build", 41823, 1000);
         let live = session("api", 41902, 1001);
-        groups.assign("pi", "box", &gone);
-        groups.assign("pi", "box", &live);
+        groups.assign("pi", "box", &gone).unwrap();
+        groups.assign("pi", "box", &live).unwrap();
         groups.prune(&["box".into()], &[hosted("box", live.clone())]);
         assert_eq!(groups.group_of("box", &gone), None);
         assert_eq!(groups.group_of("box", &live), Some("pi"));
@@ -272,7 +328,7 @@ mod tests {
     fn a_session_on_a_host_that_did_not_answer_is_left_alone() {
         let mut groups = Groups::default();
         let asleep = session("train", 2201, 500);
-        groups.assign("pi", "gpu-box", &asleep);
+        groups.assign("pi", "gpu-box", &asleep).unwrap();
         groups.prune(&["box".into()], &[]);
         assert_eq!(groups.group_of("gpu-box", &asleep), Some("pi"));
     }
@@ -282,7 +338,9 @@ mod tests {
     #[test]
     fn a_group_whose_last_session_ended_is_gone() {
         let mut groups = Groups::default();
-        groups.assign("pi", "box", &session("build", 41823, 1000));
+        groups
+            .assign("pi", "box", &session("build", 41823, 1000))
+            .unwrap();
         groups.prune(&["box".into()], &[]);
         assert!(groups.names().is_empty());
     }
@@ -290,7 +348,9 @@ mod tests {
     #[test]
     fn the_group_file_round_trips() {
         let mut groups = Groups::default();
-        groups.assign("pi", "box", &session("build", 41823, 1000));
+        groups
+            .assign("pi", "box", &session("build", 41823, 1000))
+            .unwrap();
         let text = toml::to_string_pretty(&groups).unwrap();
         let back: Groups = toml::from_str(&text).unwrap();
         assert_eq!(
@@ -305,9 +365,9 @@ mod tests {
         let a = session("build", 1, 1000);
         let b = session("api", 2, 1001);
         let c = session("train", 3, 1002);
-        groups.assign("pi", "box", &a);
-        groups.assign("pi", "box", &b);
-        groups.assign("manymux", "gpu-box", &c);
+        groups.assign("pi", "box", &a).unwrap();
+        groups.assign("pi", "box", &b).unwrap();
+        groups.assign("manymux", "gpu-box", &c).unwrap();
         let listing = vec![hosted("box", a), hosted("box", b), hosted("gpu-box", c)];
         assert_eq!(
             groups.tally(&listing),

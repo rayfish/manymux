@@ -469,8 +469,8 @@ mod tests {
         let train = at("train", 3, 1002);
         let other = at("build", 4, 1003);
         let mut groups = Groups::default();
-        groups.assign("pi", "box", &build);
-        groups.assign("pi", "gpu-box", &train);
+        groups.assign("pi", "box", &build).unwrap();
+        groups.assign("pi", "gpu-box", &train).unwrap();
         let listing = vec![
             HostedSession {
                 host: "box".into(),

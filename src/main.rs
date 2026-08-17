@@ -432,7 +432,9 @@ async fn run(cli: Cli) -> Result<u8> {
                 .ok_or_else(|| anyhow!("no session named {} on {}", at.session, at.host))?;
             let mut groups = Groups::load()?;
             match &name {
-                Some(name) => groups.assign(name, &at.host, session),
+                Some(name) => {
+                    groups.assign(name, &at.host, session)?;
+                }
                 None => groups.clear(&at.host, session),
             }
             groups.save()?;
@@ -1679,7 +1681,9 @@ async fn regroup(
         .find(|s| s.name == at.session)
         .ok_or_else(|| anyhow!("{} is no longer running", at.session))?;
     match &group {
-        Some(name) => groups.assign(name, &at.host, session),
+        Some(name) => {
+            groups.assign(name, &at.host, session)?;
+        }
         None => groups.clear(&at.host, session),
     }
     groups.save()

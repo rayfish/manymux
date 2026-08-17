@@ -646,6 +646,17 @@ impl Popup {
         }
     }
 
+    /// The mode this list is read in. The session list is control mode itself;
+    /// the two group lists are their own, because the session keys must not
+    /// reach them. Anything that has to put the keyboard back where it was
+    /// asks here rather than assuming, since which list is up decides it.
+    fn mode(&self) -> Mode {
+        match self.what {
+            Showing::Sessions => Mode::Control,
+            Showing::Moving { .. } | Showing::Narrowing => Mode::Picking,
+        }
+    }
+
     /// The session row the popup is acting on, if it is on one.
     ///
     /// Narrowing, it is on none: the highlighted row there is a *group*, and
@@ -906,6 +917,17 @@ async fn pump(
                         if popup.as_ref().is_none_or(|up| up.subject().is_none()) =>
                     {
                         keys.stop_typing();
+                        // And back to the mode the key arrived in, which
+                        // `KeyFilter::after` has already left at `Mode::Rename`
+                        // for a prompt that is not going to open. A mode with
+                        // no prompt behind it falls through to the session
+                        // table, so the group list was left on the screen with
+                        // `m`, `d` and `n` live over it: `m` there reads a
+                        // group row as a session, which is the thing refusing
+                        // this key exists to stop.
+                        let back = popup.as_ref().map_or(Mode::Focus, Popup::mode);
+                        keys.set_mode(back);
+                        status.set_mode(back);
                         status.set_grouping(None);
                         status.set_notice("no session here to put in a group");
                         notice_until = Some(tokio::time::Instant::now() + NOTICE_FOR);
@@ -1599,6 +1621,16 @@ async fn pump(
                     // is showing that.
                     Chased::Stopped => {}
                     Chased::Full => {
+                        // The move that hit the limit still moved: it is walked
+                        // back to what a copy can carry, not undone, so the
+                        // window and the highlight are both a step from what
+                        // was last painted. Nothing else is going to paint
+                        // them, since the hand is holding still and there are
+                        // no more reports coming, and the notice would then be
+                        // describing a screen showing something else.
+                        let painted = view.paint();
+                        status.set_scrolled(Some(view.offset()));
+                        stdout.write_all(painted.as_bytes()).await?;
                         status.set_notice(&format!(
                             "{} lines is as much as one copy takes",
                             scroll::COPY_LINES
@@ -1856,6 +1888,16 @@ mod tests {
             what: Showing::Moving { row: 1 },
         };
         assert_eq!(moving.subject(), Some(1));
+
+        // And each list says which mode it is read in, because refusing a key
+        // has to put the keyboard back where it came from: `KeyFilter::after`
+        // has already moved it to `Mode::Rename` for a prompt that is not going
+        // to open, and a mode with no prompt behind it falls through to the
+        // session table, which over the group list is `m` reading a group row
+        // as a session.
+        assert_eq!(sessions.mode(), Mode::Control);
+        assert_eq!(narrowing.mode(), Mode::Picking);
+        assert_eq!(moving.mode(), Mode::Picking);
     }
 
     /// A mode the node turns back on for a session, and the client forgets to
