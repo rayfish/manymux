@@ -1043,10 +1043,10 @@ mod tests {
             taken: 1_700_000_000,
             sessions: vec![
                 Kept {
-                    host: "dev.box.ray".into(),
-                    name: "manymux".into(),
-                    cwd: "/home/dario/rayfish/manymux".into(),
-                    group: Some("rayfish".into()),
+                    host: "gpu-box".into(),
+                    name: "build".into(),
+                    cwd: "/srv/project".into(),
+                    group: Some("work".into()),
                     command: argv(&["claude", "--continue"]),
                 },
                 Kept {

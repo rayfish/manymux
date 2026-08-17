@@ -2446,9 +2446,9 @@ impl Listed {
             // The machine on a line of its own rather than in front of every
             // name. `host/name` is how a session is addressed, so it was the
             // obvious label, but a real host name is most of the column: with
-            // `dev.box.ray/` in front of it there was no room left to tell
-            // `rayfish-iroh-dev` from `rayfish-iroh-debug`, and which session
-            // it is is the one thing the row exists to say.
+            // a mesh name and a slash in front of it there was no room left to
+            // tell `service-iroh-dev` from `service-iroh-debug`, and which
+            // session it is is the one thing the row exists to say.
             let mut machine: Option<&str> = None;
             for (hosted, _) in showing.iter().filter(|(_, g)| *g == Some(group)) {
                 if machine != Some(hosted.host.as_str()) {

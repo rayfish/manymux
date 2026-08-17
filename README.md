@@ -449,7 +449,7 @@ started with under it, since what runs is the captured command inside a wrapper
 that keeps the login shell behind it:
 
 ```
-dev.box.ray/manymux @rayfish claude --continue in /home/dario/rayfish/manymux
+gpu-box/build @work claude --continue in /srv/project
   exec sh -mc '"$@"; exec "${SHELL:-/bin/sh}" -l' sh claude --continue
 ```
 

@@ -961,7 +961,7 @@ mod tests {
             Doing {
                 name: "build".into(),
                 pid: 41823,
-                cwd: Some("/home/dario/rayfish/manymux".into()),
+                cwd: Some("/srv/project".into()),
                 foreground: vec!["claude".into(), "--resume".into()],
             },
             Doing {

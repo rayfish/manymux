@@ -390,9 +390,9 @@ Three consequences run through the whole codebase and are worth keeping intact:
   far ones leaves the eye working out which kind of row it is looking at. The
   A machine goes on a line of its own inside a group rather than in front of
   every name: `host/name` is how a session is addressed and was the obvious
-  label, but a real host name is most of the column, and with `dev.box.ray/` in
-  front of it there was no room left to tell `rayfish-iroh-dev` from
-  `rayfish-iroh-debug`, which is the one thing the row exists to say. So every
+  label, but a real host name is most of the column, and with a mesh name and a
+  slash in front of it there was no room left to tell `service-iroh-dev` from
+  `service-iroh-debug`, which is the one thing the row exists to say. So every
   session sits under a machine either way and a group is a level above that.
   Sections are ordered by their first session and sessions by `started`, never
   by name, for the reason every listing here has: a name moves under a rename
