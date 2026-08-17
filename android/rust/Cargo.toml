@@ -1,0 +1,50 @@
+# Deliberately not a member of any workspace, and with a lockfile of its own.
+#
+# The root crate has no `[workspace]` table, so cargo's search would walk past
+# it today; the empty table here is what keeps that true if one is ever added.
+# The lockfile is the substantive half: russh and uniffi pull in some two
+# hundred crates that `mm` never compiles, and sharing a lockfile would have
+# every `--locked` build of the binary, including the four cross targets in CI,
+# resolving against entries that churn whenever russh bumps.
+[workspace]
+
+[package]
+name = "manymux-android"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+publish = false
+
+# `cdylib` is what the APK loads; `lib` is so the shim's own tests and the
+# bindgen binary can link it as an ordinary crate.
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[dependencies]
+# The client core. `default-features = false` is the whole contract: no
+# pty-process, no crossterm, no clap, and no `mm` binary.
+manymux = { path = "../..", default-features = false }
+
+# ssh in-process, because an Android app cannot fork the `ssh` binary that
+# `src/ssh.rs` is built on.
+#
+# The backend is not a free choice: russh is a hard `compile_error!` without
+# either `ring` or `aws-lc-rs`. The default is `aws-lc-rs`, which wants cmake
+# and bindgen and is the painful cross-compile; `ring` needs only a C compiler,
+# which the NDK supplies. `rsa` stays because plenty of sshd still presents an
+# `rsa-sha2-512` host key.
+russh = { version = "0.62", default-features = false, features = [
+    "ring",
+    "flate2",
+    "rsa",
+] }
+
+anyhow = "1.0.104"
+tokio = { version = "1.53.1", features = [
+    "io-util",
+    "macros",
+    "net",
+    "rt-multi-thread",
+    "sync",
+    "time",
+] }

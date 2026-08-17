@@ -1,4 +1,7 @@
 /target
+# The shim builds outside the root crate's workspace, so it has a target
+# directory of its own that the anchored rule above does not reach.
+/android/rust/target
 
 # Specs and plans stay on disk, untracked.
 /docs
