@@ -1172,6 +1172,13 @@ async fn pump(
                     // after whatever brought us back here, so this opens on
                     // what is true rather than asking and waiting.
                     if std::mem::take(&mut greet) {
+                        // And ask, the same as the key that opens one does. The
+                        // rows handed over are whatever the caller knew, which
+                        // after a slow fan-out is nothing at all: opening on
+                        // them without asking left an empty box that only the
+                        // next keypress would fill, and an empty box is one
+                        // there is nothing obvious to press in.
+                        let _ = asks.try_send(());
                         popup = Some(Popup::sessions(&rows));
                         draw_popup(&mut stdout, &mut popup, &mut status, &mut restate).await?;
                     }

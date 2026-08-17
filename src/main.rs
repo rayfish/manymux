@@ -897,6 +897,9 @@ async fn do_attach(
     // Where the listing task leaves its answer, so the ids the popup hands back
     // are looked up in the rows it was actually showing.
     let latest: Arc<Mutex<Option<Listed>>> = Arc::new(Mutex::new(None));
+    // What the popup's lister last found, for the loop to take back: it hands
+    // its own pending listing over, so the answer arrives there and not here.
+    let seen: Arc<Mutex<Option<Snapshot>>> = Arc::new(Mutex::new(None));
 
     let mut held = attach::hold(screen)?;
     let mut mode = Mode::Focus;
@@ -981,7 +984,15 @@ async fn do_attach(
         // for the same reason: what is already known stands rather than being
         // waited on, since a machine that is asleep must not hold up a screen.
         take_listing(&mut listing, &mut cycle, &mut snapshot, &mut groups).await;
-        if !settled && !snapshot.is_empty() {
+        // Narrowing to the group of the session you arrived in, which is a
+        // thing to decide on the way in and never afterwards. It used to wait
+        // for a listing that said anything, and on a fleet slower than
+        // `LISTING_WAIT` the first of those lands well after the run has
+        // started: the block then fired on whatever session you were on by
+        // then, so putting a session in a group silently narrowed the run to
+        // it. Not knowing is an answer here, and the answer is to narrow to
+        // nothing.
+        if !settled {
             settled = true;
             if let Some(info) = snapshot.info(cycle.current()) {
                 let group = groups
@@ -1004,21 +1015,41 @@ async fn do_attach(
             let focus = cycle.focused().map(str::to_string);
             let current = cycle.current().clone();
             let latest = Arc::clone(&latest);
+            let seen = Arc::clone(&seen);
+            // The listing already out there, handed over rather than left to
+            // finish into a variable nobody reads again until the attach ends.
+            // `take_listing` gives one half a second and no more, so on a fleet
+            // where a fan-out takes longer this is *always* still running when
+            // the popup opens, and the popup then started a second one from
+            // scratch: two ssh commands per host for one keypress, and an empty
+            // box for as long as the second took.
+            let mut running = listing.take();
             tokio::spawn(async move {
                 while wanted.recv().await.is_some() {
-                    let Ok(listing) = everywhere(&socket).await else {
+                    let listing = match running.take() {
+                        Some(task) => match task.await {
+                            Ok(snapshot) => Ok(snapshot),
+                            Err(_) => continue,
+                        },
+                        None => everywhere(&socket).await.map(|listing| Snapshot {
+                            reached: listing.reached(),
+                            sessions: listing.sessions,
+                        }),
+                    };
+                    let Ok(snapshot) = listing else { continue };
+                    if snapshot.is_empty() {
                         continue;
-                    };
-                    let snapshot = Snapshot {
-                        reached: listing.reached(),
-                        sessions: listing.sessions,
-                    };
+                    }
                     let listed = Listed::of(&snapshot, &groups, focus.as_deref(), &current);
                     // Kept where the caller can read it once the attach ends:
                     // the ids the popup hands back are this listing's, and
                     // looking them up in the one it opened with would name the
                     // wrong session.
                     *held_lock(&latest) = Some(listed.clone());
+                    // And the snapshot behind them, because the loop's own copy
+                    // is now the older of the two: it gave up waiting on the
+                    // listing this task went on to collect.
+                    *held_lock(&seen) = Some(snapshot);
                     if answered.send(listed.rows).is_err() {
                         return;
                     }
@@ -1043,6 +1074,17 @@ async fn do_attach(
         // The rows the ids in `outcome` belong to: the last answer if one
         // landed while the popup was up, else the ones it opened with.
         let listed = held_lock(&latest).take().unwrap_or(listed);
+        // And what those rows were built from, which the loop gave up waiting
+        // for and the popup went on to collect. Without taking it back, a fleet
+        // slower than `LISTING_WAIT` never fills this in at all: every attach
+        // hands its pending listing to the popup, so nothing is ever left for
+        // `take_listing` to find.
+        if let Some(fresher) = held_lock(&seen).take() {
+            groups.prune(&fresher.reached, &fresher.sessions);
+            let _ = groups.save();
+            snapshot = fresher;
+            cycle.refresh(entries(&snapshot, &groups));
+        }
         // Renamed from inside, so the name this run has been using is nobody's
         // now: the cycle would hop to a session that is not there, and the line
         // printed on the way out would name it too.

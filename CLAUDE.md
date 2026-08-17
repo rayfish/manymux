@@ -557,6 +557,14 @@ Three consequences run through the whole codebase and are worth keeping intact:
   shifted ones arrive as the alternate the terminal reports beside the key,
   which is why `Encoded::text` reads case out of the alternate rather than the
   code.
+- **A key held down is a key still being pressed** (`Encoded::down`). The
+  protocols that report event types stop repeating the plain byte and send
+  repeats instead, so a client that took only presses was one where holding tab
+  walked the list exactly once, and only while a program like `pi` had the
+  terminal in that mode: the same hand on the same key worked everywhere else,
+  which is the kind of difference nobody thinks to report. Releases are still
+  dropped, and that is the half the rule was written for: the ctrl you were
+  holding reports its own release the moment you let go of the mode key.
 - **A mode the client is holding is left by a keystroke and by nothing else.**
   A session that asked for mouse tracking or focus reporting has the terminal
   sending reports whenever the hand or the window moves, and those arrive on the
@@ -641,6 +649,18 @@ Three consequences run through the whole codebase and are worth keeping intact:
   because `SystemTime` has no `Default`, and a host too old to send it ties all
   of its sessions at the epoch, where the name tiebreak leaves them in the order
   they have always been in.
+- **The listing already out there is handed to the popup, not left to finish
+  into a variable nobody reads again.** `take_listing` gives one half a second,
+  so on a fleet where a fan-out takes longer it is *always* still running when
+  the popup opens. The popup used to start a second one from scratch: two ssh
+  commands per host for one keypress, and an empty box for as long as the
+  second took. Now the pending handle moves into the lister task, whose first
+  ask awaits it. Two things follow. The task hands the snapshot back through
+  `seen`, because the loop has given up its own copy and would otherwise never
+  fill one in again. And the narrowing that happens on the way in
+  (`settled`) can no longer wait for a listing that says something: on a slow
+  fleet the first one lands after the run has started, and firing then narrowed
+  the run to whatever group you had just put a session in.
 - **A press is the only thing that asks the machines what they are running, so
   every press has to ask.** Nothing refreshes the switch keys' listing on a
   timer: it is asked for after a key is pressed and read by the next one

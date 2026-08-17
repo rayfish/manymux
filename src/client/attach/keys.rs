@@ -127,6 +127,9 @@ const CTRL: u8 = 4;
 const LOCKS: u8 = 64 | 128;
 
 const PRESS: u8 = 1;
+/// What a terminal reports for a key being held down long enough to repeat.
+/// A keystroke like any other: holding a key is how anybody walks a long list.
+const REPEAT: u8 = 2;
 
 /// The key codes control mode and the prompts read. No letters: one typed
 /// without modifiers still arrives as itself, whatever protocol is on.
@@ -197,6 +200,17 @@ impl Encoded {
         MODIFIER_KEYS.contains(&self.code)
     }
 
+    /// Whether the key is down: pressed, or held long enough to be repeating.
+    ///
+    /// Both count, and only letting go does not. Under the protocols that
+    /// report event types at all, a held key stops sending the plain byte over
+    /// and over and sends repeats instead, so dropping them meant that holding
+    /// tab in the list moved the highlight exactly once, but only while a
+    /// program like `pi` had the terminal in that mode.
+    fn down(&self) -> bool {
+        self.event == PRESS || self.event == REPEAT
+    }
+
     /// The byte this key stands for at a prompt, if it is one of the few that
     /// mean anything there.
     ///
@@ -206,7 +220,7 @@ impl Encoded {
     /// else a program's mode brings with it (releases, modifiers, the arrows,
     /// the mode key itself) is not text and stands for nothing.
     fn typed(&self) -> Option<u8> {
-        if self.event != PRESS {
+        if !self.down() {
             return None;
         }
         match self.code {
@@ -248,10 +262,10 @@ impl Encoded {
     /// than guessed at further: the client's keys read their own case (`h` and
     /// `H`), and a layout it cannot see is not worth more than that.
     fn text(&self) -> Option<char> {
-        // Letting go of a key types nothing, and neither does holding it down
-        // long enough to repeat: a mode that reports both would otherwise type
-        // a character two and three times over.
-        if self.event != PRESS || self.mods & !(SHIFT | LOCKS) != 0 {
+        // Letting go of a key types nothing. Holding one down does, over and
+        // over, which is what holding a key has always meant and what a
+        // terminal not in one of these modes does by sending the byte again.
+        if !self.down() || self.mods & !(SHIFT | LOCKS) != 0 {
             return None;
         }
         let shift = self.mods & SHIFT != 0;
@@ -1373,12 +1387,14 @@ impl KeyFilter {
             return None;
         }
 
-        // Dropping everything that is not a press is what makes control mode
-        // usable at all once a program has asked for event types: the ctrl you
-        // were holding reports its own release the moment you let go of the
-        // mode key, and reading that as a key would drop you back to focus
-        // before you had typed anything.
-        if key.event != PRESS || key.is_modifier() {
+        // Dropping the releases is what makes control mode usable at all once a
+        // program has asked for event types: the ctrl you were holding reports
+        // its own release the moment you let go of the mode key, and reading
+        // that as a key would drop you back to focus before you had typed
+        // anything. A repeat is not one of those. It is the key still being
+        // held, which is how a long list gets walked, and dropping it meant
+        // holding tab moved the highlight once and then stopped.
+        if !key.down() || key.is_modifier() {
             return None;
         }
         // The key as the byte the ordinary encoding would have sent, so that
@@ -2280,6 +2296,42 @@ mod tests {
         assert_eq!(f.filter(b"\x1b[93;5:3u"), held());
         assert_eq!(f.filter(b"\x1b[57442;5:3u"), held());
         assert_eq!(f.filter(b"d"), asked(Action::Detach, Mode::Focus));
+    }
+
+    /// Holding a key is how a list of twenty sessions gets walked. Under a
+    /// program that asked for event types the terminal stops repeating the
+    /// plain byte and reports repeats instead, so dropping them meant holding
+    /// tab moved the highlight once and then stopped, and only while such a
+    /// program was running: the same hand on the same key worked everywhere
+    /// else.
+    #[test]
+    fn a_held_key_repeats_in_the_popup() {
+        let mut f = KeyFilter::default();
+        assert_eq!(f.filter(b"\x1b[93;5u"), held());
+        // Tab pressed, then the same tab repeating twice as it is held.
+        for spelling in [&b"\x1b[9;1u"[..], b"\x1b[9;1:2u", b"\x1b[9;1:2u"] {
+            assert_eq!(
+                f.filter(spelling),
+                asked(Action::Pick(Pick::Down), Mode::Control),
+                "{}",
+                String::from_utf8_lossy(spelling)
+            );
+        }
+        // And letting go still says nothing, which is the half that has to
+        // keep working: the ctrl underneath it reports its own release.
+        assert_eq!(f.filter(b"\x1b[9;1:3u"), held());
+    }
+
+    /// The same key held at a prompt types its character again, the way it
+    /// would in any other text field.
+    #[test]
+    fn a_held_key_repeats_at_a_prompt() {
+        let mut f = KeyFilter::default();
+        f.set_scroll(true);
+        f.filter(&[DEFAULT_PREFIX, b'/']);
+        f.filter(b"\x1b[97;1u");
+        f.filter(b"\x1b[97;1:2u");
+        assert_eq!(f.needle().as_deref(), Some("aa"));
     }
 
     /// A release in focus mode is the session's, and goes to it, unless the
