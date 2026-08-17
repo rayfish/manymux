@@ -100,10 +100,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # rustup rather than an action, as in `ci.yml`, which explains why: an
+      # action is fetched from codeload per job, and enough of those in a row
+      # is answered with a 429 before any step has run.
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
+        run: |
+          if ! command -v rustup >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+              | sh -s -- -y --profile minimal --default-toolchain none --no-modify-path
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+            export PATH="$HOME/.cargo/bin:$PATH"
+          fi
+          rustup toolchain install stable --profile minimal -t ${{ matrix.target }} --no-self-update
+          rustup default stable
+          rustc --version
 
       - name: Install musl tools
         if: contains(matrix.target, 'musl')

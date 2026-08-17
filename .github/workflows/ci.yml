@@ -29,10 +29,32 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # rustup rather than an action, and the reason is the one thing an
+      # action cannot be cached out of. Every third-party action is fetched
+      # from codeload while the job is being set up, before the first step
+      # runs, so six jobs is six fetches of the same tarball per push and the
+      # release and nightly workflows add more. GitHub started answering 429,
+      # and a job that never compiled anything failed on whichever runner lost
+      # the race. Caching cannot reach it: the cache action is fetched the same
+      # way, one step later.
+      #
+      # What is asked for is still the newest stable rather than whatever the
+      # image happens to ship, because `Cargo.toml` names a `rust-version` and
+      # an image a few weeks behind it would fail to build at all. That
+      # download comes from the Rust project's own CDN, which is not the host
+      # that ran out of patience, and it is skipped entirely when the image is
+      # already current.
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy, rustfmt
+        run: |
+          if ! command -v rustup >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+              | sh -s -- -y --profile minimal --default-toolchain none --no-modify-path
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+            export PATH="$HOME/.cargo/bin:$PATH"
+          fi
+          rustup toolchain install stable --profile minimal -c clippy,rustfmt --no-self-update
+          rustup default stable
+          rustc --version && cargo clippy --version && cargo fmt --version
 
       # Debug artifacts, so a key of its own rather than sharing with the
       # release builds, which would thrash both. Only master saves; see below.
@@ -82,10 +104,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # As in the test job above, and for the same reason: an action fetched
+      # per job is what ran into GitHub's rate limit, and this fetches nothing.
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
+        run: |
+          if ! command -v rustup >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+              | sh -s -- -y --profile minimal --default-toolchain none --no-modify-path
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+            export PATH="$HOME/.cargo/bin:$PATH"
+          fi
+          rustup toolchain install stable --profile minimal -t ${{ matrix.target }} --no-self-update
+          rustup default stable
+          rustc --version
 
       - name: Install musl tools
         if: contains(matrix.target, 'musl')
