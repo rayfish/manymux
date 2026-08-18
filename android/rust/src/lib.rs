@@ -12,6 +12,8 @@
 //! `--no-default-features` build of the crate one directory up, so a fix there
 //! is a fix here.
 
+pub mod keys;
+pub mod machine;
 pub mod ssh;
 
 /// What this build of the client core is, as `0.1.0 (a1b2c3d4)`.

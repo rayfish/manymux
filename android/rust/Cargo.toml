@@ -39,6 +39,11 @@ russh = { version = "0.62", default-features = false, features = [
     "rsa",
 ] }
 
+# The system random source, for generating this device's identity. `sys_rng`
+# is the feature that hands back an rng rather than a byte-filling function;
+# ssh-key wants one it can ask for a `u32`.
+getrandom = { version = "0.4", features = ["sys_rng"] }
+
 anyhow = "1.0.104"
 tokio = { version = "1.53.1", features = [
     "io-util",
@@ -47,4 +52,13 @@ tokio = { version = "1.53.1", features = [
     "rt-multi-thread",
     "sync",
     "time",
+] }
+
+[dev-dependencies]
+# The tests stand a real ssh server up in-process, because what is under test
+# here *is* the transport and nothing may stand in for it.
+russh = { version = "0.62", default-features = false, features = [
+    "ring",
+    "flate2",
+    "rsa",
 ] }

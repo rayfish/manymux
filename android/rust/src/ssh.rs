@@ -74,6 +74,42 @@ impl Watch {
     }
 }
 
+/// The writing half of a [`Watch`], held by whoever is pumping the command.
+///
+/// Dropping one without saying how the command ended answers `None`, which is
+/// what a connection that went away in the middle of a rung amounts to.
+pub struct Ending {
+    status: watch::Sender<Option<i32>>,
+    said: Arc<Mutex<Vec<u8>>>,
+}
+
+impl Ending {
+    pub fn new() -> (Self, Watch) {
+        let (status, receiver) = watch::channel(None);
+        let said = Arc::new(Mutex::new(Vec::new()));
+        (
+            Self {
+                status,
+                said: Arc::clone(&said),
+            },
+            Watch {
+                status: receiver,
+                said,
+            },
+        )
+    }
+
+    /// Something the far end wrote to its stderr.
+    pub fn said(&self, bytes: &[u8]) {
+        held(&self.said).extend_from_slice(bytes);
+    }
+
+    /// How the command ended.
+    pub fn ended(&self, code: Option<i32>) {
+        let _ = self.status.send(code);
+    }
+}
+
 /// A machine reached, and the listing that reaching it produced.
 pub struct Reached {
     pub stream: Stream,
@@ -157,24 +193,18 @@ impl Remote {
         let writer = child.stdin.take().expect("stdin was piped");
         let mut said = child.stderr.take().expect("stderr was piped");
 
-        let (tx, status) = watch::channel(None);
-        let heard = Arc::new(Mutex::new(Vec::new()));
-        let into = Arc::clone(&heard);
+        let (ending, watch) = Ending::new();
         tokio::spawn(async move {
             let mut buffer = Vec::new();
             let _ = said.read_to_end(&mut buffer).await;
-            held(&into).extend_from_slice(&buffer);
-            let code = child.wait().await.ok().and_then(|status| status.code());
-            let _ = tx.send(code);
+            ending.said(&buffer);
+            ending.ended(child.wait().await.ok().and_then(|status| status.code()));
         });
 
         Ok(Self {
             reader: Box::new(reader),
             writer: Box::new(writer),
-            watch: Watch {
-                status,
-                said: heard,
-            },
+            watch,
         })
     }
 }

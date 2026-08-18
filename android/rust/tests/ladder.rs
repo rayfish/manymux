@@ -8,23 +8,15 @@
 //! spelling that is neither. Those three answers are the whole of what the
 //! ladder reads, and a double would just be the test agreeing with itself
 //! about what they mean.
+//!
+//! `tests/connect.rs` asks the same questions again over a real ssh
+//! connection, where the answers have to survive a channel.
 
-use std::path::PathBuf;
+#[path = "support/world.rs"]
+mod world;
 
 use manymux_android::ssh::{Exec, Remote, reach};
-
-/// Where `mm` is on the machine being stood up.
-enum Mm {
-    /// On the PATH, so the first rung answers.
-    OnPath,
-    /// Only in the home directory, so the first rung is a 127.
-    InHome,
-    /// Nowhere, so both rungs are.
-    Missing,
-    /// On the PATH but not working: it complains and exits non-zero, which is
-    /// a machine answering badly rather than a spelling being wrong.
-    Broken,
-}
+use world::{Mm, World};
 
 /// What a machine whose `mm` does not run says on its way out.
 const COMPLAINT: &str = "mm: error while loading shared libraries";
@@ -35,47 +27,18 @@ const COMPLAINT: &str = "mm: error while loading shared libraries";
 /// resolves the first against a PATH, and what says 127 about a spelling that
 /// is neither — the three things the ladder is reading, all of them answered by
 /// the same shell that would answer them at the other end of an ssh.
-struct Machine {
-    dir: PathBuf,
-    broken: bool,
-}
+struct Local(World);
 
-impl Machine {
-    fn where_mm_is(name: &str, mm: Mm) -> Self {
-        let dir = std::env::temp_dir().join(format!("mm-ladder-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-
-        // `mm` is a symlink to the stub agent rather than a script, so there is
-        // no file being written that the shell might find itself executing.
-        let agent = PathBuf::from(env!("CARGO_BIN_EXE_stub-agent"));
-        let put_it_at = match mm {
-            Mm::OnPath | Mm::Broken => Some(dir.join("bin/mm")),
-            Mm::InHome => Some(dir.join("home/.local/bin/mm")),
-            Mm::Missing => None,
-        };
-        std::fs::create_dir_all(dir.join("bin")).unwrap();
-        if let Some(path) = put_it_at {
-            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-            std::os::unix::fs::symlink(&agent, &path).unwrap();
-        }
-
-        Self {
-            dir,
-            broken: matches!(mm, Mm::Broken),
-        }
-    }
-}
-
-impl Exec for Machine {
+impl Exec for Local {
     async fn open(&self, command: &str) -> anyhow::Result<Remote> {
         let mut sh = tokio::process::Command::new("/bin/sh");
         sh.arg("-c").arg(command);
         // A PATH of our own, or a machine that happens to have a real `mm`
         // installed on it would answer the first rung and the test would pass
         // for a reason that has nothing to do with the code.
-        sh.env("PATH", self.dir.join("bin"));
-        sh.env("HOME", self.dir.join("home"));
-        if self.broken {
+        sh.env("PATH", self.0.dir.join("bin"));
+        sh.env("HOME", self.0.dir.join("home"));
+        if self.0.broken {
             sh.env("STUB_FAILS", COMPLAINT);
         }
         Remote::spawn(sh).await
@@ -84,7 +47,7 @@ impl Exec for Machine {
 
 #[tokio::test]
 async fn a_machine_with_mm_on_the_path_answers_on_the_first_rung() {
-    let machine = Machine::where_mm_is("onpath", Mm::OnPath);
+    let machine = Local(World::where_mm_is("ladder-onpath", Mm::OnPath));
 
     let reached = reach(&machine).await.unwrap();
 
@@ -95,7 +58,7 @@ async fn a_machine_with_mm_on_the_path_answers_on_the_first_rung() {
 
 #[tokio::test]
 async fn a_machine_with_mm_only_in_the_home_directory_is_found_on_the_second_rung() {
-    let machine = Machine::where_mm_is("inhome", Mm::InHome);
+    let machine = Local(World::where_mm_is("ladder-inhome", Mm::InHome));
 
     let reached = reach(&machine).await.unwrap();
 
@@ -105,7 +68,7 @@ async fn a_machine_with_mm_only_in_the_home_directory_is_found_on_the_second_run
 
 #[tokio::test]
 async fn a_machine_with_no_mm_anywhere_is_reported_rather_than_installed_on() {
-    let machine = Machine::where_mm_is("missing", Mm::Missing);
+    let machine = Local(World::where_mm_is("ladder-missing", Mm::Missing));
 
     let error = match reach(&machine).await {
         Ok(_) => panic!("reached a machine with no `mm` on it"),
@@ -121,7 +84,7 @@ async fn a_machine_with_no_mm_anywhere_is_reported_rather_than_installed_on() {
 
 #[tokio::test]
 async fn a_rung_that_failed_for_any_other_reason_stops_the_climb_and_is_reported() {
-    let machine = Machine::where_mm_is("broken", Mm::Broken);
+    let machine = Local(World::where_mm_is("ladder-broken", Mm::Broken));
 
     let error = match reach(&machine).await {
         Ok(_) => panic!("reached a machine whose `mm` does not work"),
