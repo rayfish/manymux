@@ -491,7 +491,14 @@ where
                 last_heard = tokio::time::Instant::now();
                 match frame.tag {
                     tag::DATA => attachment.send_input(frame.body),
-                    tag::RESIZE => attachment.resize(proto::decode(&frame.body)?),
+                    // Answered with the size the session took, which is not
+                    // always the one asked for: the smallest across every
+                    // attached client wins. A client keeping a screen of its
+                    // own has no other way to learn it.
+                    tag::RESIZE => {
+                        let took = attachment.resize(proto::decode(&frame.body)?);
+                        send(&mut write, tag::SIZE, &proto::encode(&took)?).await?
+                    }
                     tag::PONG => answers_pings = true,
                     // The client swallowed a screen switch, so what the
                     // terminal shows is no longer what the session thinks it

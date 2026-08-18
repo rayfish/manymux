@@ -709,6 +709,58 @@ async fn resizing_a_client_resizes_the_child_terminal() {
     registry.kill(&name).unwrap();
 }
 
+/// A client with a screen of its own has to be told what the session actually
+/// became, because what it asked for is only a request.
+#[tokio::test]
+async fn a_resize_is_answered_with_the_size_the_session_took() {
+    let node = test_node().await;
+    let registry = &node.registry;
+    let Spawned { name, .. } = spawn_session(&node, &["/bin/sh", "-i"]).await;
+
+    // One client at 80x24, so the smallest across every attached client is
+    // that, and the second client's request for something wider cannot win.
+    let mut narrow = Client::connect(&node);
+    let attach = Request::Attach {
+        name: name.clone(),
+        size: Size::new(80, 24),
+        history: 0,
+        read_only: false,
+    };
+    assert!(matches!(
+        narrow.send(&attach).await.unwrap(),
+        Response::Attached { .. }
+    ));
+
+    let mut wide = Client::connect(&node);
+    assert!(matches!(
+        wide.send(&attach).await.unwrap(),
+        Response::Attached { .. }
+    ));
+    proto::write_msg(&mut wide.write, tag::RESIZE, &Size::new(200, 60))
+        .await
+        .unwrap();
+
+    // Bounded, so a node that stopped answering fails here rather than
+    // hanging whoever is running the tests.
+    let took: Size = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let frame = wide.next_frame().await.expect("a frame");
+            if frame.tag == tag::SIZE {
+                return proto::decode(&frame.body).unwrap();
+            }
+        }
+    })
+    .await
+    .expect("the node never said what size it took");
+
+    // Not the 200x60 that was asked for. A client that reflowed its own copy
+    // to what it asked for would be painting a screen the session never had,
+    // and the two would scroll at different rows from then on.
+    assert_eq!(took, Size::new(80, 24));
+
+    registry.kill(&name).unwrap();
+}
+
 /// The state `mm update` cannot see from the outside: replacing the binary
 /// leaves this process running the old one, so the node has to be able to say
 /// which build it started from. Hashing its own path later would answer with

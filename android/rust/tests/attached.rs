@@ -19,31 +19,47 @@ use manymux_android::session::{Session, State};
 use sshd::Sshd;
 use world::{Mm, World};
 
-/// How the machine at the other end behaves.
+/// How the machine at the other end behaves, one word per connection.
+///
+/// The words are the stub's, and the count is what makes them mean "the first
+/// attach" rather than "every attach": each connection is a fresh process at
+/// the far end.
 enum How {
     /// Answers, and stays.
     Steady,
-    /// Goes away without a word the first time somebody attaches, and behaves
-    /// from then on.
+    /// Goes away without a word after the first attach, and behaves after.
     Drops,
     /// Goes away, and by the time anybody comes back the session has ended.
     Gone,
+    /// Goes away, and the connection after it drops between answering the
+    /// listing and answering the attach. A radio dropping mid-exchange, which
+    /// is not a session ending however much the failing call looks like one.
+    Vanishes,
+}
+
+impl How {
+    fn script(&self) -> &'static str {
+        match self {
+            How::Steady => "",
+            How::Drops => "drop",
+            How::Gone => "drop,gone",
+            How::Vanishes => "drop,vanish",
+        }
+    }
 }
 
 /// A phone, a machine, and one session on it.
 async fn attached(name: &str, how: How) -> Session {
     let world = World::where_mm_is(name, Mm::OnPath);
-    // Named but not created: the stub makes the file the first time it drops
-    // and behaves from then on. It goes through the server rather than through
-    // this process, or it would reach every test running beside this one.
-    let marker = world.dir.join("dropped").display().to_string();
-    let extra: Vec<(&str, String)> = match how {
-        How::Steady => Vec::new(),
-        How::Drops => vec![("STUB_DROPS", marker)],
-        // The same file both ways round: dropping writes it, and its being
-        // there is what makes the next attach find nothing.
-        How::Gone => vec![("STUB_DROPS", marker.clone()), ("STUB_REFUSES", marker)],
-    };
+    // The counter goes through the server rather than through this process, or
+    // it would reach every test running beside this one.
+    let extra = vec![
+        ("STUB_SCRIPT", how.script().to_string()),
+        (
+            "STUB_COUNT",
+            world.dir.join("connections").display().to_string(),
+        ),
+    ];
     let sshd = Sshd::listening(&world.dir, generate().unwrap(), &extra).await;
 
     Session::open(
@@ -120,8 +136,22 @@ async fn a_resize_is_told_to_the_far_end() {
 
     session.resize(Size::new(30, 6));
 
-    let screen = until_it_says(&session, "size 30x6").await;
-    assert!(screen.contains("size 30x6"), "{screen}");
+    // The far end took 20 columns rather than the 30 asked for, standing in
+    // for another client holding the session narrower. What matters is that
+    // the screen here follows what it took: a copy reflowed to a shape the
+    // session never had scrolls at a different row from then on.
+    for _ in 0..200 {
+        let frame = session.take_frame();
+        if frame.cols == 20 && frame.rows == 6 {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let frame = session.take_frame();
+    panic!(
+        "the screen is {}x{}, not the {}x{} the far end took",
+        frame.cols, frame.rows, 20, 6
+    );
 }
 
 #[tokio::test]
@@ -188,4 +218,18 @@ async fn a_session_that_is_gone_when_the_connection_comes_back_is_not_waited_for
         }
     }
     panic!("still {:?} long after the session went", session.state());
+}
+
+#[tokio::test]
+async fn a_connection_lost_in_the_middle_of_attaching_is_waited_out() {
+    let session = attached("attach-vanishes", How::Vanishes).await;
+
+    // The listing was answered and the attach was not. Read as the node's
+    // answer, that is a session reported gone and a run that is over, while
+    // the session sits there on a machine that never noticed the phone left.
+    // It is the ordinary shape of a radio dropping.
+    let screen = until_it_says(&session, "ready").await;
+
+    assert!(screen.contains("ready"), "{screen}");
+    assert_eq!(session.state(), State::Attached);
 }

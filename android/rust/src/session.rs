@@ -16,7 +16,7 @@
 //! output is the one thing that could put the answer behind a queue.
 
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use manymux::client::attach::reconnect_after;
 use manymux::client::{Attached, SessionHalves, Update};
@@ -85,6 +85,9 @@ enum Say {
 /// an install being answered.
 const REACH_FOR: Duration = Duration::from_secs(10);
 
+/// How long an attach has to last before it counts as having worked.
+const STEADY: Duration = Duration::from_secs(30);
+
 /// Why an attach did not happen.
 ///
 /// The two mean opposite things and the distinction is the whole of what
@@ -92,6 +95,14 @@ const REACH_FOR: Duration = Duration::from_secs(10);
 /// waited for, while a node that answered and has no such session is a session
 /// that ended, and reconnecting to it every ten seconds forever is the bug
 /// this exists to stop.
+///
+/// `main.rs` draws the same line and then waits out both, on the grounds that
+/// a node restarting is a session that can come back under the same name. This
+/// end diverges deliberately: there is no cycle to fall back to and no hop to
+/// undo, so waiting means a phone showing a dead screen and a bar that says
+/// "reconnecting" forever about something the node has said outright is not
+/// there. Reporting it puts somebody back at the list, where they can start
+/// another one.
 enum Missed {
     Machine(anyhow::Error),
     Gone(String),
@@ -187,12 +198,6 @@ impl Session {
     pub fn state(&self) -> State {
         self.state.borrow().clone()
     }
-
-    /// Wait until the state is something other than what was last seen.
-    pub async fn changed(&mut self) -> State {
-        let _ = self.state.changed().await;
-        self.state.borrow().clone()
-    }
 }
 
 /// What it takes to attach, kept together because a reattach needs all of it
@@ -240,9 +245,9 @@ async fn keep_attached(
                 return;
             }
             Some(Ok(riding)) => {
-                tries = 0;
                 ever = true;
                 let _ = state.send(State::Attached);
+                let began = Instant::now();
                 match pump(riding, &screen, &mut said, &mut attaching.wanted).await {
                     Ending::Exited(code) => {
                         let _ = state.send(State::Ended { status: code });
@@ -252,7 +257,17 @@ async fn keep_attached(
                         let _ = state.send(State::Detached);
                         return;
                     }
-                    Ending::Lost => {}
+                    // The count starts again only for an attach that lasted,
+                    // or a machine that accepts a connection and hangs up
+                    // immediately would be retried every second forever, each
+                    // one a full handshake on a phone's battery. The same
+                    // reasoning as `peers::STEADY`, and the same shape of
+                    // machine behind it.
+                    Ending::Lost => {
+                        if began.elapsed() >= STEADY {
+                            tries = 0;
+                        }
+                    }
                 }
             }
             // The node answered and has no such session, which is an answer
@@ -343,22 +358,42 @@ async fn reaching(
 }
 
 /// Connect, climb the ladder, and attach.
+///
+/// What tells a session that ended from a connection that went is the
+/// *listing*, not which call failed. Reading the failure of `Stream::attach`
+/// as the node's answer, as this once did, was wrong twice over: that call
+/// begins with a request, so a radio dropping in the window before the answer
+/// arrives came back as a session that had ended, and the run was reported and
+/// over while the session sat there on a machine that never noticed.
+///
+/// The listing costs nothing, being the same round trip that climbs the
+/// ladder, and it is unambiguous: a node that answered with the sessions it
+/// has and did not name this one has said the session is gone.
 async fn attach(attaching: Attaching) -> Result<Riding, Missed> {
     let connection = Connection::open(&attaching.machine, &attaching.identity, &attaching.known)
         .await
         .map_err(Missed::Machine)?;
     let reached = reach(&connection).await.map_err(Missed::Machine)?;
+
+    if !reached
+        .sessions
+        .iter()
+        .any(|session| session.name == attaching.name)
+    {
+        return Err(Missed::Gone(format!(
+            "there is no session called {} on {} any more",
+            attaching.name,
+            attaching.machine.at()
+        )));
+    }
+
     // No history: the phone has no scrollback of its own to put it in, and the
     // node keeps the real one.
-    //
-    // A failure from here on is the node's answer rather than the machine's
-    // silence, which is what tells a session that ended from a connection that
-    // went.
     let attached = reached
         .stream
         .attach(&attaching.name, attaching.wanted, 0, false)
         .await
-        .map_err(|error| Missed::Gone(format!("{error:#}")))?;
+        .map_err(Missed::Machine)?;
     Ok(Riding {
         _connection: connection,
         attached,
@@ -422,6 +457,17 @@ async fn pump(
                 // Answered here and nowhere else. A client that waited for the
                 // app to draw before saying it was alive would be detached by
                 // the host for being in somebody's pocket.
+                // What the session actually became, which is not always what
+                // was asked for: the node takes the smallest across every
+                // attached client. Reflowing this end's copy to the size that
+                // was asked for, as it did before the node said, paints a
+                // screen the session never had and the two scroll at different
+                // rows from then on.
+                Ok(Update::Resized(size)) => {
+                    if painting.send(Paint::Resized(size)).await.is_err() {
+                        break Ending::Lost;
+                    }
+                }
                 Ok(Update::Ping) => {
                     if writer.pong().await.is_err() {
                         break Ending::Lost;
@@ -442,6 +488,10 @@ async fn pump(
                 }
                 Some(Say::Resize(size)) => {
                     *wanted = size;
+                    // Optimistically, and corrected by `Update::Resized` when
+                    // the node says what it took. A node too old to say leaves
+                    // this as the only answer there is, which is what happened
+                    // before it could.
                     if painting.send(Paint::Resized(size)).await.is_err() {
                         break Ending::Lost;
                     }

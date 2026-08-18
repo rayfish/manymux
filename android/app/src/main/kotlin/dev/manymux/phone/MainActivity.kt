@@ -54,6 +54,9 @@ class MainActivity : Activity() {
     /** The bar's own clock, kept so it can be stopped. */
     private var ticking: Runnable? = null
 
+    /** Whether everything has been let go of, so late work stays away. */
+    private var gone = false
+
     override fun onCreate(saved: Bundle?) {
         super.onCreate(saved)
         // App-private storage: the key this device is known by lives here and
@@ -66,6 +69,7 @@ class MainActivity : Activity() {
         super.onDestroy()
         // The session goes on running on the machine. This only stops watching
         // it, which is the whole point of the thing.
+        gone = true
         letGo()
         phone.close()
         elsewhere.shutdownNow()
@@ -134,6 +138,11 @@ class MainActivity : Activity() {
         elsewhere.execute {
             val answer = runCatching { phone.runningOn(machine) }
             here.post {
+                // The answer can arrive after somebody left: the executor
+                // cannot interrupt a thread sitting in a call across the
+                // boundary, so this lands on an activity that has already let
+                // go of everything.
+                if (isFinishing || gone) return@post
                 val rows = column()
                 answer
                     .onSuccess { sessions ->
@@ -146,8 +155,25 @@ class MainActivity : Activity() {
                         }
                     }
                     .onFailure { why ->
+                        val said = why.message ?: "could not reach it"
                         rows.addView(heading(machine.address))
-                        rows.addView(note(why.message ?: "could not reach it"))
+                        rows.addView(note(said))
+                        // The one failure with something to press: a key that
+                        // changed is either a machine that was reinstalled or
+                        // somebody in the middle, and only the person reading
+                        // it can say which. Saying so and offering nothing was
+                        // a dead end.
+                        if (said.contains("host key")) {
+                            rows.addView(
+                                Button(this).apply {
+                                    text = "it was reinstalled: forget the old key"
+                                    setOnClickListener {
+                                        phone.forget(machine)
+                                        listSessions(machine)
+                                    }
+                                },
+                            )
+                        }
                     }
                 rows.addView(
                     Button(this).apply {
@@ -174,6 +200,7 @@ class MainActivity : Activity() {
             // anything into yet.
             val answer = runCatching { phone.startOn(machine, Grid(80u, 24u)) }
             here.post {
+                if (isFinishing || gone) return@post
                 answer
                     .onSuccess { name -> open(machine, name) }
                     .onFailure { why -> say(why.message ?: "could not start one") }

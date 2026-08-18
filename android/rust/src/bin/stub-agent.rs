@@ -11,12 +11,15 @@
 //!
 //! - `STUB_FAILS`: complain and exit non-zero, which is a machine that has
 //!   `mm` and cannot run it.
-//! - `STUB_DROPS`: go away without a word the first time somebody attaches,
-//!   and behave from then on. The named file is how it remembers, since each
-//!   attach is a fresh process.
-//! - `STUB_REFUSES`: answer an attach with "no session", once the named file
-//!   exists. Pointed at the same file as `STUB_DROPS`, that is a connection
-//!   that dropped and a session that had ended by the time anybody came back.
+//! - `STUB_SCRIPT`: a comma-separated word per connection, saying what to do
+//!   with each in turn. `drop` answers the attach and then goes away without a
+//!   word; `vanish` answers the listing and goes away before answering the
+//!   attach, which is a connection dropping mid-exchange and is not a session
+//!   ending; `gone` leaves the session out of the listing and refuses the
+//!   attach, which is one that ended. Anything past the end of the script, and
+//!   any other word, behaves.
+//! - `STUB_COUNT`: the file the script is counted through. Each connection is
+//!   a fresh process, so a file is the only memory there is.
 
 use std::time::SystemTime;
 
@@ -25,6 +28,10 @@ use tokio::io::{AsyncWriteExt, stdin, stdout};
 
 /// What the one session is called, and what a test attaches to.
 const SESSION: &str = "build";
+
+/// The widest this stub will let a session be, so a resize is answered with
+/// something other than what was asked for.
+const CLIPPED: u16 = 20;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
@@ -37,6 +44,7 @@ async fn main() -> anyhow::Result<()> {
         std::process::exit(3);
     }
 
+    let doing = step();
     let mut reader = proto::FrameReader::new(stdin());
     let mut out = stdout();
     let mut attached = false;
@@ -45,6 +53,10 @@ async fn main() -> anyhow::Result<()> {
         match frame.tag {
             tag::REQUEST => {
                 let answer = match proto::decode::<Request>(&frame.body)? {
+                    // A machine whose session has ended answers the listing
+                    // without it, which is the answer a client reads to tell a
+                    // session that went from a machine that never spoke.
+                    Request::List if doing == "gone" => Response::Sessions(Vec::new()),
                     Request::List => Response::Sessions(vec![listed()]),
                     // Named after the command with a counter, the way a node
                     // names one, so a test can see that what came back is the
@@ -52,7 +64,10 @@ async fn main() -> anyhow::Result<()> {
                     Request::Spawn(spec) => Response::Spawned {
                         name: format!("{}-2", spec.command.first().cloned().unwrap_or_default()),
                     },
-                    Request::Attach { name, .. } if gone() => {
+                    // Gone mid-exchange: the listing was answered and this is
+                    // not going to be.
+                    Request::Attach { .. } if doing == "vanish" => std::process::exit(0),
+                    Request::Attach { name, .. } if doing == "gone" => {
                         Response::Error(format!("no session named {name}"))
                     }
                     Request::Attach { size, .. } => Response::Attached {
@@ -69,7 +84,7 @@ async fn main() -> anyhow::Result<()> {
                 proto::write_msg(&mut out, tag::RESPONSE, &answer).await?;
 
                 if attaching {
-                    if drops_this_time() {
+                    if doing == "drop" {
                         // Gone without a detach and without an exit, which is
                         // what a connection dropping looks like from here.
                         std::process::exit(0);
@@ -101,9 +116,14 @@ async fn main() -> anyhow::Result<()> {
                 out.flush().await?;
             }
             tag::DETACH => break,
+            // Answered the way a node answers: with the size it took, which
+            // is clipped here to stand in for another client holding the
+            // session narrower than this one asked for.
             tag::RESIZE => {
-                let size: Size = proto::decode(&frame.body)?;
-                let said = format!("size {}x{}", size.cols, size.rows);
+                let asked: Size = proto::decode(&frame.body)?;
+                let took = Size::new(asked.cols.min(CLIPPED), asked.rows);
+                proto::write_msg(&mut out, tag::SIZE, &took).await?;
+                let said = format!("size {}x{}", took.cols, took.rows);
                 proto::write_frame(&mut out, tag::DATA, said.as_bytes()).await?;
                 out.flush().await?;
             }
@@ -135,22 +155,21 @@ fn painted() -> String {
     screen.dump()
 }
 
-/// Whether the session has ended since the last attach.
-fn gone() -> bool {
-    std::env::var("STUB_REFUSES")
-        .ok()
-        .is_some_and(|marker| std::fs::metadata(marker).is_ok())
-}
-
-/// Whether this attach is the one that goes away.
-fn drops_this_time() -> bool {
-    let Ok(marker) = std::env::var("STUB_DROPS") else {
-        return false;
+/// What this connection is meant to do, from the script and the count.
+fn step() -> String {
+    let Ok(counting) = std::env::var("STUB_COUNT") else {
+        return String::new();
     };
-    // Each attach is a fresh process, so the file is the only memory there is.
-    if std::fs::metadata(&marker).is_ok() {
-        return false;
-    }
-    let _ = std::fs::write(&marker, b"dropped");
-    true
+    let so_far: usize = std::fs::read_to_string(&counting)
+        .ok()
+        .and_then(|count| count.trim().parse().ok())
+        .unwrap_or(0);
+    let _ = std::fs::write(&counting, (so_far + 1).to_string());
+
+    std::env::var("STUB_SCRIPT")
+        .unwrap_or_default()
+        .split(',')
+        .nth(so_far)
+        .unwrap_or_default()
+        .to_string()
 }

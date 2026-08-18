@@ -166,7 +166,10 @@ impl Screen {
             cols: self.size.cols,
             rows: self.size.rows,
             cursor: Cursor {
-                col: cursor.col as u16,
+                // Clamped, because `avt` lets the column sit one past the last
+                // one while a wrap is pending, and the widget would draw the
+                // block in a column the screen has not got.
+                col: (cursor.col as u16).min(self.size.cols.saturating_sub(1)),
                 row: cursor.row as u16,
                 visible: cursor.visible,
             },

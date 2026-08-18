@@ -1609,6 +1609,11 @@ async fn pump(
                 // does not hold the writing half to answer with.
                 Update::Ping => writer.pong().await?,
                 Update::Exited(code) => return Ok(Outcome::Exited(code)),
+                // Nothing to do here. This client's screen is the terminal's,
+                // which is whatever size the terminal is, and the node clips
+                // what it paints to the size it took. It is a client keeping a
+                // screen of its own that has to hear this.
+                Update::Resized(_) => {}
                 Update::Disconnected => return Ok(Outcome::Disconnected),
             },
             _ = winch.recv() => {
@@ -1889,7 +1894,8 @@ async fn paste(
                 Update::History(_)
                 | Update::View(_)
                 | Update::Found(_)
-                | Update::Renamed(_) => {}
+                | Update::Renamed(_)
+                | Update::Resized(_) => {}
                 Update::Exited(code) => return Ok(Pasted::Ended(Outcome::Exited(code))),
                 Update::Disconnected => return Ok(Pasted::Ended(Outcome::Disconnected)),
             },

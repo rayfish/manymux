@@ -141,6 +141,22 @@ pub mod tag {
     /// A node too old to know the tag skips it in silence, which is why
     /// [`super::Response::Attached`] says whether this one does.
     pub const RENAME: u8 = 0x1d;
+
+    /// The size the session settled on, sent whenever it changes.
+    ///
+    /// A client's [`RESIZE`] is a request rather than an instruction: the node
+    /// takes the smallest size across every attached client, so a client that
+    /// asked for a bigger screen than another one has been given a smaller
+    /// one and, until this existed, was told nothing about it. That mattered
+    /// for a client that keeps a screen of its own, which a mobile one does:
+    /// it reflowed its own copy to a size the session never took, and from
+    /// then on the two pictures scrolled at different rows and nothing put
+    /// them back.
+    ///
+    /// Unsolicited and unanswered, so a client too old to know the tag skips
+    /// it and behaves exactly as it did. The attach response carries the same
+    /// number for the same reason; this is that answer kept up to date.
+    pub const SIZE: u8 = 0x1e;
 }
 
 /// The largest file a paste may carry. A screenshot is a couple of megabytes;

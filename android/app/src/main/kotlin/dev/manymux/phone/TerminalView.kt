@@ -57,8 +57,6 @@ class TerminalView(context: Context) : View(context), Choreographer.FrameCallbac
     private var cellWidth = 0f
     private var lineHeight = 0f
     private var baseline = 0f
-    private var cols = 0
-    private var rowCount = 0
 
     init {
         isFocusable = true
@@ -73,9 +71,10 @@ class TerminalView(context: Context) : View(context), Choreographer.FrameCallbac
     private fun grid(): Grid {
         val across = if (cellWidth > 0) (width / cellWidth).toInt() else 0
         val down = if (lineHeight > 0) (height / lineHeight).toInt() else 0
-        cols = across.coerceAtLeast(1)
-        rowCount = down.coerceAtLeast(1)
-        return Grid(cols.toUShort(), rowCount.toUShort())
+        return Grid(
+            across.coerceAtLeast(1).toUShort(),
+            down.coerceAtLeast(1).toUShort(),
+        )
     }
 
     override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {

@@ -186,3 +186,36 @@ jobs:
       # on the runner.
       - name: Test
         run: cargo test --locked
+
+  # The app, which nothing above compiles: the job beside this one builds the
+  # Rust shim and stops at the boundary, leaving the Kotlin that calls it
+  # checked by nobody. `assembleDebug` runs `build-rust.sh` first, so this
+  # covers the generated bindings agreeing with the library as well.
+  app:
+    name: android app
+    runs-on: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup target add aarch64-linux-android x86_64-linux-android
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: android/rust
+          shared-key: "android-app"
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+
+      - name: Build the APK
+        working-directory: android
+        run: ANDROID_NDK_HOME="$ANDROID_NDK_LATEST_HOME" ./gradlew --no-daemon assembleDebug

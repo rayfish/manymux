@@ -179,22 +179,38 @@ impl KnownHosts {
     }
 }
 
-/// Write a file nobody else on the device can read.
+/// Write a file nobody else on the device can read, all at once or not at all.
 ///
-/// App-private storage is already per-app, so this is the second lock rather
-/// than the only one; it is here because the same code runs in the host-target
-/// example, where the directory is an ordinary one in a home.
+/// Written beside and renamed over, rather than truncated in place. Both files
+/// here are ones a torn write ruins outright: a zero-byte `id_ed25519` cannot
+/// be read and cannot be regenerated either, since a key file that exists and
+/// will not parse is deliberately an error rather than a reason to make a
+/// second key — so the app would fail to start, every time, with nothing to do
+/// about it but clear its storage. `known_hosts` is rewritten whole on every
+/// first contact with a machine, so the same accident drops every host key
+/// this device has ever recorded and quietly puts every machine back to trust
+/// on first use.
+///
+/// App-private storage is already per-app, so the mode is the second lock
+/// rather than the only one; it is here because the same code runs in the
+/// host-target example, where the directory is an ordinary one in a home.
 fn write_privately(path: &Path, bytes: &[u8]) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
+    let beside = path.with_extension("writing");
     let mut file: File = OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(true)
         .mode(0o600)
-        .open(path)?;
+        .open(&beside)?;
     file.write_all(bytes)?;
+    // Before the rename, or a crash in between leaves the name pointing at a
+    // file whose contents never reached the disk.
+    file.sync_all()?;
+    drop(file);
+    fs::rename(&beside, path)?;
     Ok(())
 }
 

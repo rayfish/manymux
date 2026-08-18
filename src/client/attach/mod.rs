@@ -153,8 +153,11 @@ pub async fn collect_until(
             // renders sessions itself reads these from its own subscription.
             Update::Event(_) => continue,
             // Nothing here scrolls, so nothing here asked for a window or went
-            // looking through one, and nothing here renames.
-            Update::View(_) | Update::Found(_) | Update::Renamed(_) => continue,
+            // looking through one, nothing here renames, and nothing here has
+            // a screen to reflow.
+            Update::View(_) | Update::Found(_) | Update::Renamed(_) | Update::Resized(_) => {
+                continue;
+            }
             Update::Exited(code) => Outcome::Exited(code),
             Update::Disconnected => Outcome::Disconnected,
         };

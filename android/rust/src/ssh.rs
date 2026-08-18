@@ -17,6 +17,7 @@
 
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::{Result, bail};
 use manymux::client::{PROGRAMS, Stream};
@@ -60,9 +61,16 @@ impl Watch {
     /// A rung that had no `mm` is at EOF by the time anybody asks, so the wait
     /// is already over; polling would race the far end into answering `None`
     /// and read a missing `mm` as a machine that broke.
+    ///
+    /// Bounded, because a request can fail for reasons that leave the far end
+    /// running: a frame that would not decode is an error here and a command
+    /// still sitting there at the other end, and an unbounded wait on a
+    /// process that is not going to exit hangs the one call the app makes
+    /// before it has anything to show. The library's own version waits on a
+    /// child it can see; there is no process on this side of an ssh channel.
     pub async fn ended(&mut self) -> Option<i32> {
         if self.status.borrow().is_none() {
-            let _ = self.status.changed().await;
+            let _ = tokio::time::timeout(SETTLING, self.status.changed()).await;
         }
         *self.status.borrow()
     }
@@ -120,6 +128,13 @@ impl Ending {
         let _ = self.status.send(code);
     }
 }
+
+/// How long a command that has failed is given to say how it ended.
+///
+/// A command whose spelling was wrong has already exited by the time anybody
+/// asks, so this is not the ordinary path; it is the bound on the ones that
+/// have not.
+const SETTLING: Duration = Duration::from_secs(2);
 
 /// How much of what the far end complained about is worth keeping.
 const KEPT: usize = 8 * 1024;

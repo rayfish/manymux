@@ -163,14 +163,21 @@ impl Attachment {
     ///
     /// A viewer never joins that negotiation, so its window changing size is
     /// nothing to do with the session's geometry.
-    pub fn resize(&self, size: Size) {
+    /// Ask for a size, and answer with the one the session took.
+    ///
+    /// Not always the one asked for: the smallest across every attached client
+    /// wins, so a client that asked for more than somebody else's terminal has
+    /// been given less. A client with a screen of its own has to be told, or it
+    /// reflows its copy to a shape the session never had.
+    pub fn resize(&self, size: Size) -> Size {
         if self.read_only {
-            return;
+            return held(&self.session.state).size;
         }
         let mut state = held(&self.session.state);
         state.clients.insert(self.id, size.sane());
         let effective = state.effective_size();
         self.session.apply_size(&mut state, effective);
+        effective
     }
 
     /// Whether the program is expecting pastes to be bracketed, which decides

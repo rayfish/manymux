@@ -34,7 +34,7 @@ build() {
         "CC_$(echo "$target" | tr - _)=$clang" \
         "AR_$(echo "$target" | tr - _)=$tools/llvm-ar" \
         "CARGO_TARGET_${upper}_LINKER=$clang" \
-        cargo build --release --manifest-path "$crate/Cargo.toml" --target "$target"
+        cargo build --release --locked --manifest-path "$crate/Cargo.toml" --target "$target"
     mkdir -p "$out/jniLibs/$abi"
     cp "$crate/target/$target/release/libmanymux_android.so" "$out/jniLibs/$abi/"
 }
@@ -44,13 +44,13 @@ build x86_64-linux-android x86_64 x86_64-linux-android
 
 # The bindings, from a host build of the same crate: uniffi reads the library's
 # own metadata, and a host library carries the same metadata as a cross one.
-cargo build --release --manifest-path "$crate/Cargo.toml"
+cargo build --release --locked --manifest-path "$crate/Cargo.toml"
 case "$(uname -s)" in
     Darwin) host_library="$crate/target/release/libmanymux_android.dylib" ;;
     *) host_library="$crate/target/release/libmanymux_android.so" ;;
 esac
 rm -rf "$out/uniffi"
-cargo run --release --quiet --manifest-path "$crate/Cargo.toml" --bin uniffi-bindgen -- \
+cargo run --release --locked --quiet --manifest-path "$crate/Cargo.toml" --bin uniffi-bindgen -- \
     generate \
     --library "$host_library" \
     --language kotlin \
