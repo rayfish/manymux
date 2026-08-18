@@ -18,7 +18,7 @@ use manymux::proto::{Size, SpawnSpec};
 use tokio::runtime::Runtime;
 
 use crate::keys::{Identity, KnownHosts};
-use crate::machine::{Connection, Machine};
+use crate::machine::{Connection, Connections, Machine};
 use crate::screen::Frame;
 use crate::session::{Session, State};
 use crate::ssh::{reach, start};
@@ -90,6 +90,10 @@ pub struct Phone {
     runtime: Arc<Runtime>,
     identity: Identity,
     known: KnownHosts,
+    /// Shared by everything that reaches a machine, which is what makes going
+    /// back to the list and into another session cost a round trip rather than
+    /// a handshake.
+    connections: Arc<Connections>,
 }
 
 #[uniffi::export]
@@ -106,6 +110,7 @@ impl Phone {
             runtime: Arc::new(runtime),
             identity: Identity::kept_at(&dir.join("id_ed25519"))?,
             known: KnownHosts::at(dir.join("known_hosts")),
+            connections: Arc::new(Connections::none()),
         }))
     }
 
@@ -124,9 +129,18 @@ impl Phone {
     /// app's main thread.
     pub fn running_on(&self, machine: Machine) -> Result<Vec<Running>, Trouble> {
         self.runtime.block_on(async {
-            let connection = Connection::open(&machine, &self.identity, &self.known).await?;
-            let reached = reach(&connection).await?;
-            connection.close().await;
+            let connection = self.reach_for(&machine).await?;
+            let reached = match reach(&*connection).await {
+                Ok(reached) => reached,
+                Err(error) => {
+                    // Held connections go stale silently on a phone, so a
+                    // failure on one is a failure of the pool as much as of
+                    // the request: dropped here, the retry somebody makes by
+                    // pressing the button again opens a fresh one.
+                    self.connections.forget().await;
+                    return Err(error.into());
+                }
+            };
             Ok(reached
                 .sessions
                 .into_iter()
@@ -152,9 +166,9 @@ impl Phone {
     /// Blocks, like [`Phone::running_on`].
     pub fn start_on(&self, machine: Machine, grid: Grid) -> Result<String, Trouble> {
         self.runtime.block_on(async {
-            let connection = Connection::open(&machine, &self.identity, &self.known).await?;
+            let connection = self.reach_for(&machine).await?;
             let name = start(
-                &connection,
+                &*connection,
                 SpawnSpec {
                     name: None,
                     command: Vec::new(),
@@ -164,7 +178,6 @@ impl Phone {
                 },
             )
             .await?;
-            connection.close().await;
             Ok(name)
         })
     }
@@ -184,6 +197,7 @@ impl Phone {
                 machine,
                 self.identity.clone(),
                 self.known.clone(),
+                Arc::clone(&self.connections),
                 name,
                 grid.into(),
             ),
@@ -192,9 +206,27 @@ impl Phone {
 
     /// Forget a machine's host key, which is what somebody says after deciding
     /// that a key which changed is a machine they reinstalled.
+    ///
+    /// The connection goes with it: one held to the machine whose key is being
+    /// argued about is one authenticated against the key that is in doubt.
     pub fn forget(&self, machine: Machine) -> Result<(), Trouble> {
         self.known.forget(&machine.at())?;
+        self.runtime.block_on(self.connections.forget());
         Ok(())
+    }
+}
+
+impl Phone {
+    /// The connection to a machine, from the pool.
+    ///
+    /// Not exported: the app names a machine and this decides whether that
+    /// costs a handshake, which is exactly the decision it should not have to
+    /// make or even know about.
+    async fn reach_for(&self, machine: &Machine) -> Result<Arc<Connection>, Trouble> {
+        Ok(self
+            .connections
+            .to(machine, &self.identity, &self.known)
+            .await?)
     }
 }
 

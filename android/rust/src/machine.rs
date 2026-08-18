@@ -20,6 +20,7 @@ use russh::keys::ssh_key::PublicKey;
 use russh::{ChannelMsg, Disconnect};
 use tokio::io::AsyncWriteExt;
 
+use crate::AsyncMutex;
 use crate::keys::{Identity, KnownHosts, Verdict};
 use crate::ssh::{Ending, Exec, Remote};
 
@@ -122,6 +123,90 @@ impl Connection {
             .handle
             .disconnect(Disconnect::ByApplication, "", "")
             .await;
+    }
+
+    /// Whether this connection has gone, so nothing tries to open a channel on
+    /// the far end of a radio that slept.
+    pub fn is_closed(&self) -> bool {
+        self.handle.is_closed()
+    }
+}
+
+/// The ssh connections this device is holding on to.
+///
+/// `manymux::ssh` gets this free from OpenSSH: `ControlMaster=auto` puts every
+/// command to a host on one connection, so the second one skips the handshake.
+/// There is no ssh binary here and so no control socket, which leaves the
+/// sharing to be done in the process.
+///
+/// It is worth more here than it is there. A phone's model is a list you leave
+/// a session for and come back through, and a key exchange plus a public-key
+/// auth on a radio that has to wake up for them is most of the time between
+/// tapping a row and seeing the session. Without this, every glance at the list
+/// pays it twice.
+///
+/// One machine, because that is what this version reaches. A second entry is a
+/// map keyed by [`Machine::at`] and nothing else about this changes.
+pub struct Connections {
+    /// Async, and the one lock here that is: what it protects is the thing
+    /// being waited for, so two callers arriving together share one handshake
+    /// rather than racing to make two. A `std` lock cannot be held across the
+    /// connect, and dropping it to connect is the race.
+    holding: AsyncMutex<Option<Held>>,
+}
+
+/// One machine's connection, and which machine it is to.
+struct Held {
+    at: String,
+    connection: Arc<Connection>,
+}
+
+impl Default for Connections {
+    fn default() -> Self {
+        Self::none()
+    }
+}
+
+impl Connections {
+    /// Holding nothing yet.
+    pub fn none() -> Self {
+        Self {
+            holding: AsyncMutex::new(None),
+        }
+    }
+
+    /// The connection to `machine`, opening one if what is held is to another
+    /// machine, has gone, or was never there.
+    pub async fn to(
+        &self,
+        machine: &Machine,
+        identity: &Identity,
+        known: &KnownHosts,
+    ) -> Result<Arc<Connection>> {
+        let at = machine.at();
+        let mut holding = self.holding.lock().await;
+        if let Some(held) = holding.as_ref()
+            && held.at == at
+            && !held.connection.is_closed()
+        {
+            return Ok(Arc::clone(&held.connection));
+        }
+        let connection = Arc::new(Connection::open(machine, identity, known).await?);
+        *holding = Some(Held {
+            at,
+            connection: Arc::clone(&connection),
+        });
+        Ok(connection)
+    }
+
+    /// Let go of what is held, after something on it failed.
+    ///
+    /// A connection that answered a moment ago and has stopped answering is
+    /// not always closed: a radio that slept leaves one that looks open and
+    /// never completes anything. So a failure says so here rather than waiting
+    /// for `is_closed` to notice, which on that connection it never will.
+    pub async fn forget(&self) {
+        *self.holding.lock().await = None;
     }
 }
 

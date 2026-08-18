@@ -25,7 +25,7 @@ use manymux::proto::Size;
 use tokio::sync::{mpsc, watch};
 
 use crate::keys::{Identity, KnownHosts};
-use crate::machine::{Connection, Machine};
+use crate::machine::{Connection, Connections, Machine};
 use crate::screen::{Frame, Screen};
 use crate::ssh::{ask, reach};
 
@@ -144,6 +144,7 @@ impl Session {
         machine: Machine,
         identity: Identity,
         known: KnownHosts,
+        connections: Arc<Connections>,
         name: String,
         size: Size,
     ) -> Self {
@@ -156,6 +157,7 @@ impl Session {
                 machine,
                 identity,
                 known,
+                connections,
                 name,
                 wanted: size,
             },
@@ -210,6 +212,9 @@ struct Attaching {
     machine: Machine,
     identity: Identity,
     known: KnownHosts,
+    /// Shared with the app, so a session opened after somebody went back to
+    /// the list rides the connection the list was drawn over.
+    connections: Arc<Connections>,
     name: String,
     /// The size the phone is asking for, which is not the size the session
     /// settles on: the node takes the smallest of every attached client's.
@@ -218,10 +223,12 @@ struct Attaching {
 
 /// One attach, and the connection it is riding on.
 ///
-/// The connection is held because dropping it closes the ssh session under the
-/// channel the attach is on.
+/// The connection is held because dropping the last handle to it closes the
+/// ssh session under the channel the attach is on. Shared rather than owned:
+/// the pool holds one too, which is what lets the next attach skip the
+/// handshake.
 struct Riding {
-    _connection: Connection,
+    _connection: Arc<Connection>,
     attached: Attached,
 }
 
@@ -370,10 +377,23 @@ async fn reaching(
 /// ladder, and it is unambiguous: a node that answered with the sessions it
 /// has and did not name this one has said the session is gone.
 async fn attach(attaching: Attaching) -> Result<Riding, Missed> {
-    let connection = Connection::open(&attaching.machine, &attaching.identity, &attaching.known)
+    let connection = attaching
+        .connections
+        .to(&attaching.machine, &attaching.identity, &attaching.known)
         .await
         .map_err(Missed::Machine)?;
-    let reached = reach(&connection).await.map_err(Missed::Machine)?;
+
+    // A pooled connection is one that worked a moment ago, which on a phone is
+    // no promise at all: a radio that slept leaves one that looks open and
+    // completes nothing. So a failure on it puts it out of the pool rather
+    // than leaving the next attempt to fail on the same dead handle.
+    let reached = match reach(&*connection).await {
+        Ok(reached) => reached,
+        Err(error) => {
+            attaching.connections.forget().await;
+            return Err(Missed::Machine(error));
+        }
+    };
 
     if !reached
         .sessions
@@ -389,7 +409,7 @@ async fn attach(attaching: Attaching) -> Result<Riding, Missed> {
 
     // A stream of its own, because the listing spent the one it came on: a
     // node answers one request per connection and hangs up.
-    let stream = ask(&connection, reached.program)
+    let stream = ask(&*connection, reached.program)
         .await
         .map_err(Missed::Machine)?;
 

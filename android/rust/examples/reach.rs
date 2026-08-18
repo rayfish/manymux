@@ -16,12 +16,13 @@
 //! this in.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Result, bail};
 use manymux::proto::Size;
 use manymux_android::keys::{Identity, KnownHosts};
-use manymux_android::machine::{Connection, Machine};
+use manymux_android::machine::{Connection, Connections, Machine};
 use manymux_android::session::{Session, State};
 use manymux_android::ssh::reach;
 
@@ -57,7 +58,14 @@ async fn main() -> Result<()> {
         }
         Some(name) => {
             let size = Size::new(80, 24);
-            let session = Session::open(machine, identity, known, name, size);
+            let session = Session::open(
+                machine,
+                identity,
+                known,
+                Arc::new(Connections::none()),
+                name,
+                size,
+            );
             print(&session, size).await;
         }
     }

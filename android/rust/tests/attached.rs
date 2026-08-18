@@ -11,13 +11,14 @@ mod sshd;
 mod world;
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use manymux::proto::Size;
 use manymux_android::keys::{Identity, KnownHosts, generate};
-use manymux_android::machine::Machine;
+use manymux_android::machine::{Connections, Machine};
 use manymux_android::session::{Session, State};
-use sshd::Sshd;
+use sshd::{Serving, Sshd};
 use world::{Mm, World};
 
 /// How the machine at the other end behaves, one word per connection.
@@ -64,15 +65,42 @@ struct Reaching {
     /// The file the stub counts its connections through, which is the only
     /// place a test can see how many the client actually opened.
     connections: PathBuf,
+    /// Everything needed to reach that machine again, so a test can leave a
+    /// session and come back to one the way somebody does.
+    at: Reachable,
+    sshd: Sshd,
+}
+
+/// A machine, and what it takes to get onto it.
+struct Reachable {
+    machine: Machine,
+    identity: Identity,
+    known: KnownHosts,
+    connections: Arc<Connections>,
+}
+
+impl Reachable {
+    /// Attach to a session on it, the way the app does when somebody taps a
+    /// row.
+    fn attach(&self, name: &str) -> Session {
+        Session::open(
+            self.machine.clone(),
+            self.identity.clone(),
+            self.known.clone(),
+            Arc::clone(&self.connections),
+            name.to_string(),
+            Size::new(40, 8),
+        )
+    }
 }
 
 /// A phone, a machine, and one session on it.
 async fn attached(name: &str, how: How) -> Session {
-    reaching(name, how, usize::MAX).await.session
+    reaching(name, how, Serving::forever()).await.session
 }
 
-/// The same, where the machine stops speaking after `serving` connections.
-async fn reaching(name: &str, how: How, serving: usize) -> Reaching {
+/// The same, where the machine stops answering on `serving`'s terms.
+async fn reaching(name: &str, how: How, serving: Serving) -> Reaching {
     let world = World::where_mm_is(name, Mm::OnPath);
     // The counter goes through the server rather than through this process, or
     // it would reach every test running beside this one.
@@ -83,20 +111,22 @@ async fn reaching(name: &str, how: How, serving: usize) -> Reaching {
     ];
     let sshd = Sshd::listening_until(&world.dir, generate().unwrap(), &extra, serving).await;
 
-    let session = Session::open(
-        Machine {
+    let at = Reachable {
+        machine: Machine {
             address: "127.0.0.1".to_string(),
             port: sshd.port,
             user: "whoever".to_string(),
         },
-        Identity::kept_at(&world.dir.join("id_ed25519")).unwrap(),
-        KnownHosts::at(world.dir.join("known_hosts")),
-        "build".to_string(),
-        Size::new(40, 8),
-    );
+        identity: Identity::kept_at(&world.dir.join("id_ed25519")).unwrap(),
+        known: KnownHosts::at(world.dir.join("known_hosts")),
+        connections: Arc::new(Connections::none()),
+    };
+    let session = at.attach("build");
     Reaching {
         session,
         connections,
+        at,
+        sshd,
     }
 }
 
@@ -128,8 +158,25 @@ async fn until_it_says(session: &Session, wanted: &str) -> String {
 }
 
 #[tokio::test]
+async fn coming_back_to_a_machine_uses_the_connection_that_is_already_open() {
+    let reaching = reaching("attach-again", How::Steady, Serving::forever()).await;
+    until_it_says(&reaching.session, "ready").await;
+
+    // Back to the list, and into a session again: what somebody does every
+    // time they check on one thing and then another. The attach is torn down
+    // and rebuilt, which is the app's model and is fine; what must not be torn
+    // down with it is the ssh connection, or every glance at a list costs a key
+    // exchange and an auth on a radio that has to wake up for it.
+    reaching.session.detach();
+    let again = reaching.at.attach("build");
+    until_it_says(&again, "ready").await;
+
+    assert_eq!(reaching.sshd.connections(), 1);
+}
+
+#[tokio::test]
 async fn the_listing_and_the_attach_are_asked_on_connections_of_their_own() {
-    let reaching = reaching("attach-apiece", How::Steady, usize::MAX).await;
+    let reaching = reaching("attach-apiece", How::Steady, Serving::forever()).await;
 
     until_it_says(&reaching.session, "ready").await;
 
@@ -290,7 +337,9 @@ async fn an_attempt_that_never_answers_is_given_up_on() {
     // The first connection attaches and drops; every one after it is accepted
     // and never spoken to, which is a captive portal or a wedged sshd and is
     // the one failure that never finishes by itself.
-    let session = reaching("attach-wedged", How::Late, 1).await.session;
+    let session = reaching("attach-wedged", How::Late, Serving::going_mid_session())
+        .await
+        .session;
     until_it_says(&session, "ready").await;
 
     // A second wait, and not the first: the first is the drop being noticed,

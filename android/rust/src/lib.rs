@@ -14,6 +14,15 @@
 
 uniffi::setup_scaffolding!();
 
+/// The one kind of lock that may be held across an await.
+///
+/// Everything else here takes a `std` one through `manymux::lock::held`, which
+/// `clippy::await_holding_lock` enforces. The exception earns its name in
+/// [`machine::Connections`], where what the lock protects *is* the thing being
+/// waited for: two callers wanting a machine at once should share one
+/// handshake, and serialising them means holding the lock while it happens.
+pub type AsyncMutex<T> = tokio::sync::Mutex<T>;
+
 pub mod ffi;
 pub mod keys;
 pub mod machine;

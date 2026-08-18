@@ -15,10 +15,11 @@
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use russh::keys::PrivateKey;
 use russh::server::{self, Auth, Handler, Msg, Server, Session};
-use russh::{Channel, ChannelId};
+use russh::{Channel, ChannelId, Disconnect};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::process::{ChildStdin, Command};
@@ -29,16 +30,66 @@ use tokio::process::{ChildStdin, Command};
 /// happens when it changes.
 pub struct Sshd {
     pub port: u16,
+    /// How many TCP connections have been accepted, which is the only place a
+    /// test can see the difference between a second channel and a second
+    /// handshake. They cost wildly different amounts on a phone and look
+    /// identical from above.
+    accepted: Arc<AtomicUsize>,
+}
+
+impl Sshd {
+    /// How many separate ssh connections the client has made.
+    pub fn connections(&self) -> usize {
+        self.accepted.load(Ordering::Relaxed)
+    }
+}
+
+/// How long the machine keeps answering, and how it stops.
+#[derive(Clone, Copy)]
+pub struct Serving {
+    /// Connections after this many are accepted and never spoken to.
+    pub until: usize,
+    /// How many commands a connection serves before it is disconnected.
+    ///
+    /// Counted per connection rather than switched on, because a command
+    /// ending and a connection going are different machines and the client
+    /// tells them apart: a command that exits is a session that ended on a
+    /// machine still sitting there, and the connection is worth keeping, since
+    /// the next attach rides it and skips a handshake. Only the connection
+    /// going puts the client back to making one.
+    pub commands: usize,
+}
+
+impl Serving {
+    pub fn forever() -> Self {
+        Self {
+            until: usize::MAX,
+            commands: usize::MAX,
+        }
+    }
+
+    /// One connection that answers a listing and an attach and then goes, with
+    /// every connection after it accepted and never spoken to.
+    ///
+    /// The shape of a phone whose radio slept in the middle of a session: what
+    /// it was on is gone, and what it can reach now answers TCP and nothing
+    /// else.
+    pub fn going_mid_session() -> Self {
+        Self {
+            until: 1,
+            commands: 2,
+        }
+    }
 }
 
 impl Sshd {
     /// Start one, serving commands in `root` with `extra` in their environment.
     pub async fn listening(root: &Path, key: PrivateKey, extra: &[(&str, String)]) -> Self {
-        Self::listening_until(root, key, extra, usize::MAX).await
+        Self::listening_until(root, key, extra, Serving::forever()).await
     }
 
-    /// The same, but the connections after `serving` are accepted and never
-    /// spoken to.
+    /// The same, but the connections after `serving.until` are accepted and
+    /// never spoken to.
     ///
     /// A TCP that connects to something which never sends a banner is what a
     /// captive portal, a middlebox or a wedged sshd looks like from here, and
@@ -48,7 +99,7 @@ impl Sshd {
         root: &Path,
         key: PrivateKey,
         extra: &[(&str, String)],
-        serving: usize,
+        serving: Serving,
     ) -> Self {
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -62,12 +113,19 @@ impl Sshd {
             .iter()
             .map(|(name, value)| ((*name).to_string(), value.clone()))
             .collect();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let counting = Arc::clone(&accepted);
         tokio::spawn(async move {
-            let mut machine = Machine { root, extra };
+            let mut machine = Machine {
+                root,
+                extra,
+                commands: serving.commands,
+            };
             let mut taken = 0usize;
             while let Ok((socket, from)) = listener.accept().await {
                 taken += 1;
-                if taken > serving {
+                counting.store(taken, Ordering::Relaxed);
+                if taken > serving.until {
                     // Held open and never spoken to. Dropping it would be a
                     // refusal, which is a different thing entirely: a refusal
                     // fails at once and this is what never finishes.
@@ -87,13 +145,15 @@ impl Sshd {
             }
         });
 
-        Self { port }
+        Self { port, accepted }
     }
 }
 
 /// The far end: a home directory and a PATH, and a shell to run commands with.
 struct Machine {
     root: PathBuf,
+    /// How many commands each connection serves before it is disconnected.
+    commands: usize,
     /// What the tests need in the environment of whatever is run. The far end
     /// of an ssh is reached through a shell, so there is nowhere else to put
     /// it, and setting it in this process would leak into every test running
@@ -108,6 +168,8 @@ impl Server for Machine {
         Shell {
             root: self.root.clone(),
             extra: self.extra.clone(),
+            commands: self.commands,
+            served: 0,
             stdin: None,
         }
     }
@@ -117,6 +179,9 @@ impl Server for Machine {
 struct Shell {
     root: PathBuf,
     extra: Vec<(String, String)>,
+    commands: usize,
+    /// How many commands this connection has been asked for.
+    served: usize,
     /// Held so that what the client writes reaches the command's stdin, which
     /// is the whole protocol once a rung has answered.
     stdin: Option<ChildStdin>,
@@ -186,6 +251,8 @@ impl Handler for Shell {
         let mut out = child.stdout.take().unwrap();
         let mut err = child.stderr.take().unwrap();
         let handle = session.handle();
+        self.served += 1;
+        let going = self.served >= self.commands;
 
         session.channel_success(channel)?;
 
@@ -227,6 +294,14 @@ impl Handler for Shell {
                 let _ = handle.exit_status_request(channel, status as u32).await;
             }
             let _ = handle.close(channel).await;
+            // A machine that went, rather than a command that finished. The
+            // client keeps the connection across the second and only the first
+            // puts it back to making one.
+            if going {
+                let _ = handle
+                    .disconnect(Disconnect::ByApplication, String::new(), String::new())
+                    .await;
+            }
         });
 
         Ok(())
