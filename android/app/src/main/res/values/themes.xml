@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  One theme, always dark, rather than following the system.
+
+  A terminal is a dark surface whatever the phone is set to: the session's own
+  colours are chosen against a dark ground by every program that sets any, and
+  a light chrome around a dark grid reads as two applications stitched together.
+  So this is a deliberate single look rather than an omission.
+-->
+<resources>
+    <style name="Theme.Manymux" parent="@android:style/Theme.Material.NoActionBar">
+        <item name="android:colorBackground">@color/ground</item>
+        <item name="android:windowBackground">@color/ground</item>
+        <item name="android:colorAccent">@color/accent</item>
+        <item name="android:colorControlActivated">@color/accent</item>
+        <item name="android:colorControlNormal">@color/dim</item>
+        <item name="android:textColorPrimary">@color/text</item>
+        <item name="android:textColorSecondary">@color/dim</item>
+        <item name="android:textColorHint">@color/hint</item>
+        <item name="android:statusBarColor">@color/ground</item>
+        <item name="android:navigationBarColor">@color/ground</item>
+    </style>
+</resources>

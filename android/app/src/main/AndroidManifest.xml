@@ -5,11 +5,6 @@
          connection to a machine somebody named. -->
     <uses-permission android:name="android.permission.INTERNET" />
 
-    <!-- Back is read in `MainActivity.onBackPressed`. From Android 15 an app
-         that targets it gets predictive back by default and the platform
-         delivers back through `OnBackInvokedDispatcher` instead; a plain
-         activity that registers nothing there would lose the one gesture that
-         gets you out of a session. The animation is worth less than that. -->
     <!-- `smallestScreenSize` and `density` are the two a foldable turns on.
          Unfolding changes the smallest screen dimension, and an undeclared
          configuration change destroys and recreates the activity: the attach
@@ -19,9 +14,11 @@
          what the terminal wants anyway. -->
     <application
         android:allowBackup="false"
-        android:enableOnBackInvokedCallback="false"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round"
         android:label="manymux"
-        android:supportsRtl="true">
+        android:supportsRtl="true"
+        android:theme="@style/Theme.Manymux">
         <activity
             android:name=".MainActivity"
             android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|density|keyboardHidden"

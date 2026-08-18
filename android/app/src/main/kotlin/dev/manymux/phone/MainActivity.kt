@@ -5,6 +5,10 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.SharedPreferences
+import android.graphics.Color
+import android.graphics.Typeface
+import android.graphics.drawable.GradientDrawable
+import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -14,13 +18,13 @@ import android.view.View
 import android.view.ViewGroup.LayoutParams.MATCH_PARENT
 import android.view.ViewGroup.LayoutParams.WRAP_CONTENT
 import android.view.inputmethod.InputMethodManager
-import android.widget.Button
 import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.PopupMenu
 import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
+import android.window.OnBackInvokedDispatcher
 import java.util.concurrent.Executors
 import uniffi.manymux_android.Attach
 import uniffi.manymux_android.Grid
@@ -38,15 +42,18 @@ import uniffi.manymux_android.State
  * wants every key of it; a phone has chrome the session does not own, so the
  * key goes straight through and the verbs behind it become things you press.
  *
- * The shape that follows from it is the platform's own: what is running is the
- * main screen, a session is a screen on top of it, and back is how you come
- * out. That is already the gesture people have, since a swipe in from the left
- * edge *is* back on any phone with gesture navigation, and it needs no drawer
- * and nothing to learn. What made it feel like a place you would rather not
- * leave was never the navigation, it was that leaving used to take the ssh
- * connection with it. It no longer does (`machine::Connections`), so the list
- * is the fast way between two sessions and there is no second surface that
- * would also be one.
+ * The shape that follows is the platform's own: what is running is the main
+ * screen, a session is a screen on top of it, and back is how you come out.
+ * That is already the gesture people have, since a swipe in from the left edge
+ * *is* back, so it needs no drawer and nothing to learn. What made leaving
+ * expensive was never the navigation, it was that leaving used to take the ssh
+ * connection with it. It no longer does (`machine::Connections`).
+ *
+ * Every size here is worked out from the screen's density through [dp].
+ * Written as plain numbers, as they were, they are device pixels: on an
+ * ordinary phone that is a third of the spacing intended, which is most of what
+ * made this look like a form somebody threw together. `TextView.textSize` is
+ * the exception and needs no conversion, being in scaled points already.
  */
 class MainActivity : Activity() {
 
@@ -76,6 +83,7 @@ class MainActivity : Activity() {
         // nowhere else.
         phone = Phone.keptIn(filesDir.absolutePath)
         remembered = getSharedPreferences("manymux", MODE_PRIVATE)
+        takeBack()
 
         // Straight to what is running, if there is somewhere to ask. Opening on
         // a form asking for an address every time would be asking somebody to
@@ -97,6 +105,43 @@ class MainActivity : Activity() {
         letGo()
         phone.close()
         elsewhere.shutdownNow()
+    }
+
+    // ---- back ------------------------------------------------------------
+
+    /**
+     * Take the back gesture, in whichever way this Android delivers it.
+     *
+     * The app used to ask for the old delivery with
+     * `android:enableOnBackInvokedCallback="false"` and read `onBackPressed`.
+     * That flag stops being honoured for an app targeting SDK 36: predictive
+     * back is on regardless and the deprecated callbacks are no longer called,
+     * so back closed the app rather than leaving the session, which is the one
+     * gesture the whole shape depends on. Registered here, it works on both
+     * sides of that line: the dispatcher from API 33, `onBackPressed` before.
+     */
+    private fun takeBack() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            onBackInvokedDispatcher.registerOnBackInvokedCallback(
+                OnBackInvokedDispatcher.PRIORITY_DEFAULT,
+            ) { goBack() }
+        }
+    }
+
+    /** Leave the session for the list, or the list for whatever came before. */
+    private fun goBack() {
+        if (attach == null) {
+            finish()
+            return
+        }
+        letGo()
+        machine?.let { listSessions(it) } ?: showMachine()
+    }
+
+    @Deprecated("Reached only below API 33, where the dispatcher does not exist.")
+    @Suppress("MissingSuperCall")
+    override fun onBackPressed() {
+        goBack()
     }
 
     // ---- the machine ---------------------------------------------------
@@ -122,62 +167,90 @@ class MainActivity : Activity() {
     /** The form: which machine, and this device's key. */
     private fun showMachine() {
         val known = lastMachine()
-        val layout = column()
-        val address = field("address", known?.address ?: "")
-        val port = field("port", (known?.port ?: 22u).toString()).apply {
+        val address = field("address", known?.address ?: "", "gpu-box.example")
+        val port = field("port", (known?.port ?: 22u).toString(), "22").apply {
             inputType = InputType.TYPE_CLASS_NUMBER
         }
-        val user = field("user", known?.user ?: "")
+        val user = field("user", known?.user ?: "", "who to be there")
 
-        layout.addView(heading("Reach a machine"))
-        layout.addView(address)
-        layout.addView(port)
-        layout.addView(user)
-        layout.addView(
-            Button(this).apply {
-                text = "sessions"
-                setOnClickListener {
+        val layout = column().apply {
+            addView(title("manymux"))
+            addView(
+                note(
+                    "A terminal you can work in, on machines you reach over ssh. " +
+                        "Sessions keep running when you leave.",
+                ),
+            )
+
+            addView(label("Machine"))
+            addView(address)
+            addView(port)
+            addView(user)
+            addView(
+                primary("see what is running") {
                     val reaching = Machine(
                         address.text.toString().trim(),
                         (port.text.toString().toUShortOrNull() ?: 22u),
                         user.text.toString().trim(),
                     )
-                    machine = reaching
-                    remember(reaching)
-                    listSessions(reaching)
-                }
-            },
-        )
+                    if (reaching.address.isBlank() || reaching.user.isBlank()) {
+                        say("it wants an address and a user")
+                    } else {
+                        machine = reaching
+                        remember(reaching)
+                        listSessions(reaching)
+                    }
+                },
+            )
 
-        layout.addView(heading("This device's key"))
-        layout.addView(
-            TextView(this).apply {
-                text = phone.authorizedLine()
-                textSize = 11f
-                setPadding(0, 8, 0, 8)
-            },
-        )
-        layout.addView(
-            Button(this).apply {
-                text = "copy the key"
-                setOnClickListener {
+            addView(label("This device's key"))
+            addView(
+                note("That machine will not let this in until the line below is in the account's authorized_keys."),
+            )
+            addView(
+                TextView(this@MainActivity).apply {
+                    text = phone.authorizedLine()
+                    typeface = Typeface.MONOSPACE
+                    textSize = 11f
+                    setTextColor(colour(R.color.dim))
+                    setPadding(dp(14), dp(12), dp(14), dp(12))
+                    background = panel(R.color.raised)
+                },
+                wide().apply { topMargin = dp(6) },
+            )
+            addView(
+                secondary("copy the key") {
                     val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
                     clipboard.setPrimaryClip(
                         ClipData.newPlainText("manymux", phone.authorizedLine()),
                     )
-                    say("copied: put it in that account's authorized_keys")
-                }
-            },
-        )
+                    say("copied")
+                },
+            )
+            addView(
+                TextView(this@MainActivity).apply {
+                    text = version()
+                    textSize = 11f
+                    setTextColor(colour(R.color.hint))
+                    setPadding(0, dp(28), 0, 0)
+                },
+            )
+        }
 
-        setContentView(ScrollView(this).apply { addView(layout) })
+        setContentView(scrolling(layout))
+    }
+
+    /** What this build is, so an install can be told from the one before it. */
+    private fun version(): String {
+        val app = packageManager.getPackageInfo(packageName, 0).versionName ?: "?"
+        return "app $app  ·  core ${uniffi.manymux_android.coreVersion()}"
     }
 
     // ---- what is running -----------------------------------------------
 
     /** The main screen: everything running on that machine. */
     private fun listSessions(machine: Machine) {
-        setContentView(overview(machine, reaching(machine.address)))
+        setContentView(overview(machine, column().apply { addView(note("reaching ${machine.address}")) }))
 
         elsewhere.execute {
             val answer = runCatching { phone.runningOn(machine) }
@@ -200,29 +273,45 @@ class MainActivity : Activity() {
     private fun overview(machine: Machine, body: View): View {
         val name = TextView(this).apply {
             text = machine.address
-            textSize = 17f
-            setPadding(0, 0, 0, 0)
+            typeface = Typeface.MONOSPACE
+            textSize = 15f
+            setTextColor(colour(R.color.text))
         }
-        val add = Button(this).apply {
+        val who = TextView(this).apply {
+            text = machine.user
+            textSize = 11f
+            setTextColor(colour(R.color.hint))
+        }
+        val words = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            addView(name)
+            addView(who)
+        }
+        val add = TextView(this).apply {
             text = "+"
-            textSize = 20f
-            minWidth = 0
-            setPadding(28, 0, 28, 0)
+            textSize = 22f
+            gravity = Gravity.CENTER
+            setTextColor(colour(R.color.ground))
+            background = panel(R.color.accent, round = dp(8))
+            setPadding(dp(14), dp(2), dp(14), dp(6))
             contentDescription = "new session, or another machine"
+            isClickable = true
             setOnClickListener { view -> offerToAdd(view, machine) }
         }
         val bar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setPadding(32, 20, 20, 12)
-            addView(name, LinearLayout.LayoutParams(0, WRAP_CONTENT).apply { weight = 1f })
-            addView(add, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT))
+            setBackgroundColor(colour(R.color.panel))
+            setPadding(dp(20), dp(16), dp(16), dp(16))
+            addView(words, LinearLayout.LayoutParams(0, WRAP_CONTENT).apply { weight = 1f })
+            addView(add)
         }
         return LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
+            setBackgroundColor(colour(R.color.ground))
             addView(bar, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
             addView(
-                ScrollView(this@MainActivity).apply { addView(body) },
+                scrolling(body),
                 LinearLayout.LayoutParams(MATCH_PARENT, 0).apply { weight = 1f },
             )
         }
@@ -243,76 +332,87 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun reaching(address: String) = column().apply {
-        addView(note("reaching $address"))
-    }
-
-    private fun sessions(machine: Machine, running: List<Running>): View = column().apply {
-        if (running.isEmpty()) {
-            addView(note("nothing is running there yet. The + starts one."))
+    private fun sessions(machine: Machine, running: List<Running>): View =
+        LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            if (running.isEmpty()) {
+                addView(note("Nothing is running there yet. The + starts a session."))
+            }
+            for (session in running) {
+                addView(row(machine, session))
+                addView(hairline())
+            }
         }
-        for (session in running) {
-            addView(row(machine, session))
-        }
-    }
 
     private fun trouble(machine: Machine, said: String): View = column().apply {
-        addView(note(said))
+        addView(
+            TextView(this@MainActivity).apply {
+                text = said
+                textSize = 14f
+                setTextColor(colour(R.color.warn))
+                setPadding(dp(14), dp(14), dp(14), dp(14))
+                background = panel(R.color.raised)
+            },
+            wide(),
+        )
         // The one failure with something to press: a key that changed is
         // either a machine that was reinstalled or somebody in the middle, and
         // only the person reading it can say which. Saying so and offering
         // nothing was a dead end.
         if (said.contains("host key")) {
             addView(
-                Button(this@MainActivity).apply {
-                    text = "it was reinstalled: forget the old key"
-                    setOnClickListener {
-                        phone.forget(machine)
-                        listSessions(machine)
-                    }
+                secondary("it was reinstalled: forget the old key") {
+                    phone.forget(machine)
+                    listSessions(machine)
                 },
             )
         }
-        addView(
-            Button(this@MainActivity).apply {
-                text = "try again"
-                setOnClickListener { listSessions(machine) }
-            },
-        )
+        addView(primary("try again") { listSessions(machine) })
+        addView(secondary("another machine") { showMachine() })
     }
 
     /** One session in the list: what it is called, what it is doing, how long ago. */
     private fun row(machine: Machine, session: Running): View {
         val what = if (session.title.isBlank()) session.command else session.title
-        val name = TextView(this).apply {
-            text = session.name
-            textSize = 16f
-        }
-        val doing = TextView(this).apply {
-            text = what
-            textSize = 13f
-            isSingleLine = true
+        val words = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            addView(
+                TextView(this@MainActivity).apply {
+                    text = session.name
+                    typeface = Typeface.MONOSPACE
+                    textSize = 16f
+                    setTextColor(colour(R.color.text))
+                },
+            )
+            addView(
+                TextView(this@MainActivity).apply {
+                    text = what
+                    textSize = 12f
+                    isSingleLine = true
+                    setTextColor(colour(R.color.dim))
+                    setPadding(0, dp(3), 0, 0)
+                },
+            )
         }
         val since = TextView(this).apply {
             // A dot for somebody else already in there, the way the mark row
             // draws one: two people typing into one session is worth knowing
             // before you start rather than after.
             text = if (session.attached > 0u) "● ${ago(session.idle)}" else ago(session.idle)
-            textSize = 13f
+            textSize = 12f
             gravity = Gravity.END
-        }
-        val words = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            addView(name)
-            addView(doing)
+            setTextColor(
+                if (session.attached > 0u) colour(R.color.accent) else colour(R.color.hint),
+            )
         }
         return LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
             isClickable = true
-            setPadding(24, 22, 24, 22)
+            setBackgroundResource(pressable())
+            setPadding(dp(20), dp(16), dp(20), dp(16))
             addView(words, LinearLayout.LayoutParams(0, WRAP_CONTENT).apply { weight = 1f })
-            addView(since, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT))
+            addView(since)
             setOnClickListener { open(machine, session.name) }
         }
     }
@@ -330,6 +430,7 @@ class MainActivity : Activity() {
 
     /** A login shell on that machine, opened as soon as it has a name. */
     private fun start(machine: Machine) {
+        say("starting one")
         elsewhere.execute {
             // A size to start it at. The real one is sent the moment the view
             // knows its own, which is a resize the session has not printed
@@ -349,10 +450,11 @@ class MainActivity : Activity() {
     private fun open(machine: Machine, name: String) {
         val bar = TextView(this).apply {
             text = "${machine.address}/$name"
-            setPadding(16, 12, 16, 12)
-            setBackgroundColor(0xFF22252A.toInt())
-            setTextColor(Palette.TEXT)
-            textSize = 13f
+            typeface = Typeface.MONOSPACE
+            setPadding(dp(14), dp(10), dp(14), dp(10))
+            setBackgroundColor(colour(R.color.panel))
+            setTextColor(colour(R.color.text))
+            textSize = 12f
         }
 
         val screen = TerminalView(this)
@@ -360,7 +462,7 @@ class MainActivity : Activity() {
 
         val layout = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setBackgroundColor(Palette.GROUND)
+            setBackgroundColor(colour(R.color.ground))
             addView(bar, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
             addView(
                 screen,
@@ -403,6 +505,14 @@ class MainActivity : Activity() {
                     is State.Detached -> "$where  ·  detached"
                     is State.Failed -> state.why
                 }
+                bar.setTextColor(
+                    when (attached.state()) {
+                        is State.Attached -> colour(R.color.text)
+                        is State.Failed -> colour(R.color.warn)
+                        is State.Waiting -> colour(R.color.warn)
+                        else -> colour(R.color.dim)
+                    },
+                )
                 here.postDelayed(this, 500)
             }
         }
@@ -435,26 +545,35 @@ class MainActivity : Activity() {
     private fun extraKeys(screen: TerminalView): View {
         val keys = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
-            setBackgroundColor(0xFF22252A.toInt())
+            setBackgroundColor(colour(R.color.panel))
         }
-        fun key(label: String, press: () -> Unit) {
+        fun key(label: String, press: (TextView) -> Unit) {
+            val button = TextView(this).apply {
+                text = label
+                textSize = 13f
+                gravity = Gravity.CENTER
+                setTextColor(colour(R.color.text))
+                setPadding(0, dp(14), 0, dp(14))
+                isClickable = true
+                setBackgroundResource(pressable())
+            }
+            button.setOnClickListener { press(button) }
             keys.addView(
-                Button(this).apply {
-                    text = label
-                    textSize = 12f
-                    setPadding(0, 0, 0, 0)
-                    setOnClickListener { press() }
-                },
+                button,
                 LinearLayout.LayoutParams(0, WRAP_CONTENT).apply { weight = 1f },
             )
         }
         key("esc") { screen.send(byteArrayOf(0x1b)) }
         key("tab") { screen.send(byteArrayOf(0x09)) }
         // Held rather than pressed with something: the next character typed is
-        // the chord, which is the only way a soft keyboard can spell one.
-        key("ctrl") {
+        // the chord, which is the only way a soft keyboard can spell one. It
+        // says so by staying lit, since a modifier you cannot see the state of
+        // is one you press twice.
+        key("ctrl") { button ->
             screen.control = !screen.control
-            say(if (screen.control) "ctrl: the next key" else "ctrl off")
+            button.setTextColor(
+                if (screen.control) colour(R.color.accent) else colour(R.color.text),
+            )
         }
         key("↑") { screen.send("\u001b[A".toByteArray()) }
         key("↓") { screen.send("\u001b[B".toByteArray()) }
@@ -468,52 +587,108 @@ class MainActivity : Activity() {
         return keys
     }
 
-    /**
-     * Back leaves the session running and goes back to what is running.
-     *
-     * This is also the swipe: on a phone with gesture navigation, dragging in
-     * from the left edge *is* back, so the gesture people already have lands
-     * here without the app claiming an edge or drawing a drawer.
-     *
-     * `onBackPressed` and not `onKeyDown`: from Android 15 an app that targets
-     * it gets predictive back by default, and the platform stops dispatching
-     * `KEYCODE_BACK` as a key at all. Read there, the one gesture that gets you
-     * out of a session would instead close the app.
-     */
-    @Suppress("DEPRECATION", "MissingSuperCall")
-    override fun onBackPressed() {
-        if (attach == null) {
-            @Suppress("DEPRECATION")
-            super.onBackPressed()
-            return
-        }
-        letGo()
-        machine?.let { listSessions(it) } ?: showMachine()
+    // ---- the small stuff ----------------------------------------------
+
+    /** Density-independent pixels, which is what every size here is written in. */
+    private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
+
+    private fun colour(id: Int): Int = resources.getColor(id, theme)
+
+    /** A filled, optionally rounded background. */
+    private fun panel(id: Int, round: Int = dp(6)): GradientDrawable = GradientDrawable().apply {
+        setColor(colour(id))
+        cornerRadius = round.toFloat()
     }
 
-    // ---- the small stuff ----------------------------------------------
+    /** The platform's own press feedback, so a row looks like something to tap. */
+    private fun pressable(): Int {
+        val out = android.util.TypedValue()
+        theme.resolveAttribute(android.R.attr.selectableItemBackground, out, true)
+        return out.resourceId
+    }
+
+    private fun scrolling(body: View) = ScrollView(this).apply {
+        setBackgroundColor(colour(R.color.ground))
+        isFillViewport = true
+        addView(body, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
+    }
 
     private fun column() = LinearLayout(this).apply {
         orientation = LinearLayout.VERTICAL
-        setPadding(8, 8, 8, 32)
+        setPadding(dp(20), dp(20), dp(20), dp(32))
     }
 
-    private fun heading(what: String) = TextView(this).apply {
+    private fun wide() = LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT)
+
+    private fun title(what: String) = TextView(this).apply {
         text = what
-        textSize = 18f
-        setPadding(24, 16, 24, 8)
+        textSize = 30f
+        typeface = Typeface.create("sans-serif-light", Typeface.NORMAL)
+        setTextColor(colour(R.color.text))
+        setPadding(0, dp(20), 0, dp(6))
+    }
+
+    /** A small uppercase heading, which is what separates the sections. */
+    private fun label(what: String) = TextView(this).apply {
+        text = what.uppercase()
+        textSize = 11f
+        letterSpacing = 0.14f
+        setTextColor(colour(R.color.accent))
+        setPadding(0, dp(28), 0, dp(10))
     }
 
     private fun note(what: String) = TextView(this).apply {
         text = what
-        setPadding(24, 8, 24, 8)
+        textSize = 13f
+        setTextColor(colour(R.color.dim))
+        setPadding(dp(20), dp(20), dp(20), dp(8))
     }
 
-    private fun field(what: String, filled: String) = EditText(this).apply {
-        hint = what
+    private fun field(what: String, filled: String, example: String) = EditText(this).apply {
+        hint = example
+        contentDescription = what
         setText(filled)
         setSingleLine()
-        setPadding(24, 12, 24, 12)
+        textSize = 15f
+        setTextColor(colour(R.color.text))
+        setHintTextColor(colour(R.color.hint))
+        background = panel(R.color.raised)
+        setPadding(dp(14), dp(14), dp(14), dp(14))
+        layoutParams = wide().apply { bottomMargin = dp(8) }
+    }
+
+    /** The one button on a screen that says what the screen is for. */
+    private fun primary(what: String, press: () -> Unit) = TextView(this).apply {
+        text = what
+        textSize = 15f
+        gravity = Gravity.CENTER
+        setTextColor(colour(R.color.ground))
+        background = panel(R.color.accent)
+        setPadding(dp(16), dp(15), dp(16), dp(15))
+        isClickable = true
+        setOnClickListener { press() }
+        layoutParams = wide().apply { topMargin = dp(10) }
+    }
+
+    private fun secondary(what: String, press: () -> Unit) = TextView(this).apply {
+        text = what
+        textSize = 14f
+        gravity = Gravity.CENTER
+        setTextColor(colour(R.color.text))
+        background = GradientDrawable().apply {
+            setColor(Color.TRANSPARENT)
+            cornerRadius = dp(6).toFloat()
+            setStroke(dp(1), colour(R.color.line))
+        }
+        setPadding(dp(16), dp(13), dp(16), dp(13))
+        isClickable = true
+        setOnClickListener { press() }
+        layoutParams = wide().apply { topMargin = dp(8) }
+    }
+
+    private fun hairline() = View(this).apply {
+        setBackgroundColor(colour(R.color.line))
+        layoutParams = LinearLayout.LayoutParams(MATCH_PARENT, dp(1))
     }
 
     private fun say(what: String) {

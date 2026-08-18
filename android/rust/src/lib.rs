@@ -33,7 +33,11 @@ pub mod ssh;
 /// What this build of the client core is, as `0.1.0 (a1b2c3d4)`.
 ///
 /// The app's own version says what the APK is; this says what it is speaking,
-/// which is the half that has to agree with a node.
+/// which is the half that has to agree with a node. Exported because the two
+/// can disagree: the Kotlin is rebuilt by Gradle and the library by cargo, and
+/// an app showing both is one that can answer "did that install take" without
+/// anybody having to guess.
+#[uniffi::export]
 pub fn core_version() -> String {
     manymux::VERSION.to_string()
 }
