@@ -1,6 +1,7 @@
 package dev.manymux.phone
 
 import android.content.Context
+import android.content.res.Configuration
 import android.graphics.Canvas
 import android.graphics.Paint
 import android.graphics.Typeface
@@ -14,6 +15,17 @@ import uniffi.manymux_android.Attach
 import uniffi.manymux_android.Grid
 import uniffi.manymux_android.Row
 import uniffi.manymux_android.Run
+
+/**
+ * How tall one cell's text is, in density-independent pixels.
+ *
+ * Chosen to land where the pixel size it replaces landed on an ordinary phone,
+ * which is about fifty columns: enough for a build log and a prompt, and the
+ * width the session reflows to. It is the one number in the app somebody might
+ * reasonably want to change, which is what makes it a setting one day rather
+ * than a constant.
+ */
+private const val CELL_DP = 12.5f
 
 /**
  * The session's screen.
@@ -35,7 +47,9 @@ class TerminalView(context: Context) : View(context), Choreographer.FrameCallbac
         set(value) {
             field = value
             rows.clear()
-            value?.resize(grid())
+            // A fresh attach has been told nothing, whatever the last one knew.
+            told = null
+            tellGrid()
             invalidate()
         }
 
@@ -44,7 +58,6 @@ class TerminalView(context: Context) : View(context), Choreographer.FrameCallbac
 
     private val ink = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         typeface = Typeface.MONOSPACE
-        textSize = 34f
     }
     private val block = Paint()
 
@@ -58,13 +71,60 @@ class TerminalView(context: Context) : View(context), Choreographer.FrameCallbac
     private var lineHeight = 0f
     private var baseline = 0f
 
+    /** The last grid the far end was told about, so it is told only on a change. */
+    private var told: Grid? = null
+
     init {
         isFocusable = true
         isFocusableInTouchMode = true
+        measureCell()
+    }
+
+    /**
+     * Work out what one cell is, in this screen's pixels.
+     *
+     * [CELL_DP] and not a pixel count: `Paint.setTextSize` takes device pixels,
+     * so a size written as a number is a different physical size on every
+     * screen. It showed up on the screens that come in pairs. A foldable's two
+     * panels do not have to report the same density, so a size in pixels is
+     * text that changes size when the phone is opened, on the one gesture whose
+     * whole point is that you are looking at the same thing.
+     *
+     * Density and not the font scale: the accessibility setting belongs to text
+     * that reflows, and a terminal answers a larger one by having fewer columns.
+     * Making that somebody's choice is a setting, not a multiplier applied
+     * behind their back.
+     */
+    private fun measureCell() {
+        ink.textSize = CELL_DP * resources.displayMetrics.density
         cellWidth = ink.measureText("M")
         val metrics = ink.fontMetrics
         lineHeight = metrics.descent - metrics.ascent
         baseline = -metrics.ascent
+    }
+
+    /**
+     * A screen that changed shape, unfolded, or moved to a display of another
+     * density.
+     *
+     * Reached at all because the activity declares these rather than being
+     * recreated for them: the attach outlives the fold, which is the whole
+     * point of it.
+     */
+    override fun onConfigurationChanged(config: Configuration?) {
+        super.onConfigurationChanged(config)
+        measureCell()
+        rows.clear()
+        tellGrid()
+    }
+
+    /** Tell the far end the shape, if it is not the shape it was already told. */
+    private fun tellGrid() {
+        val grid = grid()
+        if (grid == told) return
+        told = grid
+        attach?.resize(grid)
+        onGrid?.invoke(grid)
     }
 
     /** How many cells fit, which is what the far end is told. */
@@ -78,9 +138,7 @@ class TerminalView(context: Context) : View(context), Choreographer.FrameCallbac
     }
 
     override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
-        val grid = grid()
-        attach?.resize(grid)
-        onGrid?.invoke(grid)
+        tellGrid()
     }
 
     override fun onAttachedToWindow() {

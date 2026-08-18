@@ -10,6 +10,13 @@
          delivers back through `OnBackInvokedDispatcher` instead; a plain
          activity that registers nothing there would lose the one gesture that
          gets you out of a session. The animation is worth less than that. -->
+    <!-- `smallestScreenSize` and `density` are the two a foldable turns on.
+         Unfolding changes the smallest screen dimension, and an undeclared
+         configuration change destroys and recreates the activity: the attach
+         would be torn down, the ssh connection dropped with it, and whoever
+         opened the big screen to see more of a build would be looking at the
+         session list instead. The activity handles the resize itself, which is
+         what the terminal wants anyway. -->
     <application
         android:allowBackup="false"
         android:enableOnBackInvokedCallback="false"
@@ -17,7 +24,7 @@
         android:supportsRtl="true">
         <activity
             android:name=".MainActivity"
-            android:configChanges="orientation|screenSize|keyboardHidden|screenLayout"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|density|keyboardHidden"
             android:exported="true"
             android:windowSoftInputMode="adjustResize">
             <intent-filter>
