@@ -9,6 +9,9 @@
 //!
 //! It listens on loopback, on a port the kernel picks.
 
+// Each test binary uses part of this, never all of it.
+#![allow(dead_code)]
+
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
