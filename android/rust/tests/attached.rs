@@ -35,6 +35,9 @@ enum How {
     /// listing and answering the attach. A radio dropping mid-exchange, which
     /// is not a session ending however much the failing call looks like one.
     Vanishes,
+    /// Paints the screen and then goes away, which is a connection dropping in
+    /// the middle of somebody working.
+    Late,
 }
 
 impl How {
@@ -44,12 +47,18 @@ impl How {
             How::Drops => "drop",
             How::Gone => "drop,gone",
             How::Vanishes => "drop,vanish",
+            How::Late => "late",
         }
     }
 }
 
 /// A phone, a machine, and one session on it.
 async fn attached(name: &str, how: How) -> Session {
+    reaching(name, how, usize::MAX).await
+}
+
+/// The same, where the machine stops speaking after `serving` connections.
+async fn reaching(name: &str, how: How, serving: usize) -> Session {
     let world = World::where_mm_is(name, Mm::OnPath);
     // The counter goes through the server rather than through this process, or
     // it would reach every test running beside this one.
@@ -60,7 +69,7 @@ async fn attached(name: &str, how: How) -> Session {
             world.dir.join("connections").display().to_string(),
         ),
     ];
-    let sshd = Sshd::listening(&world.dir, generate().unwrap(), &extra).await;
+    let sshd = Sshd::listening_until(&world.dir, generate().unwrap(), &extra, serving).await;
 
     Session::open(
         Machine {
@@ -232,4 +241,31 @@ async fn a_connection_lost_in_the_middle_of_attaching_is_waited_out() {
 
     assert!(screen.contains("ready"), "{screen}");
     assert_eq!(session.state(), State::Attached);
+}
+
+/// Slow on purpose: the deadline it is about is ten seconds, and a shorter one
+/// would be a different deadline.
+#[tokio::test]
+async fn an_attempt_that_never_answers_is_given_up_on() {
+    // The first connection attaches and drops; every one after it is accepted
+    // and never spoken to, which is a captive portal or a wedged sshd and is
+    // the one failure that never finishes by itself.
+    let session = reaching("attach-wedged", How::Late, 1).await;
+    until_it_says(&session, "ready").await;
+
+    // A second wait, and not the first: the first is the drop being noticed,
+    // and reaching that proves nothing. Getting back to one means the attempt
+    // in between ended, which left to itself it never does — it reads nothing
+    // and returns never, so the bar says "reaching" with nothing counting down
+    // and a back button nobody is reading.
+    for _ in 0..120 {
+        if matches!(session.state(), State::Waiting { tries } if tries >= 2) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    panic!(
+        "still {:?} long after the machine stopped answering",
+        session.state()
+    );
 }

@@ -15,7 +15,9 @@
 //!   with each in turn. `drop` answers the attach and then goes away without a
 //!   word; `vanish` answers the listing and goes away before answering the
 //!   attach, which is a connection dropping mid-exchange and is not a session
-//!   ending; `gone` leaves the session out of the listing and refuses the
+//!   ending; `late` paints the screen and then goes away, which is a
+//!   connection dropping mid-session; `gone` leaves the session out of the
+//!   listing and refuses the
 //!   attach, which is one that ended. Anything past the end of the script, and
 //!   any other word, behaves.
 //! - `STUB_COUNT`: the file the script is counted through. Each connection is
@@ -95,6 +97,12 @@ async fn main() -> anyhow::Result<()> {
                     proto::write_frame(&mut out, tag::DATA, painted().as_bytes()).await?;
                     proto::write_frame(&mut out, tag::PING, &[]).await?;
                     out.flush().await?;
+                    // Gone after painting, which is a connection that went
+                    // rather than one that never worked: what was on the
+                    // screen is what the client is left holding.
+                    if doing == "late" {
+                        std::process::exit(0);
+                    }
                 }
             }
             // Typed at. Echoed the way a shell echoes, so a test can see that

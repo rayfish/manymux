@@ -31,6 +31,22 @@ pub struct Sshd {
 impl Sshd {
     /// Start one, serving commands in `root` with `extra` in their environment.
     pub async fn listening(root: &Path, key: PrivateKey, extra: &[(&str, String)]) -> Self {
+        Self::listening_until(root, key, extra, usize::MAX).await
+    }
+
+    /// The same, but the connections after `serving` are accepted and never
+    /// spoken to.
+    ///
+    /// A TCP that connects to something which never sends a banner is what a
+    /// captive portal, a middlebox or a wedged sshd looks like from here, and
+    /// it is the shape a client with no deadline on its attempt hangs on
+    /// forever.
+    pub async fn listening_until(
+        root: &Path,
+        key: PrivateKey,
+        extra: &[(&str, String)],
+        serving: usize,
+    ) -> Self {
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let port = listener.local_addr().unwrap().port();
 
@@ -45,7 +61,27 @@ impl Sshd {
             .collect();
         tokio::spawn(async move {
             let mut machine = Machine { root, extra };
-            let _ = machine.run_on_socket(config, &listener).await;
+            let mut taken = 0usize;
+            while let Ok((socket, from)) = listener.accept().await {
+                taken += 1;
+                if taken > serving {
+                    // Held open and never spoken to. Dropping it would be a
+                    // refusal, which is a different thing entirely: a refusal
+                    // fails at once and this is what never finishes.
+                    tokio::spawn(async move {
+                        let _holding = socket;
+                        std::future::pending::<()>().await;
+                    });
+                    continue;
+                }
+                let handler = machine.new_client(Some(from));
+                let config = Arc::clone(&config);
+                tokio::spawn(async move {
+                    if let Ok(session) = server::run_stream(config, socket, handler).await {
+                        let _ = session.await;
+                    }
+                });
+            }
         });
 
         Self { port }
