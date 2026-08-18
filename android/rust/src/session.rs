@@ -27,7 +27,7 @@ use tokio::sync::{mpsc, watch};
 use crate::keys::{Identity, KnownHosts};
 use crate::machine::{Connection, Machine};
 use crate::screen::{Frame, Screen};
-use crate::ssh::reach;
+use crate::ssh::{ask, reach};
 
 /// How many chunks of output may be waiting to be painted.
 ///
@@ -387,10 +387,15 @@ async fn attach(attaching: Attaching) -> Result<Riding, Missed> {
         )));
     }
 
+    // A stream of its own, because the listing spent the one it came on: a
+    // node answers one request per connection and hangs up.
+    let stream = ask(&connection, reached.program)
+        .await
+        .map_err(Missed::Machine)?;
+
     // No history: the phone has no scrollback of its own to put it in, and the
     // node keeps the real one.
-    let attached = reached
-        .stream
+    let attached = stream
         .attach(&attaching.name, attaching.wanted, 0, false)
         .await
         .map_err(Missed::Machine)?;

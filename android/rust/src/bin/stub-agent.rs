@@ -103,6 +103,17 @@ async fn main() -> anyhow::Result<()> {
                     if doing == "late" {
                         std::process::exit(0);
                     }
+                } else {
+                    // One request per connection, which is the node's rule and
+                    // not a shortcut here: `Node::handle` reads a single
+                    // request and either answers it and returns, closing the
+                    // socket under `mm agent`, or hands the whole connection
+                    // to an attach. A stub that went on answering was a fake
+                    // more capable than the thing it stands for, and it hid
+                    // the bug it was there to catch: a client that listed and
+                    // then attached on the same stream reached a far end that
+                    // had already hung up.
+                    break;
                 }
             }
             // Typed at. Echoed the way a shell echoes, so a test can see that

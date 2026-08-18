@@ -12,6 +12,16 @@
 //! It is climbed with `Request::List`, which is the question a session list
 //! wants answered anyway, so looking for `mm` costs no round trip of its own.
 //!
+//! **A stream is worth one request.** `Node::handle` reads a single request and
+//! either answers it and returns, which closes the socket and takes the `mm
+//! agent` bridging it down with it, or hands the whole connection to an attach.
+//! So a ladder climbed with `List` ends holding a stream that is already spent,
+//! and what is worth keeping out of it is [`Reached::program`]: the rung that
+//! answered, so the command that follows opens a channel of its own and starts
+//! at the spelling that worked instead of climbing again. The desktop pays the
+//! same price, an `ssh host mm agent` per command; on one ssh connection a
+//! second channel is cheaper than that.
+//!
 //! Nothing here installs anything. `client::Consent` is never constructed, and
 //! a machine at the end of the ladder is reported rather than offered a copy.
 
@@ -140,12 +150,26 @@ const SETTLING: Duration = Duration::from_secs(2);
 const KEPT: usize = 8 * 1024;
 
 /// A machine reached, and the listing that reaching it produced.
+///
+/// No stream: the one the listing was asked on is spent by the time it is
+/// answered, and the far end has hung up. What comes back instead is the rung
+/// that worked, which is what [`ask`] needs to open the next one.
 pub struct Reached {
-    pub stream: Stream,
     pub sessions: Vec<SessionInfo>,
     /// Which of [`PROGRAMS`] answered. Worth keeping: every later command to
     /// this machine should start at the rung that worked.
     pub program: &'static str,
+}
+
+/// A stream to a machine whose `mm` has already been found, for the one
+/// request it is good for.
+///
+/// The ladder is not climbed again: a machine that answered on this rung a
+/// moment ago answers on it now, and a 127 here would be a machine that lost
+/// its `mm` between two requests, which is not a case to spend a round trip on.
+pub async fn ask<E: Exec>(exec: &E, program: &str) -> Result<Stream> {
+    let remote = exec.open(&format!("{program} agent")).await?;
+    Ok(Stream::from_halves(remote.reader, remote.writer))
 }
 
 /// Climb [`PROGRAMS`] until one of them answers the protocol.
@@ -158,13 +182,7 @@ pub async fn reach<E: Exec>(exec: &E) -> Result<Reached> {
         let mut stream = Stream::from_halves(remote.reader, remote.writer);
 
         match stream.request(&Request::List).await {
-            Ok(Response::Sessions(sessions)) => {
-                return Ok(Reached {
-                    stream,
-                    sessions,
-                    program,
-                });
-            }
+            Ok(Response::Sessions(sessions)) => return Ok(Reached { sessions, program }),
             Ok(Response::Error(said)) => bail!(said),
             Ok(other) => bail!("expected a listing, got {other:?}"),
             Err(failed) => {
@@ -211,8 +229,9 @@ pub async fn reach<E: Exec>(exec: &E) -> Result<Reached> {
 /// which. Drawing the one that was asked for would put a row on the screen
 /// that nothing addresses.
 pub async fn start<E: Exec>(exec: &E, spec: SpawnSpec) -> Result<String> {
-    let mut reached = reach(exec).await?;
-    match reached.stream.request(&Request::Spawn(spec)).await? {
+    let reached = reach(exec).await?;
+    let mut stream = ask(exec, reached.program).await?;
+    match stream.request(&Request::Spawn(spec)).await? {
         Response::Spawned { name } => Ok(name),
         Response::Error(said) => bail!(said),
         other => bail!("expected a new session, got {other:?}"),

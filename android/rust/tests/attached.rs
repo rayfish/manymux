@@ -10,6 +10,7 @@ mod sshd;
 #[path = "support/world.rs"]
 mod world;
 
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use manymux::proto::Size;
@@ -24,6 +25,11 @@ use world::{Mm, World};
 /// The words are the stub's, and the count is what makes them mean "the first
 /// attach" rather than "every attach": each connection is a fresh process at
 /// the far end.
+///
+/// Two per attempt, and the `ok` in front of each of these is that second one
+/// being real: a node answers one request per connection, so the listing and
+/// the attach are never the same far end. A script that named the attach first
+/// would be describing a machine this client does not talk to.
 enum How {
     /// Answers, and stays.
     Steady,
@@ -44,34 +50,40 @@ impl How {
     fn script(&self) -> &'static str {
         match self {
             How::Steady => "",
-            How::Drops => "drop",
-            How::Gone => "drop,gone",
-            How::Vanishes => "drop,vanish",
-            How::Late => "late",
+            How::Drops => "ok,drop",
+            How::Gone => "ok,drop,gone",
+            How::Vanishes => "ok,drop,ok,vanish",
+            How::Late => "ok,late",
         }
     }
 }
 
+/// A session, and the far end's own count of what it has been asked.
+struct Reaching {
+    session: Session,
+    /// The file the stub counts its connections through, which is the only
+    /// place a test can see how many the client actually opened.
+    connections: PathBuf,
+}
+
 /// A phone, a machine, and one session on it.
 async fn attached(name: &str, how: How) -> Session {
-    reaching(name, how, usize::MAX).await
+    reaching(name, how, usize::MAX).await.session
 }
 
 /// The same, where the machine stops speaking after `serving` connections.
-async fn reaching(name: &str, how: How, serving: usize) -> Session {
+async fn reaching(name: &str, how: How, serving: usize) -> Reaching {
     let world = World::where_mm_is(name, Mm::OnPath);
     // The counter goes through the server rather than through this process, or
     // it would reach every test running beside this one.
+    let connections = world.dir.join("connections");
     let extra = vec![
         ("STUB_SCRIPT", how.script().to_string()),
-        (
-            "STUB_COUNT",
-            world.dir.join("connections").display().to_string(),
-        ),
+        ("STUB_COUNT", connections.display().to_string()),
     ];
     let sshd = Sshd::listening_until(&world.dir, generate().unwrap(), &extra, serving).await;
 
-    Session::open(
+    let session = Session::open(
         Machine {
             address: "127.0.0.1".to_string(),
             port: sshd.port,
@@ -81,7 +93,19 @@ async fn reaching(name: &str, how: How, serving: usize) -> Session {
         KnownHosts::at(world.dir.join("known_hosts")),
         "build".to_string(),
         Size::new(40, 8),
-    )
+    );
+    Reaching {
+        session,
+        connections,
+    }
+}
+
+/// How many connections the far end has served.
+fn served(connections: &Path) -> usize {
+    std::fs::read_to_string(connections)
+        .ok()
+        .and_then(|count| count.trim().parse().ok())
+        .unwrap_or(0)
 }
 
 /// Wait for the screen to say something, or give up and show what it says.
@@ -101,6 +125,22 @@ async fn until_it_says(session: &Session, wanted: &str) -> String {
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
     panic!("the screen never said {wanted:?}; it said:\n{screen}");
+}
+
+#[tokio::test]
+async fn the_listing_and_the_attach_are_asked_on_connections_of_their_own() {
+    let reaching = reaching("attach-apiece", How::Steady, usize::MAX).await;
+
+    until_it_says(&reaching.session, "ready").await;
+
+    // A node answers one request per connection and hangs up, so a client that
+    // listed and then attached on the same stream was writing into a far end
+    // that had already gone: the listing worked, the attach came back as "the
+    // host closed the connection without responding", and nothing on a phone
+    // could ever be attached to. Counted rather than inferred from the screen,
+    // because the screen is exactly what a stub too willing to answer twice
+    // would have shown.
+    assert_eq!(served(&reaching.connections), 2);
 }
 
 #[tokio::test]
@@ -250,7 +290,7 @@ async fn an_attempt_that_never_answers_is_given_up_on() {
     // The first connection attaches and drops; every one after it is accepted
     // and never spoken to, which is a captive portal or a wedged sshd and is
     // the one failure that never finishes by itself.
-    let session = reaching("attach-wedged", How::Late, 1).await;
+    let session = reaching("attach-wedged", How::Late, 1).await.session;
     until_it_says(&session, "ready").await;
 
     // A second wait, and not the first: the first is the drop being noticed,
