@@ -82,10 +82,28 @@ impl Serving {
     }
 }
 
+/// Whether the far end has been given this device's key.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Welcome {
+    /// Any key gets in. Which key it was is the client's business, and testing
+    /// sshd's authorisation would be testing sshd.
+    AnyKey,
+    /// None does, which is what an account nobody has pasted this device's
+    /// public half into looks like from here. It is the ordinary state of
+    /// every machine the first time a phone is pointed at it, so it is worth a
+    /// server of its own rather than being read off a connection that ended.
+    NoKey,
+}
+
 impl Sshd {
     /// Start one, serving commands in `root` with `extra` in their environment.
     pub async fn listening(root: &Path, key: PrivateKey, extra: &[(&str, String)]) -> Self {
         Self::listening_until(root, key, extra, Serving::forever()).await
+    }
+
+    /// One that takes no key at all, however good the connection to it is.
+    pub async fn refusing(root: &Path, key: PrivateKey) -> Self {
+        Self::serving(root, key, &[], Serving::forever(), Welcome::NoKey).await
     }
 
     /// The same, but the connections after `serving.until` are accepted and
@@ -100,6 +118,16 @@ impl Sshd {
         key: PrivateKey,
         extra: &[(&str, String)],
         serving: Serving,
+    ) -> Self {
+        Self::serving(root, key, extra, serving, Welcome::AnyKey).await
+    }
+
+    async fn serving(
+        root: &Path,
+        key: PrivateKey,
+        extra: &[(&str, String)],
+        serving: Serving,
+        welcome: Welcome,
     ) -> Self {
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -120,6 +148,7 @@ impl Sshd {
                 root,
                 extra,
                 commands: serving.commands,
+                welcome,
             };
             let mut taken = 0usize;
             while let Ok((socket, from)) = listener.accept().await {
@@ -159,6 +188,7 @@ struct Machine {
     /// it, and setting it in this process would leak into every test running
     /// beside this one.
     extra: Vec<(String, String)>,
+    welcome: Welcome,
 }
 
 impl Server for Machine {
@@ -169,6 +199,7 @@ impl Server for Machine {
             root: self.root.clone(),
             extra: self.extra.clone(),
             commands: self.commands,
+            welcome: self.welcome,
             served: 0,
             stdin: None,
         }
@@ -180,6 +211,7 @@ struct Shell {
     root: PathBuf,
     extra: Vec<(String, String)>,
     commands: usize,
+    welcome: Welcome,
     /// How many commands this connection has been asked for.
     served: usize,
     /// Held so that what the client writes reaches the command's stdin, which
@@ -190,13 +222,20 @@ struct Shell {
 impl Handler for Shell {
     type Error = russh::Error;
 
-    /// Any key gets in. Which key it was is the client's business, and testing
-    /// sshd's authorisation would be testing sshd.
+    /// Whatever this machine was started to say. Which key it was is the
+    /// client's business, and testing sshd's authorisation would be testing
+    /// sshd.
     async fn auth_publickey(
         &mut self,
         _: &str,
         _: &russh::keys::ssh_key::PublicKey,
     ) -> Result<Auth, Self::Error> {
+        if self.welcome == Welcome::NoKey {
+            return Ok(Auth::Reject {
+                proceed_with_methods: None,
+                partial_success: false,
+            });
+        }
         Ok(Auth::Accept)
     }
 

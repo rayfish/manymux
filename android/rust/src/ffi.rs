@@ -18,26 +18,46 @@ use manymux::proto::{Size, SpawnSpec};
 use tokio::runtime::Runtime;
 
 use crate::keys::{Identity, KnownHosts};
-use crate::machine::{Connection, Connections, Machine};
+use crate::machine::{Connection, Connections, Machine, Rebuff};
 use crate::screen::Frame;
 use crate::session::{Session, State};
 use crate::ssh::{reach, start};
 
 /// Anything that went wrong, in the one sentence worth showing somebody.
 ///
-/// One variant, because the app does nothing different for different failures:
-/// what it does is say what happened, and the difference that matters is the
-/// wording. Where a decision does hang on it, as with a host key that changed,
-/// it is a state rather than an error.
+/// Three variants, and the split is by what the screen can *offer* rather than
+/// by what happened: [`Trouble::Reaching`] has a sentence and a "try again",
+/// while the other two each have one button that fixes them. Anything the app
+/// would answer the same way stays in the first.
+///
+/// `flat_error` is load-bearing rather than a detail. Without it UniFFI builds
+/// the Kotlin exception's message out of the variant's *fields*, so a phone
+/// showed `why=gpu-box:22 would not take this device's key`: the name of a
+/// field in this file, on a screen, in front of somebody trying to work out
+/// what to do. With it the message is this type's `Display` and nothing else.
 #[derive(Debug, uniffi::Error)]
+#[uniffi(flat_error)]
 pub enum Trouble {
+    /// Something to read and a "try again" behind it.
     Reaching { why: String },
+    /// The account has not been given this device's key. The app holds the
+    /// key, so this is the failure it can hand somebody the fix for.
+    Refused { why: String },
+    /// The host key is not the one written down.
+    HostKey { why: String },
+}
+
+impl Trouble {
+    fn why(&self) -> &str {
+        match self {
+            Self::Reaching { why } | Self::Refused { why } | Self::HostKey { why } => why,
+        }
+    }
 }
 
 impl std::fmt::Display for Trouble {
     fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let Self::Reaching { why } = self;
-        write!(out, "{why}")
+        write!(out, "{}", self.why())
     }
 }
 
@@ -45,10 +65,24 @@ impl std::error::Error for Trouble {}
 
 impl From<anyhow::Error> for Trouble {
     fn from(error: anyhow::Error) -> Self {
-        Self::Reaching {
+        // Downcast rather than read the sentence. A `Rebuff` is wrapped in
+        // whatever context it passed through on the way up, and anyhow looks
+        // through those, so the kind survives however deep it was raised.
+        match error.downcast_ref::<Rebuff>() {
+            // Its own sentence, not the chain: it names the machine in its
+            // first four words, and `connecting to gpu-box:22: gpu-box:22
+            // would not take` is a longer line that says less.
+            Some(rebuff @ Rebuff::Key { .. }) => Self::Refused {
+                why: rebuff.to_string(),
+            },
+            Some(rebuff @ Rebuff::Host { .. }) => Self::HostKey {
+                why: rebuff.to_string(),
+            },
             // The whole chain: `connecting to ...: connection refused` says
             // what to do about it and `connection refused` does not.
-            why: format!("{error:#}"),
+            None => Self::Reaching {
+                why: format!("{error:#}"),
+            },
         }
     }
 }
@@ -264,5 +298,66 @@ impl Attach {
 
     pub fn state(&self) -> State {
         self.session.state()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use anyhow::anyhow;
+
+    use super::Trouble;
+    use crate::machine::Rebuff;
+
+    /// The two failures the app can offer something about arrive typed, and
+    /// they arrive typed from underneath whatever context was wrapped around
+    /// them on the way up. Read off the sentence instead, as this once was, a
+    /// reworded message silently turns the button that fixes it into no button
+    /// at all.
+    #[test]
+    fn a_refusal_worth_acting_on_keeps_its_kind_across_the_boundary() {
+        let refused = anyhow!(Rebuff::Key {
+            at: "gpu-box:22".to_string(),
+            user: "somebody".to_string(),
+            fingerprint: "SHA256:whatever".to_string(),
+        })
+        .context("connecting to gpu-box:22");
+        assert!(matches!(Trouble::from(refused), Trouble::Refused { .. }));
+
+        let changed = anyhow!(Rebuff::Host {
+            at: "gpu-box:22".to_string(),
+            had: "SHA256:before".to_string(),
+            now: "SHA256:after".to_string(),
+        })
+        .context("connecting to gpu-box:22");
+        assert!(matches!(Trouble::from(changed), Trouble::HostKey { .. }));
+    }
+
+    /// And what it says is the refusal's own sentence, not the chain around
+    /// it. The context is there for the failures nobody typed a message for,
+    /// where `connection refused` alone does not say what to do; a rebuff
+    /// already names the machine in its first four words, and prefixing it
+    /// with the same machine again is a longer message that says less.
+    #[test]
+    fn a_refusal_is_shown_as_the_sentence_it_wrote_for_the_screen() {
+        let refused = anyhow!(Rebuff::Key {
+            at: "gpu-box:22".to_string(),
+            user: "somebody".to_string(),
+            fingerprint: "SHA256:whatever".to_string(),
+        })
+        .context("connecting to gpu-box:22");
+        let said = Trouble::from(refused).to_string();
+        assert!(!said.contains("connecting to"), "{said}");
+        assert!(said.contains("SHA256:whatever"), "{said}");
+    }
+
+    /// Everything else keeps the whole chain, which is the reason the chain is
+    /// formatted at all: `connection refused` says nothing about which machine
+    /// or which port, and that is the whole of what somebody needs.
+    #[test]
+    fn anything_else_is_still_shown_with_what_it_was_doing() {
+        let ordinary = anyhow!("connection refused").context("connecting to gpu-box:22");
+        let said = Trouble::from(ordinary).to_string();
+        assert!(said.contains("connecting to gpu-box:22"), "{said}");
+        assert!(said.contains("connection refused"), "{said}");
     }
 }

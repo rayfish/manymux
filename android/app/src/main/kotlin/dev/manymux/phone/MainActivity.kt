@@ -6,6 +6,7 @@ import android.content.ClipboardManager
 import android.content.Context
 import android.content.SharedPreferences
 import android.graphics.Color
+import android.graphics.Rect
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.os.Build
@@ -17,6 +18,7 @@ import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup.LayoutParams.MATCH_PARENT
 import android.view.ViewGroup.LayoutParams.WRAP_CONTENT
+import android.view.WindowInsets
 import android.view.inputmethod.InputMethodManager
 import android.widget.EditText
 import android.widget.LinearLayout
@@ -32,6 +34,7 @@ import uniffi.manymux_android.Machine
 import uniffi.manymux_android.Phone
 import uniffi.manymux_android.Running
 import uniffi.manymux_android.State
+import uniffi.manymux_android.Trouble
 
 /**
  * The whole app: a machine, what is running on it, and one of those on the
@@ -207,26 +210,8 @@ class MainActivity : Activity() {
             addView(
                 note("That machine will not let this in until the line below is in the account's authorized_keys."),
             )
-            addView(
-                TextView(this@MainActivity).apply {
-                    text = phone.authorizedLine()
-                    typeface = Typeface.MONOSPACE
-                    textSize = 11f
-                    setTextColor(colour(R.color.dim))
-                    setPadding(dp(14), dp(12), dp(14), dp(12))
-                    background = panel(R.color.raised)
-                },
-                wide().apply { topMargin = dp(6) },
-            )
-            addView(
-                secondary("copy the key") {
-                    val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                    clipboard.setPrimaryClip(
-                        ClipData.newPlainText("manymux", phone.authorizedLine()),
-                    )
-                    say("copied")
-                },
-            )
+            addView(deviceKey(), wide().apply { topMargin = dp(6) })
+            addView(copyTheKey())
             addView(
                 TextView(this@MainActivity).apply {
                     text = version()
@@ -237,7 +222,7 @@ class MainActivity : Activity() {
             )
         }
 
-        setContentView(scrolling(layout))
+        show(scrolling(layout))
     }
 
     /** What this build is, so an install can be told from the one before it. */
@@ -250,7 +235,7 @@ class MainActivity : Activity() {
 
     /** The main screen: everything running on that machine. */
     private fun listSessions(machine: Machine) {
-        setContentView(overview(machine, column().apply { addView(note("reaching ${machine.address}")) }))
+        show(overview(machine, column().apply { addView(note("reaching ${machine.address}")) }))
 
         elsewhere.execute {
             val answer = runCatching { phone.runningOn(machine) }
@@ -262,9 +247,9 @@ class MainActivity : Activity() {
                 if (isFinishing || gone) return@post
                 val body = answer.fold(
                     onSuccess = { running -> sessions(machine, running) },
-                    onFailure = { why -> trouble(machine, why.message ?: "could not reach it") },
+                    onFailure = { why -> trouble(machine, why) },
                 )
-                setContentView(overview(machine, body))
+                show(overview(machine, body))
             }
         }
     }
@@ -308,7 +293,11 @@ class MainActivity : Activity() {
         }
         return LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setBackgroundColor(colour(R.color.ground))
+            // The bar's colour rather than the ground's, because the root is
+            // what carries the padding the system bars ask for: painted the
+            // ground colour, the strip behind the clock read as a gap above
+            // the bar instead of as the top of it.
+            setBackgroundColor(colour(R.color.panel))
             addView(bar, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
             addView(
                 scrolling(body),
@@ -344,10 +333,18 @@ class MainActivity : Activity() {
             }
         }
 
-    private fun trouble(machine: Machine, said: String): View = column().apply {
+    /**
+     * A machine that would not answer, and whatever can be done about it.
+     *
+     * Which failure it was is read off the type rather than out of the words
+     * (`ffi::Trouble`). Sniffing the sentence, as this did, means a message
+     * reworded on the Rust side quietly takes the button that fixes it away,
+     * and nothing anywhere fails when that happens.
+     */
+    private fun trouble(machine: Machine, why: Throwable): View = column().apply {
         addView(
             TextView(this@MainActivity).apply {
-                text = said
+                text = why.message ?: "could not reach it"
                 textSize = 14f
                 setTextColor(colour(R.color.warn))
                 setPadding(dp(14), dp(14), dp(14), dp(14))
@@ -355,20 +352,53 @@ class MainActivity : Activity() {
             },
             wide(),
         )
-        // The one failure with something to press: a key that changed is
-        // either a machine that was reinstalled or somebody in the middle, and
-        // only the person reading it can say which. Saying so and offering
-        // nothing was a dead end.
-        if (said.contains("host key")) {
-            addView(
+        when (why) {
+            // The account has never been given this device's key, which is
+            // where every machine starts. Saying "add it to `authorized_keys`"
+            // and then keeping the key itself behind a form on another screen
+            // was a dead end: that line is in this app and in no other place a
+            // phone can reach, so it belongs next to the sentence asking for
+            // it.
+            is Trouble.Refused -> {
+                addView(label("This device's key"))
+                addView(
+                    note("Add this line to ${machine.user}'s authorized_keys on that machine."),
+                )
+                addView(deviceKey(), wide().apply { topMargin = dp(6) })
+                addView(copyTheKey())
+            }
+            // Either a machine that was reinstalled or somebody in the middle,
+            // and only the person reading it can say which. Saying so and
+            // offering nothing was a dead end too.
+            is Trouble.HostKey -> addView(
                 secondary("it was reinstalled: forget the old key") {
                     phone.forget(machine)
                     listSessions(machine)
                 },
             )
+            else -> Unit
         }
         addView(primary("try again") { listSessions(machine) })
         addView(secondary("another machine") { showMachine() })
+    }
+
+    /** The line to paste into a machine's `authorized_keys`. */
+    private fun deviceKey() = TextView(this).apply {
+        text = phone.authorizedLine()
+        typeface = Typeface.MONOSPACE
+        textSize = 11f
+        setTextColor(colour(R.color.dim))
+        setPadding(dp(14), dp(12), dp(14), dp(12))
+        background = panel(R.color.raised)
+        // A key is pasted somewhere else, and getting it there off a phone
+        // means either the button below or selecting it by hand.
+        setTextIsSelectable(true)
+    }
+
+    private fun copyTheKey() = secondary("copy the key") {
+        val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+        clipboard.setPrimaryClip(ClipData.newPlainText("manymux", phone.authorizedLine()))
+        say("copied")
     }
 
     /** One session in the list: what it is called, what it is doing, how long ago. */
@@ -462,7 +492,9 @@ class MainActivity : Activity() {
 
         val layout = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setBackgroundColor(colour(R.color.ground))
+            // The bar above and the keys below are both this colour, so the
+            // strips the system bars leave at the top and bottom continue them.
+            setBackgroundColor(colour(R.color.panel))
             addView(bar, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
             addView(
                 screen,
@@ -470,7 +502,7 @@ class MainActivity : Activity() {
             )
             addView(extraKeys(screen), LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
         }
-        setContentView(layout)
+        show(layout)
 
         // Attaching needs a grid to ask for, and the view only knows its size
         // once it has been laid out. So the attach waits for the first one.
@@ -588,6 +620,52 @@ class MainActivity : Activity() {
     }
 
     // ---- the small stuff ----------------------------------------------
+
+    /**
+     * Put a screen up, inside whatever the system bars have left.
+     *
+     * Every screen goes through here rather than `setContentView`, because an
+     * app targeting SDK 36 is laid out edge to edge whether it asked to be or
+     * not: SDK 35 had an opt-out flag and this one does not, so a screen put
+     * up without reading the insets draws its top row underneath the clock.
+     * Which is what it did: the machine's name sat behind the status bar and
+     * the `+` behind the battery.
+     *
+     * The padding goes on the root and the root is painted the same colour as
+     * the bar, so the strip behind the status bar reads as part of the bar
+     * rather than as a gap above it. The keyboard is in the same set on
+     * purpose: `adjustResize` is what used to lift the extra keys clear of it,
+     * and edge to edge means the window is no longer resized for us.
+     */
+    private fun show(view: View) {
+        view.setOnApplyWindowInsetsListener { at, insets ->
+            val edges = edges(insets)
+            at.setPadding(edges.left, edges.top, edges.right, edges.bottom)
+            insets
+        }
+        setContentView(view)
+    }
+
+    /** What the bars, the cutout and the keyboard are covering. */
+    private fun edges(insets: WindowInsets): Rect =
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            val covered = insets.getInsets(
+                WindowInsets.Type.systemBars() or
+                    WindowInsets.Type.displayCutout() or
+                    WindowInsets.Type.ime(),
+            )
+            Rect(covered.left, covered.top, covered.right, covered.bottom)
+        } else {
+            // Below API 30 there is one set of insets and the window is still
+            // resized for the keyboard, so this is the whole of it.
+            @Suppress("DEPRECATION")
+            Rect(
+                insets.systemWindowInsetLeft,
+                insets.systemWindowInsetTop,
+                insets.systemWindowInsetRight,
+                insets.systemWindowInsetBottom,
+            )
+        }
 
     /** Density-independent pixels, which is what every size here is written in. */
     private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()

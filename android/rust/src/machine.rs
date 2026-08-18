@@ -12,7 +12,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow};
 use manymux::lock::held;
 use russh::client::{self, Handle};
 use russh::keys::key::PrivateKeyWithHashAlg;
@@ -47,6 +47,62 @@ pub struct Machine {
     pub port: u16,
     pub user: String,
 }
+
+/// A machine saying no, when the answer is one somebody can act on.
+///
+/// Everything else that goes wrong here is a sentence to read: a name that did
+/// not resolve, a port with nothing behind it, a radio that slept. These two
+/// are the failures with a button behind them, so they are a type rather than
+/// wording: the app decides what to offer by matching on this, and a message
+/// reworded next month must not be able to turn the button that fixes it into
+/// no button at all.
+///
+/// The sentence lives here with the kind, rather than at the screen, because
+/// there is exactly one right way to say each of these and both ways in (the
+/// list, an attach that could not get back) want it.
+#[derive(Debug)]
+pub enum Rebuff {
+    /// The account has never been given this device's public half. The
+    /// ordinary state of every machine the first time a phone is pointed at
+    /// it, and the one failure where what fixes it is held by the app.
+    Key {
+        at: String,
+        user: String,
+        fingerprint: String,
+    },
+    /// The machine presented a host key that is not the one written down,
+    /// which is either a machine that was reinstalled or somebody in the
+    /// middle. Only the person reading it can say which.
+    Host {
+        at: String,
+        had: String,
+        now: String,
+    },
+}
+
+impl std::fmt::Display for Rebuff {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Key {
+                at,
+                user,
+                fingerprint,
+            } => write!(
+                out,
+                "{at} would not take this device's key for {user}: add it to that \
+                 account's `authorized_keys` ({fingerprint})"
+            ),
+            Self::Host { at, had, now } => write!(
+                out,
+                "the host key for {at} has changed: it was {had} and is now {now}. \
+                 If that machine was reinstalled, forget the old key; otherwise \
+                 somebody is in the middle."
+            ),
+        }
+    }
+}
+
+impl std::error::Error for Rebuff {}
 
 impl Machine {
     /// How this machine is written down in [`KnownHosts`].
@@ -94,7 +150,7 @@ impl Connection {
             // ordinary connection error, and it is the one that has something
             // worth reading behind it.
             .map_err(|error| match held(&refused).take() {
-                Some(said) => anyhow!(said),
+                Some(rebuff) => anyhow!(rebuff),
                 None => error,
             })
             .with_context(|| format!("connecting to {}", machine.at()))?;
@@ -105,13 +161,12 @@ impl Connection {
             .await
             .with_context(|| format!("authenticating as {} on {}", machine.user, machine.at()))?;
         if !allowed.success() {
-            bail!(
-                "{} would not take this device's key for {}: add it to that account's \
-                 `authorized_keys` ({})",
-                machine.at(),
-                machine.user,
-                identity.fingerprint()
-            );
+            return Err(Rebuff::Key {
+                at: machine.at(),
+                user: machine.user.clone(),
+                fingerprint: identity.fingerprint(),
+            }
+            .into());
         }
 
         Ok(Self { handle })
@@ -280,7 +335,7 @@ struct Trusting {
     known: KnownHosts,
     /// Why the key was refused, for [`Connection::open`] to report instead of
     /// russh's own account of a connection that ended.
-    refused: Arc<Mutex<Option<String>>>,
+    refused: Arc<Mutex<Option<Rebuff>>>,
 }
 
 impl client::Handler for Trusting {
@@ -300,13 +355,11 @@ impl client::Handler for Trusting {
             // machine that was reinstalled or somebody in the middle is not a
             // question this layer can answer, and the answer is `forget`.
             Verdict::Changed { had } => {
-                *held(&self.refused) = Some(format!(
-                    "the host key for {} has changed: it was {had} and is now {}. \
-                     If that machine was reinstalled, forget the old key; otherwise \
-                     somebody is in the middle.",
-                    self.at,
-                    offered.fingerprint(Default::default())
-                ));
+                *held(&self.refused) = Some(Rebuff::Host {
+                    at: self.at.clone(),
+                    had,
+                    now: offered.fingerprint(Default::default()).to_string(),
+                });
                 Ok(false)
             }
         }

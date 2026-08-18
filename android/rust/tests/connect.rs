@@ -15,7 +15,7 @@ mod world;
 
 use manymux::proto::{Size, SpawnSpec};
 use manymux_android::keys::{Identity, KnownHosts, Verdict, generate};
-use manymux_android::machine::{Connection, Machine};
+use manymux_android::machine::{Connection, Machine, Rebuff};
 use manymux_android::ssh::{reach, start};
 use russh::keys::PrivateKey;
 use sshd::Sshd;
@@ -36,6 +36,25 @@ impl Reachable {
         let world = World::where_mm_is(name, mm);
         let host_key = generate().unwrap();
         let sshd = Sshd::listening(&world.dir, host_key.clone(), &[]).await;
+
+        let dir = world.dir.clone();
+        Self {
+            machine: Machine {
+                address: "127.0.0.1".to_string(),
+                port: sshd.port,
+                user: "whoever".to_string(),
+            },
+            identity: Identity::kept_at(&dir.join("id_ed25519")).unwrap(),
+            known: KnownHosts::at(dir.join("known_hosts")),
+            host_key,
+        }
+    }
+
+    /// The same machine, on an account nobody has given this device's key to.
+    async fn unwelcoming(name: &str) -> Self {
+        let world = World::where_mm_is(name, Mm::OnPath);
+        let host_key = generate().unwrap();
+        let sshd = Sshd::refusing(&world.dir, host_key.clone()).await;
 
         let dir = world.dir.clone();
         Self {
@@ -89,11 +108,20 @@ async fn a_host_offering_a_key_that_is_not_the_one_written_down_is_refused() {
         .remember(&reachable.machine.at(), impostor.public_key())
         .unwrap();
 
-    let error = match reachable.connect().await {
+    let failed = match reachable.connect().await {
         Ok(_) => panic!("connected to a machine whose key had changed"),
-        Err(error) => format!("{error:#}"),
+        Err(error) => error,
     };
 
+    // Typed, and typed through the context layer `open` wraps it in: this is
+    // the other failure with something to press, and the app tells the two
+    // apart by which one this is rather than by reading the sentence.
+    let rebuff = failed
+        .downcast_ref::<Rebuff>()
+        .unwrap_or_else(|| panic!("a changed host key came back untyped: {failed:#}"));
+    assert!(matches!(rebuff, Rebuff::Host { .. }), "{rebuff:?}");
+
+    let error = format!("{failed:#}");
     // Both fingerprints, because the only person who can say whether this is a
     // reinstall or somebody in the middle is the one reading the message.
     assert!(error.contains("changed"), "{error}");
@@ -113,6 +141,34 @@ async fn a_host_offering_a_key_that_is_not_the_one_written_down_is_refused() {
         .verdict(&reachable.machine.at(), impostor.public_key())
         .unwrap();
     assert_eq!(seen, Verdict::Known);
+}
+
+#[tokio::test]
+async fn a_machine_that_has_not_been_given_this_devices_key_says_which_key_to_add() {
+    let reachable = Reachable::unwelcoming("connect-refused").await;
+
+    let error = match reachable.connect().await {
+        Ok(_) => panic!("got in with a key the machine had never been given"),
+        Err(error) => error,
+    };
+
+    // Typed rather than a sentence to read, because this is the failure with
+    // the most obvious thing to do about it and the app has to be able to
+    // offer it: the key to paste is in the app and nowhere else, so a screen
+    // that says "add it" without handing it over is a dead end on a device
+    // with no other way to get at the file.
+    let rebuff = error
+        .downcast_ref::<Rebuff>()
+        .unwrap_or_else(|| panic!("a refused key came back untyped: {error:#}"));
+    assert!(matches!(rebuff, Rebuff::Key { .. }), "{rebuff:?}");
+
+    // And it still reads, since the same sentence goes on the screen. The
+    // fingerprint is in it because a machine somebody has pasted *a* key into
+    // is the confusing case: it says which one this device is offering.
+    let said = rebuff.to_string();
+    assert!(said.contains(&reachable.identity.fingerprint()), "{said}");
+    assert!(said.contains("authorized_keys"), "{said}");
+    assert!(said.contains(&reachable.machine.user), "{said}");
 }
 
 #[tokio::test]
