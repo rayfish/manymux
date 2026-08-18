@@ -62,6 +62,14 @@ val cargoBuild by tasks.registering(Exec::class) {
     )
     inputs.dir("${rootDir}/rust/src")
     inputs.file("${rootDir}/rust/Cargo.toml")
+    inputs.file("${rootDir}/rust/Cargo.lock")
+    // The crate one directory further up is most of what gets linked, and the
+    // whole claim of this arrangement is that a fix there is a fix here. Left
+    // undeclared, a change to the client core leaves Gradle calling this task
+    // up to date and packaging the library from before it.
+    inputs.dir("${rootDir}/../src")
+    inputs.file("${rootDir}/../Cargo.toml")
+    inputs.file("${rootDir}/../Cargo.lock")
     outputs.dir(layout.buildDirectory.dir("rust"))
 }
 

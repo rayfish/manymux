@@ -9,7 +9,6 @@ import android.os.Handler
 import android.os.Looper
 import android.text.InputType
 import android.view.Gravity
-import android.view.KeyEvent
 import android.view.View
 import android.view.ViewGroup.LayoutParams.MATCH_PARENT
 import android.view.ViewGroup.LayoutParams.WRAP_CONTENT
@@ -52,6 +51,9 @@ class MainActivity : Activity() {
     /** The machine last connected to, kept so a session list can be reopened. */
     private var machine: Machine? = null
 
+    /** The bar's own clock, kept so it can be stopped. */
+    private var ticking: Runnable? = null
+
     override fun onCreate(saved: Bundle?) {
         super.onCreate(saved)
         // App-private storage: the key this device is known by lives here and
@@ -64,7 +66,8 @@ class MainActivity : Activity() {
         super.onDestroy()
         // The session goes on running on the machine. This only stops watching
         // it, which is the whole point of the thing.
-        attach?.detach()
+        letGo()
+        phone.close()
         elsewhere.shutdownNow()
     }
 
@@ -247,7 +250,26 @@ class MainActivity : Activity() {
                 here.postDelayed(this, 500)
             }
         }
+        ticking = tick
         here.post(tick)
+    }
+
+    /**
+     * Stop watching, and let go of the far end.
+     *
+     * All three parts matter. The tick reposts itself forever and holds the bar,
+     * which holds the activity; the `Attach` is a handle to an object on the
+     * other side of the boundary that nothing else will release; and leaving
+     * either behind means a second session opened later has two of them.
+     */
+    private fun letGo() {
+        ticking?.let { here.removeCallbacks(it) }
+        ticking = null
+        terminal?.attach = null
+        terminal = null
+        attach?.detach()
+        attach?.close()
+        attach = null
     }
 
     /** The keys a phone keyboard has not got. */
@@ -287,16 +309,23 @@ class MainActivity : Activity() {
         return keys
     }
 
-    /** Back leaves the session running and goes back to the list. */
-    override fun onKeyDown(code: Int, event: KeyEvent): Boolean {
-        if (code == KeyEvent.KEYCODE_BACK && attach != null) {
-            attach?.detach()
-            attach = null
-            terminal?.attach = null
-            machine?.let { listSessions(it) } ?: showMachine()
-            return true
+    /**
+     * Back leaves the session running and goes back to the list.
+     *
+     * `onBackPressed` and not `onKeyDown`: from Android 15 an app that targets
+     * it gets predictive back by default, and the platform stops dispatching
+     * `KEYCODE_BACK` as a key at all. Read there, the one gesture that gets you
+     * out of a session would instead close the app.
+     */
+    @Suppress("DEPRECATION", "MissingSuperCall")
+    override fun onBackPressed() {
+        if (attach == null) {
+            @Suppress("DEPRECATION")
+            super.onBackPressed()
+            return
         }
-        return super.onKeyDown(code, event)
+        letGo()
+        machine?.let { listSessions(it) } ?: showMachine()
     }
 
     // ---- the small stuff ----------------------------------------------

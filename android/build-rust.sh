@@ -45,10 +45,14 @@ build x86_64-linux-android x86_64 x86_64-linux-android
 # The bindings, from a host build of the same crate: uniffi reads the library's
 # own metadata, and a host library carries the same metadata as a cross one.
 cargo build --release --manifest-path "$crate/Cargo.toml"
+case "$(uname -s)" in
+    Darwin) host_library="$crate/target/release/libmanymux_android.dylib" ;;
+    *) host_library="$crate/target/release/libmanymux_android.so" ;;
+esac
 rm -rf "$out/uniffi"
 cargo run --release --quiet --manifest-path "$crate/Cargo.toml" --bin uniffi-bindgen -- \
     generate \
-    --library "$crate/target/release/libmanymux_android.so" \
+    --library "$host_library" \
     --language kotlin \
     --no-format \
     --out-dir "$out/uniffi"

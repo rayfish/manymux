@@ -14,6 +14,9 @@
 //! - `STUB_DROPS`: go away without a word the first time somebody attaches,
 //!   and behave from then on. The named file is how it remembers, since each
 //!   attach is a fresh process.
+//! - `STUB_REFUSES`: answer an attach with "no session", once the named file
+//!   exists. Pointed at the same file as `STUB_DROPS`, that is a connection
+//!   that dropped and a session that had ended by the time anybody came back.
 
 use std::time::SystemTime;
 
@@ -49,6 +52,9 @@ async fn main() -> anyhow::Result<()> {
                     Request::Spawn(spec) => Response::Spawned {
                         name: format!("{}-2", spec.command.first().cloned().unwrap_or_default()),
                     },
+                    Request::Attach { name, .. } if gone() => {
+                        Response::Error(format!("no session named {name}"))
+                    }
                     Request::Attach { size, .. } => Response::Attached {
                         size,
                         paste: false,
@@ -88,6 +94,12 @@ async fn main() -> anyhow::Result<()> {
                 proto::write_frame(&mut out, tag::DATA, b"pong").await?;
                 out.flush().await?;
             }
+            // The client swallowed something the terminal would have redrawn,
+            // or resized. Answered with a screen, which is what a node does.
+            tag::RESYNC => {
+                proto::write_frame(&mut out, tag::RESYNC, b"resynced").await?;
+                out.flush().await?;
+            }
             tag::DETACH => break,
             tag::RESIZE => {
                 let size: Size = proto::decode(&frame.body)?;
@@ -121,6 +133,13 @@ fn painted() -> String {
     let mut screen = avt::Vt::builder().size(80, 24).build();
     screen.feed_str("ready");
     screen.dump()
+}
+
+/// Whether the session has ended since the last attach.
+fn gone() -> bool {
+    std::env::var("STUB_REFUSES")
+        .ok()
+        .is_some_and(|marker| std::fs::metadata(marker).is_ok())
 }
 
 /// Whether this attach is the one that goes away.

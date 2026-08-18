@@ -23,6 +23,7 @@ use manymux::client::{PROGRAMS, Stream};
 use manymux::lock::held;
 use manymux::proto::{Request, Response, SessionInfo, SpawnSpec};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
+use tokio::process::Command;
 use tokio::sync::watch;
 
 /// A way to run one command on a machine and talk to it.
@@ -100,8 +101,18 @@ impl Ending {
     }
 
     /// Something the far end wrote to its stderr.
+    ///
+    /// Capped, because this is recorded for the life of the command and an
+    /// attach lasts as long as somebody is working: a program that chatters at
+    /// its stderr would otherwise fill a phone's memory with a complaint
+    /// nobody is going to read. What is worth reading is at the front of it.
     pub fn said(&self, bytes: &[u8]) {
-        held(&self.said).extend_from_slice(bytes);
+        let mut said = held(&self.said);
+        let room = KEPT.saturating_sub(said.len());
+        if room == 0 {
+            return;
+        }
+        said.extend_from_slice(&bytes[..bytes.len().min(room)]);
     }
 
     /// How the command ended.
@@ -109,6 +120,9 @@ impl Ending {
         let _ = self.status.send(code);
     }
 }
+
+/// How much of what the far end complained about is worth keeping.
+const KEPT: usize = 8 * 1024;
 
 /// A machine reached, and the listing that reaching it produced.
 pub struct Reached {
@@ -144,8 +158,16 @@ pub async fn reach<E: Exec>(exec: &E) -> Result<Reached> {
                 // else is a machine that answered badly and must not be asked
                 // again a different way.
                 if watch.ended().await != Some(NOT_FOUND) {
+                    // Only when there is something to add: a far end that
+                    // failed silently would otherwise be reported as
+                    // `: the host closed the connection`, which reads as a
+                    // message with its first half missing.
                     let said = watch.said();
-                    return Err(failed.context(said));
+                    return Err(if said.is_empty() {
+                        failed
+                    } else {
+                        failed.context(said)
+                    });
                 }
                 // The `mm: command not found` behind this is the probe working.
                 // Held rather than printed: it is on the way to being the error
@@ -196,7 +218,7 @@ impl Remote {
     /// reads is a real shell's 127 rather than something's idea of one, which
     /// is also why the caller builds the command: what the far end resolves
     /// `mm` against is the thing under test.
-    pub async fn spawn(mut command: tokio::process::Command) -> Result<Self> {
+    pub async fn spawn(mut command: Command) -> Result<Self> {
         let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

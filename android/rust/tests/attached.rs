@@ -19,17 +19,30 @@ use manymux_android::session::{Session, State};
 use sshd::Sshd;
 use world::{Mm, World};
 
+/// How the machine at the other end behaves.
+enum How {
+    /// Answers, and stays.
+    Steady,
+    /// Goes away without a word the first time somebody attaches, and behaves
+    /// from then on.
+    Drops,
+    /// Goes away, and by the time anybody comes back the session has ended.
+    Gone,
+}
+
 /// A phone, a machine, and one session on it.
-async fn attached(name: &str, drops: bool) -> Session {
+async fn attached(name: &str, how: How) -> Session {
     let world = World::where_mm_is(name, Mm::OnPath);
     // Named but not created: the stub makes the file the first time it drops
     // and behaves from then on. It goes through the server rather than through
     // this process, or it would reach every test running beside this one.
-    let dropping = world.dir.join("dropped").display().to_string();
-    let extra: Vec<(&str, String)> = if drops {
-        vec![("STUB_DROPS", dropping)]
-    } else {
-        Vec::new()
+    let marker = world.dir.join("dropped").display().to_string();
+    let extra: Vec<(&str, String)> = match how {
+        How::Steady => Vec::new(),
+        How::Drops => vec![("STUB_DROPS", marker)],
+        // The same file both ways round: dropping writes it, and its being
+        // there is what makes the next attach find nothing.
+        How::Gone => vec![("STUB_DROPS", marker.clone()), ("STUB_REFUSES", marker)],
     };
     let sshd = Sshd::listening(&world.dir, generate().unwrap(), &extra).await;
 
@@ -67,7 +80,7 @@ async fn until_it_says(session: &Session, wanted: &str) -> String {
 
 #[tokio::test]
 async fn the_screen_comes_back_painted_with_what_the_session_had_on_it() {
-    let session = attached("attach-paint", false).await;
+    let session = attached("attach-paint", How::Steady).await;
 
     let screen = until_it_says(&session, "ready").await;
 
@@ -77,7 +90,7 @@ async fn the_screen_comes_back_painted_with_what_the_session_had_on_it() {
 
 #[tokio::test]
 async fn a_probe_is_answered_without_anything_asking_for_a_frame() {
-    let session = attached("attach-ping", false).await;
+    let session = attached("attach-ping", How::Steady).await;
     // Nothing is drawing: no `take_frame` until the assertion below, which is
     // an app in the background. The answer is the read loop's and must not
     // wait on anybody, or a phone in a pocket is detached by the host after
@@ -91,7 +104,7 @@ async fn a_probe_is_answered_without_anything_asking_for_a_frame() {
 
 #[tokio::test]
 async fn what_is_typed_reaches_the_far_end() {
-    let session = attached("attach-typed", false).await;
+    let session = attached("attach-typed", How::Steady).await;
     until_it_says(&session, "ready").await;
 
     session.send(b"hello there".to_vec());
@@ -102,7 +115,7 @@ async fn what_is_typed_reaches_the_far_end() {
 
 #[tokio::test]
 async fn a_resize_is_told_to_the_far_end() {
-    let session = attached("attach-resize", false).await;
+    let session = attached("attach-resize", How::Steady).await;
     until_it_says(&session, "ready").await;
 
     session.resize(Size::new(30, 6));
@@ -113,7 +126,7 @@ async fn a_resize_is_told_to_the_far_end() {
 
 #[tokio::test]
 async fn a_connection_that_drops_is_waited_out_and_taken_up_again() {
-    let session = attached("attach-dropped", true).await;
+    let session = attached("attach-dropped", How::Drops).await;
 
     // The first attach goes away without a detach and without an exit, which
     // is a network hop rather than anything ending. The session is still
@@ -127,7 +140,7 @@ async fn a_connection_that_drops_is_waited_out_and_taken_up_again() {
 
 #[tokio::test]
 async fn detaching_ends_the_attach_and_nothing_else() {
-    let session = attached("attach-detach", false).await;
+    let session = attached("attach-detach", How::Steady).await;
     until_it_says(&session, "ready").await;
 
     session.detach();
@@ -139,4 +152,40 @@ async fn detaching_ends_the_attach_and_nothing_else() {
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
     panic!("still {:?} long after detaching", session.state());
+}
+
+#[tokio::test]
+async fn a_resize_asks_for_the_screen_back() {
+    let session = attached("attach-resync", How::Steady).await;
+    until_it_says(&session, "ready").await;
+
+    session.resize(Size::new(30, 6));
+
+    // Telling the node the new size redraws nothing: a session that printed
+    // and went quiet has no answer to a SIGWINCH, so both ends reflow on their
+    // own and drift apart. What puts them back together is asking for the
+    // screen, and the answer to that is a repaint.
+    let screen = until_it_says(&session, "resynced").await;
+    assert!(screen.contains("resynced"), "{screen}");
+}
+
+#[tokio::test]
+async fn a_session_that_is_gone_when_the_connection_comes_back_is_not_waited_for() {
+    let session = attached("attach-gone", How::Gone).await;
+
+    // The connection drops, and by the time it comes back the session has
+    // ended: the node answers, and says there is no such thing. That is the
+    // opposite of a machine that never answered, and waiting for it is
+    // reconnecting every ten seconds forever to a session nobody is running.
+    for _ in 0..400 {
+        match session.state() {
+            State::Failed { why } => {
+                assert!(why.contains("no session"), "{why}");
+                return;
+            }
+            State::Ended { .. } => return,
+            _ => tokio::time::sleep(Duration::from_millis(25)).await,
+        }
+    }
+    panic!("still {:?} long after the session went", session.state());
 }

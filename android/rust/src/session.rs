@@ -16,6 +16,7 @@
 //! output is the one thing that could put the answer behind a queue.
 
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use manymux::client::attach::reconnect_after;
 use manymux::client::{Attached, SessionHalves, Update};
@@ -68,6 +69,32 @@ enum Say {
     Input(Vec<u8>),
     Resize(Size),
     Detach,
+}
+
+/// How long an attempt to get back to a session may take.
+///
+/// The waiting between attempts is unbounded on purpose, and reads the
+/// keyboard throughout. The *attempt* reads nothing, so one that never returns
+/// is a screen frozen on "reconnecting" with nothing counting down and a back
+/// button nobody is reading. russh puts no deadline on a connect, and a TCP
+/// that reaches something which never sends a banner will sit there for as
+/// long as the network lets it.
+///
+/// It applies to reconnects alone: the first attach of a run is a thing
+/// somebody asked for, and may legitimately be a cold ssh, a node starting, or
+/// an install being answered.
+const REACH_FOR: Duration = Duration::from_secs(10);
+
+/// Why an attach did not happen.
+///
+/// The two mean opposite things and the distinction is the whole of what
+/// decides between waiting and reporting: a machine that never answered is
+/// waited for, while a node that answered and has no such session is a session
+/// that ended, and reconnecting to it every ten seconds forever is the bug
+/// this exists to stop.
+enum Missed {
+    Machine(anyhow::Error),
+    Gone(String),
 }
 
 /// What ended an attach.
@@ -170,6 +197,10 @@ impl Session {
 
 /// What it takes to attach, kept together because a reattach needs all of it
 /// again.
+///
+/// Cloned per attempt so that the attempt can be waited on and given up while
+/// the size it was asked for goes on changing under it.
+#[derive(Clone)]
 struct Attaching {
     machine: Machine,
     identity: Identity,
@@ -201,8 +232,14 @@ async fn keep_attached(
 
     loop {
         let _ = state.send(State::Reaching);
-        match attach(&attaching).await {
-            Ok(riding) => {
+        let reached = reaching(attaching.clone(), ever, &mut said, &mut attaching.wanted).await;
+        match reached {
+            // The back button, pressed while it was still trying.
+            None => {
+                let _ = state.send(State::Detached);
+                return;
+            }
+            Some(Ok(riding)) => {
                 tries = 0;
                 ever = true;
                 let _ = state.send(State::Attached);
@@ -218,11 +255,17 @@ async fn keep_attached(
                     Ending::Lost => {}
                 }
             }
-            Err(error) => {
+            // The node answered and has no such session, which is an answer
+            // rather than a connection that went.
+            Some(Err(Missed::Gone(why))) => {
+                let _ = state.send(State::Failed { why });
+                return;
+            }
+            Some(Err(Missed::Machine(error))) => {
                 // The first attach is a thing somebody asked for, and its
-                // failure is an answer: the machine is not reachable, or there
-                // is no session by that name. Every failure after it is a
-                // connection that went, and the session is still running.
+                // failure is an answer: the machine is not reachable. Every
+                // failure after it is a connection that went, and the session
+                // is still running.
                 if !ever {
                     let _ = state.send(State::Failed {
                         why: format!("{error:#}"),
@@ -258,17 +301,64 @@ async fn keep_attached(
     }
 }
 
+/// One attempt, which the app can give up on and which gives up on itself.
+///
+/// `None` is somebody who left while it was out. The keyboard is read
+/// throughout for the same reason the waiting reads it: an attempt is not a
+/// state anybody should be stuck in, and what is typed at one is dropped
+/// rather than queued, or it arrives in a shell minutes after it was pressed.
+async fn reaching(
+    attaching: Attaching,
+    ever: bool,
+    said: &mut mpsc::UnboundedReceiver<Say>,
+    wanted: &mut Size,
+) -> Option<Result<Riding, Missed>> {
+    // Named before the attempt takes it, so the message a deadline produces
+    // can still say which machine it was about.
+    let at = attaching.machine.at();
+    let attempt = attach(attaching);
+    tokio::pin!(attempt);
+    let deadline = tokio::time::sleep(if ever { REACH_FOR } else { Duration::MAX });
+    tokio::pin!(deadline);
+
+    loop {
+        tokio::select! {
+            got = &mut attempt => return Some(got),
+            // Dropping the attempt is what ends it, which works because
+            // russh's connection goes with the future holding it.
+            _ = &mut deadline => {
+                return Some(Err(Missed::Machine(anyhow::anyhow!(
+                    "gave up reaching {} after {}s",
+                    at,
+                    REACH_FOR.as_secs()
+                ))));
+            }
+            asked = said.recv() => match asked {
+                Some(Say::Detach) | None => return None,
+                Some(Say::Input(_)) => {}
+                Some(Say::Resize(size)) => *wanted = size,
+            },
+        }
+    }
+}
+
 /// Connect, climb the ladder, and attach.
-async fn attach(attaching: &Attaching) -> anyhow::Result<Riding> {
-    let connection =
-        Connection::open(&attaching.machine, &attaching.identity, &attaching.known).await?;
-    let reached = reach(&connection).await?;
+async fn attach(attaching: Attaching) -> Result<Riding, Missed> {
+    let connection = Connection::open(&attaching.machine, &attaching.identity, &attaching.known)
+        .await
+        .map_err(Missed::Machine)?;
+    let reached = reach(&connection).await.map_err(Missed::Machine)?;
     // No history: the phone has no scrollback of its own to put it in, and the
     // node keeps the real one.
+    //
+    // A failure from here on is the node's answer rather than the machine's
+    // silence, which is what tells a session that ended from a connection that
+    // went.
     let attached = reached
         .stream
         .attach(&attaching.name, attaching.wanted, 0, false)
-        .await?;
+        .await
+        .map_err(|error| Missed::Gone(format!("{error:#}")))?;
     Ok(Riding {
         _connection: connection,
         attached,
@@ -356,6 +446,17 @@ async fn pump(
                         break Ending::Lost;
                     }
                     if writer.resize(size).await.is_err() {
+                        break Ending::Lost;
+                    }
+                    // Telling the node the size redraws nothing: a session that
+                    // printed and went quiet has no answer to a SIGWINCH, so
+                    // both ends reflow on their own and do it differently, the
+                    // node having a scrollback to pull lines back out of and
+                    // this end having none. Two screens a few rows out of step
+                    // is every cursor-addressed write landing on the wrong
+                    // line, and nothing repairs it short of reattaching. So the
+                    // screen is asked for, and the answer is a repaint.
+                    if writer.resync().await.is_err() {
                         break Ending::Lost;
                     }
                 }

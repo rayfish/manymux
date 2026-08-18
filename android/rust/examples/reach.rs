@@ -89,13 +89,26 @@ async fn print(session: &Session, size: Size) {
     session.detach();
 }
 
-/// `user@host` or `user@host:port`.
+/// `user@host` or `user@host:port`, where the host may be a v6 literal.
 fn parse(destination: &str) -> Result<Machine> {
     let Some((user, rest)) = destination.split_once('@') else {
         bail!("that is not a destination: it wants `user@host` or `user@host:port`");
     };
-    let (address, port) = match rest.rsplit_once(':') {
-        Some((address, port)) => (address, port.parse()?),
+    // A v6 literal is mostly colons, so a port is only a port after a `]` or
+    // where there is exactly one colon to be found. Splitting on the last one
+    // regardless reads `fd00::1` as the host `fd00:` on port 1.
+    let (address, port) = match rest.rsplit_once(']') {
+        Some((inside, after)) => {
+            let address = inside.trim_start_matches('[');
+            match after.strip_prefix(':') {
+                Some(port) => (address, port.parse()?),
+                None => (address, 22),
+            }
+        }
+        None if rest.matches(':').count() == 1 => {
+            let (address, port) = rest.rsplit_once(':').expect("one colon");
+            (address, port.parse()?)
+        }
         None => (rest, 22),
     };
     Ok(Machine {

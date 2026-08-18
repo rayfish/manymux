@@ -20,6 +20,15 @@ publish = false
 [lib]
 crate-type = ["cdylib", "lib"]
 
+[lints.clippy]
+# The same two the root crate denies, and for the same reason: every mutex here
+# is a `std` one guarding a short synchronous critical section, which is only
+# correct while none of them is held across an await. Repeated rather than
+# inherited because this crate is deliberately outside that workspace, and a
+# lint that lives only over there is one this half does not have.
+await_holding_lock = "deny"
+await_holding_invalid_type = "deny"
+
 [dependencies]
 # The client core. `default-features = false` is the whole contract: no
 # pty-process, no crossterm, no clap, and no `mm` binary.

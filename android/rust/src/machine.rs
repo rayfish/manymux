@@ -38,6 +38,10 @@ const HOLD: usize = 64 * 1024;
 /// the library still stores none.
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct Machine {
+    /// A free-form string rather than a parsed host, which is the one place
+    /// this crate takes the loose type on purpose: it crosses the boundary as
+    /// a record, it is whatever somebody typed into a field, and the thing
+    /// that decides whether it is a name or an address is the resolver.
     pub address: String,
     pub port: u16,
     pub user: String,

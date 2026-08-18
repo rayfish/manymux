@@ -87,7 +87,7 @@ pub struct Running {
 /// has to know there is one.
 #[derive(uniffi::Object)]
 pub struct Phone {
-    runtime: Runtime,
+    runtime: Arc<Runtime>,
     identity: Identity,
     known: KnownHosts,
 }
@@ -103,7 +103,7 @@ impl Phone {
             why: format!("starting the client: {error}"),
         })?;
         Ok(Arc::new(Self {
-            runtime,
+            runtime: Arc::new(runtime),
             identity: Identity::kept_at(&dir.join("id_ed25519"))?,
             known: KnownHosts::at(dir.join("known_hosts")),
         }))
@@ -176,6 +176,10 @@ impl Phone {
     pub fn attach(&self, machine: Machine, name: String, grid: Grid) -> Arc<Attach> {
         let _running = self.runtime.enter();
         Arc::new(Attach {
+            // The runtime is held here as well as by the phone: an attach that
+            // outlived the object that started it would have its tasks stop
+            // without a word, or take a thread down with them.
+            runtime: Arc::clone(&self.runtime),
             session: Session::open(
                 machine,
                 self.identity.clone(),
@@ -197,6 +201,8 @@ impl Phone {
 /// One attached session.
 #[derive(uniffi::Object)]
 pub struct Attach {
+    #[allow(dead_code)]
+    runtime: Arc<Runtime>,
     session: Session,
 }
 
