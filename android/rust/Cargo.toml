@@ -44,6 +44,11 @@ russh = { version = "0.62", default-features = false, features = [
 # ssh-key wants one it can ask for a `u32`.
 getrandom = { version = "0.4", features = ["sys_rng"] }
 
+# The terminal emulator, on this side of the wire. The same version the node
+# uses one directory up: the screen a phone paints and the screen the node
+# paints have to be the same screen.
+avt = "0.18.0"
+
 anyhow = "1.0.104"
 tokio = { version = "1.53.1", features = [
     "io-util",

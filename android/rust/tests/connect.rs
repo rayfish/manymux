@@ -34,7 +34,7 @@ impl Reachable {
     async fn with(name: &str, mm: Mm) -> Self {
         let world = World::where_mm_is(name, mm);
         let host_key = generate().unwrap();
-        let sshd = Sshd::listening(&world.dir, host_key.clone()).await;
+        let sshd = Sshd::listening(&world.dir, host_key.clone(), &[]).await;
 
         let dir = world.dir.clone();
         Self {

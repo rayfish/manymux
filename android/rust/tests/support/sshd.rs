@@ -29,8 +29,8 @@ pub struct Sshd {
 }
 
 impl Sshd {
-    /// Start one, serving commands in `root`.
-    pub async fn listening(root: &Path, key: PrivateKey) -> Self {
+    /// Start one, serving commands in `root` with `extra` in their environment.
+    pub async fn listening(root: &Path, key: PrivateKey, extra: &[(&str, String)]) -> Self {
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let port = listener.local_addr().unwrap().port();
 
@@ -39,8 +39,12 @@ impl Sshd {
             ..Default::default()
         });
         let root = root.to_path_buf();
+        let extra: Vec<(String, String)> = extra
+            .iter()
+            .map(|(name, value)| ((*name).to_string(), value.clone()))
+            .collect();
         tokio::spawn(async move {
-            let mut machine = Machine { root };
+            let mut machine = Machine { root, extra };
             let _ = machine.run_on_socket(config, &listener).await;
         });
 
@@ -51,6 +55,11 @@ impl Sshd {
 /// The far end: a home directory and a PATH, and a shell to run commands with.
 struct Machine {
     root: PathBuf,
+    /// What the tests need in the environment of whatever is run. The far end
+    /// of an ssh is reached through a shell, so there is nowhere else to put
+    /// it, and setting it in this process would leak into every test running
+    /// beside this one.
+    extra: Vec<(String, String)>,
 }
 
 impl Server for Machine {
@@ -59,6 +68,7 @@ impl Server for Machine {
     fn new_client(&mut self, _: Option<std::net::SocketAddr>) -> Shell {
         Shell {
             root: self.root.clone(),
+            extra: self.extra.clone(),
             stdin: None,
         }
     }
@@ -67,6 +77,7 @@ impl Server for Machine {
 /// One connection's worth of shell.
 struct Shell {
     root: PathBuf,
+    extra: Vec<(String, String)>,
     /// Held so that what the client writes reaches the command's stdin, which
     /// is the whole protocol once a rung has answered.
     stdin: Option<ChildStdin>,
@@ -120,6 +131,11 @@ impl Handler for Shell {
             .arg(&command)
             .env("PATH", self.root.join("bin"))
             .env("HOME", self.root.join("home"))
+            .envs(
+                self.extra
+                    .iter()
+                    .map(|(name, value)| (name.as_str(), value.as_str())),
+            )
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
