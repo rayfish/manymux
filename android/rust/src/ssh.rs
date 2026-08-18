@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Result, bail};
 use manymux::client::{PROGRAMS, Stream};
 use manymux::lock::held;
-use manymux::proto::{Request, Response, SessionInfo};
+use manymux::proto::{Request, Response, SessionInfo, SpawnSpec};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::sync::watch;
 
@@ -165,6 +165,21 @@ pub async fn reach<E: Exec>(exec: &E) -> Result<Reached> {
             format!(" ({complaint})")
         }
     )
+}
+
+/// Start a new session on a machine, and answer with what it ended up called.
+///
+/// The name back rather than the name asked for: a spawn has nobody to tell
+/// that a name is taken, so the node takes the next free counter and says
+/// which. Drawing the one that was asked for would put a row on the screen
+/// that nothing addresses.
+pub async fn start<E: Exec>(exec: &E, spec: SpawnSpec) -> Result<String> {
+    let mut reached = reach(exec).await?;
+    match reached.stream.request(&Request::Spawn(spec)).await? {
+        Response::Spawned { name } => Ok(name),
+        Response::Error(said) => bail!(said),
+        other => bail!("expected a new session, got {other:?}"),
+    }
 }
 
 /// What a shell exits with for a command it could not find. The same constant

@@ -97,7 +97,9 @@ pub enum Colour {
     #[default]
     Default,
     /// One of the terminal palette's, which the app resolves.
-    Indexed { index: u8 },
+    Indexed {
+        index: u8,
+    },
     Rgb {
         red: u8,
         green: u8,

@@ -631,6 +631,12 @@ in the background. There is no service to install, since Android has none.
 
 `INSTALL_DIR` overrides the location and `MM_VERSION` pins a release.
 
+There is also an Android app, in `android/`. It is not a copy of the CLI: it
+makes its own ssh connection in the process, emulates the session's screen on
+the phone, and has no mode key, since a phone has chrome a terminal has not and
+every verb behind `Ctrl-]` can be something you press instead. It is early, and
+`android/README.md` says what is in it.
+
 ## Environment
 
 | | |

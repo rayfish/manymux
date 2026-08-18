@@ -13,9 +13,10 @@ mod sshd;
 #[path = "support/world.rs"]
 mod world;
 
+use manymux::proto::{Size, SpawnSpec};
 use manymux_android::keys::{Identity, KnownHosts, Verdict, generate};
 use manymux_android::machine::{Connection, Machine};
-use manymux_android::ssh::reach;
+use manymux_android::ssh::{reach, start};
 use russh::keys::PrivateKey;
 use sshd::Sshd;
 use world::{Mm, World};
@@ -155,4 +156,27 @@ async fn a_generated_identity_is_readable_by_nobody_else() {
 
     let mode = std::fs::metadata(&path).unwrap().permissions().mode();
     assert_eq!(mode & 0o777, 0o600, "{mode:o}");
+}
+
+#[tokio::test]
+async fn a_session_started_on_a_machine_answers_with_the_name_it_got() {
+    let reachable = Reachable::with("connect-new", Mm::OnPath).await;
+    let connection = reachable.connect().await.unwrap();
+
+    let name = start(
+        &connection,
+        SpawnSpec {
+            name: None,
+            command: vec!["sh".to_string()],
+            cwd: None,
+            size: Size::new(40, 8),
+            label: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    // The name back rather than the name asked for: a spawn has nobody to tell
+    // that a name is taken, so it takes the next free one and says which.
+    assert_eq!(name, "sh-2");
 }

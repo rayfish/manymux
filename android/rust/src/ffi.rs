@@ -14,14 +14,14 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use manymux::proto::Size;
+use manymux::proto::{Size, SpawnSpec};
 use tokio::runtime::Runtime;
 
 use crate::keys::{Identity, KnownHosts};
 use crate::machine::{Connection, Machine};
 use crate::screen::Frame;
 use crate::session::{Session, State};
-use crate::ssh::reach;
+use crate::ssh::{reach, start};
 
 /// Anything that went wrong, in the one sentence worth showing somebody.
 ///
@@ -138,6 +138,34 @@ impl Phone {
                     idle: session.idle,
                 })
                 .collect())
+        })
+    }
+
+    /// Start a new session there and answer with what it ended up called.
+    ///
+    /// A login shell and nothing else. The node runs a spawn as
+    /// `shell -lc <command>` with the words quoted one at a time, so a command
+    /// line typed at a phone would have to be split the way a shell splits it
+    /// before it could be sent, and getting that half right is a keyboard this
+    /// version does not have.
+    ///
+    /// Blocks, like [`Phone::running_on`].
+    pub fn start_on(&self, machine: Machine, grid: Grid) -> Result<String, Trouble> {
+        self.runtime.block_on(async {
+            let connection = Connection::open(&machine, &self.identity, &self.known).await?;
+            let name = start(
+                &connection,
+                SpawnSpec {
+                    name: None,
+                    command: Vec::new(),
+                    cwd: None,
+                    size: grid.into(),
+                    label: None,
+                },
+            )
+            .await?;
+            connection.close().await;
+            Ok(name)
         })
     }
 

@@ -43,6 +43,12 @@ async fn main() -> anyhow::Result<()> {
             tag::REQUEST => {
                 let answer = match proto::decode::<Request>(&frame.body)? {
                     Request::List => Response::Sessions(vec![listed()]),
+                    // Named after the command with a counter, the way a node
+                    // names one, so a test can see that what came back is the
+                    // node's answer rather than what was asked for.
+                    Request::Spawn(spec) => Response::Spawned {
+                        name: format!("{}-2", spec.command.first().cloned().unwrap_or_default()),
+                    },
                     Request::Attach { size, .. } => Response::Attached {
                         size,
                         paste: false,

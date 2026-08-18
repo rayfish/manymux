@@ -50,13 +50,17 @@ pub enum State {
         tries: u32,
     },
     /// The session's own process exited, with its status.
-    Ended { status: i32 },
+    Ended {
+        status: i32,
+    },
     /// Detached on purpose.
     Detached,
     /// The first attach did not work. Only the first: after that a failure is
     /// a connection that went rather than a command that did not work, and is
     /// waited out rather than reported.
-    Failed { why: String },
+    Failed {
+        why: String,
+    },
 }
 
 /// What the app asks of a session it is attached to.

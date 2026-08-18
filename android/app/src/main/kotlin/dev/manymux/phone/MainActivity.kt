@@ -22,6 +22,7 @@ import android.widget.TextView
 import android.widget.Toast
 import java.util.concurrent.Executors
 import uniffi.manymux_android.Attach
+import uniffi.manymux_android.Grid
 import uniffi.manymux_android.Machine
 import uniffi.manymux_android.Phone
 import uniffi.manymux_android.Running
@@ -147,11 +148,32 @@ class MainActivity : Activity() {
                     }
                 rows.addView(
                     Button(this).apply {
+                        text = "new session"
+                        setOnClickListener { start(machine) }
+                    },
+                )
+                rows.addView(
+                    Button(this).apply {
                         text = "another machine"
                         setOnClickListener { showMachine() }
                     },
                 )
                 setContentView(ScrollView(this).apply { addView(rows) })
+            }
+        }
+    }
+
+    /** A login shell on that machine, opened as soon as it has a name. */
+    private fun start(machine: Machine) {
+        elsewhere.execute {
+            // A size to start it at. The real one is sent the moment the view
+            // knows its own, which is a resize the session has not printed
+            // anything into yet.
+            val answer = runCatching { phone.startOn(machine, Grid(80u, 24u)) }
+            here.post {
+                answer
+                    .onSuccess { name -> open(machine, name) }
+                    .onFailure { why -> say(why.message ?: "could not start one") }
             }
         }
     }
