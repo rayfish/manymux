@@ -49,6 +49,10 @@ getrandom = { version = "0.4", features = ["sys_rng"] }
 # paints have to be the same screen.
 avt = "0.18.0"
 
+# The Kotlin side of the boundary, generated from the types below rather than
+# written twice.
+uniffi = { version = "0.32", features = ["cli"] }
+
 anyhow = "1.0.104"
 tokio = { version = "1.53.1", features = [
     "io-util",
@@ -67,3 +71,9 @@ russh = { version = "0.62", default-features = false, features = [
     "flate2",
     "rsa",
 ] }
+
+[[bin]]
+# The bindings generator, which reads the built library and writes the Kotlin
+# that calls it. A binary of its own because that is how uniffi is driven.
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"

@@ -12,6 +12,9 @@
 //! `--no-default-features` build of the crate one directory up, so a fix there
 //! is a fix here.
 
+uniffi::setup_scaffolding!();
+
+pub mod ffi;
 pub mod keys;
 pub mod machine;
 pub mod screen;

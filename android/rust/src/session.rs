@@ -37,7 +37,7 @@ use crate::ssh::reach;
 const BACKLOG: usize = 64;
 
 /// Where the client is with this session.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Enum)]
 pub enum State {
     /// On the way to it: connecting, climbing the ladder, attaching.
     Reaching,
@@ -50,13 +50,13 @@ pub enum State {
         tries: u32,
     },
     /// The session's own process exited, with its status.
-    Ended(i32),
+    Ended { status: i32 },
     /// Detached on purpose.
     Detached,
     /// The first attach did not work. Only the first: after that a failure is
     /// a connection that went rather than a command that did not work, and is
     /// waited out rather than reported.
-    Failed(String),
+    Failed { why: String },
 }
 
 /// What the app asks of a session it is attached to.
@@ -204,7 +204,7 @@ async fn keep_attached(
                 let _ = state.send(State::Attached);
                 match pump(riding, &screen, &mut said, &mut attaching.wanted).await {
                     Ending::Exited(code) => {
-                        let _ = state.send(State::Ended(code));
+                        let _ = state.send(State::Ended { status: code });
                         return;
                     }
                     Ending::Detached => {
@@ -220,7 +220,9 @@ async fn keep_attached(
                 // is no session by that name. Every failure after it is a
                 // connection that went, and the session is still running.
                 if !ever {
-                    let _ = state.send(State::Failed(format!("{error:#}")));
+                    let _ = state.send(State::Failed {
+                        why: format!("{error:#}"),
+                    });
                     return;
                 }
             }

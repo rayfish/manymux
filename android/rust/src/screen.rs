@@ -34,8 +34,10 @@ pub struct Screen {
 }
 
 /// What changed since the last frame.
+#[derive(uniffi::Record)]
 pub struct Frame {
-    pub size: Size,
+    pub cols: u16,
+    pub rows: u16,
     pub cursor: Cursor,
     /// Only the rows that changed, in order. A frame with none of them is a
     /// frame the app can skip drawing entirely.
@@ -43,7 +45,7 @@ pub struct Frame {
 }
 
 /// Where the cursor is, in cells.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, uniffi::Record)]
 pub struct Cursor {
     pub col: u16,
     pub row: u16,
@@ -51,7 +53,7 @@ pub struct Cursor {
 }
 
 /// One row of the screen, as runs of a single pen.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, uniffi::Record)]
 pub struct Row {
     pub at: u16,
     pub runs: Vec<Run>,
@@ -61,7 +63,7 @@ pub struct Row {
 ///
 /// Runs rather than cells: a row of 45 cells is a handful of these, and the
 /// widget draws each with one call.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, uniffi::Record)]
 pub struct Run {
     pub text: String,
     /// How many cells wide, which is not the number of characters: a wide
@@ -73,7 +75,7 @@ pub struct Run {
 }
 
 /// How a run is painted.
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Default, PartialEq, Eq, uniffi::Record)]
 pub struct Look {
     pub foreground: Colour,
     pub background: Colour,
@@ -87,7 +89,7 @@ pub struct Look {
 }
 
 /// A colour, or the absence of one.
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Default, PartialEq, Eq, uniffi::Enum)]
 pub enum Colour {
     /// Whatever the app's theme says text or background is. Kept apart from an
     /// explicit colour because a theme can be light or dark and a session that
@@ -95,7 +97,7 @@ pub enum Colour {
     #[default]
     Default,
     /// One of the terminal palette's, which the app resolves.
-    Indexed(u8),
+    Indexed { index: u8 },
     Rgb {
         red: u8,
         green: u8,
@@ -159,7 +161,8 @@ impl Screen {
             .collect();
 
         Frame {
-            size: self.size,
+            cols: self.size.cols,
+            rows: self.size.rows,
             cursor: Cursor {
                 col: cursor.col as u16,
                 row: cursor.row as u16,
@@ -205,7 +208,7 @@ fn look_of(cells: &[Cell]) -> Look {
 fn colour_of(colour: Option<avt::Color>) -> Colour {
     match colour {
         None => Colour::Default,
-        Some(avt::Color::Indexed(index)) => Colour::Indexed(index),
+        Some(avt::Color::Indexed(index)) => Colour::Indexed { index },
         Some(avt::Color::RGB(rgb)) => Colour::Rgb {
             red: rgb.r,
             green: rgb.g,
@@ -388,7 +391,7 @@ mod tests {
             .find(|run| run.text.starts_with("loud"))
             .expect("the run that was written in red");
         assert!(loud.look.bold);
-        assert_eq!(loud.look.foreground, Colour::Indexed(1));
+        assert_eq!(loud.look.foreground, Colour::Indexed { index: 1 });
         let plain = runs
             .iter()
             .find(|run| run.text.starts_with("plain"))

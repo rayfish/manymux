@@ -36,7 +36,7 @@ const HOLD: usize = 64 * 1024;
 /// Only the app knows this. It is the phone's stand-in for `~/.ssh/config`, and
 /// the reason `src/hosts.rs`'s rule that nothing stores an address survives:
 /// the library still stores none.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, uniffi::Record)]
 pub struct Machine {
     pub address: String,
     pub port: u16,
