@@ -36,18 +36,7 @@ impl Reachable {
         let world = World::where_mm_is(name, mm);
         let host_key = generate().unwrap();
         let sshd = Sshd::listening(&world.dir, host_key.clone(), &[]).await;
-
-        let dir = world.dir.clone();
-        Self {
-            machine: Machine {
-                address: "127.0.0.1".to_string(),
-                port: sshd.port,
-                user: "whoever".to_string(),
-            },
-            identity: Identity::kept_at(&dir.join("id_ed25519")).unwrap(),
-            known: KnownHosts::at(dir.join("known_hosts")),
-            host_key,
-        }
+        Self::knowing(&world, host_key, sshd.port)
     }
 
     /// The same machine, on an account nobody has given this device's key to.
@@ -55,12 +44,24 @@ impl Reachable {
         let world = World::where_mm_is(name, Mm::OnPath);
         let host_key = generate().unwrap();
         let sshd = Sshd::refusing(&world.dir, host_key.clone()).await;
+        Self::knowing(&world, host_key, sshd.port)
+    }
 
+    /// And the same machine again, going while the key is being offered.
+    async fn going_mid_auth(name: &str) -> Self {
+        let world = World::where_mm_is(name, Mm::OnPath);
+        let host_key = generate().unwrap();
+        let sshd = Sshd::going_mid_auth(&world.dir, host_key.clone()).await;
+        Self::knowing(&world, host_key, sshd.port)
+    }
+
+    /// What this device knows about a machine on `port`.
+    fn knowing(world: &World, host_key: PrivateKey, port: u16) -> Self {
         let dir = world.dir.clone();
         Self {
             machine: Machine {
                 address: "127.0.0.1".to_string(),
-                port: sshd.port,
+                port,
                 user: "whoever".to_string(),
             },
             identity: Identity::kept_at(&dir.join("id_ed25519")).unwrap(),
@@ -169,6 +170,32 @@ async fn a_machine_that_has_not_been_given_this_devices_key_says_which_key_to_ad
     assert!(said.contains(&reachable.identity.fingerprint()), "{said}");
     assert!(said.contains("authorized_keys"), "{said}");
     assert!(said.contains(&reachable.machine.user), "{said}");
+}
+
+#[tokio::test]
+async fn a_machine_that_goes_while_being_asked_is_not_read_as_a_refused_key() {
+    let reachable = Reachable::going_mid_auth("connect-vanished").await;
+
+    let error = match reachable.connect().await {
+        Ok(_) => panic!("authenticated against a machine that went"),
+        Err(error) => error,
+    };
+
+    // russh answers a session that ended under the question with the same
+    // "not authenticated" it answers a refusal with, so a client reading only
+    // whether it got in tells somebody to paste a key into a machine that never
+    // looked at one. The cost of that is a person going to another device,
+    // editing `authorized_keys` on the strength of it, coming back and being
+    // told the same thing.
+    assert!(
+        error.downcast_ref::<Rebuff>().is_none(),
+        "a connection that went was reported as a key: {error:#}"
+    );
+
+    // And what it says is where it happened, since that is all anybody knows.
+    let said = format!("{error:#}");
+    assert!(said.contains(&reachable.machine.at()), "{said}");
+    assert!(!said.contains("authorized_keys"), "{said}");
 }
 
 #[tokio::test]

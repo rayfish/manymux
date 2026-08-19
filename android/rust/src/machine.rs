@@ -12,9 +12,9 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use manymux::lock::held;
-use russh::client::{self, Handle};
+use russh::client::{self, AuthResult, Handle};
 use russh::keys::key::PrivateKeyWithHashAlg;
 use russh::keys::ssh_key::PublicKey;
 use russh::{ChannelMsg, Disconnect};
@@ -160,13 +160,35 @@ impl Connection {
             .authenticate_publickey(&machine.user, key)
             .await
             .with_context(|| format!("authenticating as {} on {}", machine.user, machine.at()))?;
-        if !allowed.success() {
-            return Err(Rebuff::Key {
-                at: machine.at(),
-                user: machine.user.clone(),
-                fingerprint: identity.fingerprint(),
+        match allowed {
+            AuthResult::Success => {}
+            // A machine that looked at the key and said no says in the same
+            // breath what it would take instead, since the point of the answer
+            // is to let a client go on to another method. So a non-empty list
+            // is the far end having answered, and this is the refusal worth
+            // handing somebody the key for.
+            AuthResult::Failure {
+                remaining_methods, ..
+            } if !remaining_methods.is_empty() => {
+                return Err(Rebuff::Key {
+                    at: machine.at(),
+                    user: machine.user.clone(),
+                    fingerprint: identity.fingerprint(),
+                }
+                .into());
             }
-            .into());
+            // And nothing at all is nobody having answered. russh reports a
+            // session that ended under the question as an ordinary failure to
+            // authenticate (`wait_recv_reply` answers a closed channel with an
+            // empty `MethodSet`), which on a phone is the common case rather
+            // than the exotic one: the radio sleeps between the key exchange
+            // and the reply. Read as a refusal it sends somebody to another
+            // device to paste a key into a machine that never looked at one,
+            // and the same screen comes back afterwards.
+            AuthResult::Failure { .. } => bail!(
+                "the connection to {} went before it said anything about this device's key",
+                machine.at()
+            ),
         }
 
         Ok(Self { handle })

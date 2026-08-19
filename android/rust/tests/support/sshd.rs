@@ -93,6 +93,10 @@ pub enum Welcome {
     /// every machine the first time a phone is pointed at it, so it is worth a
     /// server of its own rather than being read off a connection that ended.
     NoKey,
+    /// Nothing is said either way: the connection goes while the question is
+    /// out. A radio that slept between the key exchange and the answer, which
+    /// on a phone is the ordinary way for one to end.
+    Gone,
 }
 
 impl Sshd {
@@ -104,6 +108,13 @@ impl Sshd {
     /// One that takes no key at all, however good the connection to it is.
     pub async fn refusing(root: &Path, key: PrivateKey) -> Self {
         Self::serving(root, key, &[], Serving::forever(), Welcome::NoKey).await
+    }
+
+    /// One that goes while the key is being offered, having said nothing about
+    /// it. The key exchange has already happened, so this is past everything
+    /// `connect` answers for and lands in the middle of the auth.
+    pub async fn going_mid_auth(root: &Path, key: PrivateKey) -> Self {
+        Self::serving(root, key, &[], Serving::forever(), Welcome::Gone).await
     }
 
     /// The same, but the connections after `serving.until` are accepted and
@@ -230,13 +241,17 @@ impl Handler for Shell {
         _: &str,
         _: &russh::keys::ssh_key::PublicKey,
     ) -> Result<Auth, Self::Error> {
-        if self.welcome == Welcome::NoKey {
-            return Ok(Auth::Reject {
+        match self.welcome {
+            Welcome::AnyKey => Ok(Auth::Accept),
+            Welcome::NoKey => Ok(Auth::Reject {
                 proceed_with_methods: None,
                 partial_success: false,
-            });
+            }),
+            // The session ends here rather than answering. From the client that
+            // is indistinguishable from the connection going, which is the
+            // point: both leave it holding a question nobody replied to.
+            Welcome::Gone => Err(russh::Error::Disconnect),
         }
-        Ok(Auth::Accept)
     }
 
     async fn channel_open_session(
