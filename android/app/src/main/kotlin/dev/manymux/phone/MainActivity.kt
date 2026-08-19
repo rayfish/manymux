@@ -19,7 +19,6 @@ import android.view.View
 import android.view.ViewGroup.LayoutParams.MATCH_PARENT
 import android.view.ViewGroup.LayoutParams.WRAP_CONTENT
 import android.view.WindowInsets
-import android.view.inputmethod.InputMethodManager
 import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.PopupMenu
@@ -528,9 +527,7 @@ class MainActivity : Activity() {
             }
         }
 
-        screen.requestFocus()
-        (getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager)
-            .showSoftInput(screen, InputMethodManager.SHOW_IMPLICIT)
+        screen.openKeyboard()
     }
 
     /** The bar says what the mark row says: where you are, and how it is going. */
@@ -629,6 +626,7 @@ class MainActivity : Activity() {
             val text = clipboard.primaryClip?.getItemAt(0)?.coerceToText(this)?.toString()
             if (!text.isNullOrEmpty()) screen.send(text.toByteArray())
         }
+        key("⌨") { screen.openKeyboard() }
         return keys
     }
 

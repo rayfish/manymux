@@ -7,10 +7,12 @@ import android.graphics.Paint
 import android.graphics.Typeface
 import android.view.Choreographer
 import android.view.KeyEvent
+import android.view.MotionEvent
 import android.view.View
 import android.view.inputmethod.BaseInputConnection
 import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputConnection
+import android.view.inputmethod.InputMethodManager
 import uniffi.manymux_android.Attach
 import uniffi.manymux_android.Grid
 import uniffi.manymux_android.Row
@@ -121,7 +123,11 @@ class TerminalView(context: Context) : View(context), Choreographer.FrameCallbac
     /** Tell the far end the shape, if it is not the shape it was already told. */
     private fun tellGrid() {
         val grid = grid()
-        android.util.Log.i("manymux", "grid: ${grid.cols}x${grid.rows} view=${width}x$height")
+        android.util.Log.i(
+            "manymux",
+            "grid: ${grid.cols}x${grid.rows} view=${width}x$height" +
+                " told=${told?.cols}x${told?.rows} attached=${attach != null}",
+        )
         if (grid == told) return
         told = grid
         attach?.resize(grid)
@@ -219,6 +225,35 @@ class TerminalView(context: Context) : View(context), Choreographer.FrameCallbac
 
     /** Whether the next key is a control chord, set by the extra-keys row. */
     var control = false
+
+    /**
+     * Ask for the keyboard.
+     *
+     * There has to be a way back to it, and on a phone the keyboard's own key
+     * for going away is always there: pressed once, a session became something
+     * you could read and not type in, for the rest of the attach. A terminal is
+     * not a form and has no field to tap on, so the surface itself is what is
+     * tapped, which is what every terminal on this platform does, and the row
+     * of keys under it says so as well for a hand that has just used that row.
+     */
+    fun openKeyboard() {
+        requestFocus()
+        val ime = context.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
+        ime.showSoftInput(this, InputMethodManager.SHOW_IMPLICIT)
+    }
+
+    override fun onTouchEvent(event: MotionEvent): Boolean {
+        if (event.actionMasked == MotionEvent.ACTION_UP) performClick()
+        // Taken whatever it is, or the up that ends the tap goes to whoever
+        // took the down.
+        return true
+    }
+
+    override fun performClick(): Boolean {
+        super.performClick()
+        openKeyboard()
+        return true
+    }
 
     override fun onCheckIsTextEditor(): Boolean = true
 
