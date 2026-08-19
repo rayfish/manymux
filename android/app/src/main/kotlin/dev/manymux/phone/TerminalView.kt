@@ -121,6 +121,7 @@ class TerminalView(context: Context) : View(context), Choreographer.FrameCallbac
     /** Tell the far end the shape, if it is not the shape it was already told. */
     private fun tellGrid() {
         val grid = grid()
+        android.util.Log.i("manymux", "grid: ${grid.cols}x${grid.rows} view=${width}x$height")
         if (grid == told) return
         told = grid
         attach?.resize(grid)

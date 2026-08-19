@@ -654,6 +654,14 @@ class MainActivity : Activity() {
     private fun show(view: View) {
         view.setOnApplyWindowInsetsListener { at, insets ->
             val edges = edges(insets)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                android.util.Log.i(
+                    "manymux",
+                    "insets: keyboard=${insets.getInsets(WindowInsets.Type.ime()).bottom}" +
+                        " bars=${insets.getInsets(WindowInsets.Type.systemBars()).bottom}" +
+                        " padding=${edges.bottom} height=${at.height}",
+                )
+            }
             at.setPadding(edges.left, edges.top, edges.right, edges.bottom)
             insets
         }
