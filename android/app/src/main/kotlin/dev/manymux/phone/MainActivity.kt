@@ -82,6 +82,19 @@ class MainActivity : Activity() {
 
     override fun onCreate(saved: Bundle?) {
         super.onCreate(saved)
+
+        // Say outright that laying this window out is the app's job, rather
+        // than inheriting an answer from whichever Android is underneath.
+        // Android 15 decides it for an app targeting SDK 35 or above and hands
+        // the job over; every version before it keeps the job and resizes the
+        // window for the keyboard itself, which is what `adjustResize` in the
+        // manifest asks for. Left to the platform that is two behaviours for
+        // one screen to be right under, and the one this was written against
+        // is not the one most phones are running. Said here it is one.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            window.setDecorFitsSystemWindows(false)
+        }
+
         // App-private storage: the key this device is known by lives here and
         // nowhere else.
         phone = Phone.keptIn(filesDir.absolutePath)
@@ -635,7 +648,8 @@ class MainActivity : Activity() {
      * the bar, so the strip behind the status bar reads as part of the bar
      * rather than as a gap above it. The keyboard is in the same set on
      * purpose: `adjustResize` is what used to lift the extra keys clear of it,
-     * and edge to edge means the window is no longer resized for us.
+     * and a window this app lays out itself is no longer resized for us, which
+     * [onCreate] now says outright rather than leaving to the platform.
      */
     private fun show(view: View) {
         view.setOnApplyWindowInsetsListener { at, insets ->
@@ -644,6 +658,14 @@ class MainActivity : Activity() {
             insets
         }
         setContentView(view)
+        // And asks for them rather than waiting to be told. Insets are
+        // dispatched when they change, and a screen put up in the middle of a
+        // run is a new view in a window whose insets have not changed at all:
+        // whatever the last screen was told, this one has been told nothing,
+        // and sits unpadded until something moves. The first screen of a run is
+        // the one that gets a dispatch for nothing, which is what made this
+        // look done.
+        view.requestApplyInsets()
     }
 
     /** What the bars, the cutout and the keyboard are covering. */
