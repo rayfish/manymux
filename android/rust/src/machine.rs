@@ -12,13 +12,14 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow};
 use manymux::lock::held;
 use russh::client::{self, AuthResult, Handle};
 use russh::keys::key::PrivateKeyWithHashAlg;
 use russh::keys::ssh_key::PublicKey;
-use russh::{ChannelMsg, Disconnect};
+use russh::{ChannelMsg, Disconnect, Error as SshError, MethodKind};
 use tokio::io::AsyncWriteExt;
+use tokio::time::timeout;
 
 use crate::AsyncMutex;
 use crate::keys::{Identity, KnownHosts, Verdict};
@@ -124,6 +125,65 @@ pub struct Connection {
     handle: Handle<Trusting>,
 }
 
+/// Whether a machine that did not let this device in said so, or went.
+///
+/// The distinction has to be made because russh does not make it. A failure to
+/// authenticate comes back as `AuthResult::Failure` whether the far end sent
+/// one or the session ended under the question: `wait_recv_reply` answers a
+/// closed channel with an empty `MethodSet`, which is also, exactly, what a
+/// machine offering the `none` method alone sends when it says no, since RFC
+/// 4252 keeps `none` out of the ways to continue and leaves it with nothing to
+/// list. So neither the result nor the methods in it can be read for this.
+enum Answer {
+    /// The far end said something. Either it is still there, or it closed the
+    /// connection itself once there was nothing left to ask it, which is a
+    /// machine turning this device away rather than a connection going.
+    Said,
+    /// The connection broke, which is the session ending in an error rather
+    /// than ending.
+    Went(anyhow::Error),
+}
+
+/// How long a session that has already ended is given to say how.
+///
+/// It has ended, so this expires only if `is_closed` and the task disagree.
+/// The fallback is [`Answer::Said`], since blaming the network is the claim
+/// that needs the evidence.
+const LAST_WORD: Duration = Duration::from_secs(2);
+
+/// Ask the session how it ended, which is the one place the difference is
+/// recorded.
+///
+/// Consuming the handle is the point rather than a cost: this is only reached
+/// where there is nothing left to ask the far end, so what is left of the
+/// connection is its outcome.
+async fn answer(handle: Handle<Trusting>) -> Answer {
+    // Still there, so it replied: a session cannot both be running and have
+    // been the reason the reply was empty.
+    if !handle.is_closed() {
+        return Answer::Said;
+    }
+    match timeout(LAST_WORD, handle).await {
+        Ok(Ok(())) => Answer::Said,
+        // The one error that is an answer. russh raises it in exactly one
+        // place, on reading a failure that named no way to continue, and it
+        // sends the reply on before it does: a machine offering `none` alone
+        // ends every refusal this way, so reading it as a broken connection
+        // would put a network problem in front of somebody whose network is
+        // fine.
+        Ok(Err(error)) if names(&error, &SshError::NoAuthMethod) => Answer::Said,
+        Ok(Err(error)) => Answer::Went(error),
+        Err(_) => Answer::Said,
+    }
+}
+
+/// Whether an error is, under whatever it was wrapped in, this one.
+fn names(error: &anyhow::Error, ssh: &SshError) -> bool {
+    error
+        .downcast_ref::<SshError>()
+        .is_some_and(|found| std::mem::discriminant(found) == std::mem::discriminant(ssh))
+}
+
 impl Connection {
     /// Connect, check the host key, and authenticate with this device's key.
     pub async fn open(machine: &Machine, identity: &Identity, known: &KnownHosts) -> Result<Self> {
@@ -155,40 +215,69 @@ impl Connection {
             })
             .with_context(|| format!("connecting to {}", machine.at()))?;
 
+        // Ask before offering anything, which is what every ssh client does
+        // and what this did not. The `none` method is how a client finds out
+        // what the far end will take, and on a machine reached through a mesh
+        // it is also the whole of the answer: the peer has already been
+        // identified by the link the connection arrived over, so its ssh has
+        // no `authorized_keys` anywhere in it and admits the session here.
+        // Opening with a key instead, this was told no by machines that would
+        // have let it straight in, and then said the key was the problem. That
+        // it worked from a terminal on the same phone and not from the app is
+        // the shape of the bug: `ssh` asks first.
+        let offered = match handle
+            .authenticate_none(&machine.user)
+            .await
+            .with_context(|| format!("asking {} how to log in", machine.at()))?
+        {
+            AuthResult::Success => return Ok(Self { handle }),
+            AuthResult::Failure {
+                remaining_methods, ..
+            } => remaining_methods,
+        };
+        // A machine that will not take a key is one where no key would have
+        // changed the answer, so somebody sent off to paste one has been sent
+        // nowhere. What decides is on the machine.
+        if !offered.contains(&MethodKind::PublicKey) {
+            return Err(match answer(handle).await {
+                Answer::Said => anyhow!(
+                    "{} would not let {} in and never asked for a key: whatever admits \
+                     people to that machine has not been told about this device",
+                    machine.at(),
+                    machine.user
+                ),
+                Answer::Went(error) => error.context(format!(
+                    "the connection to {} went before it said how to log in",
+                    machine.at()
+                )),
+            });
+        }
+
         let key = PrivateKeyWithHashAlg::new(identity.key(), None);
         let allowed = handle
             .authenticate_publickey(&machine.user, key)
             .await
             .with_context(|| format!("authenticating as {} on {}", machine.user, machine.at()))?;
-        match allowed {
-            AuthResult::Success => {}
-            // A machine that looked at the key and said no says in the same
-            // breath what it would take instead, since the point of the answer
-            // is to let a client go on to another method. So a non-empty list
-            // is the far end having answered, and this is the refusal worth
-            // handing somebody the key for.
-            AuthResult::Failure {
-                remaining_methods, ..
-            } if !remaining_methods.is_empty() => {
-                return Err(Rebuff::Key {
+        if !allowed.success() {
+            // The same question again, for the same reason: a phone loses
+            // connections in the middle of things, and a session that ended
+            // under the offer comes back from russh looking exactly like a
+            // machine that read the key and said no. Told apart wrongly, this
+            // sends somebody to another device to paste a key into a machine
+            // that never looked at one, and the same screen comes back
+            // afterwards.
+            return Err(match answer(handle).await {
+                Answer::Said => Rebuff::Key {
                     at: machine.at(),
                     user: machine.user.clone(),
                     fingerprint: identity.fingerprint(),
                 }
-                .into());
-            }
-            // And nothing at all is nobody having answered. russh reports a
-            // session that ended under the question as an ordinary failure to
-            // authenticate (`wait_recv_reply` answers a closed channel with an
-            // empty `MethodSet`), which on a phone is the common case rather
-            // than the exotic one: the radio sleeps between the key exchange
-            // and the reply. Read as a refusal it sends somebody to another
-            // device to paste a key into a machine that never looked at one,
-            // and the same screen comes back afterwards.
-            AuthResult::Failure { .. } => bail!(
-                "the connection to {} went before it said anything about this device's key",
-                machine.at()
-            ),
+                .into(),
+                Answer::Went(error) => error.context(format!(
+                    "the connection to {} went while this device's key was being offered",
+                    machine.at()
+                )),
+            });
         }
 
         Ok(Self { handle })

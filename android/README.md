@@ -77,3 +77,8 @@ cargo run --example reach -- user@host build     # attach and print a screen
 The first run generates this device's key and prints the line to add to that
 account's `authorized_keys`. Host keys are trusted on first use and written
 down, and a key that changes afterwards is refused with both fingerprints.
+
+A machine reached through a mesh needs none of that. Where the peer is already
+identified by the link the connection arrived over, its ssh offers the `none`
+method alone and there is no `authorized_keys` in it anywhere, so the client
+asks how to log in before it offers anything, the way every `ssh` does.

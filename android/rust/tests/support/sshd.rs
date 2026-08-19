@@ -16,10 +16,11 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 use russh::keys::PrivateKey;
 use russh::server::{self, Auth, Handler, Msg, Server, Session};
-use russh::{Channel, ChannelId, Disconnect};
+use russh::{Channel, ChannelId, Disconnect, MethodKind, MethodSet};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::process::{ChildStdin, Command};
@@ -82,7 +83,7 @@ impl Serving {
     }
 }
 
-/// Whether the far end has been given this device's key.
+/// What the far end does when this device tries to log in.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Welcome {
     /// Any key gets in. Which key it was is the client's business, and testing
@@ -97,6 +98,26 @@ pub enum Welcome {
     /// out. A radio that slept between the key exchange and the answer, which
     /// on a phone is the ordinary way for one to end.
     Gone,
+    /// The far end already knows who this is and asks for nothing: it offers
+    /// the `none` method alone and admits the session on it. A mesh that
+    /// identifies its peers by the link they arrived over works this way, and
+    /// a machine reached through one is what the phone actually meets.
+    Unasked,
+    /// The same machine, saying no. It knows who this is and does not want it,
+    /// so there is no key it would have taken and nothing to paste anywhere.
+    Unwanted,
+}
+
+impl Welcome {
+    /// What the far end says it will take. A mesh has proven who this is
+    /// before the ssh starts, so `none` is the whole of it and offering a key
+    /// method would be inviting an answer it has no use for.
+    fn methods(self) -> MethodSet {
+        match self {
+            Self::Unasked | Self::Unwanted => MethodSet::from(&[MethodKind::None][..]),
+            _ => MethodSet::server_supported(),
+        }
+    }
 }
 
 impl Sshd {
@@ -115,6 +136,16 @@ impl Sshd {
     /// `connect` answers for and lands in the middle of the auth.
     pub async fn going_mid_auth(root: &Path, key: PrivateKey) -> Self {
         Self::serving(root, key, &[], Serving::forever(), Welcome::Gone).await
+    }
+
+    /// One that knows who this is already and asks for nothing.
+    pub async fn unasking(root: &Path, key: PrivateKey) -> Self {
+        Self::serving(root, key, &[], Serving::forever(), Welcome::Unasked).await
+    }
+
+    /// The same, refusing this device outright.
+    pub async fn unwanting(root: &Path, key: PrivateKey) -> Self {
+        Self::serving(root, key, &[], Serving::forever(), Welcome::Unwanted).await
     }
 
     /// The same, but the connections after `serving.until` are accepted and
@@ -145,6 +176,10 @@ impl Sshd {
 
         let config = Arc::new(server::Config {
             keys: vec![key],
+            methods: welcome.methods(),
+            // A real server sits on a rejection to slow somebody guessing.
+            // There is nobody guessing here and every test pays it.
+            auth_rejection_time: Duration::ZERO,
             ..Default::default()
         });
         let root = root.to_path_buf();
@@ -243,14 +278,30 @@ impl Handler for Shell {
     ) -> Result<Auth, Self::Error> {
         match self.welcome {
             Welcome::AnyKey => Ok(Auth::Accept),
-            Welcome::NoKey => Ok(Auth::Reject {
-                proceed_with_methods: None,
-                partial_success: false,
-            }),
             // The session ends here rather than answering. From the client that
             // is indistinguishable from the connection going, which is the
             // point: both leave it holding a question nobody replied to.
             Welcome::Gone => Err(russh::Error::Disconnect),
+            // A machine that asks for nothing is not asked for this either,
+            // and one that answered a key it never offered to take would be a
+            // machine no client has to deal with.
+            _ => Ok(Auth::Reject {
+                proceed_with_methods: None,
+                partial_success: false,
+            }),
+        }
+    }
+
+    /// The method a mesh admits on, its peers being known before the ssh
+    /// starts. Everything else refuses it, which is what a stock sshd does and
+    /// what makes the client go on and offer the key.
+    async fn auth_none(&mut self, _: &str) -> Result<Auth, Self::Error> {
+        match self.welcome {
+            Welcome::Unasked => Ok(Auth::Accept),
+            _ => Ok(Auth::Reject {
+                proceed_with_methods: None,
+                partial_success: false,
+            }),
         }
     }
 

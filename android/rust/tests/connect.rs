@@ -55,6 +55,23 @@ impl Reachable {
         Self::knowing(&world, host_key, sshd.port)
     }
 
+    /// A machine reached over a mesh, which knows who this is before the ssh
+    /// starts and asks for nothing.
+    async fn unasking(name: &str) -> Self {
+        let world = World::where_mm_is(name, Mm::OnPath);
+        let host_key = generate().unwrap();
+        let sshd = Sshd::unasking(&world.dir, host_key.clone()).await;
+        Self::knowing(&world, host_key, sshd.port)
+    }
+
+    /// The same, not admitting this device.
+    async fn unwanting(name: &str) -> Self {
+        let world = World::where_mm_is(name, Mm::OnPath);
+        let host_key = generate().unwrap();
+        let sshd = Sshd::unwanting(&world.dir, host_key.clone()).await;
+        Self::knowing(&world, host_key, sshd.port)
+    }
+
     /// What this device knows about a machine on `port`.
     fn knowing(world: &World, host_key: PrivateKey, port: u16) -> Self {
         let dir = world.dir.clone();
@@ -192,9 +209,51 @@ async fn a_machine_that_goes_while_being_asked_is_not_read_as_a_refused_key() {
         "a connection that went was reported as a key: {error:#}"
     );
 
-    // And what it says is where it happened, since that is all anybody knows.
+    // And what it says is that the connection went, since that is all anybody
+    // knows. Spelled out because the two failures with an empty answer behind
+    // them are told apart here and nowhere else: a machine that offers only
+    // `none` says nothing on the wire either (RFC 4252 keeps `none` out of the
+    // list of ways to continue), so a client reading the list alone calls a
+    // live machine a dropped connection.
     let said = format!("{error:#}");
     assert!(said.contains(&reachable.machine.at()), "{said}");
+    assert!(said.contains("went"), "{said}");
+    assert!(!said.contains("authorized_keys"), "{said}");
+}
+
+#[tokio::test]
+async fn a_machine_that_knows_this_device_already_is_not_asked_for_a_key() {
+    let reachable = Reachable::unasking("connect-unasked").await;
+
+    // A mesh proves who a peer is by the link the connection arrived over, so
+    // its ssh offers the `none` method and nothing else: there is no
+    // `authorized_keys` anywhere in it, and a client that opens by offering a
+    // key is told no by a machine that would have let it straight in. Every
+    // stock `ssh` asks with `none` first, which is why this works from a
+    // terminal on the same phone and did not work from the app.
+    let connection = reachable.connect().await.unwrap();
+    let reached = reach(&connection).await.unwrap();
+    assert_eq!(reached.sessions.len(), 1);
+}
+
+#[tokio::test]
+async fn a_machine_that_asks_for_nothing_and_says_no_does_not_send_anybody_to_a_key_file() {
+    let reachable = Reachable::unwanting("connect-unwanted").await;
+
+    let error = match reachable.connect().await {
+        Ok(_) => panic!("got in to a machine that does not admit this device"),
+        Err(error) => error,
+    };
+
+    // It never asked for a key, so no key would have changed the answer and
+    // there is nowhere to paste one. The machine is where the decision is.
+    assert!(
+        error.downcast_ref::<Rebuff>().is_none(),
+        "a machine that asked for no key was reported as one refusing it: {error:#}"
+    );
+    let said = format!("{error:#}");
+    assert!(said.contains(&reachable.machine.at()), "{said}");
+    assert!(said.contains("never asked for a key"), "{said}");
     assert!(!said.contains("authorized_keys"), "{said}");
 }
 
