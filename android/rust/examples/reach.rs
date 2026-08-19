@@ -21,6 +21,7 @@ use std::time::Duration;
 
 use anyhow::{Result, bail};
 use manymux::proto::Size;
+use manymux_android::agent::Agent;
 use manymux_android::keys::{Identity, KnownHosts};
 use manymux_android::machine::{Connection, Connections, Machine};
 use manymux_android::session::{Session, State};
@@ -39,9 +40,14 @@ async fn main() -> Result<()> {
         std::env::var("MM_PHONE_DIR").unwrap_or_else(|_| ".manymux-phone".to_string()),
     );
     let fresh = !dir.join("id_ed25519").exists();
-    let identity = Identity::kept_at(&dir.join("id_ed25519"))?;
+    // The agent this shell was told about, which the phone half of this crate
+    // never has and a desk always does. It is looked up here rather than down
+    // in the connect so that a test run never offers whoever is running it
+    // their own keys.
+    let agent = Agent::in_the_environment();
+    let identity = Identity::kept_at(&dir.join("id_ed25519"))?.asking(agent.clone());
     let known = KnownHosts::at(dir.join("known_hosts"));
-    if fresh {
+    if fresh && agent.is_none() {
         println!("this device's key is new. Put it in that account's authorized_keys:");
         println!("{}", identity.authorized_line());
     }

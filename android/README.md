@@ -82,3 +82,8 @@ A machine reached through a mesh needs none of that. Where the peer is already
 identified by the link the connection arrived over, its ssh offers the `none`
 method alone and there is no `authorized_keys` in it anywhere, so the client
 asks how to log in before it offers anything, the way every `ssh` does.
+
+Nor does a machine that already knows a key in your agent. `SSH_AUTH_SOCK` is
+read here and never on a phone, which has no agent to read, so what this buys
+is the run above: the keys the machines already know, without pasting a fresh
+one into every account first. The device's own key is the rung after it.

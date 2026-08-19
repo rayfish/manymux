@@ -14,11 +14,11 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use russh::keys::PrivateKey;
+use russh::keys::{PrivateKey, PublicKey};
 use russh::server::{self, Auth, Handler, Msg, Server, Session};
 use russh::{Channel, ChannelId, Disconnect, MethodKind, MethodSet};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -36,12 +36,20 @@ pub struct Sshd {
     /// handshake. They cost wildly different amounts on a phone and look
     /// identical from above.
     accepted: Arc<AtomicUsize>,
+    /// The key the far end let in, which is how a test asks *which* of the
+    /// keys a client had it actually offered.
+    admitted: Arc<Mutex<Option<PublicKey>>>,
 }
 
 impl Sshd {
     /// How many separate ssh connections the client has made.
     pub fn connections(&self) -> usize {
         self.accepted.load(Ordering::Relaxed)
+    }
+
+    /// The key it let in, if a key was what let anybody in.
+    pub fn admitted(&self) -> Option<PublicKey> {
+        self.admitted.lock().unwrap().clone()
     }
 }
 
@@ -84,7 +92,7 @@ impl Serving {
 }
 
 /// What the far end does when this device tries to log in.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum Welcome {
     /// Any key gets in. Which key it was is the client's business, and testing
     /// sshd's authorisation would be testing sshd.
@@ -106,13 +114,17 @@ pub enum Welcome {
     /// The same machine, saying no. It knows who this is and does not want it,
     /// so there is no key it would have taken and nothing to paste anywhere.
     Unwanted,
+    /// This key and no other, which is what a real `authorized_keys` is. It is
+    /// here because a test about *which* key a client offered cannot be
+    /// written against a machine that takes any of them.
+    OnlyThis(Box<PublicKey>),
 }
 
 impl Welcome {
     /// What the far end says it will take. A mesh has proven who this is
     /// before the ssh starts, so `none` is the whole of it and offering a key
     /// method would be inviting an answer it has no use for.
-    fn methods(self) -> MethodSet {
+    fn methods(&self) -> MethodSet {
         match self {
             Self::Unasked | Self::Unwanted => MethodSet::from(&[MethodKind::None][..]),
             _ => MethodSet::server_supported(),
@@ -146,6 +158,12 @@ impl Sshd {
     /// The same, refusing this device outright.
     pub async fn unwanting(root: &Path, key: PrivateKey) -> Self {
         Self::serving(root, key, &[], Serving::forever(), Welcome::Unwanted).await
+    }
+
+    /// One with an `authorized_keys` of exactly one line.
+    pub async fn taking(root: &Path, key: PrivateKey, allowed: &PublicKey) -> Self {
+        let welcome = Welcome::OnlyThis(Box::new(allowed.clone()));
+        Self::serving(root, key, &[], Serving::forever(), welcome).await
     }
 
     /// The same, but the connections after `serving.until` are accepted and
@@ -189,12 +207,15 @@ impl Sshd {
             .collect();
         let accepted = Arc::new(AtomicUsize::new(0));
         let counting = Arc::clone(&accepted);
+        let admitted = Arc::new(Mutex::new(None));
+        let noting = Arc::clone(&admitted);
         tokio::spawn(async move {
             let mut machine = Machine {
                 root,
                 extra,
                 commands: serving.commands,
                 welcome,
+                admitted: noting,
             };
             let mut taken = 0usize;
             while let Ok((socket, from)) = listener.accept().await {
@@ -220,7 +241,11 @@ impl Sshd {
             }
         });
 
-        Self { port, accepted }
+        Self {
+            port,
+            accepted,
+            admitted,
+        }
     }
 }
 
@@ -235,6 +260,7 @@ struct Machine {
     /// beside this one.
     extra: Vec<(String, String)>,
     welcome: Welcome,
+    admitted: Arc<Mutex<Option<PublicKey>>>,
 }
 
 impl Server for Machine {
@@ -245,7 +271,8 @@ impl Server for Machine {
             root: self.root.clone(),
             extra: self.extra.clone(),
             commands: self.commands,
-            welcome: self.welcome,
+            welcome: self.welcome.clone(),
+            admitted: Arc::clone(&self.admitted),
             served: 0,
             stdin: None,
         }
@@ -258,6 +285,7 @@ struct Shell {
     extra: Vec<(String, String)>,
     commands: usize,
     welcome: Welcome,
+    admitted: Arc<Mutex<Option<PublicKey>>>,
     /// How many commands this connection has been asked for.
     served: usize,
     /// Held so that what the client writes reaches the command's stdin, which
@@ -271,13 +299,19 @@ impl Handler for Shell {
     /// Whatever this machine was started to say. Which key it was is the
     /// client's business, and testing sshd's authorisation would be testing
     /// sshd.
-    async fn auth_publickey(
-        &mut self,
-        _: &str,
-        _: &russh::keys::ssh_key::PublicKey,
-    ) -> Result<Auth, Self::Error> {
-        match self.welcome {
-            Welcome::AnyKey => Ok(Auth::Accept),
+    async fn auth_publickey(&mut self, _: &str, offered: &PublicKey) -> Result<Auth, Self::Error> {
+        match &self.welcome {
+            Welcome::AnyKey => {
+                *self.admitted.lock().unwrap() = Some(offered.clone());
+                Ok(Auth::Accept)
+            }
+            // On the key and not on the whole line: an `authorized_keys` entry
+            // carries a comment, what arrives over the wire does not, and a
+            // machine that matched the two would take nobody's key at all.
+            Welcome::OnlyThis(allowed) if allowed.key_data() == offered.key_data() => {
+                *self.admitted.lock().unwrap() = Some(offered.clone());
+                Ok(Auth::Accept)
+            }
             // The session ends here rather than answering. From the client that
             // is indistinguishable from the connection going, which is the
             // point: both leave it holding a question nobody replied to.
@@ -296,7 +330,7 @@ impl Handler for Shell {
     /// starts. Everything else refuses it, which is what a stock sshd does and
     /// what makes the client go on and offer the key.
     async fn auth_none(&mut self, _: &str) -> Result<Auth, Self::Error> {
-        match self.welcome {
+        match &self.welcome {
             Welcome::Unasked => Ok(Auth::Accept),
             _ => Ok(Auth::Reject {
                 proceed_with_methods: None,

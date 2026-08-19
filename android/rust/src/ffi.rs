@@ -134,6 +134,12 @@ pub struct Phone {
 impl Phone {
     /// Read this device's identity out of `dir`, generating one if there is
     /// none there yet.
+    ///
+    /// No agent, and not by omission. `SSH_AUTH_SOCK` is not a thing Android
+    /// sets, and a socket belonging to another app is not one this process
+    /// could open if it were: an agent is [`crate::agent`]'s answer for the
+    /// desktop the `reach` example runs on. The key generated here is the
+    /// phone's whole identity.
     #[uniffi::constructor]
     pub fn kept_in(dir: String) -> Result<Arc<Self>, Trouble> {
         let dir = PathBuf::from(dir);

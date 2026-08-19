@@ -80,6 +80,10 @@ russh = { version = "0.62", default-features = false, features = [
     "flate2",
     "rsa",
 ] }
+# And a real ssh agent beside it, for the same reason. russh's agent server
+# wants a stream of accepted connections rather than a listener, which is the
+# whole of what this is for.
+tokio-stream = { version = "0.1", features = ["net"] }
 
 [[bin]]
 # The bindings generator, which reads the built library and writes the Kotlin

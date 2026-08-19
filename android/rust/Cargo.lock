@@ -1098,6 +1098,7 @@ dependencies = [
  "manymux",
  "russh",
  "tokio",
+ "tokio-stream",
  "uniffi",
 ]
 

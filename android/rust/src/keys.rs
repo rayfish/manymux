@@ -14,10 +14,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+
 use getrandom::SysRng;
 use russh::keys::ssh_key::LineEnding;
 use russh::keys::ssh_key::rand_core::UnwrapErr;
 use russh::keys::{Algorithm, PrivateKey, PublicKey};
+
+use crate::agent::Agent;
 
 /// A fresh ed25519 key.
 ///
@@ -29,10 +32,16 @@ pub fn generate() -> Result<PrivateKey> {
         .context("generating an ed25519 key")
 }
 
-/// This device's key, kept in app-private storage.
+/// This device's key, kept in app-private storage, and whatever else it has
+/// been given to sign with.
+///
+/// The key is the whole of it on a phone. An agent is the desktop's half: see
+/// [`crate::agent`] for why it arrives here rather than being looked up where
+/// it is used.
 #[derive(Clone)]
 pub struct Identity {
     key: Arc<PrivateKey>,
+    agent: Option<Agent>,
 }
 
 impl Identity {
@@ -47,17 +56,37 @@ impl Identity {
             Ok(text) => {
                 let key = PrivateKey::from_openssh(&text)
                     .with_context(|| format!("reading the key in {}", path.display()))?;
-                Ok(Self { key: Arc::new(key) })
+                Ok(Self::of(key))
             }
             Err(error) if error.kind() == ErrorKind::NotFound => {
                 let mut key = generate()?;
                 key.set_comment("manymux");
                 write_privately(path, key.to_openssh(LineEnding::LF)?.as_bytes())
                     .with_context(|| format!("writing the key to {}", path.display()))?;
-                Ok(Self { key: Arc::new(key) })
+                Ok(Self::of(key))
             }
             Err(error) => Err(error).with_context(|| format!("reading {}", path.display())),
         }
+    }
+
+    fn of(key: PrivateKey) -> Self {
+        Self {
+            key: Arc::new(key),
+            agent: None,
+        }
+    }
+
+    /// The same identity, also able to sign with what `agent` is holding.
+    ///
+    /// Takes an `Option` because the caller's question is "is there one", and
+    /// making every caller write the `if` around this would be the same line
+    /// four times.
+    pub fn asking(self, agent: Option<Agent>) -> Self {
+        Self { agent, ..self }
+    }
+
+    pub(crate) fn agent(&self) -> Option<&Agent> {
+        self.agent.as_ref()
     }
 
     /// The line to paste into a machine's `authorized_keys`.

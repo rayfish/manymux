@@ -17,6 +17,7 @@ use manymux::lock::held;
 use russh::client::{self, AuthResult, Handle};
 use russh::keys::key::PrivateKeyWithHashAlg;
 use russh::keys::ssh_key::PublicKey;
+use russh::keys::{Algorithm, HashAlg};
 use russh::{ChannelMsg, Disconnect, Error as SshError, MethodKind};
 use tokio::io::AsyncWriteExt;
 use tokio::time::timeout;
@@ -151,6 +152,16 @@ enum Answer {
 /// that needs the evidence.
 const LAST_WORD: Duration = Duration::from_secs(2);
 
+/// How many of an agent's keys are offered before this device's own.
+///
+/// The number is `MaxAuthTries` arithmetic rather than a taste. OpenSSH's
+/// default is six attempts per connection and it counts every one, including
+/// the `none` that opens the ladder; one more has to be left for this device's
+/// key, which is the rung that is actually known to work and the one the
+/// failure message tells somebody to install. An agent holding a working set of
+/// a dozen keys must not be able to spend the connection before reaching it.
+const FROM_AN_AGENT: usize = 4;
+
 /// Ask the session how it ended, which is the one place the difference is
 /// recorded.
 ///
@@ -251,6 +262,34 @@ impl Connection {
                     machine.at()
                 )),
             });
+        }
+
+        // Whatever an agent is holding goes first, the way OpenSSH tries agent
+        // identities before the files on disk, and for the same reason: those
+        // are the keys the machines already know. On a phone this does nothing
+        // at all, since nothing there sets `SSH_AUTH_SOCK`.
+        //
+        // An agent that cannot be reached is stepped over rather than reported.
+        // The device's own key is still to come and is the rung that works, and
+        // a broken `SSH_AUTH_SOCK` is not a thing to fail a connection over.
+        if let Some(agent) = identity.agent()
+            && let Ok(mut held) = agent.open().await
+        {
+            for key in held.keys().into_iter().take(FROM_AN_AGENT) {
+                // SHA-512 for RSA, since a bare `ssh-rsa` signature is SHA-1
+                // and every sshd of the last several years refuses it. Asking
+                // the server which it prefers means waiting on an extension it
+                // may never send, and this is the answer that wait would give.
+                let hash_alg =
+                    matches!(key.algorithm(), Algorithm::Rsa { .. }).then_some(HashAlg::Sha512);
+                let offered = handle
+                    .authenticate_publickey_with(&machine.user, key, hash_alg, &mut held)
+                    .await
+                    .with_context(|| format!("offering an agent key to {}", machine.at()))?;
+                if offered.success() {
+                    return Ok(Self { handle });
+                }
+            }
         }
 
         let key = PrivateKeyWithHashAlg::new(identity.key(), None);

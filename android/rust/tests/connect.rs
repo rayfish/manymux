@@ -8,16 +8,22 @@
 //! `mm` on the PATH and reports a hang on exactly the machines the ladder
 //! exists for.
 
+#[path = "support/agent.rs"]
+mod agent;
 #[path = "support/sshd.rs"]
 mod sshd;
 #[path = "support/world.rs"]
 mod world;
 
+use std::slice::from_ref;
+
+use agent::Agency;
 use manymux::proto::{Size, SpawnSpec};
+use manymux_android::agent::Agent;
 use manymux_android::keys::{Identity, KnownHosts, Verdict, generate};
 use manymux_android::machine::{Connection, Machine, Rebuff};
 use manymux_android::ssh::{reach, start};
-use russh::keys::PrivateKey;
+use russh::keys::{PrivateKey, PublicKey};
 use sshd::Sshd;
 use world::{Mm, World};
 
@@ -29,6 +35,15 @@ struct Reachable {
     /// The server's own key, so a test can ask what the store has written down
     /// about it.
     host_key: PrivateKey,
+    /// Held so a test can ask the machine what it saw, which for a device with
+    /// more than one key to offer is the only way to tell which was used.
+    sshd: Sshd,
+}
+
+/// Whose key is the one line in a machine's `authorized_keys`.
+enum Allows {
+    TheAgent,
+    ThisDevice,
 }
 
 impl Reachable {
@@ -36,7 +51,7 @@ impl Reachable {
         let world = World::where_mm_is(name, mm);
         let host_key = generate().unwrap();
         let sshd = Sshd::listening(&world.dir, host_key.clone(), &[]).await;
-        Self::knowing(&world, host_key, sshd.port)
+        Self::knowing(&world, host_key, sshd)
     }
 
     /// The same machine, on an account nobody has given this device's key to.
@@ -44,7 +59,7 @@ impl Reachable {
         let world = World::where_mm_is(name, Mm::OnPath);
         let host_key = generate().unwrap();
         let sshd = Sshd::refusing(&world.dir, host_key.clone()).await;
-        Self::knowing(&world, host_key, sshd.port)
+        Self::knowing(&world, host_key, sshd)
     }
 
     /// And the same machine again, going while the key is being offered.
@@ -52,7 +67,7 @@ impl Reachable {
         let world = World::where_mm_is(name, Mm::OnPath);
         let host_key = generate().unwrap();
         let sshd = Sshd::going_mid_auth(&world.dir, host_key.clone()).await;
-        Self::knowing(&world, host_key, sshd.port)
+        Self::knowing(&world, host_key, sshd)
     }
 
     /// A machine reached over a mesh, which knows who this is before the ssh
@@ -61,7 +76,7 @@ impl Reachable {
         let world = World::where_mm_is(name, Mm::OnPath);
         let host_key = generate().unwrap();
         let sshd = Sshd::unasking(&world.dir, host_key.clone()).await;
-        Self::knowing(&world, host_key, sshd.port)
+        Self::knowing(&world, host_key, sshd)
     }
 
     /// The same, not admitting this device.
@@ -69,21 +84,46 @@ impl Reachable {
         let world = World::where_mm_is(name, Mm::OnPath);
         let host_key = generate().unwrap();
         let sshd = Sshd::unwanting(&world.dir, host_key.clone()).await;
-        Self::knowing(&world, host_key, sshd.port)
+        Self::knowing(&world, host_key, sshd)
     }
 
-    /// What this device knows about a machine on `port`.
-    fn knowing(world: &World, host_key: PrivateKey, port: u16) -> Self {
+    /// A machine with one line in its `authorized_keys`, and an agent on this
+    /// device holding one key of its own.
+    ///
+    /// `allows` says whose key that line is, which is the whole of what the two
+    /// tests using this differ by. The agent's key comes back so a test can
+    /// name it.
+    async fn with_an_agent(name: &str, allows: Allows) -> (Self, PrivateKey) {
+        let world = World::where_mm_is(name, Mm::OnPath);
+        let host_key = generate().unwrap();
+        let identity = Identity::kept_at(&world.dir.join("id_ed25519")).unwrap();
+        let theirs = generate().unwrap();
+
+        let allowed = match allows {
+            Allows::TheAgent => theirs.public_key().clone(),
+            Allows::ThisDevice => PublicKey::from_openssh(&identity.authorized_line()).unwrap(),
+        };
+        let sshd = Sshd::taking(&world.dir, host_key.clone(), &allowed).await;
+        let agency = Agency::holding(&world.dir.join("agent.sock"), from_ref(&theirs)).await;
+
+        let mut reachable = Self::knowing(&world, host_key, sshd);
+        reachable.identity = identity.asking(Some(Agent::on(&agency.at)));
+        (reachable, theirs)
+    }
+
+    /// What this device knows about a machine.
+    fn knowing(world: &World, host_key: PrivateKey, sshd: Sshd) -> Self {
         let dir = world.dir.clone();
         Self {
             machine: Machine {
                 address: "127.0.0.1".to_string(),
-                port,
+                port: sshd.port,
                 user: "whoever".to_string(),
             },
             identity: Identity::kept_at(&dir.join("id_ed25519")).unwrap(),
             known: KnownHosts::at(dir.join("known_hosts")),
             host_key,
+            sshd,
         }
     }
 
@@ -255,6 +295,38 @@ async fn a_machine_that_asks_for_nothing_and_says_no_does_not_send_anybody_to_a_
     assert!(said.contains(&reachable.machine.at()), "{said}");
     assert!(said.contains("never asked for a key"), "{said}");
     assert!(!said.contains("authorized_keys"), "{said}");
+}
+
+#[tokio::test]
+async fn a_key_an_agent_is_holding_is_offered_and_gets_in() {
+    let (reachable, theirs) = Reachable::with_an_agent("connect-agent", Allows::TheAgent).await;
+
+    // This device's own key is not in that machine's `authorized_keys` and the
+    // agent's is, which is the ordinary shape at a desk: the machines already
+    // know the keys somebody works with, and having to paste a fresh one into
+    // every account before this can be pointed at them is a poor trade.
+    reachable.connect().await.unwrap();
+    assert_eq!(
+        reachable.sshd.admitted().as_ref(),
+        Some(theirs.public_key())
+    );
+}
+
+#[tokio::test]
+async fn this_devices_key_is_still_offered_after_the_agent_had_nothing_that_worked() {
+    let (reachable, theirs) = Reachable::with_an_agent("connect-spare", Allows::ThisDevice).await;
+
+    // An agent is somebody's whole working set, and most of it is for machines
+    // that are not this one. So a key it holds being turned down is the
+    // ordinary case rather than the end of the ladder, and the key this device
+    // generated for itself is the rung after it.
+    reachable.connect().await.unwrap();
+    let admitted = reachable.sshd.admitted().unwrap();
+    assert_ne!(&admitted, theirs.public_key());
+    assert_eq!(
+        admitted.fingerprint(Default::default()).to_string(),
+        reachable.identity.fingerprint()
+    );
 }
 
 #[tokio::test]

@@ -23,6 +23,7 @@ uniffi::setup_scaffolding!();
 /// handshake, and serialising them means holding the lock while it happens.
 pub type AsyncMutex<T> = tokio::sync::Mutex<T>;
 
+pub mod agent;
 pub mod ffi;
 pub mod keys;
 pub mod machine;
