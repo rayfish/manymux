@@ -55,7 +55,9 @@ android-clean:
 
 # Put it on whatever is plugged in.
 android-install: android
-    adb install -r android/app/build/outputs/apk/debug/app-debug.apk
+    # -d because the version does not move between builds, and a phone holding
+    # one from when it did would refuse this as a downgrade.
+    adb install -r -d android/app/build/outputs/apk/debug/app-debug.apk
 
 # What the app is saying, without the rest of the system's noise.
 android-log:

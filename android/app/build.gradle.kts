@@ -12,8 +12,12 @@ android {
         // The oldest Android the root crate's own target supports.
         minSdk = 24
         targetSdk = 36
-        versionCode = 6
-        versionName = "0.2.4"
+        // The app is still its first version, and stays on it until there is
+        // something to ship. A number that moves per commit says nothing about
+        // what is in the build and drifts away from the crate's own for no
+        // reason anybody can read back.
+        versionCode = 1
+        versionName = "0.1.0"
         ndk {
             // arm64 for a phone, x86_64 for an emulator. Nothing 32 bit: the
             // shim is a fresh build with no old devices to answer to.
