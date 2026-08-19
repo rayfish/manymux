@@ -501,6 +501,7 @@ class MainActivity : Activity() {
 
         val screen = TerminalView(this)
         terminal = screen
+        screen.onCannotScroll = { say("$name is on a machine too old to scroll back") }
 
         val layout = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL

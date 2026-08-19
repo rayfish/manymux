@@ -29,7 +29,6 @@
 //! over ssh per wheel notch, on machines that are usually two hops away.
 
 use crate::client::attach::Spot;
-use crate::client::status::session_size;
 use crate::proto::{Found, Size, View as Window, ViewRequest};
 
 /// Screenfuls fetched at a time. Enough that a page up or down lands inside
@@ -256,6 +255,12 @@ impl Block {
 
 impl Scrollback {
     /// Open at the bottom, where the live screen is.
+    ///
+    /// The size is the surface the view is drawn on, which is not the
+    /// terminal's: the desktop keeps a row of it for the mark and passes what
+    /// is left, and a phone drawing the view in a widget of its own passes all
+    /// of it. Worked out here, as it once was, this module would be carrying a
+    /// fact about one client's layout that the other one has to undo.
     pub fn new(size: Size) -> Self {
         Self {
             offset: 0,
@@ -263,8 +268,8 @@ impl Scrollback {
             answered: false,
             block: None,
             asked: None,
-            rows: session_size(size).rows,
-            cols: session_size(size).cols,
+            rows: size.rows,
+            cols: size.cols,
             search: None,
             selection: None,
             chasing: None,
@@ -346,8 +351,8 @@ impl Scrollback {
     }
 
     pub fn resize(&mut self, size: Size) {
-        self.rows = session_size(size).rows;
-        self.cols = session_size(size).cols;
+        self.rows = size.rows;
+        self.cols = size.cols;
         // Every row is somewhere else now, so what was painted where says
         // nothing about what is there.
         self.painted.clear();
@@ -356,6 +361,14 @@ impl Scrollback {
     /// How far back the view is, for the row at the bottom of the screen.
     pub fn offset(&self) -> u64 {
         self.offset
+    }
+
+    /// Lines the host has, screen included, as it last said. Zero until it has
+    /// said, which is what [`Self::offset`] is worth reading against: the two
+    /// together are how far through the history the view is sitting, and a
+    /// client with somewhere to draw that wants both.
+    pub fn total(&self) -> u64 {
+        self.total
     }
 
     /// Whether the view is back at the live screen, which is where leaving it
@@ -1055,7 +1068,9 @@ fn walk(line: &str, mut each: impl FnMut(Piece<'_>)) -> u16 {
 mod tests {
     use super::*;
 
-    const SIZE: Size = Size { cols: 80, rows: 25 };
+    /// The surface the view is drawn on, which on a 25 row terminal is the 24
+    /// left once the mark row has its own.
+    const SIZE: Size = Size { cols: 80, rows: 24 };
 
     /// The host, standing in: answers whatever the view asks for out of a
     /// buffer of numbered lines, with the clamping `node::history::window`
@@ -1075,7 +1090,6 @@ mod tests {
         });
     }
 
-    /// A screen of 25 rows keeps one for the mark, so a page is 24.
     fn view(total: u64) -> Scrollback {
         let mut view = Scrollback::new(SIZE);
         answer(&mut view, total);

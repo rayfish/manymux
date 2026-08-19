@@ -20,6 +20,7 @@ use tokio::runtime::Runtime;
 use crate::keys::{Identity, KnownHosts};
 use crate::machine::{Connection, Connections, Machine, Rebuff};
 use crate::screen::Frame;
+use crate::scroll::Window;
 use crate::session::{Session, State};
 use crate::ssh::{reach, start};
 
@@ -286,6 +287,39 @@ impl Attach {
     /// a frame with no rows in it is a frame the widget skips.
     pub fn take_frame(&self) -> Frame {
         self.session.take_frame()
+    }
+
+    /// The view over the host's history, taken the way a frame is.
+    ///
+    /// Called on the same frame callback and for the same reason: what is
+    /// drawn is whatever changed since the last one, and a window with no rows
+    /// in it is a window the widget skips.
+    pub fn take_window(&self) -> Window {
+        self.session.take_window()
+    }
+
+    /// Move the view back through the history, opening it if it was closed.
+    pub fn scroll_up(&self, lines: u64) {
+        self.session.scroll_up(lines);
+    }
+
+    /// Move it towards the live screen. Does nothing while it is closed.
+    pub fn scroll_down(&self, lines: u64) {
+        self.session.scroll_down(lines);
+    }
+
+    /// Back to the live screen, forgetting where the view was.
+    pub fn close_view(&self) {
+        self.session.close_view();
+    }
+
+    /// Whether this host can be scrolled back through at all.
+    ///
+    /// A host running a build from before the view existed skips the request
+    /// in silence, so the app says so where the gesture was made rather than
+    /// leaving one that quietly does nothing.
+    pub fn scrolls(&self) -> bool {
+        self.session.scrolls()
     }
 
     /// Keystrokes, or pasted text.

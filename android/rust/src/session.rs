@@ -15,11 +15,12 @@
 //! The screen is fed on a task of its own for the same reason, since a burst of
 //! output is the one thing that could put the answer behind a queue.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use manymux::client::attach::reconnect_after;
-use manymux::client::{Attached, SessionHalves, Update};
+use manymux::client::{Attached, SessionHalves, SessionWriter, Update};
 use manymux::lock::held;
 use manymux::proto::Size;
 use tokio::sync::{mpsc, watch};
@@ -27,6 +28,7 @@ use tokio::sync::{mpsc, watch};
 use crate::keys::{Identity, KnownHosts};
 use crate::machine::{Connection, Connections, Machine};
 use crate::screen::{Frame, Screen};
+use crate::scroll::{Scrolling, Window};
 use crate::ssh::{ask, reach};
 
 /// How many chunks of output may be waiting to be painted.
@@ -68,6 +70,13 @@ pub enum State {
 enum Say {
     Input(Vec<u8>),
     Resize(Size),
+    /// The view moved, so whatever it now wants should be asked for.
+    ///
+    /// The move itself has already happened: it is arithmetic over a block
+    /// that is already here, so it is done under the lock where it was asked
+    /// for rather than waited on. What has to reach the host is only the block
+    /// the move left the view short of, which may be nothing at all.
+    Look,
     Detach,
 }
 
@@ -131,6 +140,16 @@ enum Paint {
 /// into a queue.
 pub struct Session {
     screen: Arc<Mutex<Screen>>,
+    /// The view over the host's history, which is a second surface and not a
+    /// state of the first: the session goes on printing into the screen while
+    /// somebody reads what it printed a minute ago, and coming back costs
+    /// nothing because nothing was thrown away.
+    scrolling: Arc<Mutex<Scrolling>>,
+    /// Whether the host can be scrolled back through at all, as it said when
+    /// it answered the attach. A build too old to know the request would skip
+    /// it in silence, so a gesture that quietly did nothing is the thing this
+    /// exists to stop.
+    scrolls: Arc<AtomicBool>,
     say: mpsc::UnboundedSender<Say>,
     state: watch::Receiver<State>,
 }
@@ -149,6 +168,8 @@ impl Session {
         size: Size,
     ) -> Self {
         let screen = Arc::new(Mutex::new(Screen::at(size)));
+        let scrolling = Arc::new(Mutex::new(Scrolling::at(size)));
+        let scrolls = Arc::new(AtomicBool::new(false));
         let (say, said) = mpsc::unbounded_channel();
         let (state, watching) = watch::channel(State::Reaching);
 
@@ -161,13 +182,19 @@ impl Session {
                 name,
                 wanted: size,
             },
-            Arc::clone(&screen),
+            Surfaces {
+                screen: Arc::clone(&screen),
+                scrolling: Arc::clone(&scrolling),
+                scrolls: Arc::clone(&scrolls),
+            },
             said,
             state,
         ));
 
         Self {
             screen,
+            scrolling,
+            scrolls,
             say,
             state: watching,
         }
@@ -190,6 +217,44 @@ impl Session {
     /// The phone's screen is a different shape now.
     pub fn resize(&self, size: Size) {
         let _ = self.say.send(Say::Resize(size));
+    }
+
+    /// Move the view back through the history, opening it if it was not up.
+    ///
+    /// The move happens here rather than on the task, because it is arithmetic
+    /// over the block already in hand: a drag reports a row at a time and
+    /// every one of them would otherwise be a trip through a queue before the
+    /// screen it moved could be drawn. What goes to the task is the asking,
+    /// and only when the move left the view short of lines.
+    pub fn scroll_up(&self, lines: u64) {
+        if !self.scrolls.load(Ordering::Relaxed) {
+            return;
+        }
+        held(&self.scrolling).up(lines);
+        let _ = self.say.send(Say::Look);
+    }
+
+    pub fn scroll_down(&self, lines: u64) {
+        held(&self.scrolling).down(lines);
+        let _ = self.say.send(Say::Look);
+    }
+
+    /// Back to the live screen.
+    pub fn close_view(&self) {
+        held(&self.scrolling).close();
+    }
+
+    /// The view as it should now look, taken the way a frame is.
+    pub fn take_window(&self) -> Window {
+        held(&self.scrolling).take_window()
+    }
+
+    /// Whether the host this is attached to can be scrolled back through.
+    ///
+    /// False until it has answered, which is the honest answer while nothing
+    /// is attached: there is no history to reach yet.
+    pub fn scrolls(&self) -> bool {
+        self.scrolls.load(Ordering::Relaxed)
     }
 
     /// Leave, without ending anything.
@@ -221,6 +286,15 @@ struct Attaching {
     wanted: Size,
 }
 
+/// What the app draws, and what says whether the second of them is worth
+/// drawing at all. Held by the task for as long as the session is, and by the
+/// app through [`Session`].
+struct Surfaces {
+    screen: Arc<Mutex<Screen>>,
+    scrolling: Arc<Mutex<Scrolling>>,
+    scrolls: Arc<AtomicBool>,
+}
+
 /// One attach, and the connection it is riding on.
 ///
 /// The connection is held because dropping the last handle to it closes the
@@ -235,7 +309,7 @@ struct Riding {
 /// Reach the session, attach, and keep doing so.
 async fn keep_attached(
     mut attaching: Attaching,
-    screen: Arc<Mutex<Screen>>,
+    surfaces: Surfaces,
     mut said: mpsc::UnboundedReceiver<Say>,
     state: watch::Sender<State>,
 ) {
@@ -244,7 +318,14 @@ async fn keep_attached(
 
     loop {
         let _ = state.send(State::Reaching);
-        let reached = reaching(attaching.clone(), ever, &mut said, &mut attaching.wanted).await;
+        let reached = reaching(
+            attaching.clone(),
+            ever,
+            &surfaces,
+            &mut said,
+            &mut attaching.wanted,
+        )
+        .await;
         match reached {
             // The back button, pressed while it was still trying.
             None => {
@@ -253,9 +334,18 @@ async fn keep_attached(
             }
             Some(Ok(riding)) => {
                 ever = true;
+                surfaces
+                    .scrolls
+                    .store(riding.attached.scroll, Ordering::Relaxed);
+                // The history has moved under anything the view was showing,
+                // and the offsets it holds count back from a newest line that
+                // is not the newest line any more. So a reattach is where a
+                // view goes, rather than being corrected into one that could
+                // never be told from a stale one.
+                held(&surfaces.scrolling).close();
                 let _ = state.send(State::Attached);
                 let began = Instant::now();
-                match pump(riding, &screen, &mut said, &mut attaching.wanted).await {
+                match pump(riding, &surfaces, &mut said, &mut attaching.wanted).await {
                     Ending::Exited(code) => {
                         let _ = state.send(State::Ended { status: code });
                         return;
@@ -316,7 +406,13 @@ async fn keep_attached(
                     // be a keystroke arriving in somebody's shell minutes after
                     // they pressed it.
                     Some(Say::Input(_)) => {}
-                    Some(Say::Resize(size)) => attaching.wanted = size,
+                    // Nowhere to ask, and the block already in hand is what
+                    // the view has to work with until there is somewhere.
+                    Some(Say::Look) => {}
+                    Some(Say::Resize(size)) => {
+                        attaching.wanted = size;
+                        held(&surfaces.scrolling).resize(size);
+                    }
                 },
             }
         }
@@ -332,6 +428,7 @@ async fn keep_attached(
 async fn reaching(
     attaching: Attaching,
     ever: bool,
+    surfaces: &Surfaces,
     said: &mut mpsc::UnboundedReceiver<Say>,
     wanted: &mut Size,
 ) -> Option<Result<Riding, Missed>> {
@@ -357,8 +454,11 @@ async fn reaching(
             }
             asked = said.recv() => match asked {
                 Some(Say::Detach) | None => return None,
-                Some(Say::Input(_)) => {}
-                Some(Say::Resize(size)) => *wanted = size,
+                Some(Say::Input(_)) | Some(Say::Look) => {}
+                Some(Say::Resize(size)) => {
+                    *wanted = size;
+                    held(&surfaces.scrolling).resize(size);
+                }
             },
         }
     }
@@ -425,13 +525,29 @@ async fn attach(attaching: Attaching) -> Result<Riding, Missed> {
     })
 }
 
+/// Ask the host for whatever the view is short of, and answer whether the
+/// connection survived it.
+///
+/// Nothing is asked while the view is closed, or while what it is showing sits
+/// inside the block already here, which is what makes a drag through one cost
+/// no network at all. The lock is dropped before the write: everything here is
+/// arithmetic, and a lock held across an await is the one thing this client
+/// may not do.
+async fn look(scrolling: &Mutex<Scrolling>, writer: &mut SessionWriter) -> bool {
+    let Some(request) = held(scrolling).wanted() else {
+        return true;
+    };
+    writer.view(&request).await.is_ok()
+}
+
 /// Read the session until something ends it.
 async fn pump(
     riding: Riding,
-    screen: &Arc<Mutex<Screen>>,
+    surfaces: &Surfaces,
     said: &mut mpsc::UnboundedReceiver<Say>,
     wanted: &mut Size,
 ) -> Ending {
+    let screen = &surfaces.screen;
     let settled = riding.attached.size;
     let SessionHalves {
         mut reader,
@@ -456,6 +572,7 @@ async fn pump(
     // The size the session settled on, which with a desktop attached may be
     // smaller than what was asked for.
     let _ = painting.send(Paint::Resized(settled)).await;
+    held(&surfaces.scrolling).resize(settled);
     // The first output after an attach is the repaint, and only the first.
     let mut repainting = true;
 
@@ -489,12 +606,28 @@ async fn pump(
                 // screen the session never had and the two scroll at different
                 // rows from then on.
                 Ok(Update::Resized(size)) => {
+                    held(&surfaces.scrolling).resize(size);
+                    if !look(&surfaces.scrolling, &mut writer).await {
+                        break Ending::Lost;
+                    }
                     if painting.send(Paint::Resized(size)).await.is_err() {
                         break Ending::Lost;
                     }
                 }
                 Ok(Update::Ping) => {
                     if writer.pong().await.is_err() {
+                        break Ending::Lost;
+                    }
+                }
+                // A block of the history, for the view. Taking it can leave
+                // the window somewhere the block does not reach, which is
+                // ordinary rather than a mistake: a view thrown further back
+                // than the buffer goes is clamped by the first answer that
+                // says where the end is. So whatever is wanted after taking
+                // one is asked for.
+                Ok(Update::View(view)) => {
+                    held(&surfaces.scrolling).took(view);
+                    if !look(&surfaces.scrolling, &mut writer).await {
                         break Ending::Lost;
                     }
                 }
@@ -513,6 +646,14 @@ async fn pump(
                 }
                 Some(Say::Resize(size)) => {
                     *wanted = size;
+                    // A window of a different height is one the block in hand
+                    // may no longer cover, and the view is showing lines
+                    // rather than the session: nothing else is going to redraw
+                    // it.
+                    held(&surfaces.scrolling).resize(size);
+                    if !look(&surfaces.scrolling, &mut writer).await {
+                        break Ending::Lost;
+                    }
                     // Optimistically, and corrected by `Update::Resized` when
                     // the node says what it took. A node too old to say leaves
                     // this as the only answer there is, which is what happened
@@ -532,6 +673,15 @@ async fn pump(
                     // line, and nothing repairs it short of reattaching. So the
                     // screen is asked for, and the answer is a repaint.
                     if writer.resync().await.is_err() {
+                        break Ending::Lost;
+                    }
+                }
+                // Whatever the view is short of after a move that has already
+                // happened. Nothing at all while it is closed, or while what
+                // it is showing is inside the block already here, which is
+                // what makes a drag through one cost no network at all.
+                Some(Say::Look) => {
+                    if !look(&surfaces.scrolling, &mut writer).await {
                         break Ending::Lost;
                     }
                 }

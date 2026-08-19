@@ -6,6 +6,7 @@ import android.graphics.Canvas
 import android.graphics.Paint
 import android.graphics.Typeface
 import android.view.Choreographer
+import android.view.GestureDetector
 import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.View
@@ -30,6 +31,14 @@ import uniffi.manymux_android.Run
 private const val CELL_DP = 12.5f
 
 /**
+ * What is left of a fling's speed after a sixtieth of a second.
+ *
+ * Spent against the frame's own length rather than per frame, so the same
+ * flick covers the same ground on a 120Hz screen as on a 60Hz one.
+ */
+private const val DECAY = 0.92f
+
+/**
  * The session's screen.
  *
  * A plain [View] with an [onDraw], not a composable: the grid has no structure
@@ -49,6 +58,13 @@ class TerminalView(context: Context) : View(context), Choreographer.FrameCallbac
         set(value) {
             field = value
             rows.clear()
+            history.clear()
+            viewing = false
+            viewOpen = false
+            looking = false
+            speed = 0f
+            pending = 0f
+            said = false
             // A fresh attach has been told nothing, whatever the last one knew.
             told = null
             tellGrid()
@@ -57,6 +73,17 @@ class TerminalView(context: Context) : View(context), Choreographer.FrameCallbac
 
     /** Told the shape of the grid whenever it changes, so a caller can say so. */
     var onGrid: ((Grid) -> Unit)? = null
+
+    /**
+     * Told when somebody scrolls on a host that cannot answer for it.
+     *
+     * A key that quietly does nothing is the thing `Response::Attached`'s
+     * capability flags exist to stop, and a gesture is worse than a key: there
+     * is nothing on the screen saying it was ever a gesture. So it is said
+     * where it was made, once, rather than on the bar of every attach to such
+     * a host.
+     */
+    var onCannotScroll: (() -> Unit)? = null
 
     private val ink = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         typeface = Typeface.MONOSPACE
@@ -68,6 +95,23 @@ class TerminalView(context: Context) : View(context), Choreographer.FrameCallbac
     private var cursorCol = 0
     private var cursorRow = 0
     private var cursorOn = false
+
+    /**
+     * Every row of the view over the host's history, when one is up.
+     *
+     * Kept beside the screen's rows rather than instead of them: the session
+     * goes on running and its rows go on arriving while somebody reads what it
+     * printed a minute ago, so coming back is a redraw and not a round trip.
+     */
+    private val history = HashMap<Int, List<Run>>()
+
+    /** Whether the view is what is drawn. */
+    private var viewing = false
+
+    /** Whether the view is up at all, which it is before it has anything. */
+    private var viewOpen = false
+    private var viewFrom = 0L
+    private var viewTotal = 0L
 
     private var cellWidth = 0f
     private var lineHeight = 0f
@@ -162,6 +206,8 @@ class TerminalView(context: Context) : View(context), Choreographer.FrameCallbac
     override fun doFrame(nanos: Long) {
         val session = attach
         if (session != null) {
+            coast(nanos)
+            var redraw = false
             val frame = session.takeFrame()
             val moved = frame.cursor.col.toInt() != cursorCol ||
                 frame.cursor.row.toInt() != cursorRow ||
@@ -173,15 +219,40 @@ class TerminalView(context: Context) : View(context), Choreographer.FrameCallbac
                 cursorCol = frame.cursor.col.toInt()
                 cursorRow = frame.cursor.row.toInt()
                 cursorOn = frame.cursor.visible
-                invalidate()
+                // The session is still painting behind an open view, and its
+                // rows are kept for the moment somebody comes back to it. What
+                // it must not do is paint over what they are reading.
+                redraw = redraw || !viewing
             }
+            // Asked for only once somebody has reached for the history, and
+            // until the answer says the view is closed again. A session
+            // nobody scrolls is the ordinary case, and it should not pay a
+            // call across the boundary sixty times a second to be told so.
+            if (looking || viewOpen) {
+                val window = session.takeWindow()
+                // A view opened again is a view opened at the bottom, so the
+                // rows the last one left behind say nothing about this one.
+                if (window.open && !viewOpen) history.clear()
+                viewOpen = window.open
+                if (!window.open) looking = false
+                viewFrom = window.from.toLong()
+                viewTotal = window.total.toLong()
+                for (row: Row in window.changed) {
+                    history[row.at.toInt()] = row.runs
+                }
+                val showing = window.open && window.showing
+                redraw = redraw || window.changed.isNotEmpty() || showing != viewing
+                viewing = showing
+            }
+            if (redraw) invalidate()
         }
+        lastFrame = nanos
         Choreographer.getInstance().postFrameCallback(this)
     }
 
     override fun onDraw(canvas: Canvas) {
         canvas.drawColor(Palette.GROUND)
-        for ((at, runs) in rows) {
+        for ((at, runs) in if (viewing) history else rows) {
             var x = 0f
             val top = at * lineHeight
             for (run in runs) {
@@ -207,6 +278,10 @@ class TerminalView(context: Context) : View(context), Choreographer.FrameCallbac
                 x += across
             }
         }
+        if (viewing) {
+            drawMark(canvas)
+            return
+        }
         if (cursorOn) {
             block.color = Palette.TEXT
             block.alpha = 0x88
@@ -220,6 +295,29 @@ class TerminalView(context: Context) : View(context), Choreographer.FrameCallbac
             block.alpha = 0xFF
         }
     }
+
+    /**
+     * Where in the history the view is, down the right-hand edge.
+     *
+     * A phone has no mark row of its own to say it, and a screen of old output
+     * looks exactly like a screen of new output: without this the only sign
+     * that a session had stopped moving was that it had stopped moving.
+     */
+    private fun drawMark(canvas: Canvas) {
+        if (viewTotal <= 0L) return
+        val rows = (height / lineHeight).toInt().coerceAtLeast(1)
+        val reach = (viewTotal - rows).coerceAtLeast(1L)
+        val down = 1f - (viewFrom.coerceIn(0L, reach).toFloat() / reach)
+        val bar = dp(3f)
+        val tall = (height * (rows.toFloat() / viewTotal)).coerceAtLeast(dp(24f))
+        val top = (height - tall) * down
+        block.color = Palette.TEXT
+        block.alpha = 0x66
+        canvas.drawRect(width - bar * 2f, top, width - bar, top + tall, block)
+        block.alpha = 0xFF
+    }
+
+    private fun dp(value: Float) = value * resources.displayMetrics.density
 
     // ---- the keyboard -------------------------------------------------
 
@@ -243,7 +341,15 @@ class TerminalView(context: Context) : View(context), Choreographer.FrameCallbac
     }
 
     override fun onTouchEvent(event: MotionEvent): Boolean {
-        if (event.actionMasked == MotionEvent.ACTION_UP) performClick()
+        gestures.onTouchEvent(event)
+        if (event.actionMasked == MotionEvent.ACTION_UP ||
+            event.actionMasked == MotionEvent.ACTION_CANCEL
+        ) {
+            // A gesture that ended at the live screen is somebody done with
+            // the history, and leaving it is what puts the keyboard back over
+            // a session rather than over a page of old output.
+            if (speed == 0f) settle()
+        }
         // Taken whatever it is, or the up that ends the tap goes to whoever
         // took the down.
         return true
@@ -251,8 +357,129 @@ class TerminalView(context: Context) : View(context), Choreographer.FrameCallbac
 
     override fun performClick(): Boolean {
         super.performClick()
-        openKeyboard()
+        // A tap while the history is up is the way back to the session, and
+        // the obvious one to reach for: the keyboard is already there, and
+        // what is wanted is the screen under it.
+        if (viewOpen) {
+            attach?.closeView()
+            speed = 0f
+            pending = 0f
+        } else {
+            openKeyboard()
+        }
         return true
+    }
+
+    // ---- the history ----------------------------------------------------
+
+    /** Pixels dragged that have not yet added up to a whole line. */
+    private var pending = 0f
+
+    /** A fling's speed, in pixels a second, or zero while nothing is coasting. */
+    private var speed = 0f
+    private var lastFrame = 0L
+
+    private val gestures = GestureDetector(
+        context,
+        object : GestureDetector.SimpleOnGestureListener() {
+            override fun onDown(event: MotionEvent): Boolean {
+                // A hand on the screen stops a fling, which is what every
+                // list on this platform does and what somebody reaching to
+                // stop one expects.
+                speed = 0f
+                pending = 0f
+                return true
+            }
+
+            override fun onSingleTapUp(event: MotionEvent): Boolean {
+                performClick()
+                return true
+            }
+
+            override fun onScroll(
+                from: MotionEvent?,
+                to: MotionEvent,
+                acrossBy: Float,
+                downBy: Float,
+            ): Boolean {
+                // `downBy` counts the way the content moves, so pulling the
+                // screen down is negative and is what reaches back into the
+                // history.
+                drag(-downBy)
+                return true
+            }
+
+            override fun onFling(
+                from: MotionEvent?,
+                to: MotionEvent,
+                across: Float,
+                down: Float,
+            ): Boolean {
+                speed = down
+                return true
+            }
+        },
+    )
+
+    /**
+     * Move the view by however many whole lines this much dragging comes to.
+     *
+     * The remainder is kept rather than dropped: a slow drag is a run of
+     * reports each worth a fraction of a line, and rounding every one of them
+     * to nothing is a screen that does not move until the hand moves fast.
+     */
+    private fun drag(pixels: Float) {
+        val session = attach ?: return
+        if (lineHeight <= 0f) return
+        if (!session.scrolls()) {
+            if (!said) {
+                said = true
+                onCannotScroll?.invoke()
+            }
+            return
+        }
+        pending += pixels
+        val lines = (pending / lineHeight).toInt()
+        if (lines == 0) return
+        pending -= lines * lineHeight
+        if (lines > 0) {
+            looking = true
+            session.scrollUp(lines.toULong())
+        } else {
+            session.scrollDown((-lines).toULong())
+        }
+    }
+
+    /** Whether the view is worth asking about, which reaching back makes it. */
+    private var looking = false
+
+    /** Whether this attach has already been told the host cannot scroll. */
+    private var said = false
+
+    /**
+     * Carry a fling on, and stop it where there is nothing left to move to.
+     *
+     * The decay is per second rather than per frame, or the same flick would
+     * travel twice as far on a 120Hz screen as on a 60Hz one.
+     */
+    private fun coast(nanos: Long) {
+        if (speed == 0f) return
+        val seconds = if (lastFrame == 0L) 0f else (nanos - lastFrame) / 1e9f
+        if (seconds <= 0f || seconds > 0.25f) return
+        drag(speed * seconds)
+        speed *= Math.pow(DECAY.toDouble(), seconds.toDouble() * 60).toFloat()
+        val ends = viewFrom == 0L && speed < 0f ||
+            viewTotal > 0L && viewFrom >= viewTotal - (height / lineHeight).toInt() && speed > 0f
+        if (Math.abs(speed) < Math.max(lineHeight * 2f, 1f) || ends) {
+            speed = 0f
+            pending = 0f
+            settle()
+        }
+    }
+
+    /** A gesture that ended at the live screen leaves the view behind. */
+    private fun settle() {
+        if (viewOpen && viewFrom == 0L) attach?.closeView()
     }
 
     override fun onCheckIsTextEditor(): Boolean = true
@@ -345,6 +572,15 @@ class TerminalView(context: Context) : View(context), Choreographer.FrameCallbac
 
     fun send(bytes: ByteArray) {
         if (bytes.isEmpty()) return
+        // Typing is asking for the session and not for the history: what is
+        // typed lands in a shell that has moved on since the lines being read
+        // were printed, and a screen that stayed on them would be one where
+        // nothing anybody typed appeared to do anything.
+        if (viewOpen) {
+            attach?.closeView()
+            speed = 0f
+            pending = 0f
+        }
         attach?.send(bytes)
     }
 }

@@ -28,6 +28,7 @@ pub mod ffi;
 pub mod keys;
 pub mod machine;
 pub mod screen;
+pub mod scroll;
 pub mod session;
 pub mod ssh;
 

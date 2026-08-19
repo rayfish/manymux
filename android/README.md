@@ -20,9 +20,17 @@ Two halves:
 ## What is in this version
 
 One machine at a time. Reach it, list what is running, attach to one, type in
-it, resize it, leave it, and survive a connection that drops. The drawer, the
-app-bar swipes, groups, notifications and the scrollback view are the next
-ones.
+it, resize it, scroll back through what it printed, leave it, and survive a
+connection that drops. The drawer, the app-bar swipes, groups, selection and
+notifications are the next ones.
+
+Scrolling is a drag on the terminal itself, and there is nothing behind it
+here: the node holds the history and hands over a window of it, which is why
+the app keeps no scrollback of its own and cannot be grown out of memory by a
+session that prints for a week. A tap or anything typed goes back to the live
+screen, and so does dragging back down to it. A machine running a build from
+before the view existed says so where the gesture was made, rather than
+leaving one that quietly does nothing.
 
 The phone is an ordinary writable client: it sends its own size and the session
 reflows. The node applies the smallest size across every attached client, so

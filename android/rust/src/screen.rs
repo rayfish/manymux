@@ -179,7 +179,12 @@ impl Screen {
 }
 
 /// Break a line into stretches that look the same.
-fn runs_of(line: &avt::Line) -> Vec<Run> {
+///
+/// Shared with [`crate::scroll`], which paints the history into an emulator of
+/// its own: the two surfaces the app draws are rendered by one function, so a
+/// colour or a wide character cannot come out one way on the screen and
+/// another way in the lines above it.
+pub(crate) fn runs_of(line: &avt::Line) -> Vec<Run> {
     // The predicate says where to *break*, not where to carry on: read the
     // other way round every cell is a run of its own, which draws the same
     // screen one call per character and loses the run boundaries the widget
