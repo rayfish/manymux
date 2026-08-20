@@ -647,6 +647,24 @@ Three consequences run through the whole codebase and are worth keeping intact:
   answered 127 and printed on anything else, because the remote shell's
   `mm: command not found` is the probe working and would otherwise be printed on
   every command that reaches such a machine.
+- **And printing it is only right where the caller has a terminal to fail on**
+  (`client::Heard`, `main::open_hushed`). A command somebody typed does: ssh's
+  account of a machine it could not reach is the only account there is, and
+  `mm ls` has a shell to say it in. An attach does not. It is holding a screen
+  the session was painted on, and a dropped connection leaves that paint
+  exactly where it was, which is the whole of what a wait is; the terminal is
+  in raw mode besides, so each printed line lands a column further along than
+  the last. Twelve retries later, the picture the wait exists to keep is a
+  staircase of `connect to host`. So the attach client opens its streams
+  hushed, and `client::keep` writes ssh down instead of printing it, for
+  `Stream::said` to put in the error. Which is where the words are worth
+  having and not a way of dropping them: the first attach of a run reports it
+  once the terminal has been given back, since that one is a command that did
+  not work, and every reconnect after it has the log and nowhere else, since
+  those are not reported at all. The stderr is still *read*, not left in the
+  pipe: an unread pipe fills, and ssh warning about a host key into a full one
+  is ssh stopping on a connection that was fine. Closing it is worse, that
+  being a signal.
 - **`mm agent` must leave stdout strictly alone**: the protocol is on it. Only
   the daemon opens a log file; everything else logs to stderr.
 - **A bell goes to exactly one of two places, and the event says which.**

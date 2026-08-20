@@ -938,6 +938,21 @@ async fn open(socket: &Path, host: &str) -> Result<Stream> {
     Stream::over_ssh(host, Some(Arc::new(offer_to_install))).await
 }
 
+/// Like [`open`], but for the client that is holding the terminal.
+///
+/// An attach paints a session over the screen and a dropped connection leaves
+/// that paint exactly where it was, which is what a wait is for. ssh printing
+/// its account of a machine it cannot reach lands there, once per attempt, on
+/// a terminal in raw mode; kept instead, the same words go into the error,
+/// which reaches the person on the first attach of a run and the log on every
+/// reconnect after it. See [`manymux::client::Heard`].
+async fn open_hushed(socket: &Path, host: &str) -> Result<Stream> {
+    if is_this_machine(host) {
+        return Stream::local(socket).await;
+    }
+    Stream::over_ssh_hushed(host, Some(Arc::new(offer_to_install))).await
+}
+
 /// Ask whether to put `mm` on a machine that turns out not to have it.
 ///
 /// Reaching a machine you can ssh into should not need a separate trip to set
@@ -2330,7 +2345,7 @@ async fn attach_to(
     history: u32,
     watching: bool,
 ) -> Result<Attached, Missed> {
-    let stream = open(socket, &target.host)
+    let stream = open_hushed(socket, &target.host)
         .await
         .map_err(Missed::Unreachable)?;
     stream

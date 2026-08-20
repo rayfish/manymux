@@ -16,7 +16,7 @@ pub mod status;
 pub mod switch;
 
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, bail};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -26,6 +26,7 @@ use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
+use crate::lock::held;
 use crate::proto::{
     self, FindRequest, FrameReader, HostedEvent, PasteInfo, Request, Response, Size, ViewRequest,
     tag,
@@ -34,32 +35,74 @@ use crate::proto::{
 type Reader = FrameReader<Box<dyn AsyncRead + Unpin + Send>>;
 type Writer = Box<dyn AsyncWrite + Unpin + Send>;
 
+/// Where what ssh says on the way to a machine ends up.
+///
+/// Printed is the answer for a command somebody typed: it has a terminal of
+/// its own to fail on, and ssh's account of a machine it could not reach is
+/// the only account there is.
+///
+/// Kept is the answer for a client holding a terminal. An attach puts a
+/// session's screen on it and a dropped connection leaves that screen exactly
+/// as it was painted, which is the whole of what a wait is; a retry printing
+/// `connect to host` there ruins that picture once per attempt, and does it on
+/// a raw terminal, so each line lands a column further along than the last.
+/// Kept, the same words go into the error instead, which is where they are
+/// worth having: the first attach of a run reports it once the terminal has
+/// been given back, and a reconnect puts it in the log rather than anywhere.
+#[derive(Clone, Copy)]
+pub enum Heard {
+    Aloud,
+    Kept,
+}
+
+/// What ssh has said so far on a stream that keeps it. Shared because the
+/// reading happens in a task and the asking happens on a failure.
+type Kept = Arc<Mutex<Vec<u8>>>;
+
+/// How much of it is worth keeping. ssh says a line or two about a connection
+/// it could not make, but an attach lasts hours and nothing reads this until
+/// something goes wrong, so it must not be able to grow without bound behind a
+/// client that is doing fine.
+const KEEP: usize = 4096;
+
 /// The ssh process carrying a stream to another machine. Dropping it hangs up,
 /// which is why it travels with the stream rather than being left behind.
 struct Carrier {
     child: Child,
     /// Say the word and ssh's stderr is printed, and keeps being printed.
-    /// Dropped instead, it is thrown away. See [`relay`].
+    /// Dropped instead, it is thrown away. See [`relay`]. `None` on a stream
+    /// that keeps what ssh says, which has nowhere to print it.
     voice: Option<oneshot::Sender<()>>,
-    /// The relay itself, for waiting on when the word has been said and the
-    /// process is about to end.
+    /// Whichever of [`relay`] and [`keep`] is reading ssh's stderr, for
+    /// waiting on when the process is about to end and the last of what it
+    /// said is wanted.
     spoken: Option<JoinHandle<()>>,
+    /// What ssh has said, on a stream that keeps it. See [`Heard::Kept`].
+    kept: Option<Kept>,
 }
 
 impl Carrier {
-    fn new(child: Child, stderr: Option<ChildStderr>) -> Self {
-        let (voice, spoken) = match stderr {
-            Some(stderr) => {
-                let (voice, spoken) = relay(stderr);
-                (Some(voice), Some(spoken))
-            }
-            None => (None, None),
-        };
-        Self {
+    fn new(child: Child, stderr: Option<ChildStderr>, heard: Heard) -> Self {
+        let mut carrier = Self {
             child,
-            voice,
-            spoken,
+            voice: None,
+            spoken: None,
+            kept: None,
+        };
+        match (stderr, heard) {
+            (Some(stderr), Heard::Aloud) => {
+                let (voice, spoken) = relay(stderr);
+                carrier.voice = Some(voice);
+                carrier.spoken = Some(spoken);
+            }
+            (Some(stderr), Heard::Kept) => {
+                let (kept, keeping) = keep(stderr);
+                carrier.kept = Some(kept);
+                carrier.spoken = Some(keeping);
+            }
+            (None, _) => {}
         }
+        carrier
     }
 }
 
@@ -111,6 +154,36 @@ fn relay(mut stderr: ChildStderr) -> (oneshot::Sender<()>, JoinHandle<()>) {
         let _ = tokio::io::copy(&mut stderr, &mut tokio::io::stderr()).await;
     });
     (voice, relaying)
+}
+
+/// Read ssh's stderr onto a page rather than onto the terminal.
+///
+/// The other half of [`relay`], for a caller that is holding a screen; see
+/// [`Heard::Kept`] for why there are two. Read rather than left in the pipe on
+/// purpose: a pipe nobody drains fills, and ssh warning about a host key into
+/// a full pipe is ssh stopping, on a connection that is otherwise fine.
+/// Closing it instead would be worse, since what ssh gets for writing to a
+/// pipe with no reader is a signal.
+fn keep(mut stderr: ChildStderr) -> (Kept, JoinHandle<()>) {
+    let kept: Kept = Arc::new(Mutex::new(Vec::new()));
+    let page = Arc::clone(&kept);
+    let keeping = tokio::spawn(async move {
+        let mut buf = [0u8; 4096];
+        loop {
+            match stderr.read(&mut buf).await {
+                Ok(0) | Err(_) => return,
+                Ok(n) => {
+                    let mut page = held(&page);
+                    // What is kept is the first of it rather than the last:
+                    // the first thing ssh says about a connection is why it
+                    // failed, and everything after is that failure repeating.
+                    let room = KEEP.saturating_sub(page.len());
+                    page.extend_from_slice(&buf[..n.min(room)]);
+                }
+            }
+        }
+    });
+    (kept, keeping)
 }
 
 /// Put something on stderr and wait for it to actually be there.
@@ -170,6 +243,9 @@ pub struct Stream {
     /// Set only on a stream over ssh, and only while it can still be reopened
     /// a different way.
     ssh: Option<Ssh>,
+    /// Where what ssh says goes, which outlives any one carrier: the ladder
+    /// makes a new one per rung, and each has to treat it the same way.
+    heard: Heard,
 }
 
 impl Stream {
@@ -187,6 +263,7 @@ impl Stream {
             write: Box::new(write),
             carrier: None,
             ssh: None,
+            heard: Heard::Aloud,
         })
     }
 
@@ -198,7 +275,18 @@ impl Stream {
     /// A machine with no `mm` on it is offered one, if `consent` says so; see
     /// [`Consent`] and [`PROGRAMS`].
     pub async fn over_ssh(host: &str, consent: Option<Consent>) -> Result<Self> {
-        Self::carried_by(host, crate::ssh::agent, consent)
+        Self::carried_by(host, crate::ssh::agent, consent, Heard::Aloud)
+    }
+
+    /// Like [`Stream::over_ssh`], but for a caller that is holding a terminal:
+    /// what ssh has to say goes into the error rather than onto the screen.
+    ///
+    /// The same ssh either way, asking the same questions of the same person.
+    /// The only difference is where its account of a machine it could not
+    /// reach comes out, and see [`Heard::Kept`] for why that is worth a second
+    /// way in.
+    pub async fn over_ssh_hushed(host: &str, consent: Option<Consent>) -> Result<Self> {
+        Self::carried_by(host, crate::ssh::agent, consent, Heard::Kept)
     }
 
     /// Like [`Stream::over_ssh`], but ssh stays silent and does not prompt.
@@ -207,13 +295,14 @@ impl Stream {
     /// a password prompt or a host-key warning would land in the middle of the
     /// line they are typing. Nothing gets installed on a keystroke either.
     pub async fn over_ssh_quietly(host: &str) -> Result<Self> {
-        Self::carried_by(host, crate::ssh::agent_quietly, None)
+        Self::carried_by(host, crate::ssh::agent_quietly, None, Heard::Aloud)
     }
 
     fn carried_by(
         host: &str,
         open: fn(&str, &str) -> Result<crate::ssh::Agent>,
         consent: Option<Consent>,
+        heard: Heard,
     ) -> Result<Self> {
         let ssh = Ssh {
             host: host.to_string(),
@@ -226,8 +315,9 @@ impl Stream {
         Ok(Self {
             read: FrameReader::new(Box::new(agent.stdout)),
             write: Box::new(agent.stdin),
-            carrier: Some(Carrier::new(agent.child, agent.stderr)),
+            carrier: Some(Carrier::new(agent.child, agent.stderr, heard)),
             ssh: Some(ssh),
+            heard,
         })
     }
 
@@ -239,6 +329,7 @@ impl Stream {
             write,
             carrier: None,
             ssh: None,
+            heard: Heard::Aloud,
         }
     }
 
@@ -255,7 +346,10 @@ impl Stream {
                     if self.reopen().await? {
                         continue;
                     }
-                    return Err(e);
+                    return Err(match self.said() {
+                        Some(said) => e.context(said),
+                        None => e,
+                    });
                 }
             };
             let Some(frame) = frame else {
@@ -264,6 +358,12 @@ impl Stream {
                 // than "the stream ended", so go and look.
                 if self.reopen().await? {
                     continue;
+                }
+                // On a stream that keeps what ssh said, this is where it is
+                // worth having: ssh's own line about the machine says what a
+                // broken pipe and an exit status can only be read as.
+                if let Some(said) = self.said() {
+                    bail!(said);
                 }
                 if let Some(carrier) = &mut self.carrier
                     && let Ok(Some(status)) = carrier.child.try_wait()
@@ -300,6 +400,8 @@ impl Stream {
         if !self.said_no_mm().await {
             // Not a missing `mm`, so ssh's own account of it is the only one
             // there is, and the caller is about to report a failure without it.
+            // Where that account goes is the stream's to say; either way this
+            // is the moment it has to be complete.
             self.speak_now().await;
             self.ssh = Some(ssh);
             return Ok(false);
@@ -325,7 +427,7 @@ impl Stream {
         self.write = Box::new(agent.stdin);
         // The old carrier goes here, taking the "command not found" it earned
         // with it.
-        self.carrier = Some(Carrier::new(agent.child, agent.stderr));
+        self.carrier = Some(Carrier::new(agent.child, agent.stderr, self.heard));
         self.ssh = Some(ssh);
         Ok(true)
     }
@@ -342,6 +444,10 @@ impl Stream {
     /// The same, waited on. Only for an ssh already reaped, and only where the
     /// caller is about to fail: a spawned relay dies with the runtime, and the
     /// runtime is one returned error away from stopping.
+    ///
+    /// On a stream that keeps what ssh said there is nobody to speak up and
+    /// the wait is the whole of it: [`Stream::said`] is about to be asked, and
+    /// the last thing ssh wrote may still be in the pipe.
     async fn speak_now(&mut self) {
         self.speak_up();
         if let Some(carrier) = &mut self.carrier
@@ -349,6 +455,25 @@ impl Stream {
         {
             let _ = relaying.await;
         }
+    }
+
+    /// What ssh said, on a stream that keeps it rather than printing it.
+    ///
+    /// `None` on one that prints, which has already printed it, and on one
+    /// that had nothing to say. The lines are joined rather than kept apart,
+    /// because this ends up inside a sentence: an error is one line wherever
+    /// it is read, and ssh saying two things about a machine is no reason to
+    /// break the line it is being read on.
+    fn said(&self) -> Option<String> {
+        let kept = self.carrier.as_ref()?.kept.as_ref()?;
+        let said = String::from_utf8_lossy(&held(kept)).into_owned();
+        let said = said
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .collect::<Vec<_>>()
+            .join("; ");
+        (!said.is_empty()).then_some(said)
     }
 
     /// Whether the ssh carrying this stream gave up because it found no `mm`.
