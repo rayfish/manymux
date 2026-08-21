@@ -24,6 +24,14 @@
 //! it produces goes to the system clipboard rather than to somewhere only
 //! manymux can paste from.
 //!
+//! What a hand with a mouse does includes keeping hold of what it grabbed. A
+//! double or a third click sets a [`Grain`] that the drag after it goes on
+//! asking for, so words are dragged out by the word and lines by the line, the
+//! way they are everywhere else. It is applied where the ends are read rather
+//! than written into them as they move, because the hand goes back and forth
+//! over the same word and a grain baked in on the way out could not be undone
+//! on the way back.
+//!
 //! The window moves locally inside a block that has already arrived, and a
 //! block is a few screenfuls. A request per wheel notch would be a round trip
 //! over ssh per wheel notch, on machines that are usually two hops away.
@@ -141,10 +149,83 @@ struct Selection {
     anchor: Cell,
     /// Where it is now, which is what the drag moves.
     head: Cell,
-    /// Whether somebody asked for this outright, by clicking twice or three
-    /// times, rather than dragging it out. It decides what a release does with
-    /// a selection one cell wide: dragged, that is a click that never moved.
-    whole: bool,
+    /// How much each end takes, which is what the gesture that started this
+    /// asked for.
+    grain: Grain,
+}
+
+/// How much of what it lands on each end of a selection takes.
+///
+/// The gesture that starts a selection says this, and the drag after it keeps
+/// asking for the same thing, which is what every terminal and every editor
+/// does and what makes a drag feel like it is holding on to something. Set at
+/// the press and applied whenever the ends are read, rather than written into
+/// the ends themselves: the hand goes back and forth over a word, and a grain
+/// baked into `head` on the way out could not be undone on the way back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Grain {
+    /// The cell under the pointer, which is a plain drag.
+    Cell,
+    /// The word under each end, which is a double click and whatever the hand
+    /// does next.
+    Word,
+    /// Whole lines, which is a third click.
+    Line,
+}
+
+/// How much is selected, for the row to say while a hand is still drawing it
+/// and for the notice that says what a release took.
+///
+/// Two units rather than one because a selection inside a line and a selection
+/// spanning them are different questions: how much of this line, and how many
+/// lines.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Selected {
+    /// Cells of one line, which is a drag that never left it.
+    Chars(u64),
+    /// Lines, both ends included.
+    Lines(u64),
+}
+
+impl Selected {
+    /// What a piece of copied text amounts to, for the notice that says it was
+    /// taken.
+    pub fn of(text: &str) -> Self {
+        match text.lines().count() {
+            0 | 1 => Self::Chars(text.chars().count() as u64),
+            lines => Self::Lines(lines as u64),
+        }
+    }
+}
+
+impl std::fmt::Display for Selected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (count, thing) = match self {
+            Self::Chars(chars) => (*chars, "char"),
+            Self::Lines(lines) => (*lines, "line"),
+        };
+        write!(f, "{count} {thing}")?;
+        if count != 1 {
+            write!(f, "s")?;
+        }
+        Ok(())
+    }
+}
+
+/// What became of a copy that had to wait for the lines to make it out of.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Owed {
+    /// None was owed: either nothing was waiting, or the release could be
+    /// answered on the spot.
+    Nothing,
+    /// The lines arrived, and this is what was on them.
+    Copied(String),
+    /// They did not, and nothing later will. The block that came back is the
+    /// answer to the request the press made, so a selection it does not cover
+    /// is one no block after it covers either. Worth saying out loud: the
+    /// gesture is over, the clipboard still holds whatever it held, and the
+    /// highlight on the screen says otherwise.
+    Lost,
 }
 
 /// One cell of the buffer: a line counted back from the newest the way
@@ -521,7 +602,7 @@ impl Scrollback {
         self.selection = Some(Selection {
             anchor: at,
             head: at,
-            whole: false,
+            grain: Grain::Cell,
         });
     }
 
@@ -628,16 +709,57 @@ impl Scrollback {
     /// letters and digits, and the punctuation that holds a path or a URL
     /// together, so that double-clicking `src/client/scroll.rs` takes all of
     /// it rather than three letters of it.
+    ///
+    /// The drag after it goes on taking words ([`Grain::Word`]), which is what
+    /// the same gesture does everywhere else. Not where the click landed
+    /// outside a word, though: there is no word under the pointer to walk by,
+    /// and a grain that means nothing at the end it started from would take
+    /// the blank the hand happened to stop on as the whole of a copy.
     pub fn select_word(&mut self, spot: Spot) {
         let at = self.cell(spot);
         self.chasing = None;
-        let Some(line) = self.line(at.line) else {
+        let Some((from, to)) = self.word_on(at) else {
             return self.select_from(spot);
         };
-        let text: Vec<char> = plain(line, 0, u16::MAX).chars().collect();
+        self.selection = Some(Selection {
+            anchor: Cell {
+                line: at.line,
+                col: from,
+            },
+            head: Cell {
+                line: at.line,
+                col: to,
+            },
+            grain: Grain::Word,
+        });
+    }
+
+    /// And the whole line under a third, to the end of what is on it: the
+    /// blanks past that are the screen rather than the text. The drag after it
+    /// takes whole lines for the same reason a double click's takes words.
+    pub fn select_line(&mut self, spot: Spot) {
+        let at = self.cell(spot);
+        self.chasing = None;
+        self.selection = Some(Selection {
+            anchor: Cell {
+                line: at.line,
+                col: 0,
+            },
+            head: Cell {
+                line: at.line,
+                col: self.line_ends(at.line),
+            },
+            grain: Grain::Line,
+        });
+    }
+
+    /// The columns of the word around a cell, both ends included, or nothing
+    /// where the cell is not in a word or its line is not in the block.
+    fn word_on(&self, at: Cell) -> Option<(u16, u16)> {
+        let text: Vec<char> = plain(self.line(at.line)?, 0, u16::MAX).chars().collect();
         let col = usize::from(at.col);
-        if text.get(col).is_none_or(|c| !in_a_word(*c)) {
-            return self.select_from(spot);
+        if !text.get(col).is_some_and(|c| in_a_word(*c)) {
+            return None;
         }
         let start = text[..col]
             .iter()
@@ -648,38 +770,52 @@ impl Scrollback {
             .position(|c| !in_a_word(*c))
             .map_or(text.len(), |after| col + after)
             - 1;
-        self.selection = Some(Selection {
-            anchor: Cell {
-                line: at.line,
-                col: column(start),
-            },
-            head: Cell {
-                line: at.line,
-                col: column(end),
-            },
-            whole: true,
-        });
+        Some((column(start), column(end)))
     }
 
-    /// And the whole line under a third, to the end of what is on it: the
-    /// blanks past that are the screen rather than the text.
-    pub fn select_line(&mut self, spot: Spot) {
-        let at = self.cell(spot);
-        self.chasing = None;
-        let end = self.line(at.line).map_or(0, |line| {
+    /// The last column of a line with anything on it, which is where a line
+    /// selection stops: the blanks past it are the screen rather than the text.
+    fn line_ends(&self, offset: u64) -> u16 {
+        let end = self.line(offset).map_or(0, |line| {
             plain(line, 0, u16::MAX).trim_end().chars().count()
         });
-        self.selection = Some(Selection {
-            anchor: Cell {
-                line: at.line,
-                col: 0,
-            },
-            head: Cell {
-                line: at.line,
-                col: column(end.saturating_sub(1)),
-            },
-            whole: true,
-        });
+        column(end.saturating_sub(1))
+    }
+
+    /// The two ends of a selection in reading order, each grown to the grain
+    /// the gesture asked for.
+    ///
+    /// Grown here rather than in [`Selection`] because a word and a line are
+    /// facts about the text, which lives in the block: the selection knows
+    /// only where the hand went. And it widens columns and never touches line
+    /// numbers, which is what lets [`Self::holds`] and [`Self::spans`] go on
+    /// reading the raw ends.
+    fn grained(&self, selection: &Selection) -> (Cell, Cell) {
+        let (first, last) = selection.ends();
+        match selection.grain {
+            Grain::Cell => (first, last),
+            // Outwards from each end: the one that reads first back to the
+            // start of its word, the one that reads last on to the end of its
+            // own. A cell in no word is left where it is, so dragging over the
+            // space between two words does not swallow either of them.
+            Grain::Word => (
+                Cell {
+                    col: self.word_on(first).map_or(first.col, |(from, _)| from),
+                    ..first
+                },
+                Cell {
+                    col: self.word_on(last).map_or(last.col, |(_, to)| to),
+                    ..last
+                },
+            ),
+            Grain::Line => (
+                Cell { col: 0, ..first },
+                Cell {
+                    col: self.line_ends(last.line),
+                    ..last
+                },
+            ),
+        }
     }
 
     /// What letting go of the button has to copy, if it has anything.
@@ -698,7 +834,7 @@ impl Scrollback {
 
     pub fn copied(&mut self) -> Option<String> {
         let selection = self.selection?;
-        if !selection.whole && selection.anchor == selection.head {
+        if selection.grain == Grain::Cell && selection.anchor == selection.head {
             self.selection = None;
             return None;
         }
@@ -709,22 +845,54 @@ impl Scrollback {
         self.selected()
     }
 
+    /// How much is under the highlight, while anything is.
+    ///
+    /// What is highlighted rather than what would land on the clipboard, since
+    /// this is checked against the screen: a selection dragged past the end of
+    /// a short line reads here as the cells it covers, and the copy comes back
+    /// shorter because the blanks past the text are trimmed off it.
+    ///
+    /// Nothing for the cell under a press that has not moved, which is the same
+    /// answer [`Self::copied`] gives it: counting one there would put `1 char
+    /// selected` on the row the instant a button went down, for a gesture that
+    /// is usually a click and whose release is going to throw it away.
+    pub fn selected_size(&self) -> Option<Selected> {
+        let selection = self.selection?;
+        if selection.grain == Grain::Cell && selection.anchor == selection.head {
+            return None;
+        }
+        let (first, last) = self.grained(&selection);
+        Some(if first.line == last.line {
+            Selected::Chars(u64::from(last.col.saturating_sub(first.col)) + 1)
+        } else {
+            Selected::Lines(self.spans())
+        })
+    }
+
     /// The copy that was waiting for its lines, now that a block has arrived.
     ///
     /// Answered once and then forgotten, whatever the block turned out to hold.
     /// The block on its way is the one the press asked for, so a block that
     /// does not cover the selection is a selection nothing later will cover
     /// either, and a request left standing would put a copy nobody asked for on
-    /// the clipboard the next time the view moved.
-    pub fn owed_copy(&mut self) -> Option<String> {
+    /// the clipboard the next time the view moved. Which is why the failure is
+    /// [`Owed::Lost`] rather than another nothing: there is a release behind it
+    /// that took nothing and said nothing, and the highlight still on the
+    /// screen claims otherwise.
+    pub fn owed_copy(&mut self) -> Owed {
         if !std::mem::take(&mut self.owed) {
-            return None;
+            return Owed::Nothing;
         }
-        let selection = self.selection?;
+        let Some(selection) = self.selection else {
+            return Owed::Nothing;
+        };
         if !self.holds(&selection) {
-            return None;
+            return Owed::Lost;
         }
-        self.selected()
+        match self.selected() {
+            Some(text) => Owed::Copied(text),
+            None => Owed::Lost,
+        }
     }
 
     /// Whether the block in hand has the lines a selection was made on, which
@@ -743,7 +911,7 @@ impl Scrollback {
     /// blanks of each line with them: a line of a terminal is as wide as the
     /// screen and what was typed on it is not.
     pub fn selected(&self) -> Option<String> {
-        let (first, last) = self.selection?.ends();
+        let (first, last) = self.grained(&self.selection?);
         let mut out = String::new();
         let mut line = first.line;
         loop {
@@ -785,8 +953,14 @@ impl Scrollback {
     /// A line that the selection runs off the end of is selected to the edge of
     /// the screen and not one cell further: this is what is about to be drawn,
     /// and a row drawn wider than the screen wraps onto the row beneath it.
-    fn selected_on(&self, offset: u64) -> Option<(u16, u16)> {
-        let (first, last) = self.selection?.ends();
+    ///
+    /// The ends come in already grown to their grain rather than being worked
+    /// out here, because growing them reads the text of the two lines they sit
+    /// on and this is asked once per row of the window per frame: worked out
+    /// here it would be two line parses a row to answer a question about the
+    /// same two lines every time.
+    fn selected_on(&self, ends: (Cell, Cell), offset: u64) -> Option<(u16, u16)> {
+        let (first, last) = ends;
         if offset > first.line || offset < last.line {
             return None;
         }
@@ -856,6 +1030,9 @@ impl Scrollback {
         // screen has rows, and they go at the bottom of it: the oldest line
         // sits where it would have been had you scrolled to it.
         let blank = rows.saturating_sub(lines.len() as u64);
+        // Once for the frame rather than once a row: the two ends are the same
+        // two ends whichever row is being asked about.
+        let ends = self.selection.map(|selection| self.grained(&selection));
         Some(
             (1..=rows)
                 .map(|row| {
@@ -863,7 +1040,7 @@ impl Scrollback {
                         return String::new();
                     }
                     let line = &lines[(row - blank - 1) as usize];
-                    match self.selected_on(self.offset + (rows - row)) {
+                    match ends.and_then(|ends| self.selected_on(ends, self.offset + (rows - row))) {
                         Some((from, to)) => highlighted(line, from, to),
                         None => line.clone(),
                     }
@@ -1728,7 +1905,7 @@ mod tests {
         assert!(view.selecting(), "and the gesture is not over");
 
         answer(&mut view, 100);
-        assert_eq!(view.owed_copy().as_deref(), Some("line"));
+        assert_eq!(view.owed_copy(), Owed::Copied("line".into()));
     }
 
     /// Owed once. The block that arrives is the answer to the request the press
@@ -1742,8 +1919,8 @@ mod tests {
         view.select_to(at(24, 4));
         view.copied();
         answer(&mut view, 100);
-        assert!(view.owed_copy().is_some());
-        assert_eq!(view.owed_copy(), None);
+        assert!(matches!(view.owed_copy(), Owed::Copied(_)));
+        assert_eq!(view.owed_copy(), Owed::Nothing);
     }
 
     /// Nothing is owed by a copy that could be made on the spot, or letting go
@@ -1754,7 +1931,128 @@ mod tests {
         view.select_from(at(24, 1));
         view.select_to(at(24, 4));
         assert_eq!(view.copied().as_deref(), Some("line"));
-        assert_eq!(view.owed_copy(), None);
+        assert_eq!(view.owed_copy(), Owed::Nothing);
+    }
+
+    /// The block that comes back is the answer to the request the press made,
+    /// so a selection it does not cover is one nothing later covers either.
+    /// Told apart from nothing being owed because there is a release behind it
+    /// that took nothing: unanswered, the clipboard keeps what it had and the
+    /// highlight still on the screen says otherwise.
+    #[test]
+    fn a_copy_whose_lines_never_arrive_is_lost_rather_than_forgotten() {
+        let mut view = Scrollback::new(SIZE);
+        // `g` before the host has said where the far end is parks the view at
+        // a line no block will ever hold.
+        view.top();
+        view.select_from(at(24, 1));
+        view.select_to(at(24, 4));
+        assert_eq!(view.copied(), None, "nothing to copy out of yet");
+
+        answer(&mut view, 100);
+        assert_eq!(view.owed_copy(), Owed::Lost);
+        assert_eq!(view.owed_copy(), Owed::Nothing, "and asked once");
+    }
+
+    /// A double click takes a word, and the drag after it goes on taking them.
+    /// Dragged a cell at a time instead, the gesture loses the granularity it
+    /// was started with the moment the hand moves, which is the thing that
+    /// makes a selection feel like it is holding on to something.
+    #[test]
+    fn a_drag_that_started_on_a_word_goes_on_taking_words() {
+        let mut view = view(100);
+        // `line 99` on the bottom row: the word under the pointer is `line`.
+        view.select_word(at(24, 2));
+        assert_eq!(view.copied().as_deref(), Some("line"));
+
+        view.select_word(at(24, 2));
+        // Into the first digit of `99`, which a cell-wise drag would stop at.
+        view.select_to(at(24, 6));
+        assert_eq!(view.copied().as_deref(), Some("line 99"));
+    }
+
+    /// And the end it started from stays whole when the hand goes the other
+    /// way, which is the half a grain written into the ends as they moved
+    /// could not do.
+    #[test]
+    fn a_word_drag_backwards_keeps_the_word_it_started_on() {
+        let mut view = view(100);
+        view.select_word(at(24, 7));
+        assert_eq!(view.copied().as_deref(), Some("99"));
+
+        view.select_word(at(24, 7));
+        view.select_to(at(24, 3));
+        assert_eq!(view.copied().as_deref(), Some("line 99"));
+    }
+
+    /// A third click takes a line, and the drag after it takes whole ones.
+    #[test]
+    fn a_drag_that_started_on_a_line_goes_on_taking_lines() {
+        let mut view = view(100);
+        view.select_line(at(24, 3));
+        assert_eq!(view.copied().as_deref(), Some("line 99"));
+
+        view.select_line(at(24, 3));
+        // A row up and a few columns in, which cell-wise would cut both ends.
+        view.select_to(at(23, 4));
+        assert_eq!(view.copied().as_deref(), Some("line 98\nline 99"));
+    }
+
+    /// A double click that landed on no word has no word to walk by, so the
+    /// drag after it is an ordinary one. Kept at the grain instead, the blank
+    /// the hand happened to stop on would be the whole of the copy.
+    #[test]
+    fn a_double_click_off_a_word_drags_by_the_cell() {
+        let mut view = view(100);
+        // Column five of `line 99` is the space between the two words.
+        view.select_word(at(24, 5));
+        assert_eq!(view.copied(), None, "a cell nobody dragged out of");
+
+        view.select_word(at(24, 5));
+        view.select_to(at(24, 6));
+        assert_eq!(view.copied().as_deref(), Some(" 9"));
+    }
+
+    /// What the row says while a hand is still drawing a selection. Counted in
+    /// the units the selection is in: how much of this line, or how many lines.
+    #[test]
+    fn a_selection_is_counted_in_chars_until_it_leaves_a_line() {
+        let mut view = view(100);
+        assert_eq!(view.selected_size(), None, "nothing selected yet");
+
+        view.select_from(at(24, 1));
+        assert_eq!(
+            view.selected_size(),
+            None,
+            "and a press that has not moved is a click, not a char"
+        );
+
+        view.select_to(at(24, 4));
+        assert_eq!(view.selected_size(), Some(Selected::Chars(4)));
+
+        view.select_to(at(22, 4));
+        assert_eq!(view.selected_size(), Some(Selected::Lines(3)));
+    }
+
+    /// And it counts what the grain will take, not where the hand happens to
+    /// be: the highlight on the screen is already showing the whole word.
+    #[test]
+    fn a_word_selection_is_counted_whole() {
+        let mut view = view(100);
+        view.select_word(at(24, 2));
+        assert_eq!(view.selected_size(), Some(Selected::Chars(4)));
+    }
+
+    /// One of anything is one of it. Said in the row and in the notice that
+    /// answers a release, so it is worth spelling.
+    #[test]
+    fn an_amount_takes_the_plural_it_needs() {
+        assert_eq!(Selected::Chars(1).to_string(), "1 char");
+        assert_eq!(Selected::Chars(12).to_string(), "12 chars");
+        assert_eq!(Selected::Lines(1).to_string(), "1 line");
+        assert_eq!(Selected::Lines(9).to_string(), "9 lines");
+        assert_eq!(Selected::of("one line").to_string(), "8 chars");
+        assert_eq!(Selected::of("two\nlines").to_string(), "2 lines");
     }
 
     /// A drag reports every cell it crosses and each report moves the highlight

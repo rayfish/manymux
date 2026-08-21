@@ -21,7 +21,7 @@ use super::keys::wheel_is_ours;
 use super::{Action, Chose, Find, KeyFilter, Mode, Outcome, Pick, Rename, Rows, Scroll, Select};
 use crate::client::picker::Picker;
 use crate::client::screen::ScreenMode;
-use crate::client::scroll::{self, Chased, Scrollback};
+use crate::client::scroll::{self, Chased, Owed, Scrollback, Selected};
 use crate::client::status::{self, Filter, Popped, Status};
 use crate::client::{Attached, SessionHalves, SessionReader, SessionWriter, Update};
 use crate::clipboard;
@@ -451,13 +451,16 @@ const WHEEL_THEIRS: &str = "\x1b[?1006l\x1b[?1002l\x1b[?1000l";
 /// Worth saying because there is nothing else to see: the highlight was already
 /// there, the clipboard is somewhere else, and a terminal that refuses OSC 52
 /// refuses it in silence. The count rather than the text, since the text is on
-/// the screen two rows up.
+/// the screen two rows up, and it is counted in the same units the row was
+/// counting a moment earlier while the hand was still drawing the selection.
 fn copied_says(text: &str) -> String {
-    match text.lines().count() {
-        0 | 1 => "copied".to_string(),
-        lines => format!("copied {lines} lines"),
-    }
+    format!("copied {}", Selected::of(text))
 }
+
+/// And about a copy that could not be made after all, which is the one way a
+/// release ends in nothing having happened at all: the clipboard still holds
+/// whatever it held, and the highlight sitting on the screen says otherwise.
+const COPY_LOST: &str = "those lines are no longer here to copy";
 
 /// Take the wheel, or give it back.
 ///
@@ -1175,6 +1178,7 @@ async fn pump(
                         let wanted = if done { None } else { view.wanted() };
                         let painted = if done { String::new() } else { view.paint() };
                         let offset = view.offset();
+                        let selected = view.selected_size();
                         // A drag that has reached an edge and stayed there
                         // reports nothing more, so from here the view moves on
                         // a clock of its own.
@@ -1201,6 +1205,7 @@ async fn pump(
                                 .await?;
                         } else {
                             status.set_scrolled(Some(offset));
+                            status.set_selected(selected);
                             stdout.write_all(painted.as_bytes()).await?;
                             stdout
                                 .write_all(status.repaint(terminal_size()).as_bytes())
@@ -1524,14 +1529,20 @@ async fn pump(
                 // the session again, and painting lines over it would be a
                 // window nobody is looking at.
                 Update::View(window) => {
-                    // The copy a release could not be answered out of an empty
-                    // block, and whether the gesture it belongs to is over.
-                    let mut copied = None;
+                    // What became of the copy a release could not be answered
+                    // out of an empty block, and whether the gesture it belongs
+                    // to is over.
+                    let mut owing = Owed::Nothing;
                     let mut done = false;
                     if let Some(view) = scrolling.as_mut() {
                         view.take(window);
-                        copied = view.owed_copy();
-                        done = copied.is_some() && view.at_bottom();
+                        owing = view.owed_copy();
+                        // Either way the gesture is over: a copy that will
+                        // never be made is not one to go on waiting for, and
+                        // leaving the view up over it would be the same paused
+                        // picture of a session a release at the bottom hands
+                        // back.
+                        done = !matches!(owing, Owed::Nothing) && view.at_bottom();
                         // The block was asked for around where the window was
                         // before the host said how much history there is, so a
                         // move made before the first answer may have been
@@ -1545,6 +1556,7 @@ async fn pump(
                         }
                         if !done {
                             status.set_scrolled(Some(view.offset()));
+                            status.set_selected(view.selected_size());
                             stdout.write_all(view.paint().as_bytes()).await?;
                             stdout
                                 .write_all(status.repaint(terminal_size()).as_bytes())
@@ -1552,12 +1564,19 @@ async fn pump(
                             stdout.flush().await?;
                         }
                     }
-                    if let Some(text) = &copied {
-                        stdout
-                            .write_all(clipboard::to_terminal(text).as_bytes())
-                            .await?;
-                        status.set_notice(&copied_says(text));
-                        notice_until = Some(tokio::time::Instant::now() + NOTICE_FOR);
+                    match &owing {
+                        Owed::Nothing => {}
+                        Owed::Copied(text) => {
+                            stdout
+                                .write_all(clipboard::to_terminal(text).as_bytes())
+                                .await?;
+                            status.set_notice(&copied_says(text));
+                            notice_until = Some(tokio::time::Instant::now() + NOTICE_FOR);
+                        }
+                        Owed::Lost => {
+                            status.set_notice(COPY_LOST);
+                            notice_until = Some(tokio::time::Instant::now() + NOTICE_FOR);
+                        }
                     }
                     // The drag was over before its lines arrived, so this is
                     // where it ends: the same handing back of the screen the
@@ -1671,10 +1690,12 @@ async fn pump(
                         let wanted = view.wanted();
                         let painted = view.paint();
                         let offset = view.offset();
+                        let selected = view.selected_size();
                         if let Some(request) = wanted {
                             writer.view(&request).await?;
                         }
                         status.set_scrolled(Some(offset));
+                        status.set_selected(selected);
                         stdout.write_all(painted.as_bytes()).await?;
                         stdout.write_all(status.repaint(terminal_size()).as_bytes()).await?;
                         stdout.flush().await?;
@@ -1694,6 +1715,7 @@ async fn pump(
                         // describing a screen showing something else.
                         let painted = view.paint();
                         status.set_scrolled(Some(view.offset()));
+                        status.set_selected(view.selected_size());
                         stdout.write_all(painted.as_bytes()).await?;
                         status.set_notice(&format!(
                             "{} lines is as much as one copy takes",

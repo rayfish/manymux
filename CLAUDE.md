@@ -751,6 +751,35 @@ Three consequences run through the whole codebase and are worth keeping intact:
   were about to paste. So `Scrollback::copied` drops a one-cell selection unless
   it came from a second or third click, where a one-letter word is exactly what
   was asked for.
+- **A drag keeps the grain the gesture that started it asked for**
+  (`scroll::Grain`, applied in `Scrollback::grained`). A double click takes a
+  word and a third takes a line, and then the hand moves: dragged a cell at a
+  time from there, the granularity is gone by the first report and the gesture
+  reads as a selection that will not hold on to anything. So the grain sits on
+  the `Selection` and both ends are grown to it wherever they are read. Grown
+  *there* rather than written into `head` as it moves, because a hand goes back
+  and forth over the same word and a grain baked in on the way out cannot be
+  undone on the way back; and it is what makes the end a drag started from stay
+  whole when the hand goes the other way, which is the half of this people
+  notice. It widens columns and never touches line numbers, which is what lets
+  `holds` and `spans` go on reading the raw ends. The one gesture that does not
+  keep its grain is a double click that landed outside a word: there is no word
+  under the pointer to walk by, and a grain that means nothing at the end it
+  started from would take the blank the hand happened to stop on as the whole of
+  a copy.
+- **How much is selected is said on the row, because the screen cannot say it**
+  (`Scrollback::selected_size`, `Status::set_selected`). A drag held at an edge
+  walks the view under the highlight at up to a dozen lines a move, so the end
+  it started from went past the top of the window a second ago and the only
+  honest answer to "how much have I got" is a count. It takes the scroll hints'
+  place and keeps `esc live`, there being room on eighty columns for one of the
+  three, and it outranks what a search found for the reason a notice outranks
+  the hints: it is the thing moving under the hand. What it counts is what is
+  *highlighted* rather than what would land on the clipboard, since that is what
+  the eye is checking it against; a drag past the end of a short line therefore
+  reads a cell or two longer than the copy, whose trailing blanks are trimmed.
+  The same units answer the release (`copied_says`), so the notice continues the
+  sentence the row was saying rather than starting a new one.
 - **A gesture that ends at the bottom hands the screen back, whether it copied
   anything or not.** The two ways one ends are a click that selected nothing
   and a drag that has been taken, and both are somebody done with the mouse.
@@ -775,6 +804,18 @@ Three consequences run through the whole codebase and are worth keeping intact:
   moved. `Scrollback::line` answers for lines the block holds and no others for
   the same reason, the window arithmetic saturating at both ends being what a
   window wants and the opposite of what a selection wants.
+- **And an owed copy that cannot be made is answered, not dropped**
+  (`scroll::Owed`). This was an `Option`, which made "nothing was owed" and "the
+  copy owed will never be made" the same answer, and the second is not a quiet
+  case: there is a release behind it that took nothing, so the clipboard still
+  holds whatever it held, the highlight sitting on the screen says otherwise,
+  and the row says nothing at all. The gesture ended the same way it would have
+  ended by succeeding, too, which meant a view left up over a session that had
+  stopped being painted. `Owed::Lost` is the third answer, and both of the two
+  that are not `Nothing` end the gesture; only one of them writes a clipboard.
+  `g` before the host has said where the far end is is the way to reach it,
+  since `top` parks the view at `u64::MAX` and a click there lands on a line no
+  block will ever hold.
 - **A drag held against an edge moves the view itself, on a clock**
   (`Scrollback::chase`, `terminal::CHASE_EVERY`). A selection that could only
   reach what was already painted was one bounded by the window, on the surface
