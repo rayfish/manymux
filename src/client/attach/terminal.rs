@@ -1529,14 +1529,13 @@ async fn pump(
                 // the session again, and painting lines over it would be a
                 // window nobody is looking at.
                 Update::View(window) => {
-                    // What became of the copy a release could not be answered
-                    // out of an empty block, and whether the gesture it belongs
-                    // to is over.
-                    let mut owing = Owed::Nothing;
+                    // Whether the gesture the copy belongs to is over.
                     let mut done = false;
                     if let Some(view) = scrolling.as_mut() {
                         view.take(window);
-                        owing = view.owed_copy();
+                        // What became of the copy a release could not be
+                        // answered out of an empty block.
+                        let owing = view.owed_copy();
                         // Either way the gesture is over: a copy that will
                         // never be made is not one to go on waiting for, and
                         // leaving the view up over it would be the same paused
@@ -1554,6 +1553,27 @@ async fn pump(
                         {
                             writer.view(&request).await?;
                         }
+                        // Before the row is painted, and that is the whole of
+                        // why it is here rather than after: a view that is not
+                        // at the bottom is not handed back, so nothing else is
+                        // going to draw this row until the notice has expired
+                        // and taken itself off again. Set after the paint, the
+                        // one thing either of these has to do, which is be
+                        // read, is the one thing it never did.
+                        match &owing {
+                            Owed::Nothing => {}
+                            Owed::Copied(text) => {
+                                stdout
+                                    .write_all(clipboard::to_terminal(text).as_bytes())
+                                    .await?;
+                                status.set_notice(&copied_says(text));
+                                notice_until = Some(tokio::time::Instant::now() + NOTICE_FOR);
+                            }
+                            Owed::Lost => {
+                                status.set_notice(COPY_LOST);
+                                notice_until = Some(tokio::time::Instant::now() + NOTICE_FOR);
+                            }
+                        }
                         if !done {
                             status.set_scrolled(Some(view.offset()));
                             status.set_selected(view.selected_size());
@@ -1562,20 +1582,6 @@ async fn pump(
                                 .write_all(status.repaint(terminal_size()).as_bytes())
                                 .await?;
                             stdout.flush().await?;
-                        }
-                    }
-                    match &owing {
-                        Owed::Nothing => {}
-                        Owed::Copied(text) => {
-                            stdout
-                                .write_all(clipboard::to_terminal(text).as_bytes())
-                                .await?;
-                            status.set_notice(&copied_says(text));
-                            notice_until = Some(tokio::time::Instant::now() + NOTICE_FOR);
-                        }
-                        Owed::Lost => {
-                            status.set_notice(COPY_LOST);
-                            notice_until = Some(tokio::time::Instant::now() + NOTICE_FOR);
                         }
                     }
                     // The drag was over before its lines arrived, so this is

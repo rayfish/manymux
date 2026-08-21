@@ -815,7 +815,12 @@ Three consequences run through the whole codebase and are worth keeping intact:
   that are not `Nothing` end the gesture; only one of them writes a clipboard.
   `g` before the host has said where the far end is is the way to reach it,
   since `top` parks the view at `u64::MAX` and a click there lands on a line no
-  block will ever hold.
+  block will ever hold. What either answer says goes on the row *before* the
+  frame that block paints, which is the half that is easy to put back the wrong
+  way round: a view that is not at the bottom is not handed back, so that frame
+  is the only repaint there will be until the notice expires and takes itself
+  off again. Set after it, the one thing a notice has to do is the one thing it
+  never did.
 - **A drag held against an edge moves the view itself, on a clock**
   (`Scrollback::chase`, `terminal::CHASE_EVERY`). A selection that could only
   reach what was already painted was one bounded by the window, on the surface
