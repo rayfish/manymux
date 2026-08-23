@@ -19,6 +19,7 @@ import android.view.View
 import android.view.ViewGroup.LayoutParams.MATCH_PARENT
 import android.view.ViewGroup.LayoutParams.WRAP_CONTENT
 import android.view.WindowInsets
+import android.view.WindowInsetsAnimation
 import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.PopupMenu
@@ -88,6 +89,9 @@ class MainActivity : Activity() {
 
     /** Whether a listing nobody is waiting for is already out. */
     private var asking = false
+
+    /** Whether the keyboard is moving, and the padding is the animation's. */
+    private var lifting = false
 
     /** Whether everything has been let go of, so late work stays away. */
     private var gone = false
@@ -590,20 +594,29 @@ class MainActivity : Activity() {
      * is for.
      */
     private fun offerToSwitch(under: View, machine: Machine, current: String) {
+        // The keyboard goes first. A menu opened over one is a menu with the
+        // bottom of it behind the keys, and on a short phone that is most of
+        // the list; the gesture is about where you are going and not about
+        // typing, so there is nothing it is in the way of.
+        terminal?.closeKeyboard()
+
         // Asked for here as well as on the way in, so a session sat in for an
         // hour has a current list behind the second press if not the first.
         refresh(machine)
 
         val menu = PopupMenu(this, under)
         for (session in seen) {
-            val what = if (session.title.isBlank()) session.command else session.title
+            // The name and nothing else. A title is the last thing the program
+            // set and a command is what it was started with, so a row carrying
+            // one is a row of a length nobody chose, and what tells two rows
+            // apart here is the one thing that is short and is a name.
+            //
             // The one you are in is shown and not offered: a list with it
             // missing is a list whose rows move under a hand that has learnt
             // where they are, and picking it would tear the attach down to
             // build the same one again.
             val already = session.name == current
-            val line = if (already) "● ${session.name}" else "${session.name}   $what"
-            menu.menu.add(line).apply {
+            menu.menu.add(if (already) "● ${session.name}" else session.name).apply {
                 isEnabled = !already
                 setOnMenuItemClickListener {
                     open(machine, session.name)
@@ -763,18 +776,10 @@ class MainActivity : Activity() {
      */
     private fun show(view: View) {
         view.setOnApplyWindowInsetsListener { at, insets ->
-            val edges = edges(insets)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                android.util.Log.i(
-                    "manymux",
-                    "insets: keyboard=${insets.getInsets(WindowInsets.Type.ime()).bottom}" +
-                        " bars=${insets.getInsets(WindowInsets.Type.systemBars()).bottom}" +
-                        " padding=${edges.bottom} height=${at.height}",
-                )
-            }
-            at.setPadding(edges.left, edges.top, edges.right, edges.bottom)
+            if (!lifting) fit(at, insets)
             insets
         }
+        follow(view)
         setContentView(view)
         // And asks for them rather than waiting to be told. Insets are
         // dispatched when they change, and a screen put up in the middle of a
@@ -784,6 +789,59 @@ class MainActivity : Activity() {
         // the one that gets a dispatch for nothing, which is what made this
         // look done.
         view.requestApplyInsets()
+    }
+
+    /**
+     * Follow the keyboard as it moves, rather than waiting to be told where it
+     * stopped.
+     *
+     * A screen padded only from [show]'s listener is a screen that depends on
+     * one dispatch landing. It does not always: a keyboard asked for in the
+     * same breath as the screen going up races the traversal that putting the
+     * screen up already scheduled, and the session opened under a keyboard
+     * that covered its last rows until it was put away and brought back, which
+     * is a second change and a second dispatch. Read off the animation instead,
+     * the padding is taken from every frame the keyboard moves through and
+     * again from the window itself once it has stopped, so a missed dispatch is
+     * one frame rather than the rest of the attach.
+     *
+     * [lifting] is what keeps the two from fighting. The framework calls
+     * `onApplyWindowInsets` with the *end* of the animation before it starts
+     * running it, and padding for that straight away would put the screen where
+     * the keyboard is going and then animate it back down from nothing.
+     */
+    private fun follow(view: View) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return
+        view.setWindowInsetsAnimationCallback(
+            object : WindowInsetsAnimation.Callback(DISPATCH_MODE_CONTINUE_ON_SUBTREE) {
+                override fun onPrepare(animation: WindowInsetsAnimation) {
+                    if (animation.typeMask and WindowInsets.Type.ime() != 0) lifting = true
+                }
+
+                override fun onProgress(
+                    insets: WindowInsets,
+                    running: MutableList<WindowInsetsAnimation>,
+                ): WindowInsets {
+                    fit(view, insets)
+                    return insets
+                }
+
+                override fun onEnd(animation: WindowInsetsAnimation) {
+                    lifting = false
+                    // Where it actually ended, asked of the window rather than
+                    // taken from the last frame: an animation can be cut short
+                    // or replaced by another, and the frame before that is not
+                    // where the keyboard is now.
+                    view.rootWindowInsets?.let { fit(view, it) }
+                }
+            },
+        )
+    }
+
+    /** Put a screen inside what the bars, the cutout and the keyboard leave. */
+    private fun fit(at: View, insets: WindowInsets) {
+        val edges = edges(insets)
+        at.setPadding(edges.left, edges.top, edges.right, edges.bottom)
     }
 
     /** What the bars, the cutout and the keyboard are covering. */

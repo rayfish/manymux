@@ -190,6 +190,13 @@ class TerminalView(context: Context) : View(context), Choreographer.FrameCallbac
 
     override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
         tellGrid()
+        // A keyboard asked for before there was a view to type into, now that
+        // there is one. Posted rather than asked for here, because this is the
+        // middle of a layout and taking focus starts another.
+        if (wanted) {
+            wanted = false
+            post { openKeyboard() }
+        }
     }
 
     override fun onAttachedToWindow() {
@@ -324,6 +331,9 @@ class TerminalView(context: Context) : View(context), Choreographer.FrameCallbac
     /** Whether the next key is a control chord, set by the extra-keys row. */
     var control = false
 
+    /** A keyboard asked for before this view had a size to be focused at. */
+    private var wanted = false
+
     /**
      * Ask for the keyboard.
      *
@@ -333,11 +343,29 @@ class TerminalView(context: Context) : View(context), Choreographer.FrameCallbac
      * not a form and has no field to tap on, so the surface itself is what is
      * tapped, which is what every terminal on this platform does, and the row
      * of keys under it says so as well for a hand that has just used that row.
+     *
+     * A request made before the first layout waits for it. `View.canTakeFocus`
+     * refuses a view of no size, and this is asked for in the same breath as
+     * the screen going up, which is before any of it has been measured: the
+     * focus went nowhere, and the keyboard that came up anyway came up over a
+     * window that had not been told to make room for it, since the request
+     * that lifts a screen is the one made by the view being typed into.
      */
     fun openKeyboard() {
+        if (width == 0 || height == 0) {
+            wanted = true
+            return
+        }
         requestFocus()
         val ime = context.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
         ime.showSoftInput(this, InputMethodManager.SHOW_IMPLICIT)
+    }
+
+    /** Put it away, for a surface of the app's own that wants the room. */
+    fun closeKeyboard() {
+        wanted = false
+        val ime = context.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
+        ime.hideSoftInputFromWindow(windowToken, 0)
     }
 
     override fun onTouchEvent(event: MotionEvent): Boolean {
