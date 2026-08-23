@@ -74,6 +74,21 @@ class MainActivity : Activity() {
     /** The bar's own clock, kept so it can be stopped. */
     private var ticking: Runnable? = null
 
+    /**
+     * What was running the last time a machine answered.
+     *
+     * Kept so the switcher over a session opens on something rather than on a
+     * round trip: asking takes a connection, a ladder and an answer, which is
+     * a second of nothing where a list was expected, and the list somebody
+     * just came through is the same list. It is asked for again in the
+     * background whenever a session is opened, so the copy behind the button
+     * is one listing old at worst rather than as old as the screen.
+     */
+    private var seen: List<Running> = emptyList()
+
+    /** Whether a listing nobody is waiting for is already out. */
+    private var asking = false
+
     /** Whether everything has been let go of, so late work stays away. */
     private var gone = false
 
@@ -258,7 +273,10 @@ class MainActivity : Activity() {
                 // go of everything.
                 if (isFinishing || gone) return@post
                 val body = answer.fold(
-                    onSuccess = { running -> sessions(machine, running) },
+                    onSuccess = { running ->
+                        seen = running
+                        sessions(machine, running)
+                    },
                     onFailure = { why -> trouble(machine, why) },
                 )
                 show(overview(machine, body))
@@ -490,13 +508,39 @@ class MainActivity : Activity() {
     // ---- the session ----------------------------------------------------
 
     private fun open(machine: Machine, name: String) {
+        // Whatever was open before this, if this is a switch rather than an
+        // arrival: the tick holds the bar of a screen that is about to be
+        // replaced, and a second attach left beside the first is two of them.
+        letGo()
+
         val bar = TextView(this).apply {
             text = "${machine.address}/$name"
             typeface = Typeface.MONOSPACE
-            setPadding(dp(14), dp(10), dp(14), dp(10))
-            setBackgroundColor(colour(R.color.panel))
+            setPadding(dp(2), dp(10), dp(14), dp(10))
             setTextColor(colour(R.color.text))
             textSize = 12f
+        }
+        // The way to the session next door, where a desktop has `Ctrl-] tab`.
+        // Top left rather than beside the keys, because it is about where you
+        // are and not about what you are typing, and because a hand holding a
+        // phone one-handed is a hand that can reach a corner.
+        val others = TextView(this).apply {
+            text = "☰"
+            textSize = 15f
+            gravity = Gravity.CENTER
+            setTextColor(colour(R.color.text))
+            setBackgroundResource(pressable())
+            setPadding(dp(16), dp(10), dp(12), dp(10))
+            contentDescription = "the other sessions on this machine"
+            isClickable = true
+            setOnClickListener { under -> offerToSwitch(under, machine, name) }
+        }
+        val top = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setBackgroundColor(colour(R.color.panel))
+            addView(others)
+            addView(bar, LinearLayout.LayoutParams(0, WRAP_CONTENT).apply { weight = 1f })
         }
 
         val screen = TerminalView(this)
@@ -508,7 +552,7 @@ class MainActivity : Activity() {
             // The bar above and the keys below are both this colour, so the
             // strips the system bars leave at the top and bottom continue them.
             setBackgroundColor(colour(R.color.panel))
-            addView(bar, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
+            addView(top, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
             addView(
                 screen,
                 LinearLayout.LayoutParams(MATCH_PARENT, 0).apply { weight = 1f },
@@ -529,6 +573,73 @@ class MainActivity : Activity() {
         }
 
         screen.openKeyboard()
+
+        // And ask what else is running while nobody is waiting on the answer,
+        // so the button above opens on this machine as it is rather than as it
+        // was when the list was last drawn.
+        refresh(machine)
+    }
+
+    /**
+     * The other sessions on this machine, and a way straight into one.
+     *
+     * Opened from what is already known rather than from a fresh listing,
+     * because the point of it is that it costs nothing: a switch that waited
+     * for ssh is the trip through the list it exists to save. What lands under
+     * the finger is therefore at most one listing old, which is what [refresh]
+     * is for.
+     */
+    private fun offerToSwitch(under: View, machine: Machine, current: String) {
+        // Asked for here as well as on the way in, so a session sat in for an
+        // hour has a current list behind the second press if not the first.
+        refresh(machine)
+
+        val menu = PopupMenu(this, under)
+        for (session in seen) {
+            val what = if (session.title.isBlank()) session.command else session.title
+            // The one you are in is shown and not offered: a list with it
+            // missing is a list whose rows move under a hand that has learnt
+            // where they are, and picking it would tear the attach down to
+            // build the same one again.
+            val already = session.name == current
+            val line = if (already) "● ${session.name}" else "${session.name}   $what"
+            menu.menu.add(line).apply {
+                isEnabled = !already
+                setOnMenuItemClickListener {
+                    open(machine, session.name)
+                    true
+                }
+            }
+        }
+        if (seen.isEmpty()) {
+            menu.menu.add("nothing else answered").isEnabled = false
+        }
+        menu.show()
+    }
+
+    /**
+     * Ask a machine what is running, for whoever looks next rather than now.
+     *
+     * At most one at a time, which is what [asking] is for: both ways in fire
+     * on a switch, the executor is one thread, and a listing over a link that
+     * has gone slow would leave the second queued behind the first for as long
+     * as ssh takes to give up. Dropping the second costs nothing, since the
+     * one already out is asking the same question.
+     */
+    private fun refresh(machine: Machine) {
+        if (asking) return
+        asking = true
+        elsewhere.execute {
+            val answer = runCatching { phone.runningOn(machine) }
+            here.post {
+                asking = false
+                if (isFinishing || gone) return@post
+                // A failure says nothing: nobody asked for this, and the
+                // session on the screen is the thing being used. The copy that
+                // is already held stays, since a stale list beats no list.
+                answer.onSuccess { seen = it }
+            }
+        }
     }
 
     /** The bar says what the mark row says: where you are, and how it is going. */
