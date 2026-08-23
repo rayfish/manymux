@@ -19,10 +19,10 @@ use tokio::runtime::Runtime;
 
 use crate::keys::{Identity, KnownHosts};
 use crate::machine::{Connection, Connections, Machine, Rebuff};
-use crate::screen::Frame;
+use crate::screen::{Frame, Row, Screen};
 use crate::scroll::Window;
 use crate::session::{Session, State};
-use crate::ssh::{reach, start};
+use crate::ssh::{peek, reach, start};
 
 /// Anything that went wrong, in the one sentence worth showing somebody.
 ///
@@ -116,6 +116,44 @@ pub struct Running {
     pub idle: u64,
 }
 
+/// One session's screen, ready to draw small.
+///
+/// The rows are the ones [`Frame`] carries, built here rather than on the far
+/// side: the host sends the dump it would hand an attaching client, and this
+/// end feeds it to a scratch emulator the way a real attach does. So a
+/// thumbnail and a session go through one emulator and one widget, and there
+/// is no second idea of what a screen is to drift from the first.
+#[derive(uniffi::Record)]
+pub struct Preview {
+    pub name: String,
+    /// The shape the screen was painted at, which is the session's own and not
+    /// the tile's. A tile scales this to fit rather than asking for a screen
+    /// its own shape, there being no such thing: a dump paints by absolute
+    /// position and does not reflow.
+    pub cols: u16,
+    pub rows: u16,
+    pub lines: Vec<Row>,
+}
+
+/// What a machine is running, and what each of them has on the screen.
+///
+/// One answer rather than two calls, because the two questions are one screen
+/// and the ladder is climbed once for both: finding `mm` costs a channel and a
+/// process on the far side, and asking twice pays for it twice to draw a
+/// single list.
+#[derive(uniffi::Record)]
+pub struct Wall {
+    pub running: Vec<Running>,
+    /// In no particular order. The caller pairs these with [`Wall::running`] by
+    /// name and takes the order from that, which is the order the list shows.
+    pub screens: Vec<Preview>,
+    /// Whether the machine answered the question at all. A node from before
+    /// peeking existed refuses it, and that is a machine that cannot do
+    /// thumbnails rather than a machine with blank screens: with this the app
+    /// can say which, instead of drawing a wall of empty squares.
+    pub previews: bool,
+}
+
 /// This device: its key, and what it knows about the machines it reaches.
 ///
 /// One of these for the life of the app. It owns the runtime, so nothing else
@@ -193,6 +231,71 @@ impl Phone {
                     idle: session.idle,
                 })
                 .collect())
+        })
+    }
+
+    /// The same, with the screen each session has on it.
+    ///
+    /// Two requests down one connection: the ladder is climbed with the
+    /// listing, which is a question the list wants answered anyway, and the
+    /// rung that worked is where the peek is asked. A stream is worth one
+    /// request (`Node::handle` answers one and closes), so the second is a
+    /// second channel and not a second connection.
+    ///
+    /// A machine that refuses the peek still answers with its listing.
+    /// Thumbnails are the decoration and the list is the thing, so a node too
+    /// old to be asked is a wall of names rather than an error.
+    ///
+    /// Blocks, like [`Phone::running_on`].
+    pub fn wall(&self, machine: Machine) -> Result<Wall, Trouble> {
+        self.runtime.block_on(async {
+            let connection = self.reach_for(&machine).await?;
+            let reached = match reach(&*connection).await {
+                Ok(reached) => reached,
+                Err(error) => {
+                    self.connections.forget().await;
+                    return Err(error.into());
+                }
+            };
+            let running: Vec<Running> = reached
+                .sessions
+                .into_iter()
+                .map(|session| Running {
+                    name: session.name,
+                    title: session.title,
+                    command: session.command,
+                    attached: session.attached as u32,
+                    idle: session.idle,
+                })
+                .collect();
+
+            // Named rather than left empty, so a session started between the
+            // two requests is not a screen the app has no row to put under.
+            let names = running.iter().map(|one| one.name.clone()).collect();
+            let peeked = peek(&*connection, reached.program, names).await;
+            let previews = peeked.is_ok();
+            let screens = peeked
+                .unwrap_or_default()
+                .into_iter()
+                .map(|one| {
+                    let size = one.size;
+                    let mut screen = Screen::at(size);
+                    screen.repaint(one.screen.as_bytes());
+                    Preview {
+                        name: one.name,
+                        cols: size.cols,
+                        rows: size.rows,
+                        // Every row, a repaint having marked the lot changed.
+                        lines: screen.take_frame().changed,
+                    }
+                })
+                .collect();
+
+            Ok(Wall {
+                running,
+                screens,
+                previews,
+            })
         })
     }
 

@@ -20,7 +20,7 @@ use tracing::{debug, warn};
 use super::events::{Event, Scanner, Utf8Decoder};
 use crate::lock::held;
 use crate::proto::{
-    Doing, EventKind, Found, SessionEvent, SessionInfo, Size, SpawnSpec, View, ViewRequest,
+    Doing, EventKind, Found, Peek, SessionEvent, SessionInfo, Size, SpawnSpec, View, ViewRequest,
 };
 use crate::shell;
 use crate::user;
@@ -519,6 +519,23 @@ impl Session {
             idle: state.last_activity.elapsed().as_secs(),
             bells: state.bells,
             started: self.started,
+        }
+    }
+
+    /// The screen as it stands, for somebody drawing a picture of it.
+    ///
+    /// Apart from [`Session::attach`] because taking it must not make this a
+    /// session anybody is in: nothing is added to `clients`, so the geometry
+    /// is left alone and `host_clients` is untouched, which is what keeps a
+    /// wall of thumbnails from telling the machine that somebody is present.
+    /// `size` is what the screen is painted at rather than what the caller
+    /// would like, the dump having no way to reflow.
+    pub fn peek(&self) -> Peek {
+        let state = held(&self.state);
+        Peek {
+            name: self.name(),
+            size: state.size,
+            screen: state.vt.dump(),
         }
     }
 

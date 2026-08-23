@@ -32,7 +32,7 @@ use std::time::Duration;
 use anyhow::{Result, bail};
 use manymux::client::{PROGRAMS, Stream};
 use manymux::lock::held;
-use manymux::proto::{Request, Response, SessionInfo, SpawnSpec};
+use manymux::proto::{Peek, Request, Response, SessionInfo, SpawnSpec};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::process::Command;
 use tokio::sync::watch;
@@ -235,6 +235,21 @@ pub async fn start<E: Exec>(exec: &E, spec: SpawnSpec) -> Result<String> {
         Response::Spawned { name } => Ok(name),
         Response::Error(said) => bail!(said),
         other => bail!("expected a new session, got {other:?}"),
+    }
+}
+
+/// The screen each named session has on it, without attaching to any of them.
+///
+/// Asked at the rung the caller already found, so this costs a channel rather
+/// than a ladder. The error a node too old to be asked answers with is passed
+/// straight back: the caller draws names without pictures rather than showing
+/// a failure, thumbnails being the decoration and the list being the thing.
+pub async fn peek<E: Exec>(exec: &E, program: &str, names: Vec<String>) -> Result<Vec<Peek>> {
+    let mut stream = ask(exec, program).await?;
+    match stream.request(&Request::Peek { names }).await? {
+        Response::Peeked(screens) => Ok(screens),
+        Response::Error(said) => bail!(said),
+        other => bail!("expected screens, got {other:?}"),
     }
 }
 

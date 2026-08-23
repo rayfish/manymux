@@ -326,6 +326,28 @@ pub enum Request {
     /// empty and been written down as a session that was sitting at its
     /// prompt in its home directory, which is a thing the node never said.
     Snapshot,
+
+    /// The screen each session has on it right now, without attaching to any
+    /// of them.
+    ///
+    /// The screen itself is not new: [`Response::Attached`] carries the same
+    /// dump, and a resync re-reads it. What is new is asking for one without
+    /// becoming a client, which is what a wall of thumbnails needs. Attaching
+    /// read-only would have done it and is wrong twice over: a viewer counts
+    /// in `host_clients`, so a screen of thumbnails would make the machine
+    /// think somebody is sitting there and stop raising bells on the desktop,
+    /// and it is one attach per tile for one picture each.
+    ///
+    /// Empty `names` means every session. Named, it is the sessions on the
+    /// screen and no others, since the answer carries a screen apiece and a
+    /// machine with forty sessions on it is forty screens nobody asked to see.
+    ///
+    /// A node too old to decode this answers with an error naming its version,
+    /// which the caller shows as a machine that cannot do thumbnails rather
+    /// than as a failure.
+    Peek {
+        names: Vec<String>,
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -397,7 +419,30 @@ pub enum Response {
     /// and takes the order from that, which is the order every screen shows.
     /// Nothing here may be read as saying which session is which.
     Snapshot(Vec<Doing>),
+    /// The screen each session is showing. The answer to [`Request::Peek`].
+    ///
+    /// Unordered for the same reason [`Response::Snapshot`] is: the caller
+    /// pairs these with a listing by name and takes the order from that.
+    Peeked(Vec<Peek>),
     Error(String),
+}
+
+/// One session's screen, as it stood when it was asked for.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct Peek {
+    pub name: String,
+    /// The geometry the screen below is painted at. It has to travel with it:
+    /// a dump paints by absolute position and never reflows, so a screen fed
+    /// to an emulator of a different shape is a screen taken apart. A caller
+    /// drawing a thumbnail builds its scratch emulator at this and scales the
+    /// picture, rather than the other way round.
+    pub size: Size,
+    /// `avt`'s dump and nothing else, where an attach is handed this followed
+    /// by the modes the emulator does not model. Those are for a terminal that
+    /// is about to be typed into: a caller looking at a picture has no
+    /// business turning on mouse reporting for a session it is not attached
+    /// to.
+    pub screen: String,
 }
 
 /// One session, and what it was doing when a checkpoint was taken.
@@ -919,6 +964,59 @@ mod tests {
             decode::<Request>(&encode(&Old::Version).unwrap()).unwrap(),
             Request::Version
         ));
+    }
+
+    /// The same rule for the screens behind a wall of thumbnails, and the same
+    /// reason it is a request rather than a field: a node too old to be asked
+    /// refuses it, and the caller draws names without pictures. A defaulted
+    /// field would have come back empty and been drawn as a session sitting at
+    /// a blank screen, which is a thing that node never said.
+    #[test]
+    fn a_node_too_old_to_be_peeked_cannot_decode_the_question() {
+        /// `Request` as it was before a screen could be asked for.
+        #[derive(Serialize, Deserialize)]
+        enum Old {
+            List,
+            Version,
+            Snapshot,
+        }
+
+        let asked = encode(&Request::Peek {
+            names: vec!["build".into()],
+        })
+        .unwrap();
+        assert!(
+            decode::<Old>(&asked).is_err(),
+            "an older node has to fail this, or it would answer something else"
+        );
+
+        assert!(matches!(
+            decode::<Request>(&encode(&Old::Snapshot).unwrap()).unwrap(),
+            Request::Snapshot
+        ));
+    }
+
+    #[test]
+    fn a_screen_survives_the_wire_with_the_shape_it_was_painted_at() {
+        let sent = Response::Peeked(vec![Peek {
+            name: "build".into(),
+            size: Size::new(203, 51),
+            screen: "\u{1b}[1mmaking\u{1b}[0m".into(),
+        }]);
+        let Response::Peeked(back) = decode::<Response>(&encode(&sent).unwrap()).unwrap() else {
+            panic!("a peek came back as something else");
+        };
+        assert_eq!(
+            back,
+            vec![Peek {
+                name: "build".into(),
+                // The shape has to travel with the screen: a dump paints by
+                // absolute position, so a caller that guessed this would be
+                // taking the picture apart rather than making it smaller.
+                size: Size::new(203, 51),
+                screen: "\u{1b}[1mmaking\u{1b}[0m".into(),
+            }]
+        );
     }
 
     /// The one field added to an existing message here, and the reason it

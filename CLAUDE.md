@@ -1144,6 +1144,24 @@ that break quietly.
   memory. It is also why the view is a request rather than a buffer, and why
   the app says so where the gesture was made when a host is too old to answer
   one.
+- **A peek makes no client, which is the whole reason it exists**
+  (`Request::Peek`, `Session::peek`, `Registry::peek`). The wall of tiles on
+  the app's main screen needs every session's screen at once, and the screen
+  itself is nothing new: it is the dump `Response::Attached` already carries.
+  What is new is asking for one without becoming a client. Attaching read-only
+  would have answered it and is wrong twice over: a viewer counts in
+  `host_clients`, so drawing the wall would tell the machine somebody is
+  sitting at it and stop a bell reaching the desktop, and it is one attach per
+  tile for one picture each. So nothing is added to `clients` and the geometry
+  is left alone, tested in `tests/persistence.rs`. Two things ride on it. The
+  `Size` travels with the screen, because a dump paints by absolute position
+  and never reflows: a caller that guessed the shape would be taking the
+  picture apart rather than making it smaller, which is why `SnapshotView`
+  scales the session's grid instead of asking for one its own shape. And it is
+  `vt.dump()` alone rather than `repaint()`, the modes in the second half
+  being for a terminal about to be typed into: a caller looking at a picture
+  has no business turning on mouse reporting for a session it is not attached
+  to.
 - **A repaint is a fresh screen, and only the first output after an attach is
   one.** `avt`'s dump emits no clear and no home, so `Screen::repaint` builds a
   new `Vt` and resets the UTF-8 decoder where `Screen::feed` does not, and the

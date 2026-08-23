@@ -19,10 +19,21 @@ Two halves:
 
 ## What is in this version
 
-One machine at a time. Reach it, list what is running, attach to one, type in
-it, resize it, scroll back through what it printed, leave it, and survive a
-connection that drops. The drawer, the app-bar swipes, groups, selection and
-notifications are the next ones.
+One machine at a time. Reach it, see what is running, attach to one, type in
+it, resize it, scroll back through what it printed, hop to the session next
+door, leave it, and survive a connection that drops. The drawer, the app-bar
+swipes, groups, selection and notifications are the next ones.
+
+What is running is a wall of tiles rather than a list of names, each showing
+that session's screen: a name is what somebody called it weeks ago and the
+screen is what it is doing now. The screens come from `Request::Peek`, which
+answers with the same dump an attach is handed and makes no client of the
+asker, so drawing the wall does not tell the machine somebody is sitting at
+it. A machine too old to be asked keeps the names and says so.
+
+Inside a session the bar carries a button for the others on that machine,
+which is where the desktop has `Ctrl-] tab`. It opens on the listing already
+in hand rather than on a round trip, so it costs nothing to press.
 
 Scrolling is a drag on the terminal itself, and there is nothing behind it
 here: the node holds the history and hands over a window of it, which is why

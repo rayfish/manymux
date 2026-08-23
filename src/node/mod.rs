@@ -391,6 +391,7 @@ impl Node {
                 build: self.build.clone(),
             }),
             Request::Snapshot => Ok(Response::Snapshot(self.registry.doing())),
+            Request::Peek { names } => Ok(Response::Peeked(self.registry.peek(&names))),
             Request::Attach { .. } | Request::Events | Request::Stop | Request::Reached { .. } => {
                 unreachable!("handled before the single-response path")
             }

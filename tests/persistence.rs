@@ -1260,3 +1260,105 @@ async fn a_watching_client_does_not_shrink_the_session() {
         "and the session keeps the geometry the working client gave it"
     );
 }
+
+/// The point of asking for a screen rather than attaching to get one.
+///
+/// A wall of thumbnails asks for every session on the machine at once, and an
+/// attach is the wrong way to do it twice over: a read-only client counts in
+/// `host_clients`, so drawing the wall would tell the machine somebody is
+/// sitting at it and a bell would stop reaching the desktop, and it is one
+/// attach per tile for one picture each. So this must leave no trace: nothing
+/// added to `clients`, and the geometry the session settled on left alone.
+#[tokio::test]
+async fn peeking_at_a_session_does_not_make_it_one_anybody_is_in() {
+    let node = test_node().await;
+    let Spawned { name, .. } =
+        spawn_session(&node, &["/bin/sh", "-c", "echo peek me; sleep 300"]).await;
+
+    let mut client = Client::connect(&node);
+    client
+        .send(&Request::Attach {
+            name: name.clone(),
+            size: Size::new(120, 40),
+            history: 0,
+            read_only: false,
+        })
+        .await
+        .unwrap();
+    client.read_until("peek me").await;
+
+    let mut looker = Client::connect(&node);
+    let Response::Peeked(screens) = looker
+        .send(&Request::Peek {
+            names: vec![name.clone()],
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("a peek should answer with screens");
+    };
+
+    assert_eq!(screens.len(), 1);
+    assert_eq!(screens[0].name, name);
+    assert!(
+        screens[0].screen.contains("peek me"),
+        "the screen should be the one the session printed, got {:?}",
+        screens[0].screen
+    );
+    assert_eq!(
+        screens[0].size,
+        Size::new(120, 40),
+        "the shape travels with the screen, since a dump cannot reflow"
+    );
+
+    let info = node.registry.get(&name).expect("the session").info();
+    assert_eq!(
+        info.attached, 1,
+        "peeking must not count as somebody being there"
+    );
+    assert_eq!(
+        info.size,
+        Size::new(120, 40),
+        "and must not move the geometry the attached client settled on"
+    );
+}
+
+/// Every session when nothing is named, and a name that has gone is skipped
+/// rather than refused: the caller is working from a listing it asked for a
+/// moment ago, and a session that ended since is a tile that has gone.
+#[tokio::test]
+async fn a_peek_with_no_names_answers_for_everything_running() {
+    let node = test_node().await;
+    let one = spawn_session(&node, &["/bin/sh", "-c", "sleep 300"]).await;
+    let two = spawn_session(&node, &["/bin/sh", "-c", "sleep 300"]).await;
+
+    let mut client = Client::connect(&node);
+    let Response::Peeked(all) = client
+        .send(&Request::Peek { names: Vec::new() })
+        .await
+        .unwrap()
+    else {
+        panic!("a peek should answer with screens");
+    };
+    let mut names: Vec<_> = all.iter().map(|screen| screen.name.clone()).collect();
+    names.sort();
+    let mut wanted = vec![one.name.clone(), two.name.clone()];
+    wanted.sort();
+    assert_eq!(names, wanted);
+
+    let mut asking = Client::connect(&node);
+    let Response::Peeked(some) = asking
+        .send(&Request::Peek {
+            names: vec![one.name.clone(), "gone".into()],
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("a peek should answer with screens");
+    };
+    assert_eq!(
+        some.iter().map(|screen| &screen.name).collect::<Vec<_>>(),
+        vec![&one.name],
+        "a name that matches nothing is left out rather than failing the lot"
+    );
+}

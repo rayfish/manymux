@@ -32,9 +32,11 @@ import uniffi.manymux_android.Attach
 import uniffi.manymux_android.Grid
 import uniffi.manymux_android.Machine
 import uniffi.manymux_android.Phone
+import uniffi.manymux_android.Preview
 import uniffi.manymux_android.Running
 import uniffi.manymux_android.State
 import uniffi.manymux_android.Trouble
+import uniffi.manymux_android.Wall
 
 /**
  * The whole app: a machine, what is running on it, and one of those on the
@@ -269,7 +271,7 @@ class MainActivity : Activity() {
         show(overview(machine, column().apply { addView(note("reaching ${machine.address}")) }))
 
         elsewhere.execute {
-            val answer = runCatching { phone.runningOn(machine) }
+            val answer = runCatching { phone.wall(machine) }
             here.post {
                 // The answer can arrive after somebody left: the executor
                 // cannot interrupt a thread sitting in a call across the
@@ -277,9 +279,9 @@ class MainActivity : Activity() {
                 // go of everything.
                 if (isFinishing || gone) return@post
                 val body = answer.fold(
-                    onSuccess = { running ->
-                        seen = running
-                        sessions(machine, running)
+                    onSuccess = { wall ->
+                        seen = wall.running
+                        sessions(machine, wall)
                     },
                     onFailure = { why -> trouble(machine, why) },
                 )
@@ -355,17 +357,106 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun sessions(machine: Machine, running: List<Running>): View =
+    /**
+     * The wall: one tile per session, showing what is on its screen.
+     *
+     * Two across rather than a list of names, because a name is what somebody
+     * called a session weeks ago and the screen is what it is doing now. A
+     * machine with `build`, `deploy` and three shells on it is five words that
+     * say the same amount as each other and a wall that does not.
+     *
+     * A machine too old to be peeked keeps the names and loses the pictures,
+     * which is why [Wall.previews] is answered rather than left to be guessed
+     * from empty screens: a tile with nothing in it would otherwise read as a
+     * session sitting at a blank prompt.
+     */
+    private fun sessions(machine: Machine, wall: Wall): View =
         LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            if (running.isEmpty()) {
+            setPadding(dp(8), dp(8), dp(8), dp(24))
+            if (wall.running.isEmpty()) {
                 addView(note("Nothing is running there yet. The + starts a session."))
+                return@apply
             }
-            for (session in running) {
-                addView(row(machine, session))
-                addView(hairline())
+            if (!wall.previews) {
+                addView(note("That machine is too old to show what is on the screens."))
+            }
+            val screens = wall.screens.associateBy { it.name }
+            // Two at a time, since a row of a grid is what a linear layout has
+            // and the alternative is a second layout manager for four lines of
+            // arithmetic. An odd session out gets a blank beside it rather than
+            // a tile of twice the width, or the last row would read as the
+            // important one.
+            for (pair in wall.running.chunked(ACROSS)) {
+                val strip = LinearLayout(this@MainActivity).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                }
+                for (session in pair) {
+                    strip.addView(tile(machine, session, screens[session.name]), share())
+                }
+                repeat(ACROSS - pair.size) {
+                    strip.addView(View(this@MainActivity), share())
+                }
+                addView(strip, wide())
             }
         }
+
+    /** Room for one of [ACROSS] tiles in a strip, and the gap around it. */
+    private fun share() = LinearLayout.LayoutParams(0, WRAP_CONTENT).apply {
+        weight = 1f
+        setMargins(dp(6), dp(6), dp(6), dp(6))
+    }
+
+    /**
+     * One session as a square: its screen, and underneath it what it is called.
+     *
+     * The name goes under the picture rather than over it. Written across the
+     * top of the screen it is a caption on something that already has text all
+     * over it, and the eye has to find the caption before it can use it; below
+     * the tile every name in the wall is on the same line and they read as a
+     * column.
+     */
+    private fun tile(machine: Machine, session: Running, screen: Preview?): View {
+        val glass = SnapshotView(this).apply {
+            preview = screen
+            layoutParams = LinearLayout.LayoutParams(MATCH_PARENT, dp(TALL))
+        }
+        val name = TextView(this).apply {
+            text = session.name
+            typeface = Typeface.MONOSPACE
+            textSize = 13f
+            isSingleLine = true
+            setTextColor(colour(R.color.text))
+        }
+        val since = TextView(this).apply {
+            // A dot for somebody else already in there, the way the mark row
+            // draws one: two people typing into one session is worth knowing
+            // before you start rather than after.
+            text = if (session.attached > 0u) "● ${ago(session.idle)}" else ago(session.idle)
+            textSize = 11f
+            gravity = Gravity.END
+            setTextColor(
+                if (session.attached > 0u) colour(R.color.accent) else colour(R.color.hint),
+            )
+        }
+        val under = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(8), dp(7), dp(8), dp(8))
+            addView(name, LinearLayout.LayoutParams(0, WRAP_CONTENT).apply { weight = 1f })
+            addView(since)
+        }
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            isClickable = true
+            background = panel(R.color.raised, round = dp(10))
+            foreground = resources.getDrawable(pressable(), theme)
+            clipToOutline = true
+            addView(glass, wide())
+            addView(under, wide())
+            setOnClickListener { open(machine, session.name) }
+        }
+    }
 
     /**
      * A machine that would not answer, and whatever can be done about it.
@@ -433,52 +524,6 @@ class MainActivity : Activity() {
         val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
         clipboard.setPrimaryClip(ClipData.newPlainText("manymux", phone.authorizedLine()))
         say("copied")
-    }
-
-    /** One session in the list: what it is called, what it is doing, how long ago. */
-    private fun row(machine: Machine, session: Running): View {
-        val what = if (session.title.isBlank()) session.command else session.title
-        val words = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            addView(
-                TextView(this@MainActivity).apply {
-                    text = session.name
-                    typeface = Typeface.MONOSPACE
-                    textSize = 16f
-                    setTextColor(colour(R.color.text))
-                },
-            )
-            addView(
-                TextView(this@MainActivity).apply {
-                    text = what
-                    textSize = 12f
-                    isSingleLine = true
-                    setTextColor(colour(R.color.dim))
-                    setPadding(0, dp(3), 0, 0)
-                },
-            )
-        }
-        val since = TextView(this).apply {
-            // A dot for somebody else already in there, the way the mark row
-            // draws one: two people typing into one session is worth knowing
-            // before you start rather than after.
-            text = if (session.attached > 0u) "● ${ago(session.idle)}" else ago(session.idle)
-            textSize = 12f
-            gravity = Gravity.END
-            setTextColor(
-                if (session.attached > 0u) colour(R.color.accent) else colour(R.color.hint),
-            )
-        }
-        return LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            isClickable = true
-            setBackgroundResource(pressable())
-            setPadding(dp(20), dp(16), dp(20), dp(16))
-            addView(words, LinearLayout.LayoutParams(0, WRAP_CONTENT).apply { weight = 1f })
-            addView(since)
-            setOnClickListener { open(machine, session.name) }
-        }
     }
 
     /** How long since anything was typed, in the one unit worth reading. */
@@ -962,12 +1007,22 @@ class MainActivity : Activity() {
         layoutParams = wide().apply { topMargin = dp(8) }
     }
 
-    private fun hairline() = View(this).apply {
-        setBackgroundColor(colour(R.color.line))
-        layoutParams = LinearLayout.LayoutParams(MATCH_PARENT, dp(1))
-    }
-
     private fun say(what: String) {
         Toast.makeText(this, what, Toast.LENGTH_SHORT).show()
+    }
+
+    private companion object {
+        /** Tiles to a row. Two is what fits with the text under one legible. */
+        const val ACROSS = 2
+
+        /**
+         * How tall a tile's screen is, in dp.
+         *
+         * Fixed rather than square, because a terminal is not: a screen is
+         * about twice as wide as it is tall in pixels, and a square tile spends
+         * the bottom half of itself on nothing. This is roughly that ratio at
+         * half a phone's width.
+         */
+        const val TALL = 110
     }
 }
