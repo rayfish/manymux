@@ -167,15 +167,29 @@ class TerminalView(context: Context) : View(context), Choreographer.FrameCallbac
     /** Tell the far end the shape, if it is not the shape it was already told. */
     private fun tellGrid() {
         val grid = grid()
-        android.util.Log.i(
-            "manymux",
-            "grid: ${grid.cols}x${grid.rows} view=${width}x$height" +
-                " told=${told?.cols}x${told?.rows} attached=${attach != null}",
-        )
         if (grid == told) return
         told = grid
+        forget(grid.rows.toInt())
         attach?.resize(grid)
         onGrid?.invoke(grid)
+    }
+
+    /**
+     * Drop what is held for rows the screen no longer has.
+     *
+     * A frame carries the rows that changed and a screen that lost some never
+     * mentions them again (`Screen::take_frame` reports only the rows that
+     * exist), so nothing was ever going to overwrite what is held for the ones
+     * past the new bottom. [onDraw] walks whatever is held, and a row is drawn
+     * at its own index whether or not the screen still goes that far: the line
+     * that used to be at the bottom went on being painted in the strip under
+     * the new one, which is a screen showing its own last line twice. It turns
+     * up whenever the screen gets shorter, so the keyboard coming up is where
+     * anybody meets it.
+     */
+    private fun forget(down: Int) {
+        rows.keys.retainAll { it < down }
+        history.keys.retainAll { it < down }
     }
 
     /** How many cells fit, which is what the far end is told. */
