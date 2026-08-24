@@ -29,7 +29,10 @@ that session's screen: a name is what somebody called it weeks ago and the
 screen is what it is doing now. The screens come from `Request::Peek`, which
 answers with the same dump an attach is handed and makes no client of the
 asker, so drawing the wall does not tell the machine somebody is sitting at
-it. A machine too old to be asked keeps the names and says so.
+it. The button in the top right draws them as a list instead, which is what a
+machine with twenty sessions on it wants, and the choice is remembered. A
+machine too old to be asked is a list either way, is not offered the button,
+and says why.
 
 Inside a session the bar carries a button for the others on that machine,
 which is where the desktop has `Ctrl-] tab`. It opens on the listing already

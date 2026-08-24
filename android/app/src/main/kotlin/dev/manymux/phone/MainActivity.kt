@@ -89,6 +89,29 @@ class MainActivity : Activity() {
      */
     private var seen: List<Running> = emptyList()
 
+    /**
+     * The whole of the last answer, kept so the view can be redrawn from it.
+     *
+     * [seen] is the half the switcher wants and this is the half the main
+     * screen wants: the screens, and whether the machine would hand them over
+     * at all. Held because changing how they are drawn must not be a round
+     * trip, a button that takes a second of ssh to redraw the same sessions
+     * being a button nobody presses twice.
+     */
+    private var answered: Wall? = null
+
+    /**
+     * Whether the sessions are drawn as screens rather than as a list.
+     *
+     * Which of the two is more use depends on how many there are: half a dozen
+     * tiles say what is happening at a glance, and twenty of them are a wall to
+     * scroll past when what you wanted was a name. So it is a choice, and it is
+     * remembered, being about how somebody reads rather than about the machine
+     * they are reading. A machine too old to be peeked has no choice to make
+     * and is drawn as a list whatever this says.
+     */
+    private var tiles = true
+
     /** Whether a listing nobody is waiting for is already out. */
     private var asking = false
 
@@ -119,6 +142,7 @@ class MainActivity : Activity() {
         // nowhere else.
         phone = Phone.keptIn(filesDir.absolutePath)
         remembered = getSharedPreferences("manymux", MODE_PRIVATE)
+        tiles = remembered.getBoolean("tiles", true)
         takeBack()
 
         // Straight to what is running, if there is somewhere to ask. Opening on
@@ -268,6 +292,7 @@ class MainActivity : Activity() {
 
     /** The main screen: everything running on that machine. */
     private fun listSessions(machine: Machine) {
+        answered = null
         show(overview(machine, column().apply { addView(note("reaching ${machine.address}")) }))
 
         elsewhere.execute {
@@ -281,6 +306,7 @@ class MainActivity : Activity() {
                 val body = answer.fold(
                     onSuccess = { wall ->
                         seen = wall.running
+                        answered = wall
                         sessions(machine, wall)
                     },
                     onFailure = { why -> trouble(machine, why) },
@@ -288,6 +314,21 @@ class MainActivity : Activity() {
                 show(overview(machine, body))
             }
         }
+    }
+
+    /**
+     * Draw the same answer the other way, without asking the machine again.
+     *
+     * There is nothing to press before an answer has landed, so the button is
+     * not on the bar then and this cannot be reached with [answered] empty.
+     */
+    private fun flipLayout(machine: Machine) {
+        // Nothing to draw is nothing to remember either, or the setting and
+        // the screen would part company over a press that did nothing.
+        val wall = answered ?: return
+        tiles = !tiles
+        remembered.edit().putBoolean("tiles", tiles).apply()
+        show(overview(machine, sessions(machine, wall)))
     }
 
     /** The screen the list sits in: a bar with the machine and a `+`. */
@@ -325,6 +366,7 @@ class MainActivity : Activity() {
             setBackgroundColor(colour(R.color.panel))
             setPadding(dp(20), dp(16), dp(16), dp(16))
             addView(words, LinearLayout.LayoutParams(0, WRAP_CONTENT).apply { weight = 1f })
+            howToDraw(machine)?.let { addView(it) }
             addView(add)
         }
         return LinearLayout(this).apply {
@@ -339,6 +381,32 @@ class MainActivity : Activity() {
                 scrolling(body),
                 LinearLayout.LayoutParams(MATCH_PARENT, 0).apply { weight = 1f },
             )
+        }
+    }
+
+    /**
+     * The button for the other way of drawing them, where there is one.
+     *
+     * Nothing while a machine is still being reached, and nothing for one that
+     * cannot be peeked: a switch with one destination is a control that lies
+     * about what the app can do, and the list such a machine gets is the only
+     * thing it has to show. It carries the glyph of what pressing it gives
+     * rather than of what is on the screen, which is what every other view
+     * switcher on the platform does and what the screen underneath already
+     * says.
+     */
+    private fun howToDraw(machine: Machine): View? {
+        if (answered?.previews != true) return null
+        return TextView(this).apply {
+            text = if (tiles) "☰" else "▦"
+            textSize = 17f
+            gravity = Gravity.CENTER
+            setTextColor(colour(R.color.text))
+            setBackgroundResource(pressable())
+            setPadding(dp(12), dp(4), dp(16), dp(6))
+            contentDescription = if (tiles) "show them as a list" else "show them as screens"
+            isClickable = true
+            setOnClickListener { flipLayout(machine) }
         }
     }
 
@@ -365,10 +433,11 @@ class MainActivity : Activity() {
      * machine with `build`, `deploy` and three shells on it is five words that
      * say the same amount as each other and a wall that does not.
      *
-     * A machine too old to be peeked keeps the names and loses the pictures,
-     * which is why [Wall.previews] is answered rather than left to be guessed
-     * from empty screens: a tile with nothing in it would otherwise read as a
-     * session sitting at a blank prompt.
+     * A machine too old to be peeked is drawn as a list of names instead, and
+     * is not offered the choice. That is why [Wall.previews] is answered rather
+     * than left to be guessed from empty screens: a tile with nothing in it
+     * would otherwise read as a session sitting at a blank prompt, and there is
+     * no telling the two apart from here.
      */
     private fun sessions(machine: Machine, wall: Wall): View =
         LinearLayout(this).apply {
@@ -378,8 +447,14 @@ class MainActivity : Activity() {
                 addView(note("Nothing is running there yet. The + starts a session."))
                 return@apply
             }
-            if (!wall.previews) {
-                addView(note("That machine is too old to show what is on the screens."))
+            if (!wall.previews || !tiles) {
+                if (!wall.previews) {
+                    addView(note("That machine is too old to show what is on the screens."))
+                }
+                for (session in wall.running) {
+                    addView(row(machine, session), between())
+                }
+                return@apply
             }
             val screens = wall.screens.associateBy { it.name }
             // Two at a time, since a row of a grid is what a linear layout has
@@ -407,6 +482,54 @@ class MainActivity : Activity() {
         setMargins(dp(6), dp(6), dp(6), dp(6))
     }
 
+    /** The gap between one row of a list and the next. */
+    private fun between() = wide().apply { setMargins(dp(6), dp(3), dp(6), dp(3)) }
+
+    /**
+     * One session as a row: what it is called, and how long since it was used.
+     *
+     * The same two words the tile carries under its screen, on the line the
+     * screen would have been. Which is the point of the list rather than a
+     * shortcoming of it: what a name is worth does not change with how much
+     * room is spent on it, so a machine with twenty sessions on it is twenty
+     * lines you can read in one look instead of ten screenfuls of pictures.
+     */
+    private fun row(machine: Machine, session: Running): View {
+        val name = TextView(this).apply {
+            text = session.name
+            typeface = Typeface.MONOSPACE
+            textSize = 15f
+            isSingleLine = true
+            setTextColor(colour(R.color.text))
+        }
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            isClickable = true
+            background = panel(R.color.raised, round = dp(10))
+            foreground = resources.getDrawable(pressable(), theme)
+            setPadding(dp(14), dp(14), dp(14), dp(14))
+            addView(name, LinearLayout.LayoutParams(0, WRAP_CONTENT).apply { weight = 1f })
+            addView(idle(session))
+            setOnClickListener { open(machine, session.name) }
+        }
+    }
+
+    /**
+     * How long since anything was typed there, and who is already in it.
+     *
+     * A dot for somebody else attached, the way the mark row draws one: two
+     * people typing into one session is worth knowing before you start rather
+     * than after. Shared by both ways of drawing a session, so the tile and
+     * the row cannot end up saying different amounts about the same thing.
+     */
+    private fun idle(session: Running) = TextView(this).apply {
+        text = if (session.attached > 0u) "● ${ago(session.idle)}" else ago(session.idle)
+        textSize = 11f
+        gravity = Gravity.END
+        setTextColor(if (session.attached > 0u) colour(R.color.accent) else colour(R.color.hint))
+    }
+
     /**
      * One session as a square: its screen, and underneath it what it is called.
      *
@@ -428,23 +551,12 @@ class MainActivity : Activity() {
             isSingleLine = true
             setTextColor(colour(R.color.text))
         }
-        val since = TextView(this).apply {
-            // A dot for somebody else already in there, the way the mark row
-            // draws one: two people typing into one session is worth knowing
-            // before you start rather than after.
-            text = if (session.attached > 0u) "● ${ago(session.idle)}" else ago(session.idle)
-            textSize = 11f
-            gravity = Gravity.END
-            setTextColor(
-                if (session.attached > 0u) colour(R.color.accent) else colour(R.color.hint),
-            )
-        }
         val under = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
             setPadding(dp(8), dp(7), dp(8), dp(8))
             addView(name, LinearLayout.LayoutParams(0, WRAP_CONTENT).apply { weight = 1f })
-            addView(since)
+            addView(idle(session))
         }
         return LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
