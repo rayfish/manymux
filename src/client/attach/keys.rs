@@ -799,6 +799,19 @@ pub struct KeyFilter {
     /// rather than one action per byte, which is a shape this returns nothing
     /// for.
     prompt: Option<Prompt>,
+    /// The key code of the press the client last took for itself in a mode of
+    /// its own, while that key is still down.
+    ///
+    /// It is here for the release that follows, which arrives after the action
+    /// has usually handed the keyboard back: `Ctrl-] n` starts a session and
+    /// lands you in it, so the `n` coming up is read in focus mode and was
+    /// forwarded, typing `0;1:3u` into a shell that had just started. The
+    /// press it belongs to never reached the session and neither may this.
+    /// One slot is enough because only the key that ended the mode can have
+    /// its release read anywhere else: everything pressed before it is let go
+    /// of while the client still owns the keyboard, where [`Encoded::down`]
+    /// drops it.
+    acted: Option<u32>,
 }
 
 /// A line being typed at one of the client's prompts.
@@ -940,6 +953,7 @@ impl KeyFilter {
             wheel: false,
             clicked: None,
             prompt: None,
+            acted: None,
         }
     }
 
@@ -1575,9 +1589,24 @@ impl KeyFilter {
             if key.event != PRESS {
                 // The session's own keys keep their releases, since it asked to
                 // be told about them. The client's do not: the press they
-                // belong to never got there either.
-                if !key.is(self.prefix) && !(self.paste && key.is(PASTE_KEY)) {
+                // belong to never got there either. Three keys are the
+                // client's, and the third is the one this mode cannot see for
+                // itself: a key control mode acted on, since the action that
+                // ran is usually the one that handed the keyboard back, and by
+                // the time the hand comes off the key this is where it is read.
+                let ours = key.is(self.prefix)
+                    || (self.paste && key.is(PASTE_KEY))
+                    || self.acted == Some(key.code);
+                if !ours {
                     forward.extend_from_slice(spelling);
+                }
+                // A repeat is the key still being held, so it stays the
+                // client's until it is let go of: forgetting it on the first
+                // repeat leaked every one after it, which is a key held down
+                // rather than a key pressed and is exactly the case that fills
+                // a line with them.
+                if key.event != REPEAT && self.acted == Some(key.code) {
+                    self.acted = None;
                 }
                 return None;
             }
@@ -1605,6 +1634,12 @@ impl KeyFilter {
         if !key.down() || key.is_modifier() {
             return None;
         }
+        // From here the press is the client's: every path below either acts on
+        // it or drops it, and the one that hands it to the session after all
+        // says so by clearing this again. Set before the tables rather than at
+        // each of them, since what has to be remembered is the same for all of
+        // them and a table that forgot would leak a release into a session.
+        self.acted = Some(key.code);
         // The key as the byte the ordinary encoding would have sent, so that
         // the tables the short spelling is read with answer for this one too.
         // The mode key is not among them: it is a chord, and what it means is
@@ -1657,7 +1692,9 @@ impl KeyFilter {
         }
         // An unbound key, handled the way the plain spelling of one is: back to
         // focus, with what opened the mode and what closed it both passed on.
+        // The press went to the session, so its release belongs there too.
         self.mode = Mode::Focus;
+        self.acted = None;
         forward.extend_from_slice(&self.spelling);
         forward.extend_from_slice(spelling);
         None
@@ -2650,6 +2687,51 @@ mod tests {
         assert_eq!(f.filter(b"\x1b[93;5:3u"), held());
         assert_eq!(f.filter(b"\x1b[57442;5:3u"), held());
         assert_eq!(f.filter(b"d"), asked(Action::Detach, Mode::Focus));
+    }
+
+    /// And the release of the key control mode acted on is the client's too,
+    /// which is the half the rule above was missing. `Ctrl-] n` starts a
+    /// session and hands the keyboard straight to it, so under a program that
+    /// asked for event types the `n` coming back up was typed into the shell
+    /// that had just started, and `0;1:3u` landed on somebody's prompt.
+    #[test]
+    fn the_release_of_the_key_that_acted_does_not_reach_the_session() {
+        let mut f = KeyFilter::default();
+        assert_eq!(f.filter(b"\x1b[93;5u"), held());
+        assert_eq!(f.filter(b"\x1b[110;1u"), asked(Action::New, Mode::Focus));
+        // Letting go of `n`, once the key has already put us back in focus.
+        assert_eq!(f.filter(b"\x1b[110;1:3u"), forwarded(b""));
+    }
+
+    /// And it stays the client's for as long as the hand is on it. A key held
+    /// past the repeat threshold reports every repeat, so a slot given up on
+    /// the first one leaks all the rest: the same stray sequence, once a
+    /// keypress, down the new session's first line.
+    #[test]
+    fn a_key_held_after_it_acted_leaks_none_of_its_repeats() {
+        let mut f = KeyFilter::default();
+        assert_eq!(f.filter(b"\x1b[93;5u"), held());
+        assert_eq!(f.filter(b"\x1b[110;1u"), asked(Action::New, Mode::Focus));
+        assert_eq!(f.filter(b"\x1b[110;1:2u"), forwarded(b""));
+        assert_eq!(f.filter(b"\x1b[110;1:2u"), forwarded(b""));
+        assert_eq!(f.filter(b"\x1b[110;1:3u"), forwarded(b""));
+        // Let go of, it is the session's again like any other key.
+        assert_eq!(f.filter(b"\x1b[110;1u"), forwarded(b"\x1b[110;1u"));
+        assert_eq!(f.filter(b"\x1b[110;1:3u"), forwarded(b"\x1b[110;1:3u"));
+    }
+
+    /// Every key that leaves control mode has the same release to answer for,
+    /// not just the one that starts a session: Enter commits the popup and
+    /// lands you in whatever was highlighted.
+    #[test]
+    fn the_release_of_the_key_that_commits_the_popup_stays_here_too() {
+        let mut f = KeyFilter::default();
+        assert_eq!(f.filter(b"\x1b[93;5u"), held());
+        assert_eq!(
+            f.filter(b"\x1b[13;1u"),
+            asked(Action::Pick(Pick::Go), Mode::Focus)
+        );
+        assert_eq!(f.filter(b"\x1b[13;1:3u"), forwarded(b""));
     }
 
     /// Holding a key is how a list of twenty sessions gets walked. Under a

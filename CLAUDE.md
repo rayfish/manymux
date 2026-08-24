@@ -1002,6 +1002,26 @@ Three consequences run through the whole codebase and are worth keeping intact:
   which is the kind of difference nobody thinks to report. Releases are still
   dropped, and that is the half the rule was written for: the ctrl you were
   holding reports its own release the moment you let go of the mode key.
+- **And the release of the key that acted is dropped in the mode it lands in,
+  not the one it was pressed in** (`KeyFilter::acted`). Dropping releases is
+  control mode's, so it covers only the keys let go of while the client still
+  owns the keyboard. The key that *ends* the mode is never one of them: the
+  action it ran has already handed the keyboard back, so the hand coming off
+  it is read in focus mode, where every release is the session's and goes
+  through. `Ctrl-] n` is where that shows, being the one gesture that lands
+  you at a fresh prompt with nothing on it: under a program that asked for
+  event types the `n` coming up arrived as `CSI 110;1:3u` and the new shell
+  printed `0;1:3u` on its first line. It reads as the session starting
+  broken, and it is a race rather than a certainty, since the takeover the
+  new attach writes switches the reporting off and whether it gets there
+  first is a question about how long somebody held a key. So the code of the
+  press the client took is remembered and its release matched against that,
+  which is the same argument the mode key and the paste key were already
+  making one key at a time. One slot is enough because every other key is let
+  go of while the client still has the keyboard. It is held across the
+  repeats, or a key held down leaks every repeat after the first, and it is
+  given up by the one path that hands the press to the session after all, the
+  unbound key that drops you back to focus with both bytes passed on.
 - **The keys with no byte behind them are read the same way, through
   `Special`.** `Encoded` speaks the `u` and `~` spellings and knows nothing of a
   sequence ending in a letter, so the arrows and the paging keys are matched
