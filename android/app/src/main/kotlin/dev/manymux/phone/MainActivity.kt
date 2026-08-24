@@ -932,6 +932,16 @@ class MainActivity : Activity() {
      * [onCreate] now says outright rather than leaving to the platform.
      */
     private fun show(view: View) {
+        // Whatever was moving was moving on the screen this replaces, and its
+        // callback goes with it: a view taken out of the hierarchy part way
+        // through an animation is never told the animation ended, so the flag
+        // that animation set stays set. Left set, the listener below declines
+        // to pad the screen that has just gone up, and it is the only thing
+        // that would have: the new screen's own first dispatch is the one
+        // arriving here, and there is no animation on this view for it to
+        // fight. Leaving a session puts the keyboard away, which is an
+        // animation in flight at exactly the moment the list goes up.
+        lifting = false
         view.setOnApplyWindowInsetsListener { at, insets ->
             if (!lifting) fit(at, insets)
             insets
