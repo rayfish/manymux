@@ -12,6 +12,7 @@
 use std::time::Duration;
 
 use crate::client::attach::Mode;
+use crate::client::scroll::Selected;
 use crate::proto::Size;
 use crate::settings::Screen;
 use crate::style;
@@ -125,6 +126,13 @@ pub struct Status {
     /// A place of its own rather than a notice, because a notice goes away
     /// after a few seconds and this is true for as long as the view is.
     scrolled: Option<u64>,
+    /// How much is under the highlight, while a selection is being drawn.
+    ///
+    /// The one thing about a selection the screen cannot say for itself: a
+    /// drag held at an edge walks the view under the highlight at up to a
+    /// dozen lines a move, so the end it started from went past the top of the
+    /// window a second ago and there is nowhere else to count it.
+    selected: Option<Selected>,
     /// What is being typed at a prompt, while one is open: the mark that says
     /// which prompt it is, and the text so far. Outranks everything else on the
     /// row: it is the only thing there that is being changed a keystroke at a
@@ -152,6 +160,7 @@ impl Status {
             group: None,
             notice: None,
             scrolled: None,
+            selected: None,
             prompt: None,
             searching: None,
             watching: false,
@@ -201,10 +210,18 @@ impl Status {
     pub fn set_scrolled(&mut self, lines: Option<u64>) {
         self.scrolled = lines;
         if lines.is_none() {
-            // The view has closed, and what a search found went with it.
+            // The view has closed, and what a search found went with it, along
+            // with the selection it was drawn on.
             self.searching = None;
             self.prompt = None;
+            self.selected = None;
         }
+    }
+
+    /// Say how much is under the highlight, or that nothing is. The caller
+    /// repaints.
+    pub fn set_selected(&mut self, selected: Option<Selected>) {
+        self.selected = selected;
     }
 
     /// Show what is being typed at the search prompt, or take the prompt away.
@@ -351,12 +368,19 @@ impl Status {
                 format!("{}{}", style::amber(label), style::value(prompt))
             };
         }
-        let scrolled = self.scrolled.map(|lines| match &self.searching {
-            // What a search found says where you are better than a line count
-            // does, and both will not fit.
-            Some(searching) => format!("{searching}  n next  esc live"),
-            None => format!("{lines} back  {SCROLL_HINT}"),
-        });
+        let scrolled = self
+            .scrolled
+            .map(|lines| match (&self.selected, &self.searching) {
+                // A selection outranks what a search found, being the thing moving
+                // under the hand: the search was run before the drag started and
+                // has not changed since. Both keep the way out on the row and drop
+                // the rest of the hints, there being room for one of the three.
+                (Some(selected), _) => format!("{lines} back  {selected} selected  esc live"),
+                // What a search found says where you are better than a line count
+                // does, and both will not fit.
+                (None, Some(searching)) => format!("{searching}  n next  esc live"),
+                (None, None) => format!("{lines} back  {SCROLL_HINT}"),
+            });
         let (text, styled) = match (&self.notice, &scrolled, self.mode) {
             // A notice outranks the hints: it is the answer to a key that was
             // just pressed, and the hints will be back in a few seconds.
@@ -962,6 +986,53 @@ mod tests {
         ));
         let row = status.repaint(Size::new(80, 24));
         assert!(row.contains("retrying in 10s"), "{row:?}");
+    }
+
+    /// A drag held at an edge walks the view under the highlight, so the end
+    /// it started from is off the top of the window and the row is the only
+    /// place left that can say how much is under it. It takes the scroll
+    /// hints' place and keeps the way out, there being room for one of the
+    /// three.
+    #[test]
+    fn a_selection_takes_the_scroll_hints_place_and_keeps_the_way_out() {
+        let mut status = Status::new("gpu-box/build");
+        status.set_scrolled(Some(140));
+        let hints = status.repaint(Size::new(80, 24));
+        assert!(hints.contains(SCROLL_HINT), "{hints:?}");
+
+        status.set_selected(Some(Selected::Lines(37)));
+        let row = status.repaint(Size::new(80, 24));
+        assert!(row.contains("140 back"), "{row:?}");
+        assert!(row.contains("37 lines selected"), "{row:?}");
+        assert!(row.contains("esc live"), "{row:?}");
+        assert!(!row.contains("pgup/pgdn"), "{row:?}");
+    }
+
+    /// And it outranks what a search found, being the thing moving under the
+    /// hand: the search was run before the drag started and has not changed
+    /// since.
+    #[test]
+    fn a_selection_outranks_what_a_search_found() {
+        let mut status = Status::new("gpu-box/build");
+        status.set_scrolled(Some(140));
+        status.set_searching(Some("/needle  2/9".into()));
+        status.set_selected(Some(Selected::Chars(12)));
+        let row = status.repaint(Size::new(80, 24));
+        assert!(row.contains("12 chars selected"), "{row:?}");
+        assert!(!row.contains("needle"), "{row:?}");
+    }
+
+    /// The view closing takes the selection with it, the same way it takes
+    /// what a search found: there is no highlight left to count.
+    #[test]
+    fn the_view_closing_takes_the_selection_off_the_row() {
+        let mut status = Status::new("gpu-box/build");
+        status.set_scrolled(Some(140));
+        status.set_selected(Some(Selected::Lines(37)));
+        status.set_scrolled(None);
+        status.set_scrolled(Some(140));
+        let row = status.repaint(Size::new(80, 24));
+        assert!(!row.contains("selected"), "{row:?}");
     }
 
     #[test]

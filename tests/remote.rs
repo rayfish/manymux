@@ -987,6 +987,122 @@ fn a_machine_ssh_cannot_reach_still_says_why() {
     );
 }
 
+/// And the half after that: where the caller is a client holding a terminal,
+/// ssh has nowhere to say it. A wait is the whole of what a dropped connection
+/// gets, and the screen under it is the session as it was last painted, so a
+/// retry putting `connect to host` on that screen is a picture the client was
+/// keeping, ruined once per attempt.
+#[test]
+fn a_reconnect_keeps_what_ssh_says_off_the_screen_it_is_holding() {
+    use std::io::Read;
+    use std::sync::mpsc;
+
+    let world = World::new("quiet-reconnect");
+    world.ok(
+        "gpu-box",
+        &[
+            "new",
+            "-d",
+            "-n",
+            "away",
+            "sh",
+            "-c",
+            "printf 'HELLO\\n'; sleep 300",
+        ],
+    );
+    world.wait_for_node("gpu-box");
+
+    let (mut pty, pts) = pty_process::blocking::open().unwrap();
+    let mut client = pty_process::blocking::Command::new(MM)
+        .arg("--socket")
+        .arg(world.socket("laptop"))
+        .args(["attach", "gpu-box/away"])
+        .env("MM_CONFIG_DIR", world.dir.join("laptop"))
+        .env("MM_SSH", world.ssh_stub())
+        .env("MM_LOG", "manymux=warn")
+        .env("TERM", "xterm-256color")
+        .spawn(pts)
+        .expect("attaching on a terminal");
+
+    let (seen_tx, seen_rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 1024];
+        while let Ok(read @ 1..) = pty.read(&mut buf) {
+            if seen_tx.send(buf[..read].to_vec()).is_err() {
+                return;
+            }
+        }
+    });
+
+    // Wait until the session is on the screen: the point of the test is what
+    // happens to a screen there is something on.
+    let mut seen = String::new();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !seen.contains("HELLO") {
+        if let Ok(chunk) = seen_rx.recv_timeout(Duration::from_millis(200)) {
+            seen.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the session never reached the terminal: {seen:?}"
+        );
+    }
+
+    // Take the machine away: ssh fails from here on, and the connection this
+    // client already has goes with the agent carrying it. The session itself
+    // is left running, which is what makes this a connection that dropped
+    // rather than a session that ended.
+    std::fs::write(
+        world.ssh_stub(),
+        "#!/bin/sh\necho 'ssh: connect to host gpu-box port 22: No route to host' >&2\nexit 255\n",
+    )
+    .unwrap();
+    let killed = std::process::Command::new("pkill")
+        .arg("-f")
+        .arg(format!("{} agent", world.socket("gpu-box").display()))
+        .status()
+        .expect("running pkill");
+    assert!(
+        killed.success(),
+        "the agent carrying the attach was not there"
+    );
+
+    // Long enough for several tries: the delays start at a second and double.
+    let mut after = String::new();
+    let until = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < until {
+        if let Ok(chunk) = seen_rx.recv_timeout(Duration::from_millis(200)) {
+            after.push_str(&String::from_utf8_lossy(&chunk));
+        }
+    }
+    let _ = client.kill();
+    let _ = client.wait();
+
+    assert!(
+        after.contains("lost"),
+        "the row never said the connection went: {after:?}"
+    );
+    assert!(
+        !after.contains("No route to host"),
+        "ssh was printed over the session: {after:?}"
+    );
+}
+
+/// Kept is not thrown away. The first attach of a run is a command somebody
+/// typed rather than a connection that went, and it fails with the terminal
+/// given back, so ssh's account of the machine is exactly what it has to say.
+#[test]
+fn the_first_attach_of_a_run_still_says_what_ssh_said() {
+    let world = World::where_mm_is("no-route-attach", Mm::Unreachable);
+
+    let (worked, seen) = world.on_a_terminal("laptop", &["attach", "gpu-box/away"], "");
+    assert!(!worked, "a machine that is not there was attached to");
+    assert!(
+        seen.contains("No route to host"),
+        "ssh's reason went missing: {seen:?}"
+    );
+}
+
 /// Fetching a script onto someone else's machine is not something to do on the
 /// strength of a command that never mentioned it.
 #[test]
