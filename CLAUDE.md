@@ -1144,6 +1144,26 @@ that break quietly.
   memory. It is also why the view is a request rather than a buffer, and why
   the app says so where the gesture was made when a host is too old to answer
   one.
+- **A drag belongs to the session while the session is reading the mouse, and
+  this end has to encode the notch itself** (`mouse::Tracking`,
+  `Session::drag`). The rule is the desktop's, `wheel_is_ours` being
+  `history && !session_mouse`: two readers on one wheel is one of them reading
+  input meant for the other, and a full-screen program draws its own scrolling
+  from exactly these reports. What differs is that the desktop never has to
+  spell one, its terminal doing that for it, so the two things a terminal knows
+  are read out of the session's own output here: whether it asked for reports
+  (9, 1000, 1002, 1003) and in which spelling (1006, 1015, else the one-byte
+  form). Both arrive on an attach as well as during one, `events::REPLAYED_MODES`
+  replaying them with the screen, which is why `Screen::repaint` resets the
+  tracking along with the emulator. Getting this wrong does not look like a
+  wheel going to the wrong place, it looks like scrolling being broken: the
+  alternate screen has no scrollback at the node either (`avt` gives that
+  buffer a limit of zero), so a drag inside a full-screen program opened the
+  view over a buffer with nothing behind it and moved through the screen it was
+  already showing. And `Session::drag` answers with which of the two happened,
+  because the third answer is the one worth having: a host too old for the view
+  holding a session that is not reading the mouse is a gesture with nowhere to
+  go, and it says so where it was made.
 - **A peek makes no client, which is the whole reason it exists**
   (`Request::Peek`, `Session::peek`, `Registry::peek`). The wall of tiles on
   the app's main screen needs every session's screen at once, and the screen

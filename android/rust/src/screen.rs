@@ -15,6 +15,8 @@ use std::collections::BTreeSet;
 use avt::{Cell, Vt};
 use manymux::proto::Size;
 
+use crate::mouse::Tracking;
+
 /// What the screen holds behind the visible rows.
 ///
 /// Nothing. The node keeps the real history and hands over a window of it when
@@ -31,6 +33,11 @@ pub struct Screen {
     /// Rows that have changed since the last frame was taken.
     changed: BTreeSet<usize>,
     size: Size,
+    /// Whether the program in there is reading the mouse itself, which is the
+    /// one thing about the session's output that `avt` throws away and a drag
+    /// needs. Reset with the rest of it on a repaint, the modes being replayed
+    /// with the screen they belong to.
+    mouse: Tracking,
 }
 
 /// What changed since the last frame.
@@ -117,11 +124,15 @@ impl Screen {
             decoding: Utf8Decoder::new(),
             changed: BTreeSet::new(),
             size,
+            mouse: Tracking::default(),
         }
     }
 
     /// Bytes the session printed.
     pub fn feed(&mut self, bytes: &[u8]) {
+        // Before the decoder rather than after it: a mode sequence is ASCII,
+        // and the raw bytes are what a chunk boundary falls in the middle of.
+        self.mouse.feed(bytes);
         let text = self.decoding.decode(bytes);
         let changes = self.vt.feed_str(&text);
         self.changed.extend(changes.lines.iter().copied());
@@ -140,6 +151,11 @@ impl Screen {
         *self = Self::at(self.size);
         self.feed(bytes);
         self.changed.extend(0..self.size.rows as usize);
+    }
+
+    /// What the session has asked to be told about the mouse.
+    pub fn mouse(&self) -> &Tracking {
+        &self.mouse
     }
 
     /// The session settled on a different size.

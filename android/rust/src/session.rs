@@ -27,6 +27,7 @@ use tokio::sync::{mpsc, watch};
 
 use crate::keys::{Identity, KnownHosts};
 use crate::machine::{Connection, Connections, Machine};
+use crate::mouse::At;
 use crate::screen::{Frame, Screen};
 use crate::scroll::{Scrolling, Window};
 use crate::ssh::{ask, reach};
@@ -125,6 +126,24 @@ enum Ending {
     Lost,
 }
 
+/// What a drag turned out to mean.
+///
+/// Three answers because there are three things the app draws next: nothing at
+/// all, a view that is now worth asking about, or a sentence saying the
+/// gesture has nowhere to go. The third is the one worth having a value for: a
+/// key or a drag that quietly does nothing is the thing this project keeps
+/// refusing to ship.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum Dragged {
+    /// The session is reading the mouse, and has been sent the notches.
+    Wheeled,
+    /// The view moved, so it is worth asking what it looks like now.
+    Looked,
+    /// Neither is possible here, which is a host too old for the view holding
+    /// a session that is not reading the mouse.
+    Nowhere,
+}
+
 /// A chunk on its way to the screen.
 enum Paint {
     /// The screen as the host has it. Everything before it is gone.
@@ -219,24 +238,55 @@ impl Session {
         let _ = self.say.send(Say::Resize(size));
     }
 
-    /// Move the view back through the history, opening it if it was not up.
+    /// A drag of whole lines, positive being back towards what came before.
+    ///
+    /// Where the two things a drag can mean are told apart, and the answer
+    /// says which happened so the app can draw what follows from it. A session
+    /// reading the mouse gets the notches and nothing else does: two readers
+    /// on one wheel is one of them reading input meant for the other, and a
+    /// full-screen program draws its own scrolling from exactly these reports.
+    /// That is the desktop's rule, which its terminal settles for it; here
+    /// there is no terminal, and a drag that opened the history view over a
+    /// program on the alternate screen opened it over a buffer with no history
+    /// behind it at all.
     ///
     /// The move happens here rather than on the task, because it is arithmetic
     /// over the block already in hand: a drag reports a row at a time and
     /// every one of them would otherwise be a trip through a queue before the
     /// screen it moved could be drawn. What goes to the task is the asking,
     /// and only when the move left the view short of lines.
-    pub fn scroll_up(&self, lines: u64) {
-        if !self.scrolls.load(Ordering::Relaxed) {
-            return;
+    pub fn drag(&self, lines: i64, at: At) -> Dragged {
+        if let Some(notches) = self.wheel(lines, at) {
+            self.send(notches);
+            return Dragged::Wheeled;
         }
-        held(&self.scrolling).up(lines);
+        if lines > 0 {
+            // The host cannot answer for a window, and the session is not
+            // reading the mouse either, so there is nothing this can do but
+            // say so where the gesture was made.
+            if !self.scrolls.load(Ordering::Relaxed) {
+                return Dragged::Nowhere;
+            }
+            held(&self.scrolling).up(lines as u64);
+        } else {
+            held(&self.scrolling).down(lines.unsigned_abs());
+        }
         let _ = self.say.send(Say::Look);
+        Dragged::Looked
     }
 
-    pub fn scroll_down(&self, lines: u64) {
-        held(&self.scrolling).down(lines);
-        let _ = self.say.send(Say::Look);
+    /// The drag as wheel reports, where the session asked to be sent them.
+    ///
+    /// The screen's lock is taken and given back before the view's, which is
+    /// the only order these two are ever taken in.
+    fn wheel(&self, lines: i64, at: At) -> Option<Vec<u8>> {
+        let screen = held(&self.screen);
+        if !screen.mouse().wanted() {
+            return None;
+        }
+        let up = lines > 0;
+        let notch = screen.mouse().wheel(up, at.col, at.row);
+        Some(notch.repeat(lines.unsigned_abs() as usize))
     }
 
     /// Back to the live screen.
@@ -247,14 +297,6 @@ impl Session {
     /// The view as it should now look, taken the way a frame is.
     pub fn take_window(&self) -> Window {
         held(&self.scrolling).take_window()
-    }
-
-    /// Whether the host this is attached to can be scrolled back through.
-    ///
-    /// False until it has answered, which is the honest answer while nothing
-    /// is attached: there is no history to reach yet.
-    pub fn scrolls(&self) -> bool {
-        self.scrolls.load(Ordering::Relaxed)
     }
 
     /// Leave, without ending anything.

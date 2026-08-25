@@ -46,6 +46,15 @@ screen, and so does dragging back down to it. A machine running a build from
 before the view existed says so where the gesture was made, rather than
 leaving one that quietly does nothing.
 
+Unless the program in there is reading the mouse, in which case the drag is
+its own and goes to it as wheel notches. The desktop settles this without
+knowing anything, its terminal doing the encoding; a phone has no terminal, so
+the app reads the modes out of the session's output and spells the reports the
+way that program asked for them. What it fixes is the case that looks most
+like a bug: a full-screen program keeps no scrollback anywhere, at the node or
+here, so a drag inside one used to open a view over a buffer with nothing
+behind it.
+
 The phone is an ordinary writable client: it sends its own size and the session
 reflows. The node applies the smallest size across every attached client, so
 attaching from the sofa squeezes the session on the desk. That is the trade,

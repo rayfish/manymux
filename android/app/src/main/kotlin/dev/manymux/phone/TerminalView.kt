@@ -14,7 +14,9 @@ import android.view.inputmethod.BaseInputConnection
 import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputConnection
 import android.view.inputmethod.InputMethodManager
+import uniffi.manymux_android.At
 import uniffi.manymux_android.Attach
+import uniffi.manymux_android.Dragged
 import uniffi.manymux_android.Grid
 import uniffi.manymux_android.Row
 import uniffi.manymux_android.Run
@@ -430,6 +432,7 @@ class TerminalView(context: Context) : View(context), Choreographer.FrameCallbac
                 // stop one expects.
                 speed = 0f
                 pending = 0f
+                pointer = cellUnder(event)
                 return true
             }
 
@@ -447,6 +450,7 @@ class TerminalView(context: Context) : View(context), Choreographer.FrameCallbac
                 // `downBy` counts the way the content moves, so pulling the
                 // screen down is negative and is what reaches back into the
                 // history.
+                pointer = cellUnder(to)
                 drag(-downBy)
                 return true
             }
@@ -473,24 +477,43 @@ class TerminalView(context: Context) : View(context), Choreographer.FrameCallbac
     private fun drag(pixels: Float) {
         val session = attach ?: return
         if (lineHeight <= 0f) return
-        if (!session.scrolls()) {
-            if (!said) {
-                said = true
-                onCannotScroll?.invoke()
-            }
-            return
-        }
         pending += pixels
         val lines = (pending / lineHeight).toInt()
         if (lines == 0) return
         pending -= lines * lineHeight
-        if (lines > 0) {
-            looking = true
-            session.scrollUp(lines.toULong())
-        } else {
-            session.scrollDown((-lines).toULong())
+        // Which of the two things a drag means is the far end's to decide: it
+        // is the one that knows whether the program in there is reading the
+        // mouse, and it holds the spelling that program asked to be told in.
+        when (session.drag(lines.toLong(), pointer)) {
+            Dragged.WHEELED -> Unit
+            Dragged.LOOKED -> if (lines > 0) looking = true
+            Dragged.NOWHERE -> if (!said) {
+                said = true
+                onCannotScroll?.invoke()
+            }
         }
     }
+
+    /**
+     * Which cell a touch landed in, which is what a mouse report names.
+     *
+     * Clamped to the grid the far end was told about rather than to the view's
+     * own pixels: the two disagree by whatever the last row does not fill, and
+     * a report naming a row the session has not got is one it will read as
+     * being somewhere else entirely.
+     */
+    private fun cellUnder(event: MotionEvent): At {
+        val grid = told ?: return At(0u, 0u)
+        val col = if (cellWidth > 0) (event.x / cellWidth).toInt() else 0
+        val row = if (lineHeight > 0) (event.y / lineHeight).toInt() else 0
+        return At(
+            col.coerceIn(0, maxOf(0, grid.cols.toInt() - 1)).toUShort(),
+            row.coerceIn(0, maxOf(0, grid.rows.toInt() - 1)).toUShort(),
+        )
+    }
+
+    /** The cell the hand was last in, which is where a notch is reported. */
+    private var pointer = At(0u, 0u)
 
     /** Whether the view is worth asking about, which reaching back makes it. */
     private var looking = false

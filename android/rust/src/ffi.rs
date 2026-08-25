@@ -19,9 +19,10 @@ use tokio::runtime::Runtime;
 
 use crate::keys::{Identity, KnownHosts};
 use crate::machine::{Connection, Connections, Machine, Rebuff};
+use crate::mouse::At;
 use crate::screen::{Frame, Row, Screen};
 use crate::scroll::Window;
-use crate::session::{Session, State};
+use crate::session::{Dragged, Session, State};
 use crate::ssh::{peek, reach, start};
 
 /// Anything that went wrong, in the one sentence worth showing somebody.
@@ -401,28 +402,17 @@ impl Attach {
         self.session.take_window()
     }
 
-    /// Move the view back through the history, opening it if it was closed.
-    pub fn scroll_up(&self, lines: u64) {
-        self.session.scroll_up(lines);
-    }
-
-    /// Move it towards the live screen. Does nothing while it is closed.
-    pub fn scroll_down(&self, lines: u64) {
-        self.session.scroll_down(lines);
+    /// A drag of whole lines, positive being back towards what came before.
+    ///
+    /// Either the notches go to a session that is reading the mouse, or the
+    /// view moves; the answer says which, and the app draws what follows.
+    pub fn drag(&self, lines: i64, at: At) -> Dragged {
+        self.session.drag(lines, at)
     }
 
     /// Back to the live screen, forgetting where the view was.
     pub fn close_view(&self) {
         self.session.close_view();
-    }
-
-    /// Whether this host can be scrolled back through at all.
-    ///
-    /// A host running a build from before the view existed skips the request
-    /// in silence, so the app says so where the gesture was made rather than
-    /// leaving one that quietly does nothing.
-    pub fn scrolls(&self) -> bool {
-        self.session.scrolls()
     }
 
     /// Keystrokes, or pasted text.

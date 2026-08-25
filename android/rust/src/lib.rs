@@ -27,6 +27,7 @@ pub mod agent;
 pub mod ffi;
 pub mod keys;
 pub mod machine;
+pub mod mouse;
 pub mod screen;
 pub mod scroll;
 pub mod session;
