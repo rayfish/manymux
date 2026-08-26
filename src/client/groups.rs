@@ -6,6 +6,19 @@
 //! that needs no tidying and leaves no question about what an empty one would
 //! have meant.
 //!
+//! One file, and every client on this machine is reading and writing it: two
+//! `mm attach` runs in two windows, an `mm ls` between them. So it is read
+//! before every write and never written from the copy in hand
+//! ([`Groups::update`], the only writer there is). An attach reads this once
+//! and keeps it for hours while the window next door goes on changing it, and
+//! `save` serialised the whole map: the older copy did not merge with what had
+//! arrived since, it replaced it, so a session moved into a group in one window
+//! fell out of it the next time any other window listed. That is also why the
+//! attach loop reads it again on the way round rather than watching it. Nothing
+//! in an attached screen is drawn from this file while no key is being pressed,
+//! so a watch would have nothing to push to, and the file is small enough to
+//! read once per keystroke that goes anywhere.
+//!
 //! Kept here rather than at the node on purpose. A node runs the build it
 //! started from until `mm restart`, and for a host reached over ssh nothing
 //! says it is stale, so a group defined there would work on some machines and
@@ -24,7 +37,7 @@
 //! number.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
 use anyhow::{Context, Result, bail};
@@ -75,18 +88,56 @@ pub struct Groups {
 
 impl Groups {
     pub fn load() -> Result<Self> {
-        let path = Self::path();
+        Self::read(&Self::path())
+    }
+
+    fn read(path: &Path) -> Result<Self> {
         if !path.exists() {
             return Ok(Self::default());
         }
-        let text = std::fs::read_to_string(&path)
-            .with_context(|| format!("reading {}", path.display()))?;
+        let text =
+            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
         toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))
     }
 
-    pub fn save(&self) -> Result<()> {
+    fn write_to(&self, path: &Path) -> Result<()> {
         let text = toml::to_string_pretty(self).context("encoding the group list")?;
-        config::write_private_file(&Self::path(), text.as_bytes())
+        config::write_private_file(path, text.as_bytes())
+    }
+
+    /// Read the file, change it, and write it back, in that order.
+    ///
+    /// The one way to write this file, because the copy in hand is not the
+    /// file: an attach reads it once and keeps it for hours, while the other
+    /// terminal on the same machine is reading and writing the same path the
+    /// whole time. `save` alone serialises the whole map, so an older copy
+    /// writing itself back does not merge with what arrived since, it replaces
+    /// it, and a session moved into a group in one window fell out of it the
+    /// next time any other window listed. Reading first also leaves the caller
+    /// holding the file as it is now, which is the copy it goes on to draw.
+    ///
+    /// It does not lock. Two writes landing between the same read and write
+    /// still lose one, but that window is the length of a read and a rename
+    /// rather than the length of an attach, and the write that matters is a
+    /// person pressing a key in one window at a time.
+    pub fn update<T>(&mut self, change: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
+        self.update_at(&Self::path(), change)
+    }
+
+    /// The same, for a caller with no copy to go on drawing afterwards.
+    pub fn change<T>(change: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
+        Self::default().update(change)
+    }
+
+    fn update_at<T>(
+        &mut self,
+        path: &Path,
+        change: impl FnOnce(&mut Self) -> Result<T>,
+    ) -> Result<T> {
+        *self = Self::read(path)?;
+        let answer = change(self)?;
+        self.write_to(path)?;
+        Ok(answer)
     }
 
     /// Its own file rather than a section in `settings.toml`, because
@@ -343,6 +394,77 @@ mod tests {
             .unwrap();
         groups.prune(&["box".into()], &[]);
         assert!(groups.names().is_empty());
+    }
+
+    fn temp(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("manymux-groups-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join(format!("{name}.toml"))
+    }
+
+    /// Two attached clients on one machine share this file, and each read it
+    /// when its attach started. Every listing that lands writes the whole file
+    /// back, so the older copy put the file the way it was and the session
+    /// moved into a group in the other terminal fell out of it.
+    #[test]
+    fn a_group_made_in_another_client_survives_this_one_writing() {
+        let path = temp("another-client");
+        let _ = std::fs::remove_file(&path);
+        let build = session("build", 41823, 1000);
+
+        // The client that has been attached since before there were any groups.
+        let mut older = Groups::read(&path).unwrap();
+
+        // The other terminal moves a session into a group.
+        let mut other = Groups::read(&path).unwrap();
+        other.assign("pi", "box", &build).unwrap();
+        other.write_to(&path).unwrap();
+
+        // A listing lands in the first one, which prunes and saves.
+        older
+            .update_at(&path, |groups| {
+                groups.prune(&["box".into()], &[hosted("box", build.clone())]);
+                Ok(())
+            })
+            .unwrap();
+
+        assert_eq!(
+            Groups::read(&path).unwrap().group_of("box", &build),
+            Some("pi"),
+            "the other client's move was overwritten"
+        );
+        assert_eq!(
+            older.group_of("box", &build),
+            Some("pi"),
+            "and this client is still drawing the file as it was"
+        );
+    }
+
+    /// The other half of the same thing: the client writing is moving a
+    /// session of its own, and the group the other terminal just made has to
+    /// still be there when it is done.
+    #[test]
+    fn a_move_in_one_client_does_not_undo_a_move_in_the_other() {
+        let path = temp("two-moves");
+        let _ = std::fs::remove_file(&path);
+        let build = session("build", 41823, 1000);
+        let api = session("api", 41902, 1001);
+
+        let mut older = Groups::read(&path).unwrap();
+
+        // One terminal puts `build` in a group.
+        let mut other = Groups::read(&path).unwrap();
+        other.assign("pi", "box", &build).unwrap();
+        other.write_to(&path).unwrap();
+
+        // The other, which has never heard of it, puts `api` in one.
+        older
+            .update_at(&path, |groups| groups.assign("manymux", "box", &api))
+            .unwrap();
+
+        let back = Groups::read(&path).unwrap();
+        assert_eq!(back.group_of("box", &build), Some("pi"));
+        assert_eq!(back.group_of("box", &api), Some("manymux"));
     }
 
     #[test]

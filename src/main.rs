@@ -497,24 +497,27 @@ async fn run(cli: Cli) -> Result<u8> {
                 .iter()
                 .find(|s| s.name == at.session)
                 .ok_or_else(|| anyhow!("no session named {} on {}", at.session, at.host))?;
-            let mut groups = Groups::load()?;
-            match &name {
-                Some(name) => {
-                    groups.assign(name, &at.host, session)?;
+            Groups::change(|groups| {
+                match &name {
+                    Some(name) => {
+                        groups.assign(name, &at.host, session)?;
+                    }
+                    None => groups.clear(&at.host, session),
                 }
-                None => groups.clear(&at.host, session),
-            }
-            groups.save()?;
+                Ok(())
+            })?;
             Ok(OK)
         }
 
         Command::Groups => {
             let listing = everywhere(&socket).await?;
-            let mut groups = Groups::load()?;
+            let mut groups = Groups::default();
             // The listing is the only thing that says which sessions are still
             // running, so this is where the file gets tidied.
-            groups.prune(&listing.answering(), &listing.sessions);
-            groups.save()?;
+            groups.update(|groups| {
+                groups.prune(&listing.answering(), &listing.sessions);
+                Ok(())
+            })?;
             for (name, count) in groups.tally(&listing.sessions) {
                 println!(
                     "{} {}",
@@ -1044,9 +1047,11 @@ async fn list(socket: &Path, host: Option<String>) -> Result<u8> {
     // The listing is the only thing that says which sessions are still running,
     // so this is where the group file gets tidied. Only the machines that
     // answered count: one that is asleep has said nothing about its sessions.
-    let mut groups = Groups::load().unwrap_or_default();
-    groups.prune(&listing.answering(), &listing.sessions);
-    let _ = groups.save();
+    let mut groups = Groups::default();
+    let _ = groups.update(|groups| {
+        groups.prune(&listing.answering(), &listing.sessions);
+        Ok(())
+    });
 
     let rows: Vec<_> = listing
         .sessions
@@ -1603,38 +1608,40 @@ async fn restore_checkpoint(socket: &Path, host: Option<String>, dry_run: bool) 
     // Only now do the new pids exist, and membership is keyed on them.
     if here.iter().any(|(_, _, group)| group.is_some()) {
         let listing = everywhere(socket).await?;
-        let mut groups = Groups::load().unwrap_or_default();
-        for (host, name, group) in &here {
-            let Some(group) = group else { continue };
-            // Matched the way every host name here is matched. A raw string
-            // compare missed a file spelling this machine `local`, which is
-            // the spelling `--host` documents and a hand-edited file is likely
-            // to use, and the miss was silent: the line above had already said
-            // the group was put back.
-            let found = listing
-                .sessions
-                .iter()
-                .find(|h| same_machine(&h.host, host) && h.session.name == *name);
-            let Some(hosted) = found else {
-                eprintln!(
-                    "mm: {} came back but could not be found again, so it is \
+        let put_back = |groups: &mut Groups| {
+            for (host, name, group) in &here {
+                let Some(group) = group else { continue };
+                // Matched the way every host name here is matched. A raw string
+                // compare missed a file spelling this machine `local`, which is
+                // the spelling `--host` documents and a hand-edited file is likely
+                // to use, and the miss was silent: the line above had already said
+                // the group was put back.
+                let found = listing
+                    .sessions
+                    .iter()
+                    .find(|h| same_machine(&h.host, host) && h.session.name == *name);
+                let Some(hosted) = found else {
+                    eprintln!(
+                        "mm: {} came back but could not be found again, so it is \
                      not in {group}",
-                    qualified(host, name)
-                );
-                failed += 1;
-                continue;
-            };
-            // Reported rather than propagated. The names come out of a file
-            // somebody may have edited, so one that `assign` refuses is one
-            // bad line: raised as an error here it would abandon the loop
-            // after every session had already been started, save no grouping
-            // at all, and fail a command whose sessions are all back.
-            if let Err(e) = groups.assign(group, host, &hosted.session) {
-                eprintln!("mm: {}: {e:#}", qualified(host, name));
-                failed += 1;
+                        qualified(host, name)
+                    );
+                    failed += 1;
+                    continue;
+                };
+                // Reported rather than propagated. The names come out of a file
+                // somebody may have edited, so one that `assign` refuses is one
+                // bad line: raised as an error here it would abandon the loop
+                // after every session had already been started, save no grouping
+                // at all, and fail a command whose sessions are all back.
+                if let Err(e) = groups.assign(group, host, &hosted.session) {
+                    eprintln!("mm: {}: {e:#}", qualified(host, name));
+                    failed += 1;
+                }
             }
-        }
-        groups.save()?;
+            Ok(())
+        };
+        Groups::change(put_back)?;
     }
 
     let machines = here
@@ -1918,6 +1925,16 @@ async fn do_attach(
         // then, so putting a session in a group silently narrowed the run to
         // it. Not knowing is an answer here, and the answer is to narrow to
         // nothing.
+        // Read again rather than watched. `groups.toml` is shared with every
+        // other client on this machine, so the copy this run started with goes
+        // stale the moment another terminal moves a session, and this is where
+        // the run next looks at it: the rows the popup opens on and the cycle
+        // the switch keys walk are both built below. A watch would have nothing
+        // to push to, since nothing in an attached screen is drawn from this
+        // file while a key is not being pressed, and the file is a few hundred
+        // bytes read once per keystroke that goes anywhere. Kept if it will not
+        // read, a broken file being no reason to forget what is in hand.
+        groups = Groups::load().unwrap_or(groups);
         if !settled {
             settled = true;
             if let Some(info) = snapshot.info(cycle.current()) {
@@ -1930,9 +1947,12 @@ async fn do_attach(
         let listed = Listed::new(&snapshot, &groups, &cycle);
         // The popup's way of asking what the machines are running, since the
         // attach owns this task for as long as it lasts and cannot go and look
-        // itself. Groups and the narrowing cannot change under it: every way of
-        // changing either ends the attach, which is what makes a snapshot of
-        // them safe to hand over.
+        // itself. The narrowing cannot change under it, every way of changing
+        // that ending the attach, so it is handed over as it stands. The groups
+        // can: `groups.toml` is one file shared by every client on this machine,
+        // and the other terminal moving a session while this popup is up is
+        // exactly the case, so the copy below is a fallback for a file that
+        // will not read rather than the answer.
         let (asks, mut wanted) = tokio::sync::mpsc::channel::<()>(1);
         let (answered, fresh) = tokio::sync::watch::channel(listed.rows.clone());
         let lister = {
@@ -1966,7 +1986,8 @@ async fn do_attach(
                     if snapshot.is_empty() {
                         continue;
                     }
-                    let listed = Listed::of(&snapshot, &groups, focus.as_deref(), &current);
+                    let held = Groups::load().unwrap_or_else(|_| groups.clone());
+                    let listed = Listed::of(&snapshot, &held, focus.as_deref(), &current);
                     // Kept where the caller can read it once the attach ends:
                     // the ids the popup hands back are this listing's, and
                     // looking them up in the one it opened with would name the
@@ -2006,8 +2027,10 @@ async fn do_attach(
         // hands its pending listing to the popup, so nothing is ever left for
         // `take_listing` to find.
         if let Some(fresher) = held_lock(&seen).take() {
-            groups.prune(&fresher.answered, &fresher.sessions);
-            let _ = groups.save();
+            let _ = groups.update(|groups| {
+                groups.prune(&fresher.answered, &fresher.sessions);
+                Ok(())
+            });
             snapshot = fresher;
             cycle.refresh(entries(&snapshot, &groups));
         }
@@ -2604,13 +2627,15 @@ async fn regroup(
         .iter()
         .find(|s| s.name == at.session)
         .ok_or_else(|| anyhow!("{} is no longer running", at.session))?;
-    match &group {
-        Some(name) => {
-            groups.assign(name, &at.host, session)?;
+    groups.update(|groups| {
+        match &group {
+            Some(name) => {
+                groups.assign(name, &at.host, session)?;
+            }
+            None => groups.clear(&at.host, session),
         }
-        None => groups.clear(&at.host, session),
-    }
-    groups.save()
+        Ok(())
+    })
 }
 
 /// Rename the session on a popup row, wherever it is running, and answer with
@@ -2694,8 +2719,10 @@ async fn take_listing(
     match tokio::time::timeout(LISTING_WAIT, &mut task).await {
         Ok(Ok(landed)) => {
             if !landed.is_empty() {
-                groups.prune(&landed.answered, &landed.sessions);
-                let _ = groups.save();
+                let _ = groups.update(|groups| {
+                    groups.prune(&landed.answered, &landed.sessions);
+                    Ok(())
+                });
                 *snapshot = landed;
                 cycle.refresh(entries(snapshot, groups));
             }
