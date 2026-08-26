@@ -635,7 +635,10 @@ There is also an Android app, in `android/`. It is not a copy of the CLI: it
 makes its own ssh connection in the process, emulates the session's screen on
 the phone, and has no mode key, since a phone has chrome a terminal has not and
 every verb behind `Ctrl-]` can be something you press instead. It is early, and
-`android/README.md` says what is in it.
+`android/README.md` says what is in it. Releases carry a `manymux-android.apk`
+built from the same commit as the binaries beside it. It is debug-signed for
+now, so installing a newer one over an older one may want the old one removed
+first.
 
 ## Environment
 

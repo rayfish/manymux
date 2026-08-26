@@ -205,3 +205,58 @@ jobs:
             ${{ matrix.name }}
             ${{ matrix.name }}.sha256
             ${{ matrix.name }}.sha256.sig
+
+  # The phone app, which the matrix above does not build: its
+  # `aarch64-linux-android` entry is the `mm` binary for Termux, a different
+  # thing that happens to share a target triple. `assembleDebug` runs
+  # `build-rust.sh` first, so the shim and its generated bindings come from
+  # this same build.
+  app:
+    needs: create-release
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          rustup target add aarch64-linux-android x86_64-linux-android
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: android/rust
+          shared-key: "release-android-app"
+          cache-on-failure: true
+
+      - name: Build the APK
+        working-directory: android
+        run: ANDROID_NDK_HOME="$ANDROID_NDK_LATEST_HOME" ./gradlew --no-daemon assembleDebug
+
+      # Debug-signed, which is installable by anybody but is not an upgrade
+      # path: the debug key is generated per machine, so a later release signed
+      # by another key installs as a different app. Swap this for a signed
+      # `assembleRelease` once there is a keystore to sign with.
+      - name: Package the APK
+        run: |
+          cp android/app/build/outputs/apk/debug/app-debug.apk manymux-android.apk
+          sha256sum manymux-android.apk > manymux-android.apk.sha256
+
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ needs.create-release.outputs.tag }}
+          files: |
+            manymux-android.apk
+            manymux-android.apk.sha256
