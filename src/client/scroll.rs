@@ -18,6 +18,10 @@
 //! in before it was read here. Selection is the client's wherever the mouse is,
 //! and the terminal's wherever it is not.
 //!
+//! What a selected cell looks like is [`crate::client::pen`]'s: a band under
+//! the text rather than a repaint of it, which is a question about colour and
+//! contrast rather than about scrolling.
+//!
 //! It stays a long way from tmux's copy mode all the same. There is no keyboard
 //! selection, no marks and no registers: what is here is what a hand with a
 //! mouse does, because a hand with a keyboard has the search, and the one thing
@@ -37,6 +41,7 @@
 //! over ssh per wheel notch, on machines that are usually two hops away.
 
 use crate::client::attach::Spot;
+use crate::client::pen;
 use crate::proto::{Found, Size, View as Window, ViewRequest};
 
 /// Screenfuls fetched at a time. Enough that a page up or down lands inside
@@ -1101,35 +1106,18 @@ fn plain(line: &str, from: u16, to: u16) -> String {
     out
 }
 
-/// What a selected cell is painted with: one colour for every selected cell,
-/// whatever the program had drawn there.
-///
-/// A colour of its own rather than reverse video, which is what this was and
-/// which cannot say what it means. Reverse is not a colour, it is *swap the two
-/// this cell already has*, so a selection over coloured text takes the text's
-/// colour as its background and comes out a patchwork: teal behind a path,
-/// white behind the words either side of it, one selection in three colours.
-/// And over a run the program itself drew reversed, which is how `pi` draws the
-/// message you typed, swapping again lands back where it started and the
-/// selection is invisible.
-///
-/// It starts with a reset for the same reason: bold, underline and the
-/// program's own reverse are all attributes of the cell underneath, and a
-/// selection that kept them would be showing the thing it is drawn over. Which
-/// is why the pair is spelt out rather than left to the terminal's own
-/// selection colour, that being something no escape sequence can ask for: a
-/// near-white on a near-black is the one thing that reads the same on a light
-/// terminal and a dark one.
-const SELECTED: &str = "\x1b[0;48;5;253;38;5;235m";
-
-/// The same walk, with the selected cells painted in [`SELECTED`] and the
-/// line's own pen put back after them.
+/// The same walk, with the selected cells sat on the band ([`pen::selected`])
+/// and the line's own pen put back after them.
 ///
 /// The pen is *accumulated* rather than reissued as it arrives: what a cell
 /// looks like is every SGR sequence before it on the line, so the way back to
-/// the line's own colours after a highlight is a reset and then all of them
-/// again. Inside the highlight they are held rather than written, or the
-/// colours of the text would show through the thing covering it.
+/// the line's own colours after a band is a reset and then all of them again.
+/// Inside the band they are held rather than written, since the band is worked
+/// out from them and carries them itself.
+///
+/// Which is why the band is worked out once per pen rather than once per cell,
+/// and written again whenever either of the two things it depends on moves: the
+/// pen under it, and the run of selected cells starting over.
 ///
 /// `to` is a column of the screen and never a stand-in for the end of the line:
 /// what this writes goes onto a row that is only so wide, and cells written
@@ -1139,19 +1127,26 @@ fn highlighted(line: &str, from: u16, to: u16) -> String {
     let mut out = String::new();
     // The line's own pen as it stands at this point in the walk.
     let mut pen = String::new();
+    // The band for that pen, while it is still the pen in hand.
+    let mut band: Option<String> = None;
     let mut inside = false;
     let end = walk(line, |piece| match piece {
         Piece::Pen(seq) => {
             pen.push_str(seq);
+            band = None;
             if !inside {
                 out.push_str(seq);
             }
         }
         Piece::Char(c, col) => {
             let wanted = col >= from && col < to;
-            if wanted && !inside {
-                out.push_str(SELECTED);
-            } else if !wanted && inside {
+            if wanted {
+                let known = band.is_some();
+                let band = band.get_or_insert_with(|| pen::selected(&pen));
+                if !known || !inside {
+                    out.push_str(band);
+                }
+            } else if inside {
                 out.push_str("\x1b[0m");
                 out.push_str(&pen);
             }
@@ -1165,13 +1160,14 @@ fn highlighted(line: &str, from: u16, to: u16) -> String {
     if to > end {
         // The cells between the end of the text and where the selection starts
         // are neither text nor selected, and something has to be written over
-        // them or the highlight begins at the wrong column: on a line shorter
-        // than `from`, and on an empty one that is column zero.
+        // them or the band begins at the wrong column: on a line shorter than
+        // `from`, and on an empty one that is column zero.
         let gap = from.saturating_sub(end);
         out.push_str(&" ".repeat(usize::from(gap)));
-        if !inside {
-            out.push_str(SELECTED);
-        }
+        // The bare band rather than the one the text was wearing: past the end
+        // of the line there is no text, and an underline carried out into the
+        // blanks would draw a rule across the empty half of the row.
+        out.push_str(&pen::selected(""));
         out.push_str(&" ".repeat(usize::from(to.saturating_sub(end.max(from)))));
         inside = true;
     }
@@ -1846,38 +1842,68 @@ mod tests {
         );
     }
 
-    /// The highlight is one colour over whatever was there, and the line's own
-    /// pen is put back after it: what comes back off the wire is coloured text,
-    /// and a copy mode that dropped the colours would repaint the screen in
-    /// white on the way past.
+    /// The band goes under the line's own pen, and that pen is put back after
+    /// it: what comes back off the wire is coloured text, and a copy mode that
+    /// dropped the colours would repaint the screen on the way past.
     #[test]
-    fn the_highlight_covers_the_colours_and_puts_them_back() {
+    fn the_band_goes_under_the_colours_and_puts_them_back() {
         let coloured = "\x1b[31mred\x1b[0m plain";
         let painted = highlighted(coloured, 0, 3);
         assert!(painted.starts_with("\x1b[31m"), "{painted:?}");
         assert_eq!(plain(&painted, 0, u16::MAX), "red plain");
-        // The selected cells are the selection's colour, and what follows is
-        // the pen the line had by then, reissued from a clean slate.
+        // The selected cells sit on the band, and what follows is the pen the
+        // line had by then, reissued from a clean slate.
         assert!(
-            painted.contains(&format!("{SELECTED}red\x1b[0m")),
+            painted.contains(&format!("{}red\x1b[0m", pen::selected("\x1b[31m"))),
             "{painted:?}"
         );
         assert!(painted.ends_with("\x1b[31m\x1b[0m plain"), "{painted:?}");
     }
 
-    /// Reverse video cannot say "selected": it swaps the two colours a cell
-    /// already has, so over a run the program drew reversed itself, which is
-    /// how `pi` draws the message you typed, swapping again lands back where it
-    /// started and the selection is invisible. Every selected cell is painted
-    /// the same whatever was under it.
+    /// The band is a background and nothing else: the line goes on saying what
+    /// it said, in the colour it said it in. A selection that repainted the
+    /// text would destroy the thing it was pointing at.
     #[test]
-    fn a_highlight_over_reversed_text_is_still_visible() {
+    fn the_band_keeps_the_colour_the_line_was_written_in() {
+        let painted = highlighted("\x1b[32mgreen\x1b[0m out", 0, 5);
+        assert!(
+            painted.contains(&format!("{}green", pen::selected("\x1b[32m"))),
+            "{painted:?}"
+        );
+    }
+
+    /// And it follows the pen under it. A run of selected cells is not one
+    /// colour: a line that changes colour halfway through changes colour
+    /// halfway through the selection too.
+    #[test]
+    fn a_colour_that_changes_under_the_band_is_followed() {
+        let painted = highlighted("\x1b[32mgr\x1b[33meen", 0, 4);
+        assert!(
+            painted.contains(&format!("{}gr", pen::selected("\x1b[32m"))),
+            "{painted:?}"
+        );
+        assert!(
+            painted.contains(&format!("{}ee", pen::selected("\x1b[33m"))),
+            "{painted:?}"
+        );
+    }
+
+    /// Reverse video is the one thing the band cannot be laid over: it swaps
+    /// the two colours a cell already has, so over a run the program drew
+    /// reversed itself, which is how `pi` draws the message you typed, the band
+    /// would be swapped away and the selection would be invisible at exactly
+    /// the place somebody was looking. So the swap is undone under it.
+    #[test]
+    fn a_band_over_reversed_text_is_still_visible() {
         let painted = highlighted("\x1b[7mtyped\x1b[27m out", 0, 5);
-        // The selection's own colours are the last thing written before the
-        // cells, and they open with a reset, so the program's reverse is off
-        // under them however it got there.
-        assert!(painted.contains(&format!("{SELECTED}typed")), "{painted:?}");
-        assert!(SELECTED.starts_with("\x1b[0;"), "{SELECTED:?}");
+        // The band is the last thing written before the cells, and it opens
+        // with a reset, so the program's reverse is off under it however it got
+        // there.
+        assert!(
+            painted.contains(&format!("{}typed", pen::selected("\x1b[7m"))),
+            "{painted:?}"
+        );
+        assert!(!pen::selected("\x1b[7m").contains(";7;"), "still reversed");
         // And it comes back for what was not selected.
         assert!(
             painted.ends_with("\x1b[0m\x1b[7m\x1b[27m out"),
@@ -1902,7 +1928,10 @@ mod tests {
     #[test]
     fn a_highlight_past_the_end_of_a_line_covers_the_rest_of_the_row() {
         let painted = highlighted("ab", 0, 6);
-        assert!(painted.starts_with(&format!("{SELECTED}ab")), "{painted:?}");
+        assert!(
+            painted.starts_with(&format!("{}ab", pen::selected(""))),
+            "{painted:?}"
+        );
         assert!(painted.ends_with("    \x1b[0m"), "{painted:?}");
     }
 
@@ -2084,7 +2113,7 @@ mod tests {
         view.select_from(at(24, 1));
         view.select_to(at(24, 4));
         let painted = view.paint();
-        assert!(painted.contains(SELECTED), "{painted:?}");
+        assert!(painted.contains(&pen::selected("")), "{painted:?}");
         assert_eq!(painted.matches("\x1b[K").count(), 1, "one row: {painted:?}");
     }
 
@@ -2119,7 +2148,7 @@ mod tests {
     fn a_highlight_past_a_short_line_starts_where_the_selection_does() {
         let painted = highlighted("ab", 5, 9);
         assert!(
-            painted.starts_with(&format!("ab   {SELECTED}")),
+            painted.starts_with(&format!("ab   {}", pen::selected(""))),
             "{painted:?}"
         );
         assert!(painted.ends_with("    \x1b[0m"), "{painted:?}");

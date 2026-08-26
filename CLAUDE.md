@@ -133,6 +133,7 @@ read its `//!` first, and update it in the same commit:
 | where a switch key lands, and in what order | `src/client/switch.rs` |
 | the two screen modes | `src/client/screen.rs` |
 | the history view, selection and the mouse | `src/client/scroll.rs` |
+| what a selected cell is painted with | `src/client/pen.rs` |
 | what a key arrives as, and the modes that respell it | `src/client/attach/keys.rs` |
 | titles, bells and the modes replayed on attach | `src/node/events.rs` |
 | release signing | `src/signature.rs` |
