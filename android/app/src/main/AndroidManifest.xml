@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- The only permission there is. Everything this app does is one ssh
+         connection to a machine somebody named. -->
+    <uses-permission android:name="android.permission.INTERNET" />
+
+    <!-- `smallestScreenSize` and `density` are the two a foldable turns on.
+         Unfolding changes the smallest screen dimension, and an undeclared
+         configuration change destroys and recreates the activity: the attach
+         would be torn down, the ssh connection dropped with it, and whoever
+         opened the big screen to see more of a build would be looking at the
+         session list instead. The activity handles the resize itself, which is
+         what the terminal wants anyway. -->
+    <application
+        android:allowBackup="false"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:label="manymux"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.Manymux">
+        <activity
+            android:name=".MainActivity"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|density|keyboardHidden"
+            android:exported="true"
+            android:windowSoftInputMode="adjustResize">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+
+</manifest>

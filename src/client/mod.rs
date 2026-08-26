@@ -652,6 +652,14 @@ pub enum Update {
     /// What the session is called now, in answer to [`SessionWriter::rename`],
     /// or why it is still called what it was.
     Renamed(proto::Renamed),
+    /// The size the session settled on, which is not always the one that was
+    /// asked for: the node takes the smallest across every attached client.
+    ///
+    /// Nothing to do for a client that draws on the terminal in front of it,
+    /// which is told its own size by the terminal and lets the node clip. It
+    /// is for a client keeping a screen of its own, which has to reflow that
+    /// copy to the shape the session actually took.
+    Resized(Size),
     /// The host is checking this client is still there. Answer it with
     /// [`SessionWriter::pong`], or the host will eventually conclude the client
     /// went away and detach it. Answering once is what opts a client in: one
@@ -714,6 +722,7 @@ impl SessionReader {
                 tag::VIEW => Update::View(proto::decode(&frame.body)?),
                 tag::FIND => Update::Found(proto::decode(&frame.body)?),
                 tag::RENAME => Update::Renamed(proto::decode(&frame.body)?),
+                tag::SIZE => Update::Resized(proto::decode(&frame.body)?),
                 // The first ping is what opts this connection into the deadline
                 // above, the mirror of the host holding only a client that has
                 // answered one. A node too old to ping says nothing for hours

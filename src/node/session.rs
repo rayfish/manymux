@@ -20,7 +20,7 @@ use tracing::{debug, warn};
 use super::events::{Event, Scanner, Utf8Decoder};
 use crate::lock::held;
 use crate::proto::{
-    Doing, EventKind, Found, SessionEvent, SessionInfo, Size, SpawnSpec, View, ViewRequest,
+    Doing, EventKind, Found, Peek, SessionEvent, SessionInfo, Size, SpawnSpec, View, ViewRequest,
 };
 use crate::shell;
 use crate::user;
@@ -163,14 +163,21 @@ impl Attachment {
     ///
     /// A viewer never joins that negotiation, so its window changing size is
     /// nothing to do with the session's geometry.
-    pub fn resize(&self, size: Size) {
+    /// Ask for a size, and answer with the one the session took.
+    ///
+    /// Not always the one asked for: the smallest across every attached client
+    /// wins, so a client that asked for more than somebody else's terminal has
+    /// been given less. A client with a screen of its own has to be told, or it
+    /// reflows its copy to a shape the session never had.
+    pub fn resize(&self, size: Size) -> Size {
         if self.read_only {
-            return;
+            return held(&self.session.state).size;
         }
         let mut state = held(&self.session.state);
         state.clients.insert(self.id, size.sane());
         let effective = state.effective_size();
         self.session.apply_size(&mut state, effective);
+        effective
     }
 
     /// Whether the program is expecting pastes to be bracketed, which decides
@@ -512,6 +519,23 @@ impl Session {
             idle: state.last_activity.elapsed().as_secs(),
             bells: state.bells,
             started: self.started,
+        }
+    }
+
+    /// The screen as it stands, for somebody drawing a picture of it.
+    ///
+    /// Apart from [`Session::attach`] because taking it must not make this a
+    /// session anybody is in: nothing is added to `clients`, so the geometry
+    /// is left alone and `host_clients` is untouched, which is what keeps a
+    /// wall of thumbnails from telling the machine that somebody is present.
+    /// `size` is what the screen is painted at rather than what the caller
+    /// would like, the dump having no way to reflow.
+    pub fn peek(&self) -> Peek {
+        let state = held(&self.state);
+        Peek {
+            name: self.name(),
+            size: state.size,
+            screen: state.vt.dump(),
         }
     }
 

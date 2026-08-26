@@ -1,0 +1,296 @@
+//! Reaching a machine without forking anything.
+//!
+//! [`manymux::ssh`] runs the `ssh` binary and hands its pipes to the client. An
+//! app has no binary to run, so what stands in its place is a connection made
+//! in this process, and the only thing above it that changes is where the two
+//! stream halves come from: [`manymux::client::Stream::from_halves`] takes them
+//! and everything from the framing upwards is the library's, unchanged.
+//!
+//! What does *not* come for free is the ladder. `Stream::from_halves` leaves a
+//! stream with no way back to a machine, so the retry built into
+//! `Stream::request` never fires and climbing [`PROGRAMS`] is this module's job.
+//! It is climbed with `Request::List`, which is the question a session list
+//! wants answered anyway, so looking for `mm` costs no round trip of its own.
+//!
+//! **A stream is worth one request.** `Node::handle` reads a single request and
+//! either answers it and returns, which closes the socket and takes the `mm
+//! agent` bridging it down with it, or hands the whole connection to an attach.
+//! So a ladder climbed with `List` ends holding a stream that is already spent,
+//! and what is worth keeping out of it is [`Reached::program`]: the rung that
+//! answered, so the command that follows opens a channel of its own and starts
+//! at the spelling that worked instead of climbing again. The desktop pays the
+//! same price, an `ssh host mm agent` per command; on one ssh connection a
+//! second channel is cheaper than that.
+//!
+//! Nothing here installs anything. `client::Consent` is never constructed, and
+//! a machine at the end of the ladder is reported rather than offered a copy.
+
+use std::process::Stdio;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use anyhow::{Result, bail};
+use manymux::client::{PROGRAMS, Stream};
+use manymux::lock::held;
+use manymux::proto::{Peek, Request, Response, SessionInfo, SpawnSpec};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
+use tokio::process::Command;
+use tokio::sync::watch;
+
+/// A way to run one command on a machine and talk to it.
+///
+/// The two implementations are an ssh channel and a child process, and the
+/// second exists so the ladder can be tested against a real shell's exit status
+/// rather than against something's idea of one.
+pub trait Exec {
+    fn open(&self, command: &str) -> impl Future<Output = Result<Remote>> + Send;
+}
+
+/// One command running on the far end.
+///
+/// The status and the complaint are held apart from the byte halves because
+/// [`Stream::from_halves`] takes those halves and gives nothing back: by the
+/// time a rung has failed, the only things left to ask are how it ended and
+/// what it said on the way out.
+pub struct Remote {
+    pub reader: Box<dyn AsyncRead + Unpin + Send>,
+    pub writer: Box<dyn AsyncWrite + Unpin + Send>,
+    pub watch: Watch,
+}
+
+/// What became of a command, once there is a reason to care.
+#[derive(Clone)]
+pub struct Watch {
+    status: watch::Receiver<Option<i32>>,
+    said: Arc<Mutex<Vec<u8>>>,
+}
+
+impl Watch {
+    /// The exit status, waited for rather than polled.
+    ///
+    /// A rung that had no `mm` is at EOF by the time anybody asks, so the wait
+    /// is already over; polling would race the far end into answering `None`
+    /// and read a missing `mm` as a machine that broke.
+    ///
+    /// Bounded, because a request can fail for reasons that leave the far end
+    /// running: a frame that would not decode is an error here and a command
+    /// still sitting there at the other end, and an unbounded wait on a
+    /// process that is not going to exit hangs the one call the app makes
+    /// before it has anything to show. The library's own version waits on a
+    /// child it can see; there is no process on this side of an ssh channel.
+    pub async fn ended(&mut self) -> Option<i32> {
+        if self.status.borrow().is_none() {
+            let _ = tokio::time::timeout(SETTLING, self.status.changed()).await;
+        }
+        *self.status.borrow()
+    }
+
+    /// What the far end complained about, if anything.
+    pub fn said(&self) -> String {
+        String::from_utf8_lossy(&held(&self.said))
+            .trim()
+            .to_string()
+    }
+}
+
+/// The writing half of a [`Watch`], held by whoever is pumping the command.
+///
+/// Dropping one without saying how the command ended answers `None`, which is
+/// what a connection that went away in the middle of a rung amounts to.
+pub struct Ending {
+    status: watch::Sender<Option<i32>>,
+    said: Arc<Mutex<Vec<u8>>>,
+}
+
+impl Ending {
+    pub fn new() -> (Self, Watch) {
+        let (status, receiver) = watch::channel(None);
+        let said = Arc::new(Mutex::new(Vec::new()));
+        (
+            Self {
+                status,
+                said: Arc::clone(&said),
+            },
+            Watch {
+                status: receiver,
+                said,
+            },
+        )
+    }
+
+    /// Something the far end wrote to its stderr.
+    ///
+    /// Capped, because this is recorded for the life of the command and an
+    /// attach lasts as long as somebody is working: a program that chatters at
+    /// its stderr would otherwise fill a phone's memory with a complaint
+    /// nobody is going to read. What is worth reading is at the front of it.
+    pub fn said(&self, bytes: &[u8]) {
+        let mut said = held(&self.said);
+        let room = KEPT.saturating_sub(said.len());
+        if room == 0 {
+            return;
+        }
+        said.extend_from_slice(&bytes[..bytes.len().min(room)]);
+    }
+
+    /// How the command ended.
+    pub fn ended(&self, code: Option<i32>) {
+        let _ = self.status.send(code);
+    }
+}
+
+/// How long a command that has failed is given to say how it ended.
+///
+/// A command whose spelling was wrong has already exited by the time anybody
+/// asks, so this is not the ordinary path; it is the bound on the ones that
+/// have not.
+const SETTLING: Duration = Duration::from_secs(2);
+
+/// How much of what the far end complained about is worth keeping.
+const KEPT: usize = 8 * 1024;
+
+/// A machine reached, and the listing that reaching it produced.
+///
+/// No stream: the one the listing was asked on is spent by the time it is
+/// answered, and the far end has hung up. What comes back instead is the rung
+/// that worked, which is what [`ask`] needs to open the next one.
+pub struct Reached {
+    pub sessions: Vec<SessionInfo>,
+    /// Which of [`PROGRAMS`] answered. Worth keeping: every later command to
+    /// this machine should start at the rung that worked.
+    pub program: &'static str,
+}
+
+/// A stream to a machine whose `mm` has already been found, for the one
+/// request it is good for.
+///
+/// The ladder is not climbed again: a machine that answered on this rung a
+/// moment ago answers on it now, and a 127 here would be a machine that lost
+/// its `mm` between two requests, which is not a case to spend a round trip on.
+pub async fn ask<E: Exec>(exec: &E, program: &str) -> Result<Stream> {
+    let remote = exec.open(&format!("{program} agent")).await?;
+    Ok(Stream::from_halves(remote.reader, remote.writer))
+}
+
+/// Climb [`PROGRAMS`] until one of them answers the protocol.
+pub async fn reach<E: Exec>(exec: &E) -> Result<Reached> {
+    let mut complaint = String::new();
+
+    for program in PROGRAMS {
+        let remote = exec.open(&format!("{program} agent")).await?;
+        let mut watch = remote.watch;
+        let mut stream = Stream::from_halves(remote.reader, remote.writer);
+
+        match stream.request(&Request::List).await {
+            Ok(Response::Sessions(sessions)) => return Ok(Reached { sessions, program }),
+            Ok(Response::Error(said)) => bail!(said),
+            Ok(other) => bail!("expected a listing, got {other:?}"),
+            Err(failed) => {
+                // 127 is a shell saying it could not find the program, which is
+                // the one failure that means try the next spelling. Anything
+                // else is a machine that answered badly and must not be asked
+                // again a different way.
+                if watch.ended().await != Some(NOT_FOUND) {
+                    // Only when there is something to add: a far end that
+                    // failed silently would otherwise be reported as
+                    // `: the host closed the connection`, which reads as a
+                    // message with its first half missing.
+                    let said = watch.said();
+                    return Err(if said.is_empty() {
+                        failed
+                    } else {
+                        failed.context(said)
+                    });
+                }
+                // The `mm: command not found` behind this is the probe working.
+                // Held rather than printed: it is on the way to being the error
+                // for a machine with no `mm` at all, and noise on every command
+                // to a machine that simply keeps its copy at home.
+                complaint = watch.said();
+            }
+        }
+    }
+
+    bail!(
+        "no `mm` on it: tried {}{}",
+        PROGRAMS.join(" and "),
+        if complaint.is_empty() {
+            String::new()
+        } else {
+            format!(" ({complaint})")
+        }
+    )
+}
+
+/// Start a new session on a machine, and answer with what it ended up called.
+///
+/// The name back rather than the name asked for: a spawn has nobody to tell
+/// that a name is taken, so the node takes the next free counter and says
+/// which. Drawing the one that was asked for would put a row on the screen
+/// that nothing addresses.
+pub async fn start<E: Exec>(exec: &E, spec: SpawnSpec) -> Result<String> {
+    let reached = reach(exec).await?;
+    let mut stream = ask(exec, reached.program).await?;
+    match stream.request(&Request::Spawn(spec)).await? {
+        Response::Spawned { name } => Ok(name),
+        Response::Error(said) => bail!(said),
+        other => bail!("expected a new session, got {other:?}"),
+    }
+}
+
+/// The screen each named session has on it, without attaching to any of them.
+///
+/// Asked at the rung the caller already found, so this costs a channel rather
+/// than a ladder. The error a node too old to be asked answers with is passed
+/// straight back: the caller draws names without pictures rather than showing
+/// a failure, thumbnails being the decoration and the list being the thing.
+pub async fn peek<E: Exec>(exec: &E, program: &str, names: Vec<String>) -> Result<Vec<Peek>> {
+    let mut stream = ask(exec, program).await?;
+    match stream.request(&Request::Peek { names }).await? {
+        Response::Peeked(screens) => Ok(screens),
+        Response::Error(said) => bail!(said),
+        other => bail!("expected screens, got {other:?}"),
+    }
+}
+
+/// What a shell exits with for a command it could not find. The same constant
+/// the library keeps privately, and for the same reason: it is the only sign
+/// the far end gives that it has no `mm` on it.
+const NOT_FOUND: i32 = 127;
+
+impl Remote {
+    /// Take over a command built by the caller and run it as a child process,
+    /// for the tests and for nothing else.
+    ///
+    /// An app never takes this path: it has no processes to spawn, which is the
+    /// whole reason this module exists. It is here so that what the ladder
+    /// reads is a real shell's 127 rather than something's idea of one, which
+    /// is also why the caller builds the command: what the far end resolves
+    /// `mm` against is the thing under test.
+    pub async fn spawn(mut command: Command) -> Result<Self> {
+        let mut child = command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()?;
+
+        let reader = child.stdout.take().expect("stdout was piped");
+        let writer = child.stdin.take().expect("stdin was piped");
+        let mut said = child.stderr.take().expect("stderr was piped");
+
+        let (ending, watch) = Ending::new();
+        tokio::spawn(async move {
+            let mut buffer = Vec::new();
+            let _ = said.read_to_end(&mut buffer).await;
+            ending.said(&buffer);
+            ending.ended(child.wait().await.ok().and_then(|status| status.code()));
+        });
+
+        Ok(Self {
+            reader: Box::new(reader),
+            writer: Box::new(writer),
+            watch,
+        })
+    }
+}

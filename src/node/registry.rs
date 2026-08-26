@@ -10,7 +10,7 @@ use tracing::info;
 
 use super::session::{Session, default_name};
 use crate::lock::held;
-use crate::proto::{Doing, EventKind, SessionEvent, SessionInfo, SpawnSpec};
+use crate::proto::{Doing, EventKind, Peek, SessionEvent, SessionInfo, SpawnSpec};
 
 /// Events buffered per subscriber. A subscriber that falls this far behind is
 /// missing bells anyway, so it is dropped rather than allowed to hold memory.
@@ -117,6 +117,26 @@ impl Registry {
     pub fn doing(&self) -> Vec<Doing> {
         let sessions = self.all();
         sessions.iter().map(|session| session.doing()).collect()
+    }
+
+    /// The screen each of the named sessions is showing, or every one of them
+    /// when nothing is named.
+    ///
+    /// A name that matches nothing is skipped rather than refused: the caller
+    /// is working from a listing it asked for a moment ago, and a session that
+    /// has ended since is a tile that has gone, not a request that was wrong.
+    ///
+    /// The sessions are taken under the lock and asked outside it, the way
+    /// [`Self::doing`] is: a peek copies a screenful of text per session, and
+    /// holding the registry across all of them would block every list, spawn
+    /// and attach on the machine while it happened.
+    pub fn peek(&self, names: &[String]) -> Vec<Peek> {
+        let sessions = self.all();
+        sessions
+            .iter()
+            .filter(|session| names.is_empty() || names.contains(&session.name()))
+            .map(|session| session.peek())
+            .collect()
     }
 
     pub fn kill(&self, name: &str) -> Result<()> {

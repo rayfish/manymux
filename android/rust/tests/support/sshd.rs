@@ -1,0 +1,448 @@
+//! A real ssh server, in this process, for the tests to reach.
+//!
+//! `tests/remote.rs` in the crate above stands ssh in with a shell script,
+//! because what it is testing sits above the transport. Here the transport *is*
+//! what is under test, so nothing may stand in for it: the key exchange, the
+//! public-key auth, the channel and the exit status all have to be the real
+//! ones. russh ships the server half, so the far end is a genuine sshd without
+//! anything having to be installed or a port having to be opened.
+//!
+//! It listens on loopback, on a port the kernel picks.
+
+// Each test binary uses part of this, never all of it.
+#![allow(dead_code)]
+
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use russh::keys::{PrivateKey, PublicKey};
+use russh::server::{self, Auth, Handler, Msg, Server, Session};
+use russh::{Channel, ChannelId, Disconnect, MethodKind, MethodSet};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
+use tokio::process::{ChildStdin, Command};
+
+/// A server running on loopback, with a host key of the caller's choosing.
+///
+/// The key is the caller's because the point of half these tests is what
+/// happens when it changes.
+pub struct Sshd {
+    pub port: u16,
+    /// How many TCP connections have been accepted, which is the only place a
+    /// test can see the difference between a second channel and a second
+    /// handshake. They cost wildly different amounts on a phone and look
+    /// identical from above.
+    accepted: Arc<AtomicUsize>,
+    /// The key the far end let in, which is how a test asks *which* of the
+    /// keys a client had it actually offered.
+    admitted: Arc<Mutex<Option<PublicKey>>>,
+}
+
+impl Sshd {
+    /// How many separate ssh connections the client has made.
+    pub fn connections(&self) -> usize {
+        self.accepted.load(Ordering::Relaxed)
+    }
+
+    /// The key it let in, if a key was what let anybody in.
+    pub fn admitted(&self) -> Option<PublicKey> {
+        self.admitted.lock().unwrap().clone()
+    }
+}
+
+/// How long the machine keeps answering, and how it stops.
+#[derive(Clone, Copy)]
+pub struct Serving {
+    /// Connections after this many are accepted and never spoken to.
+    pub until: usize,
+    /// How many commands a connection serves before it is disconnected.
+    ///
+    /// Counted per connection rather than switched on, because a command
+    /// ending and a connection going are different machines and the client
+    /// tells them apart: a command that exits is a session that ended on a
+    /// machine still sitting there, and the connection is worth keeping, since
+    /// the next attach rides it and skips a handshake. Only the connection
+    /// going puts the client back to making one.
+    pub commands: usize,
+}
+
+impl Serving {
+    pub fn forever() -> Self {
+        Self {
+            until: usize::MAX,
+            commands: usize::MAX,
+        }
+    }
+
+    /// One connection that answers a listing and an attach and then goes, with
+    /// every connection after it accepted and never spoken to.
+    ///
+    /// The shape of a phone whose radio slept in the middle of a session: what
+    /// it was on is gone, and what it can reach now answers TCP and nothing
+    /// else.
+    pub fn going_mid_session() -> Self {
+        Self {
+            until: 1,
+            commands: 2,
+        }
+    }
+}
+
+/// What the far end does when this device tries to log in.
+#[derive(Clone, PartialEq, Eq)]
+pub enum Welcome {
+    /// Any key gets in. Which key it was is the client's business, and testing
+    /// sshd's authorisation would be testing sshd.
+    AnyKey,
+    /// None does, which is what an account nobody has pasted this device's
+    /// public half into looks like from here. It is the ordinary state of
+    /// every machine the first time a phone is pointed at it, so it is worth a
+    /// server of its own rather than being read off a connection that ended.
+    NoKey,
+    /// Nothing is said either way: the connection goes while the question is
+    /// out. A radio that slept between the key exchange and the answer, which
+    /// on a phone is the ordinary way for one to end.
+    Gone,
+    /// The far end already knows who this is and asks for nothing: it offers
+    /// the `none` method alone and admits the session on it. A mesh that
+    /// identifies its peers by the link they arrived over works this way, and
+    /// a machine reached through one is what the phone actually meets.
+    Unasked,
+    /// The same machine, saying no. It knows who this is and does not want it,
+    /// so there is no key it would have taken and nothing to paste anywhere.
+    Unwanted,
+    /// This key and no other, which is what a real `authorized_keys` is. It is
+    /// here because a test about *which* key a client offered cannot be
+    /// written against a machine that takes any of them.
+    OnlyThis(Box<PublicKey>),
+}
+
+impl Welcome {
+    /// What the far end says it will take. A mesh has proven who this is
+    /// before the ssh starts, so `none` is the whole of it and offering a key
+    /// method would be inviting an answer it has no use for.
+    fn methods(&self) -> MethodSet {
+        match self {
+            Self::Unasked | Self::Unwanted => MethodSet::from(&[MethodKind::None][..]),
+            _ => MethodSet::server_supported(),
+        }
+    }
+}
+
+impl Sshd {
+    /// Start one, serving commands in `root` with `extra` in their environment.
+    pub async fn listening(root: &Path, key: PrivateKey, extra: &[(&str, String)]) -> Self {
+        Self::listening_until(root, key, extra, Serving::forever()).await
+    }
+
+    /// One that takes no key at all, however good the connection to it is.
+    pub async fn refusing(root: &Path, key: PrivateKey) -> Self {
+        Self::serving(root, key, &[], Serving::forever(), Welcome::NoKey).await
+    }
+
+    /// One that goes while the key is being offered, having said nothing about
+    /// it. The key exchange has already happened, so this is past everything
+    /// `connect` answers for and lands in the middle of the auth.
+    pub async fn going_mid_auth(root: &Path, key: PrivateKey) -> Self {
+        Self::serving(root, key, &[], Serving::forever(), Welcome::Gone).await
+    }
+
+    /// One that knows who this is already and asks for nothing.
+    pub async fn unasking(root: &Path, key: PrivateKey) -> Self {
+        Self::serving(root, key, &[], Serving::forever(), Welcome::Unasked).await
+    }
+
+    /// The same, refusing this device outright.
+    pub async fn unwanting(root: &Path, key: PrivateKey) -> Self {
+        Self::serving(root, key, &[], Serving::forever(), Welcome::Unwanted).await
+    }
+
+    /// One with an `authorized_keys` of exactly one line.
+    pub async fn taking(root: &Path, key: PrivateKey, allowed: &PublicKey) -> Self {
+        let welcome = Welcome::OnlyThis(Box::new(allowed.clone()));
+        Self::serving(root, key, &[], Serving::forever(), welcome).await
+    }
+
+    /// The same, but the connections after `serving.until` are accepted and
+    /// never spoken to.
+    ///
+    /// A TCP that connects to something which never sends a banner is what a
+    /// captive portal, a middlebox or a wedged sshd looks like from here, and
+    /// it is the shape a client with no deadline on its attempt hangs on
+    /// forever.
+    pub async fn listening_until(
+        root: &Path,
+        key: PrivateKey,
+        extra: &[(&str, String)],
+        serving: Serving,
+    ) -> Self {
+        Self::serving(root, key, extra, serving, Welcome::AnyKey).await
+    }
+
+    async fn serving(
+        root: &Path,
+        key: PrivateKey,
+        extra: &[(&str, String)],
+        serving: Serving,
+        welcome: Welcome,
+    ) -> Self {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let config = Arc::new(server::Config {
+            keys: vec![key],
+            methods: welcome.methods(),
+            // A real server sits on a rejection to slow somebody guessing.
+            // There is nobody guessing here and every test pays it.
+            auth_rejection_time: Duration::ZERO,
+            ..Default::default()
+        });
+        let root = root.to_path_buf();
+        let extra: Vec<(String, String)> = extra
+            .iter()
+            .map(|(name, value)| ((*name).to_string(), value.clone()))
+            .collect();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let counting = Arc::clone(&accepted);
+        let admitted = Arc::new(Mutex::new(None));
+        let noting = Arc::clone(&admitted);
+        tokio::spawn(async move {
+            let mut machine = Machine {
+                root,
+                extra,
+                commands: serving.commands,
+                welcome,
+                admitted: noting,
+            };
+            let mut taken = 0usize;
+            while let Ok((socket, from)) = listener.accept().await {
+                taken += 1;
+                counting.store(taken, Ordering::Relaxed);
+                if taken > serving.until {
+                    // Held open and never spoken to. Dropping it would be a
+                    // refusal, which is a different thing entirely: a refusal
+                    // fails at once and this is what never finishes.
+                    tokio::spawn(async move {
+                        let _holding = socket;
+                        std::future::pending::<()>().await;
+                    });
+                    continue;
+                }
+                let handler = machine.new_client(Some(from));
+                let config = Arc::clone(&config);
+                tokio::spawn(async move {
+                    if let Ok(session) = server::run_stream(config, socket, handler).await {
+                        let _ = session.await;
+                    }
+                });
+            }
+        });
+
+        Self {
+            port,
+            accepted,
+            admitted,
+        }
+    }
+}
+
+/// The far end: a home directory and a PATH, and a shell to run commands with.
+struct Machine {
+    root: PathBuf,
+    /// How many commands each connection serves before it is disconnected.
+    commands: usize,
+    /// What the tests need in the environment of whatever is run. The far end
+    /// of an ssh is reached through a shell, so there is nowhere else to put
+    /// it, and setting it in this process would leak into every test running
+    /// beside this one.
+    extra: Vec<(String, String)>,
+    welcome: Welcome,
+    admitted: Arc<Mutex<Option<PublicKey>>>,
+}
+
+impl Server for Machine {
+    type Handler = Shell;
+
+    fn new_client(&mut self, _: Option<std::net::SocketAddr>) -> Shell {
+        Shell {
+            root: self.root.clone(),
+            extra: self.extra.clone(),
+            commands: self.commands,
+            welcome: self.welcome.clone(),
+            admitted: Arc::clone(&self.admitted),
+            served: 0,
+            stdin: None,
+        }
+    }
+}
+
+/// One connection's worth of shell.
+struct Shell {
+    root: PathBuf,
+    extra: Vec<(String, String)>,
+    commands: usize,
+    welcome: Welcome,
+    admitted: Arc<Mutex<Option<PublicKey>>>,
+    /// How many commands this connection has been asked for.
+    served: usize,
+    /// Held so that what the client writes reaches the command's stdin, which
+    /// is the whole protocol once a rung has answered.
+    stdin: Option<ChildStdin>,
+}
+
+impl Handler for Shell {
+    type Error = russh::Error;
+
+    /// Whatever this machine was started to say. Which key it was is the
+    /// client's business, and testing sshd's authorisation would be testing
+    /// sshd.
+    async fn auth_publickey(&mut self, _: &str, offered: &PublicKey) -> Result<Auth, Self::Error> {
+        match &self.welcome {
+            Welcome::AnyKey => {
+                *self.admitted.lock().unwrap() = Some(offered.clone());
+                Ok(Auth::Accept)
+            }
+            // On the key and not on the whole line: an `authorized_keys` entry
+            // carries a comment, what arrives over the wire does not, and a
+            // machine that matched the two would take nobody's key at all.
+            Welcome::OnlyThis(allowed) if allowed.key_data() == offered.key_data() => {
+                *self.admitted.lock().unwrap() = Some(offered.clone());
+                Ok(Auth::Accept)
+            }
+            // The session ends here rather than answering. From the client that
+            // is indistinguishable from the connection going, which is the
+            // point: both leave it holding a question nobody replied to.
+            Welcome::Gone => Err(russh::Error::Disconnect),
+            // A machine that asks for nothing is not asked for this either,
+            // and one that answered a key it never offered to take would be a
+            // machine no client has to deal with.
+            _ => Ok(Auth::Reject {
+                proceed_with_methods: None,
+                partial_success: false,
+            }),
+        }
+    }
+
+    /// The method a mesh admits on, its peers being known before the ssh
+    /// starts. Everything else refuses it, which is what a stock sshd does and
+    /// what makes the client go on and offer the key.
+    async fn auth_none(&mut self, _: &str) -> Result<Auth, Self::Error> {
+        match &self.welcome {
+            Welcome::Unasked => Ok(Auth::Accept),
+            _ => Ok(Auth::Reject {
+                proceed_with_methods: None,
+                partial_success: false,
+            }),
+        }
+    }
+
+    async fn channel_open_session(
+        &mut self,
+        _: Channel<Msg>,
+        reply: server::ChannelOpenHandle,
+        _: &mut Session,
+    ) -> Result<(), Self::Error> {
+        reply.accept().await;
+        Ok(())
+    }
+
+    async fn data(
+        &mut self,
+        _: ChannelId,
+        data: &[u8],
+        _: &mut Session,
+    ) -> Result<(), Self::Error> {
+        if let Some(stdin) = self.stdin.as_mut() {
+            let _ = stdin.write_all(data).await;
+            let _ = stdin.flush().await;
+        }
+        Ok(())
+    }
+
+    async fn exec_request(
+        &mut self,
+        channel: ChannelId,
+        command: &[u8],
+        session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        let command = String::from_utf8_lossy(command).to_string();
+        let mut child = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(&command)
+            .env("PATH", self.root.join("bin"))
+            .env("HOME", self.root.join("home"))
+            .envs(
+                self.extra
+                    .iter()
+                    .map(|(name, value)| (name.as_str(), value.as_str())),
+            )
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+
+        self.stdin = child.stdin.take();
+        let mut out = child.stdout.take().unwrap();
+        let mut err = child.stderr.take().unwrap();
+        let handle = session.handle();
+        self.served += 1;
+        let going = self.served >= self.commands;
+
+        session.channel_success(channel)?;
+
+        tokio::spawn(async move {
+            let complaining = {
+                let handle = handle.clone();
+                tokio::spawn(async move {
+                    let mut buffer = [0u8; 4096];
+                    while let Ok(read) = err.read(&mut buffer).await {
+                        if read == 0 {
+                            break;
+                        }
+                        let _ = handle
+                            .extended_data(channel, 1, buffer[..read].to_vec())
+                            .await;
+                    }
+                })
+            };
+
+            let mut buffer = [0u8; 4096];
+            while let Ok(read) = out.read(&mut buffer).await {
+                if read == 0 {
+                    break;
+                }
+                if handle.data(channel, buffer[..read].to_vec()).await.is_err() {
+                    break;
+                }
+            }
+            let _ = complaining.await;
+
+            let status = child.wait().await.ok().and_then(|status| status.code());
+            // The eof goes out first and the status after it, which is legal and
+            // is the ordering that tells a careful client from a lucky one: a
+            // client that stops reading the channel when the output ends never
+            // sees the status, and 127 is the only sign a machine has no `mm`
+            // on it. sshd is entitled to this order, so the tests use it.
+            let _ = handle.eof(channel).await;
+            if let Some(status) = status {
+                let _ = handle.exit_status_request(channel, status as u32).await;
+            }
+            let _ = handle.close(channel).await;
+            // A machine that went, rather than a command that finished. The
+            // client keeps the connection across the second and only the first
+            // puts it back to making one.
+            if going {
+                let _ = handle
+                    .disconnect(Disconnect::ByApplication, String::new(), String::new())
+                    .await;
+            }
+        });
+
+        Ok(())
+    }
+}

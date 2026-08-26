@@ -1,0 +1,5 @@
+# Gradle's own, plus the SDK path, which is this machine's business.
+.gradle/
+build/
+app/build/
+local.properties

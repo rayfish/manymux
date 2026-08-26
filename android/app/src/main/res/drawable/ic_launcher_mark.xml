@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The same mark on its own ground, for launchers older than adaptive icons. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path
+        android:pathData="M12,0 h84 a12,12 0 0 1 12,12 v84 a12,12 0 0 1 -12,12 h-84 a12,12 0 0 1 -12,-12 v-84 a12,12 0 0 1 12,-12 z"
+        android:fillColor="@color/ground" />
+    <path
+        android:pathData="M34,36 L54,54 L34,72"
+        android:strokeColor="@color/accent"
+        android:strokeWidth="10"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round" />
+    <path
+        android:pathData="M64,40 h14 v28 h-14 z"
+        android:fillColor="@color/text" />
+</vector>

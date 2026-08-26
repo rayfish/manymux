@@ -146,3 +146,76 @@ jobs:
 
       - name: Build
         run: cargo build --release --locked --target ${{ matrix.target }}
+
+  # The Android shim, which is deliberately outside the workspace above and so
+  # is reached by none of those jobs. It is the client core plus an ssh
+  # connection made in the process and a screen emulated on this side of the
+  # wire, and it has 2000 lines of Rust and tests of its own.
+  #
+  # Host target only. The cross build is the `aarch64-linux-android` job above
+  # for the crate this one links, and the shim's own cross build wants an NDK
+  # clang rather than only a linker, since russh compiles C.
+  android:
+    name: android shim
+    runs-on: ubuntu-22.04
+    defaults:
+      run:
+        working-directory: android/rust
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal --component clippy,rustfmt
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: android/rust
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+
+      - name: Format
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      # The ssh tests stand a real server up in the process, so the transport,
+      # the key exchange and the exit status are the real ones without an sshd
+      # on the runner.
+      - name: Test
+        run: cargo test --locked
+
+  # The app, which nothing above compiles: the job beside this one builds the
+  # Rust shim and stops at the boundary, leaving the Kotlin that calls it
+  # checked by nobody. `assembleDebug` runs `build-rust.sh` first, so this
+  # covers the generated bindings agreeing with the library as well.
+  app:
+    name: android app
+    runs-on: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup target add aarch64-linux-android x86_64-linux-android
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: android/rust
+          shared-key: "android-app"
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+
+      - name: Build the APK
+        working-directory: android
+        run: ANDROID_NDK_HOME="$ANDROID_NDK_LATEST_HOME" ./gradlew --no-daemon assembleDebug

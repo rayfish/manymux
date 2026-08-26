@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  The terminal's own palette, taken out of `Palette.kt` so the chrome and the
+  session are one product. They were two: the screens around the terminal were
+  stock system widgets in whatever theme the phone was set to, and on a phone
+  set to light they did not look like the same application.
+-->
+<resources>
+    <!-- What the terminal paints on when the session asked for nothing. -->
+    <color name="ground">#FF16181A</color>
+    <!-- The bar above a session, and anything else that sits on the ground. -->
+    <color name="panel">#FF22252A</color>
+    <color name="raised">#FF1D2023</color>
+    <color name="line">#FF2C3036</color>
+
+    <color name="text">#FFD8D8D8</color>
+    <color name="dim">#FF8A9198</color>
+    <color name="hint">#FF6C7379</color>
+
+    <!-- The bright green of the 16, which is what the mark row draws a live
+         session with. Everything that means "this one" or "go" is this. -->
+    <color name="accent">#FF77DD77</color>
+    <color name="warn">#FFFFDD77</color>
+</resources>

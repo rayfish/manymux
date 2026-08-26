@@ -1041,7 +1041,7 @@ async fn pump(
                     }
                     Some(Action::Find(found)) => {
                         let view = scrolling
-                            .get_or_insert_with(|| Scrollback::new(terminal_size()));
+                            .get_or_insert_with(|| Scrollback::new(session_size()));
                         match found {
                             Find::Open | Find::Typed => {
                                 status.set_prompt(keys.needle());
@@ -1074,7 +1074,7 @@ async fn pump(
                     }
                     Some(Action::Scroll(motion)) => {
                         let view = scrolling
-                            .get_or_insert_with(|| Scrollback::new(terminal_size()));
+                            .get_or_insert_with(|| Scrollback::new(session_size()));
                         match motion {
                             Scroll::Up(lines) => view.up(lines),
                             Scroll::Down(lines) => view.down(lines),
@@ -1137,7 +1137,7 @@ async fn pump(
                     }
                     Some(Action::Select(what)) => {
                         let view = scrolling
-                            .get_or_insert_with(|| Scrollback::new(terminal_size()));
+                            .get_or_insert_with(|| Scrollback::new(session_size()));
                         match what {
                             Select::From(at) => view.select_from(at),
                             Select::To(at) => view.select_to(at),
@@ -1634,6 +1634,11 @@ async fn pump(
                 // does not hold the writing half to answer with.
                 Update::Ping => writer.pong().await?,
                 Update::Exited(code) => return Ok(Outcome::Exited(code)),
+                // Nothing to do here. This client's screen is the terminal's,
+                // which is whatever size the terminal is, and the node clips
+                // what it paints to the size it took. It is a client keeping a
+                // screen of its own that has to hear this.
+                Update::Resized(_) => {}
                 Update::Disconnected => return Ok(Outcome::Disconnected),
             },
             _ = winch.recv() => {
@@ -1650,7 +1655,7 @@ async fn pump(
                 // would be painted over it and then be gone when the view
                 // closes onto an erased screen anyway.
                 if let Some(view) = scrolling.as_mut() {
-                    view.resize(size);
+                    view.resize(status::session_size(size));
                     let wanted = view.wanted();
                     let painted = view.paint();
                     if let Some(request) = wanted {
@@ -1917,7 +1922,8 @@ async fn paste(
                 Update::History(_)
                 | Update::View(_)
                 | Update::Found(_)
-                | Update::Renamed(_) => {}
+                | Update::Renamed(_)
+                | Update::Resized(_) => {}
                 Update::Exited(code) => return Ok(Pasted::Ended(Outcome::Exited(code))),
                 Update::Disconnected => return Ok(Pasted::Ended(Outcome::Disconnected)),
             },
