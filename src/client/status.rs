@@ -276,6 +276,22 @@ impl Status {
         self.mode
     }
 
+    /// Whether the client is showing something of its own, rather than the
+    /// session as it stands.
+    ///
+    /// Which is what says where the terminal's own cursor belongs. That cursor
+    /// is the session's and sits wherever the session left it: under a box or a
+    /// view it blinks on a row that has nothing to do with what is being shown,
+    /// and at a prompt it says the typing is going somewhere it is not. So the
+    /// caller takes it away for as long as this is true.
+    ///
+    /// A window too small for a box ([`Popped::Cramped`]) is not this: the
+    /// session's screen is whole there, on every row but the mark, and the
+    /// cursor on it is still the session's own.
+    pub fn showing_its_own(&self) -> bool {
+        matches!(self.popped, Popped::Drawn) || self.scrolled.is_some() || self.prompt.is_some()
+    }
+
     /// Sent once, after the alternate screen is up: name the window, fence the
     /// session into the rows above the mark, and draw it.
     pub fn setup(&self, size: Size) -> String {
@@ -913,6 +929,30 @@ mod tests {
 
     fn through(filter: &mut Filter, input: &str) -> String {
         String::from_utf8(filter.feed(input.as_bytes())).unwrap()
+    }
+
+    /// The terminal's own cursor is the session's for as long as the session is
+    /// what is on the screen. A row too small for a box is still that: the
+    /// screen under it is the session's, whole.
+    #[test]
+    fn the_cursor_is_the_sessions_until_the_client_shows_something_of_its_own() {
+        let mut status = Status::new("host/name");
+        assert!(!status.showing_its_own(), "nothing is up");
+        status.set_popup(Popped::Cramped("sessions: name".to_string()));
+        assert!(!status.showing_its_own(), "a row is not a screen");
+        status.set_popup(Popped::Drawn);
+        assert!(status.showing_its_own(), "a box is");
+        status.set_popup(Popped::None);
+        status.set_scrolled(Some(40));
+        assert!(status.showing_its_own(), "and so is the view");
+        status.set_scrolled(None);
+        status.set_renaming(Some("na".to_string()));
+        assert!(status.showing_its_own(), "and a prompt being typed into");
+        status.set_renaming(None);
+        assert!(
+            !status.showing_its_own(),
+            "and then it is the session's again"
+        );
     }
 
     /// The row is the only thing on the screen that changes while a connection

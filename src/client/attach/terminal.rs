@@ -132,6 +132,20 @@ const REGROWN: &str = concat!(
     "\x1b[H",  // and home again, where the dump starts printing
 );
 
+/// The terminal's own cursor, taken away for as long as the client is showing
+/// something of its own and given back with the session's screen.
+///
+/// Which of the two is wanted is [`Status::showing_its_own`], and it is settled
+/// once a pass round the loop rather than at each of the ways in and out: most
+/// of them are not keys at all, and a box that came down because a window was
+/// resized under it has the same cursor to give back as one somebody pressed
+/// Esc on. Given back by hand, because `avt`'s dump says `?25l` for a session
+/// that hid its own cursor and says nothing at all for one that did not: a
+/// screen asked for after this would otherwise leave a shell with an invisible
+/// cursor.
+const HIDDEN: &str = "\x1b[?25l";
+const SHOWN: &str = "\x1b[?25h";
+
 /// Everything [`undone`] undoes, the title given back, and the screen left
 /// however the mode leaves it. A detach, in other words, where a hop stops
 /// at [`takeover`].
@@ -765,8 +779,17 @@ async fn pump(
     // written, and the rule for which of them get one.
     let mut pending = String::new();
     let bells = Bells::new(naming.host);
+    // Whether the terminal's own cursor is currently taken away. See [`HIDDEN`].
+    let mut hidden = false;
 
     loop {
+        if status.showing_its_own() != hidden {
+            hidden = !hidden;
+            stdout
+                .write_all(if hidden { HIDDEN } else { SHOWN }.as_bytes())
+                .await?;
+            stdout.flush().await?;
+        }
         tokio::select! {
             typed = keyboard.recv() => {
                 let Some(typed) = typed else {
