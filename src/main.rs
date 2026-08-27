@@ -2445,12 +2445,20 @@ impl Snapshot {
 #[derive(Clone, Default)]
 struct Listed {
     rows: Rows,
-    /// One per session row, in the same order.
+    /// What each session row's id means, looked up by that id.
+    ///
+    /// [`CURRENT`] first and then the rest in row order, rather than one per
+    /// row in the same order: the session the run is in has to wear the same id
+    /// in every listing, and it is here even when this listing has never heard
+    /// of it.
     at: Vec<Located>,
     /// One per group row. The first is `None`, which is "everything" when you
     /// are narrowing and "no group" when you are moving a session.
     groups: Vec<Option<String>>,
 }
+
+/// The id the session the run is in wears in every listing. See [`Listed::of`].
+const CURRENT: usize = 0;
 
 impl Listed {
     /// A tree two deep: a heading per machine, the groups on that machine under
@@ -2472,7 +2480,14 @@ impl Listed {
     /// with no cycle of its own can build these while an attach is up.
     fn of(snapshot: &Snapshot, groups: &Groups, focus: Option<&str>, current: &Located) -> Self {
         let mut rows = Vec::new();
-        let mut at = Vec::new();
+        // The session the run is in is [`CURRENT`] in every listing, whether or
+        // not this one has heard of it yet. An id is an index into this, so it
+        // moves the moment a machine appears or a session ends, and the popup
+        // keeps its cursor across a listing that lands under it *by id*
+        // (`Picker::replace`): unpinned, the one row that must never slide out
+        // from under the cursor was the one that did, a fuller listing arriving
+        // half a second after the box opened and taking the cursor with it.
+        let mut at = vec![current.clone()];
         // Every session that is going to be drawn, each beside the group it is
         // in, still in the order the listing arrived: by machine, then oldest
         // first. Which makes each machine's sessions a run, and the run is what
@@ -2532,11 +2547,40 @@ impl Listed {
             }
             Self::session(&mut rows, &mut at, hosted, current, 1);
         }
-        let landed = current.clone();
-        let on = at.iter().position(|there| *there == landed).unwrap_or(0);
+        // The cursor opens on the session you are looking out from, always.
+        // Where there is no row for it there is one made: a fan-out gets
+        // `LISTING_WAIT` and no more, so on a fleet slower than that the box
+        // opens on whatever landed first, and a machine that has not answered
+        // says nothing about the session the run is in. Opening on the first
+        // row instead put the cursor on a stranger's session with Enter as the
+        // next key, which is the same failure `as_listed` was written for.
+        //
+        // A machine that *did* answer and did not mention it is the other
+        // thing: the session has ended or been renamed, so there is nothing to
+        // point at and the first row is all there is.
+        let listed_here = rows.iter().any(|row| !row.heading && row.id == CURRENT);
+        if !listed_here
+            && !snapshot
+                .answered
+                .iter()
+                .any(|host| same_machine(host, &current.host))
+        {
+            // Under the machine it is on, in the shape the rest of the list
+            // uses: a heading, and the session a step in from it.
+            let deep = u16::from(focus.is_some());
+            rows.push(Row::heading(&current.host).indent(deep));
+            rows.push(
+                Row::new(CURRENT, &current.session)
+                    // The mark every listing puts on the session you are in.
+                    // What it is doing is the machine's to say, and it has not
+                    // said anything yet.
+                    .note("●")
+                    .indent(deep + 1),
+            );
+        }
         let highlight = rows
             .iter()
-            .position(|row| !row.heading && row.id == on)
+            .position(|row| !row.heading && row.id == CURRENT)
             .unwrap_or(0);
 
         // The first row is "everything" or "no group" depending on which verb
@@ -2574,9 +2618,10 @@ impl Listed {
 
     /// One session row, and the address that goes with it.
     ///
-    /// The two are pushed together and never apart: the row's id is its index
-    /// in `at`, which is how the popup can hand back a row without ever being
-    /// told what a machine is.
+    /// The two go in together and never apart: the row's id is where the
+    /// address sits in `at`, which is how the popup can hand back a row without
+    /// ever being told what a machine is. The session the run is in is the one
+    /// whose address is already there, under [`CURRENT`].
     fn session(
         rows: &mut Vec<Row>,
         at: &mut Vec<Located>,
@@ -2595,12 +2640,14 @@ impl Listed {
         rows.push(
             // The name alone: whatever heading gathered it, machine included,
             // is a line above it.
-            Row::new(at.len(), &hosted.session.name)
+            Row::new(if here { CURRENT } else { at.len() }, &hosted.session.name)
                 .detail(&hosted.session.title)
                 .note(note)
                 .indent(indent),
         );
-        at.push(Located::new(&hosted.host, &hosted.session.name));
+        if !here {
+            at.push(Located::new(&hosted.host, &hosted.session.name));
+        }
     }
 }
 
@@ -2808,6 +2855,83 @@ mod tests {
         // And the same row is the one wearing the mark, since both are the same
         // comparison and a highlight without one reads as a listing gone stale.
         assert_eq!(row.note, "●");
+    }
+
+    fn hosted_on(host: &str, name: &str) -> HostedSession {
+        HostedSession {
+            host: host.to_string(),
+            ..hosted(name)
+        }
+    }
+
+    /// A fan-out gets half a second and no more, so on a fleet slower than that
+    /// the box opens on whatever landed first, which is not necessarily the
+    /// machine you are sitting on. The cursor still opens on the session you
+    /// are in: without a row for it, it opened on a stranger's session with
+    /// Enter as the next key.
+    #[test]
+    fn the_popup_opens_on_the_session_the_run_is_in_before_its_machine_has_answered() {
+        let snapshot = Snapshot {
+            sessions: vec![hosted_on("gpu-box", "build")],
+            answered: vec!["gpu-box".to_string()],
+        };
+        let current = Located::new(as_listed(LOCAL), "test");
+        let listed = Listed::of(&snapshot, &Groups::default(), None, &current);
+        let row = &listed.rows.sessions[listed.rows.at];
+        assert_eq!(row.label, "test");
+        assert_eq!(row.note, "●");
+        // And Enter on it goes to the session the run is in, rather than to
+        // whichever session that row id happened to name.
+        assert_eq!(listed.at[row.id], current);
+    }
+
+    /// A fuller listing arriving under an open box must not take the cursor
+    /// with it: an id is an index, and a machine appearing shifts every one of
+    /// them, so the row the cursor was on named a different session a moment
+    /// later. The session the run is in wears the same id in both listings.
+    #[test]
+    fn a_listing_landing_under_the_box_keeps_the_cursor_where_the_run_is() {
+        let current = Located::new(as_listed(LOCAL), "test");
+        let partial = Snapshot {
+            sessions: vec![hosted_on("gpu-box", "build")],
+            answered: vec!["gpu-box".to_string()],
+        };
+        let first = Listed::of(&partial, &Groups::default(), None, &current);
+        let mut popup = manymux::client::picker::Picker::new(
+            "sessions",
+            "⏎ go",
+            first.rows.sessions.clone(),
+            first.rows.at,
+        );
+        let full = Snapshot {
+            sessions: vec![hosted_on("gpu-box", "build"), hosted("api"), hosted("test")],
+            answered: vec!["gpu-box".to_string(), this_machine().to_string()],
+        };
+        let then = Listed::of(&full, &Groups::default(), None, &current);
+        popup.replace(then.rows.sessions.clone(), then.rows.at);
+        let row = popup.chosen().expect("a row to be under the cursor");
+        assert_eq!(row.label, "test");
+        assert_eq!(then.at[row.id], current);
+    }
+
+    /// A machine that answered and did not mention it is a session that has
+    /// ended or been renamed, and a row for it would be a row Enter cannot
+    /// land on.
+    #[test]
+    fn a_session_the_machine_no_longer_has_gets_no_row_of_its_own() {
+        let snapshot = Snapshot {
+            sessions: vec![hosted("build")],
+            answered: vec![this_machine().to_string()],
+        };
+        let current = Located::new(as_listed(LOCAL), "gone");
+        let listed = Listed::of(&snapshot, &Groups::default(), None, &current);
+        let landable = listed
+            .rows
+            .sessions
+            .iter()
+            .filter(|row| !row.heading)
+            .count();
+        assert_eq!(landable, 1, "a session that has ended got a row");
     }
 
     /// The first attach of a run is a command somebody typed: a cold ssh, a
