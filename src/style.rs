@@ -22,6 +22,15 @@ fn enabled() -> bool {
     })
 }
 
+/// Whether anything written will be coloured at all.
+///
+/// For a drawing with more than one way of saying the same thing: the popup's
+/// cursor is a band where there are colours to sit it on, and reverse video
+/// where there are none.
+pub fn coloured() -> bool {
+    enabled()
+}
+
 fn paint(code: &str, text: &str) -> String {
     if enabled() {
         format!("\x1b[{code}m{text}\x1b[0m")

@@ -14,6 +14,16 @@
 //! table that also knew how many rows there were would be a key table that had
 //! to be told about listings.
 //!
+//! The cursor is a band and a mark rather than reverse video: a row is pointed
+//! at, not repainted, so the name stays the brightest thing on it and the detail
+//! stays the quieter one, which is how every other row in the box is read. The
+//! ground is [`super::pen::BAND`], the one a selection in the history view sits
+//! on, since both are one gesture saying "this one". Reverse video is what is
+//! left where there is no palette to sit a band on, and it is why the mark is a
+//! glyph as well as a colour. What the caller owes on the way up is the
+//! terminal's own cursor: it is the session's, it sits wherever the session left
+//! it, and under a box it blinks on a row that has nothing to do with this one.
+//!
 //! [`Row::id`] is opaque here on purpose. The caller hands rows in and gets an
 //! id back, so this never learns what a host is, and a listing that lands while
 //! the popup is up can be swapped in with [`Picker::replace`] without the
@@ -46,6 +56,25 @@ const STEP: u16 = 2;
 /// right. What is left over after the name column is the detail's.
 const GAPS: u16 = 6;
 const NOTE: u16 = 6;
+
+/// The mark on the row the cursor is on, in the first of the two columns every
+/// row starts with. A glyph as well as a colour, so the cursor is still a mark
+/// on a screen that is showing none.
+const POINT: char = '▌';
+
+/// What the two halves of the pointed-at row are drawn in, over the band.
+///
+/// Bright enough to read on it, and still one brighter than the other: a cursor
+/// marks a row, it does not repaint it.
+const NAME: &str = "1;38;5;255";
+const REST: &str = "22;38;5;250";
+
+/// The ground that row sits on: [`super::pen::BAND`], which is what a selection
+/// in the history view sits on. The two gestures say the same thing, "this
+/// one", and saying it two ways would be two vocabularies for one idea.
+fn ground() -> String {
+    format!("48;5;{}", super::pen::BAND)
+}
 
 /// What the name column is allowed to shrink and grow to.
 ///
@@ -301,8 +330,12 @@ impl Picker {
             return String::new();
         };
         let mut out = String::from("\x1b7");
-        let width = shape.inner;
-        let label_width = self.label_width(width);
+        let layout = Layout {
+            width: shape.inner,
+            label: self.label_width(shape.inner),
+            colour: style::coloured(),
+        };
+        let width = layout.width;
         let height = u16::try_from(shape.visible).unwrap_or(u16::MAX) + FURNITURE;
         out.push_str(&self.cleared(&shape, height));
         self.drawn = Some((shape.row, height));
@@ -327,7 +360,7 @@ impl Picker {
                 // A short list still gets the box it asked for, so the frame
                 // does not jump as rows come and go under a listing.
                 None => style::faint(&" ".repeat(usize::from(width))),
-                Some(row) => self.paint(row, width, label_width, index == self.at),
+                Some(row) => self.paint(row, layout, index == self.at),
             };
             put(
                 line,
@@ -372,12 +405,6 @@ impl Picker {
             .collect()
     }
 
-    /// One row, exactly `width` columns wide.
-    ///
-    /// Every column is fixed before anything is written, because a row that
-    /// sizes itself to its contents is a box with a ragged edge, and the edge is
-    /// the only thing telling you where the popup stops and the session behind
-    /// it starts.
     /// How wide the name column is for this list. See [`MIN_LABEL`].
     fn label_width(&self, width: u16) -> u16 {
         let widest = self
@@ -392,37 +419,56 @@ impl Picker {
             .min(width.saturating_sub(GAPS + NOTE))
     }
 
-    fn paint(&self, row: &Row, width: u16, label_width: u16, here: bool) -> String {
+    /// One row, exactly `layout.width` columns wide.
+    ///
+    /// Every column is fixed before anything is written, because a row that
+    /// sizes itself to its contents is a box with a ragged edge, and the edge is
+    /// the only thing telling you where the popup stops and the session behind
+    /// it starts. Which holds for the row under the cursor too, whichever of
+    /// its two spellings it is drawn in: [`POINT`] takes one of the two columns
+    /// a row starts with rather than being put in front of them.
+    fn paint(&self, row: &Row, layout: Layout, here: bool) -> String {
         // The tree, and the whole of it: a row says where it sits by how far in
         // it starts, and nothing else in the box draws the shape.
         let inset = " ".repeat(usize::from(row.indent * STEP));
         if row.heading {
-            let label = fit(&format!("{inset}{}", row.label), width - 2);
+            let label = fit(&format!("{inset}{}", row.label), layout.width - 2);
             return format!("  {}", style::host(&label));
         }
 
         // The note is pinned to the right. The detail gives way first and the
         // label is clipped last: which session it is matters more than what it
         // is doing.
-        let detail_width = width.saturating_sub(GAPS + NOTE + label_width);
+        let detail_width = layout.width.saturating_sub(GAPS + NOTE + layout.label);
         // Inside the label's column rather than in front of it, so the detail
         // and the note stay in line down the box however deep the row is.
-        let label = fit(&format!("{inset}{}", row.label), label_width);
+        let label = fit(&format!("{inset}{}", row.label), layout.label);
         let detail = fit(&row.detail, detail_width);
         let note = right(&row.note, NOTE);
 
-        if here {
-            // Reverse video rather than a colour, so the highlight survives a
-            // terminal whose palette makes any one colour unreadable.
-            format!("\x1b[7m  {label} {detail}  {note} \x1b[27m")
-        } else {
-            format!(
+        if !here {
+            return format!(
                 "  {} {}  {} ",
                 style::bold(&label),
                 style::faint(&detail),
                 style::faint(&note)
-            )
+            );
         }
+        if !layout.colour {
+            // Reverse video, which is the one way of pointing at a row that
+            // needs no palette at all: `NO_COLOR`, and anything that is not a
+            // terminal, both land here.
+            return format!("\x1b[7m  {label} {detail}  {note} \x1b[27m");
+        }
+        // The band, and the row lifted onto it rather than repainted: the name
+        // is still the brightest thing on the line and the detail is still the
+        // quieter one, which is the hierarchy every other row is drawn with and
+        // the one thing reverse video threw away. One run of SGR per column and
+        // no reset until the end, since a reset would take the ground with it.
+        format!(
+            "\x1b[0;{ground}m\x1b[{NAME}m{POINT} {label} \x1b[{REST}m{detail}  {note} \x1b[0m",
+            ground = ground(),
+        )
     }
 
     /// Where the box goes and how much of the list fits, or none when the
@@ -456,6 +502,20 @@ impl Picker {
             visible,
         })
     }
+}
+
+/// The measurements every row of one drawing shares.
+///
+/// Worked out once for the whole box, like [`Picker::label_width`] and for the
+/// same reason: a column that moved down the box would not be a column.
+#[derive(Debug, Clone, Copy)]
+struct Layout {
+    /// Columns between the two vertical edges.
+    width: u16,
+    /// What the name column was sized to.
+    label: u16,
+    /// Whether the cursor can be a band. See [`Picker::paint`].
+    colour: bool,
 }
 
 struct Shape {
@@ -561,6 +621,79 @@ mod tests {
     }
 
     const BIG: Size = Size { cols: 80, rows: 24 };
+
+    /// A row's styling taken off, so a test can read what a person sees.
+    fn plain(text: &str) -> String {
+        let mut out = String::new();
+        let mut chars = text.chars();
+        while let Some(c) = chars.next() {
+            if c != '\x1b' {
+                out.push(c);
+                continue;
+            }
+            for c in chars.by_ref() {
+                if c.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        }
+        out
+    }
+
+    fn row_of(picker: &Picker, colour: bool, here: bool) -> String {
+        let layout = Layout {
+            width: 40,
+            label: MIN_LABEL,
+            colour,
+        };
+        picker.paint(&picker.rows[0], layout, here)
+    }
+
+    fn one_row() -> Picker {
+        picker(vec![Row::new(0, "build").detail("cargo").note("2m")], 0)
+    }
+
+    /// The cursor marks the row, it does not repaint it: reverse video did
+    /// both, and the row under it was the one row in the box that could not say
+    /// which half of itself was the name.
+    #[test]
+    fn the_row_under_the_cursor_sits_on_a_band_and_wears_the_mark() {
+        let drawn = row_of(&one_row(), true, true);
+        assert!(drawn.contains(&ground()), "no band: {drawn:?}");
+        assert!(
+            plain(&drawn).starts_with(POINT),
+            "no mark: {:?}",
+            plain(&drawn)
+        );
+        assert!(
+            drawn.contains(NAME) && drawn.contains(REST),
+            "the name and the rest are drawn the same: {drawn:?}"
+        );
+    }
+
+    /// With no palette to sit a band on there is still one way of pointing at a
+    /// row that every terminal has.
+    #[test]
+    fn a_terminal_with_no_colours_gets_the_cursor_in_reverse_video() {
+        let drawn = row_of(&one_row(), false, true);
+        assert!(drawn.starts_with("\x1b[7m"), "{drawn:?}");
+        assert!(drawn.ends_with("\x1b[27m"), "{drawn:?}");
+    }
+
+    /// Whichever way it is spelt, or the box has a ragged edge, and the edge is
+    /// the only thing saying where the popup stops and the session starts.
+    #[test]
+    fn the_cursor_row_is_as_wide_as_an_ordinary_one() {
+        let picker = one_row();
+        let ordinary = plain(&row_of(&picker, true, false)).chars().count();
+        for colour in [true, false] {
+            assert_eq!(
+                plain(&row_of(&picker, colour, true)).chars().count(),
+                ordinary,
+                "the cursor row is a different width with colour {colour}"
+            );
+        }
+    }
 
     #[test]
     fn the_highlight_wraps_at_both_ends() {

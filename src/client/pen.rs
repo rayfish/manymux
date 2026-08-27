@@ -31,11 +31,14 @@
 
 /// The ground a selected cell sits on: xterm 17, a deep navy.
 ///
+/// Shared with [`super::picker`], whose cursor sits on the same ground: both
+/// are one gesture saying "this one".
+///
 /// Fixed by the cube rather than the theme, so it is the same colour on every
 /// terminal and can be measured against. Dark enough that the ordinary run of
 /// terminal colours reads on it, and blue enough to be a band rather than a
 /// shadow on a screen that is already dark.
-const BAND: u8 = 17;
+pub(super) const BAND: u8 = 17;
 
 /// What a glyph is drawn in when its own colour cannot be read on the band.
 const FALLBACK: u8 = 255;
