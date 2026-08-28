@@ -168,10 +168,20 @@ one `Ctrl-]` then `tab tab tab` walks through your sessions.
 | `h` | next machine |
 | `H` | previous machine |
 | `l` | the one you came from |
+| `1`-`9` | the sessions you have been in, most recent first |
 | `n` | start a session on this machine and go to it |
 | `r` | rename this session |
 | `d` | detach |
 | `esc`, `enter`, `Ctrl-]` | back to focus |
+
+The digits are the same trail `l` walks, all of it: the box numbers the sessions
+this attach has been in down its left edge, `1` being the one you are in and `2`
+the one you came from, and pressing one goes there. It is the order you have
+been in them rather than the order they are listed in, so `2` is the way back
+whatever you have done since, and a session that ends takes its number with it
+rather than leaving a hole. Sessions you have not been in this run wear no digit
+and are a `tab` away. Nothing on disk remembers any of this: a fresh `mm attach`
+starts with a trail of one.
 
 `n` starts a shell on the machine you are on, the way `mm new` would, and puts
 you in it in focus mode: it is the one control key that does not leave the mode

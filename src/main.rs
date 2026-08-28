@@ -1959,7 +1959,7 @@ async fn do_attach(
             let socket = socket.to_path_buf();
             let groups = groups.clone();
             let focus = cycle.focused().map(str::to_string);
-            let current = cycle.current().clone();
+            let recent = cycle.recent();
             let latest = Arc::clone(&latest);
             let seen = Arc::clone(&seen);
             // The listing already out there, handed over rather than left to
@@ -1987,7 +1987,7 @@ async fn do_attach(
                         continue;
                     }
                     let held = Groups::load().unwrap_or_else(|_| groups.clone());
-                    let listed = Listed::of(&snapshot, &held, focus.as_deref(), &current);
+                    let listed = Listed::of(&snapshot, &held, focus.as_deref(), &recent);
                     // Kept where the caller can read it once the attach ends:
                     // the ids the popup hands back are this listing's, and
                     // looking them up in the one it opened with would name the
@@ -2460,6 +2460,12 @@ struct Listed {
 /// The id the session the run is in wears in every listing. See [`Listed::of`].
 const CURRENT: usize = 0;
 
+/// How many rows can wear a digit: `1` to `9`, and no more, because a two-digit
+/// row would want a key you press twice and a moment for the client to decide
+/// you had finished pressing it. A run longer than that numbers the nine
+/// sessions you were in most recently; the rest are still a tab away.
+const DIGITS: u8 = 9;
+
 impl Listed {
     /// A tree two deep: a heading per machine, the groups on that machine under
     /// it with their sessions inside, and whatever is in no group last.
@@ -2473,12 +2479,20 @@ impl Listed {
     /// Narrowed to the focused group when there is one, because that is what
     /// every other way of moving around is narrowed to.
     fn new(snapshot: &Snapshot, groups: &Groups, cycle: &Cycle) -> Self {
-        Self::of(snapshot, groups, cycle.focused(), cycle.current())
+        Self::of(snapshot, groups, cycle.focused(), &cycle.recent())
     }
 
     /// The same, from the two things about the cycle that matter, so a task
     /// with no cycle of its own can build these while an attach is up.
-    fn of(snapshot: &Snapshot, groups: &Groups, focus: Option<&str>, current: &Located) -> Self {
+    ///
+    /// `recent` is [`Cycle::recent`]: the sessions this run has been in, most
+    /// recent first, so its head is the session the run is in now and the rest
+    /// is what the digits are handed out along. It is never empty; an empty one
+    /// is a listing with nothing to look out from, and there is no list to draw.
+    fn of(snapshot: &Snapshot, groups: &Groups, focus: Option<&str>, recent: &[Located]) -> Self {
+        let Some(current) = recent.first() else {
+            return Self::default();
+        };
         let mut rows = Vec::new();
         // The session the run is in is [`CURRENT`] in every listing, whether or
         // not this one has heard of it yet. An id is an index into this, so it
@@ -2578,6 +2592,29 @@ impl Listed {
                     .indent(deep + 1),
             );
         }
+        // The digits, handed out along the trail rather than down the box: the
+        // list is in listing order, which is the order the sessions were
+        // started in, and what a digit is for is going back to where you were.
+        //
+        // Only to rows that are here. A session that has ended, or that the
+        // narrowing is hiding, is skipped rather than spending its number, or
+        // the gap would be a key doing nothing in the middle of the ones that
+        // work. Which is why this counts rather than indexing `recent`.
+        let mut digit = 0;
+        for was in recent {
+            let Some(id) = at.iter().position(|listed| listed == was) else {
+                continue;
+            };
+            let Some(row) = rows.iter_mut().find(|row| !row.heading && row.id == id) else {
+                continue;
+            };
+            digit += 1;
+            row.number = Some(digit);
+            if digit == DIGITS {
+                break;
+            }
+        }
+
         let highlight = rows
             .iter()
             .position(|row| !row.heading && row.id == CURRENT)
@@ -2804,6 +2841,7 @@ fn current_dir() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::slice::from_ref;
 
     /// An attempt that never answers, which is what a client multiplexed onto
     /// a dead ssh master is: nothing fails, nothing times out, and the row
@@ -2849,12 +2887,24 @@ mod tests {
             answered: vec![this_machine().to_string()],
         };
         let current = Located::new(as_listed(LOCAL), "test");
-        let listed = Listed::of(&snapshot, &Groups::default(), None, &current);
+        let listed = Listed::of(&snapshot, &Groups::default(), None, from_ref(&current));
         let row = &listed.rows.sessions[listed.rows.at];
         assert_eq!(row.label, "test");
         // And the same row is the one wearing the mark, since both are the same
         // comparison and a highlight without one reads as a listing gone stale.
         assert_eq!(row.note, "●");
+    }
+
+    /// The rows wearing a digit, in the order the digits run.
+    fn numbered(listed: &Listed) -> Vec<(&str, u8)> {
+        let mut rows: Vec<(&str, u8)> = listed
+            .rows
+            .sessions
+            .iter()
+            .filter_map(|row| Some((row.label.as_str(), row.number?)))
+            .collect();
+        rows.sort_by_key(|(_, number)| *number);
+        rows
     }
 
     fn hosted_on(host: &str, name: &str) -> HostedSession {
@@ -2876,7 +2926,7 @@ mod tests {
             answered: vec!["gpu-box".to_string()],
         };
         let current = Located::new(as_listed(LOCAL), "test");
-        let listed = Listed::of(&snapshot, &Groups::default(), None, &current);
+        let listed = Listed::of(&snapshot, &Groups::default(), None, from_ref(&current));
         let row = &listed.rows.sessions[listed.rows.at];
         assert_eq!(row.label, "test");
         assert_eq!(row.note, "●");
@@ -2896,7 +2946,7 @@ mod tests {
             sessions: vec![hosted_on("gpu-box", "build")],
             answered: vec!["gpu-box".to_string()],
         };
-        let first = Listed::of(&partial, &Groups::default(), None, &current);
+        let first = Listed::of(&partial, &Groups::default(), None, from_ref(&current));
         let mut popup = manymux::client::picker::Picker::new(
             "sessions",
             "⏎ go",
@@ -2907,7 +2957,7 @@ mod tests {
             sessions: vec![hosted_on("gpu-box", "build"), hosted("api"), hosted("test")],
             answered: vec!["gpu-box".to_string(), this_machine().to_string()],
         };
-        let then = Listed::of(&full, &Groups::default(), None, &current);
+        let then = Listed::of(&full, &Groups::default(), None, from_ref(&current));
         popup.replace(then.rows.sessions.clone(), then.rows.at);
         let row = popup.chosen().expect("a row to be under the cursor");
         assert_eq!(row.label, "test");
@@ -2924,7 +2974,7 @@ mod tests {
             answered: vec![this_machine().to_string()],
         };
         let current = Located::new(as_listed(LOCAL), "gone");
-        let listed = Listed::of(&snapshot, &Groups::default(), None, &current);
+        let listed = Listed::of(&snapshot, &Groups::default(), None, from_ref(&current));
         let landable = listed
             .rows
             .sessions
@@ -2945,5 +2995,60 @@ mod tests {
                 .is_err(),
             "the first attach was cut short"
         );
+    }
+
+    /// The digit column, and the whole of what it means: the session you are in
+    /// is 1 and the one you came from is 2, so going back is always the same
+    /// key however far around the machines you have walked.
+    #[test]
+    fn the_popup_numbers_the_sessions_you_have_been_in_most_recent_first() {
+        let snapshot = Snapshot {
+            sessions: vec![hosted("build"), hosted("test"), hosted("web")],
+            answered: vec![this_machine().to_string()],
+        };
+        let recent = [
+            Located::new(as_listed(LOCAL), "test"),
+            Located::new(as_listed(LOCAL), "build"),
+        ];
+        let listed = Listed::of(&snapshot, &Groups::default(), None, &recent);
+        assert_eq!(numbered(&listed), [("test", 1), ("build", 2)]);
+    }
+
+    /// A session that has since ended has no row to number, and the digits are
+    /// read off the box rather than off the trail: a gap in them would be a key
+    /// that does nothing sitting in the middle of the ones that work.
+    #[test]
+    fn a_session_that_has_ended_leaves_no_gap_in_the_numbers() {
+        let snapshot = Snapshot {
+            sessions: vec![hosted("build"), hosted("test")],
+            answered: vec![this_machine().to_string()],
+        };
+        let recent = [
+            Located::new(as_listed(LOCAL), "test"),
+            Located::new(as_listed(LOCAL), "gone"),
+            Located::new(as_listed(LOCAL), "build"),
+        ];
+        let listed = Listed::of(&snapshot, &Groups::default(), None, &recent);
+        assert_eq!(numbered(&listed), [("test", 1), ("build", 2)]);
+    }
+
+    /// There are nine digits, and a run long enough to walk past them numbers
+    /// the nine you were in most recently. The tenth is still in the list and
+    /// still reachable with tab; it just has no key of its own.
+    #[test]
+    fn the_numbering_stops_at_the_last_digit_there_is() {
+        let names: Vec<String> = (0..12).map(|n| format!("s{n}")).collect();
+        let snapshot = Snapshot {
+            sessions: names.iter().map(|n| hosted(n)).collect(),
+            answered: vec![this_machine().to_string()],
+        };
+        let recent: Vec<Located> = names
+            .iter()
+            .map(|n| Located::new(as_listed(LOCAL), n))
+            .collect();
+        let listed = Listed::of(&snapshot, &Groups::default(), None, &recent);
+        let numbers = numbered(&listed);
+        assert_eq!(numbers.len(), 9);
+        assert_eq!(numbers.last(), Some(&("s8", 9)));
     }
 }

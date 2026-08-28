@@ -637,7 +637,12 @@ enum Showing {
     Narrowing,
 }
 
-const SESSION_HINTS: &str = "⏎ go  r name  m group  g show  n new  d detach";
+/// The digits are second, after the key every list has: they are the fastest
+/// way out of this box and the one thing in it a hand would not guess at. Only
+/// in the box, and not in [`crate::client::status`]'s ladder for a window too
+/// small to hold one, because the numbers are drawn in the box: a key for rows
+/// you cannot see is a key you cannot aim.
+const SESSION_HINTS: &str = "⏎ go  1-9 recent  r name  m group  g show  n new  d detach";
 const MOVE_HINTS: &str = "⏎ move   n new group   esc";
 const NARROW_HINTS: &str = "⏎ show   esc";
 
@@ -934,6 +939,27 @@ async fn pump(
                                 };
                                 keys.set_mode(Mode::Picking);
                                 status.set_mode(Mode::Picking);
+                            }
+                            // Enter on the row wearing that digit, without the
+                            // walk to it. Nothing at all where no row wears it,
+                            // which is a digit past the end of the trail and a
+                            // digit in the group list, whose rows are never
+                            // numbered: an unbound key in a mode holding the
+                            // keyboard must not land somewhere. The mode has
+                            // already moved, `KeyFilter::after` reading the key
+                            // rather than what this arm makes of it, so it is
+                            // put back the way the group keys put it back.
+                            Pick::Number(digit) => {
+                                let Some(row) = up.picker.at_number(digit).map(|row| row.id) else {
+                                    let back = up.mode();
+                                    keys.set_mode(back);
+                                    status.set_mode(back);
+                                    restate = true;
+                                    continue;
+                                };
+                                status.set_popup(Popped::None);
+                                writer.detach().await?;
+                                return Ok(Outcome::Chose(Chose::Go(row)));
                             }
                             Pick::Go => {
                                 let chosen = up.picker.chosen().map(|row| row.id);

@@ -19,6 +19,12 @@
 //! name is the one thing about a session that moves: renaming one shuffled the
 //! cycle under whoever was tabbing through it, so the key that had been
 //! reaching the session next door quietly started reaching a different one.
+//!
+//! Beside the order there is a second one, which is the order you have been in
+//! them: the trail. `Motion::Last` is its head, and [`Cycle::recent`] is the
+//! whole of it, which is what the popup's digits are numbered off. It is the
+//! run's own memory and nothing else's; nothing on disk says which session you
+//! were in half an hour ago, and a fresh attach starts with a trail of one.
 
 use crate::client::attach::Motion;
 
@@ -90,8 +96,16 @@ pub struct Cycle {
     /// Every session on every watched machine, in listing order.
     sessions: Vec<Entry>,
     current: Located,
-    /// Where the last hop came from, for [`Motion::Last`].
-    previous: Option<Located>,
+    /// The sessions this run has been in, most recent first and this one not
+    /// among them: the head is where [`Motion::Last`] goes, and the whole of it
+    /// is what the popup numbers its rows off.
+    ///
+    /// A session appears once. Coming back to one moves it up rather than
+    /// adding it again, because what this answers is "which sessions have you
+    /// been in, and how recently", not "which hops have you made": a number
+    /// against the same session twice is two keys that do one thing and a
+    /// third session pushed off the end of the digits.
+    trail: Vec<Located>,
     /// The group the cycle is narrowed to, if any.
     focus: Option<String>,
 }
@@ -101,7 +115,7 @@ impl Cycle {
         Self {
             sessions: Vec::new(),
             current,
-            previous: None,
+            trail: Vec::new(),
             focus: None,
         }
     }
@@ -171,7 +185,7 @@ impl Cycle {
     /// Where a motion lands, or `None` when it lands where you already are.
     pub fn step(&self, motion: Motion) -> Option<Located> {
         let next = match motion {
-            Motion::Last => self.previous.clone()?,
+            Motion::Last => self.trail.first().cloned()?,
             Motion::Next | Motion::Previous => {
                 // With no group active, only this machine's sessions: tab is
                 // for moving inside the work you are already in, and `h` is for
@@ -219,7 +233,21 @@ impl Cycle {
 
     /// Record a hop, so `Motion::Last` knows where to come back to.
     pub fn moved_to(&mut self, next: Located) {
-        self.previous = Some(std::mem::replace(&mut self.current, next));
+        self.trail.retain(|at| *at != next);
+        let was = std::mem::replace(&mut self.current, next);
+        self.trail.insert(0, was);
+    }
+
+    /// The sessions this run has been in, most recent first, starting with the
+    /// one it is in now.
+    ///
+    /// The order the popup numbers its rows in, and the reason the trail is a
+    /// list rather than the single step back it started as: pressing a digit
+    /// wants every session you have been in, not only the last one.
+    pub fn recent(&self) -> Vec<Located> {
+        std::iter::once(self.current.clone())
+            .chain(self.trail.iter().cloned())
+            .collect()
     }
 
     /// The session you are in is called something else now. Not a hop, so
@@ -237,6 +265,13 @@ impl Cycle {
                 entry.at.session = name.to_string();
             }
         }
+        // And in the trail, for the same reason: it is a list of addresses, and
+        // one under the old name is a row the numbering cannot find.
+        for at in &mut self.trail {
+            if at.host == self.current.host && at.session == was {
+                at.session = name.to_string();
+            }
+        }
     }
 
     /// The session you are in has ended: go back to the one you came from, and
@@ -247,7 +282,10 @@ impl Cycle {
     /// `Motion::Last` both: the way back leads to a session that has exited,
     /// and there is nothing there to come back to.
     pub fn fall_back(&mut self) -> Option<Located> {
-        let back = self.previous.take()?;
+        if self.trail.is_empty() {
+            return None;
+        }
+        let back = self.trail.remove(0);
         let ended = std::mem::replace(&mut self.current, back);
         self.forget(&ended);
         Some(self.current.clone())
@@ -256,14 +294,15 @@ impl Cycle {
     /// Take back the last hop, leaving no trail: for one that could not be
     /// made, where coming back must not become the place `Motion::Last` goes.
     pub fn undo(&mut self) {
-        if let Some(previous) = self.previous.take() {
-            self.current = previous;
+        if !self.trail.is_empty() {
+            self.current = self.trail.remove(0);
         }
     }
 
     /// Drop a session from the listing, for one that turned out to be gone.
     pub fn forget(&mut self, gone: &Located) {
         self.sessions.retain(|entry| &entry.at != gone);
+        self.trail.retain(|at| at != gone);
     }
 }
 
@@ -294,6 +333,11 @@ mod tests {
                 .collect(),
         );
         cycle
+    }
+
+    /// The trail as the popup numbers it: the session the run is in first.
+    fn recent(cycle: &Cycle) -> Vec<String> {
+        cycle.recent().iter().map(|at| at.session.clone()).collect()
     }
 
     fn step(cycle: &Cycle, motion: Motion) -> Option<String> {
@@ -586,5 +630,62 @@ mod tests {
         assert_eq!(step(&cycle, Motion::Last).as_deref(), Some("api"));
         cycle.moved_to(Located::new("here", "api"));
         assert_eq!(step(&cycle, Motion::Last).as_deref(), Some("web"));
+    }
+    #[test]
+    fn the_trail_is_the_sessions_you_have_been_in_most_recent_first() {
+        let mut cycle = cycle(&["api", "build", "web"], "api");
+        cycle.moved_to(Located::new("here", "build"));
+        cycle.moved_to(Located::new("here", "web"));
+        assert_eq!(recent(&cycle), ["web", "build", "api"]);
+    }
+
+    /// A session you come back to has not been in two places at once, so it is
+    /// moved up the trail rather than listed twice: the numbers the popup draws
+    /// off this are a list of sessions, not a list of hops.
+    #[test]
+    fn coming_back_to_a_session_moves_it_up_the_trail_rather_than_repeating_it() {
+        let mut cycle = cycle(&["api", "build", "web"], "api");
+        cycle.moved_to(Located::new("here", "build"));
+        cycle.moved_to(Located::new("here", "web"));
+        cycle.moved_to(Located::new("here", "api"));
+        assert_eq!(recent(&cycle), ["api", "web", "build"]);
+    }
+
+    #[test]
+    fn a_rename_moves_the_session_in_the_trail_it_is_already_in() {
+        let mut cycle = cycle(&["api", "build"], "api");
+        cycle.moved_to(Located::new("here", "build"));
+        cycle.renamed("nightly");
+        assert_eq!(recent(&cycle), ["nightly", "api"]);
+    }
+
+    #[test]
+    fn a_session_dropped_from_the_listing_is_dropped_from_the_trail() {
+        let mut cycle = cycle(&["api", "build", "web"], "api");
+        cycle.moved_to(Located::new("here", "build"));
+        cycle.moved_to(Located::new("here", "web"));
+        cycle.forget(&Located::new("here", "build"));
+        assert_eq!(recent(&cycle), ["web", "api"]);
+    }
+
+    #[test]
+    fn falling_back_takes_the_session_that_ended_out_of_the_trail() {
+        let mut cycle = cycle(&["api", "build", "web"], "api");
+        cycle.moved_to(Located::new("here", "web"));
+        cycle.moved_to(Located::new("here", "build"));
+        cycle.fall_back();
+        assert_eq!(recent(&cycle), ["web", "api"]);
+    }
+
+    /// A hop that could not be made never happened, so the trail must not
+    /// remember it: the session it failed to reach would otherwise wear a
+    /// number and be the place `Motion::Last` goes.
+    #[test]
+    fn a_hop_that_was_undone_leaves_the_trail_as_it_was() {
+        let mut cycle = cycle(&["api", "build", "web"], "api");
+        cycle.moved_to(Located::new("here", "web"));
+        cycle.moved_to(Located::new("here", "build"));
+        cycle.undo();
+        assert_eq!(recent(&cycle), ["web", "api"]);
     }
 }

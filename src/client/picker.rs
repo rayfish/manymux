@@ -24,6 +24,14 @@
 //! terminal's own cursor: it is the session's, it sits wherever the session left
 //! it, and under a box it blinks on a row that has nothing to do with this one.
 //!
+//! A session row can carry a digit, drawn in a column of its own down the left
+//! of the box. It is the key that reaches that row, and the caller works out
+//! which rows get one: this only draws it, and takes the column back off a list
+//! where nothing is numbered, which is both group lists. In front of the name
+//! rather than beside the note, because it is read on the way *to* a row, and
+//! in a column rather than in front of the label, or the names of numbered and
+//! unnumbered rows would sit two columns apart.
+//!
 //! [`Row::id`] is opaque here on purpose. The caller hands rows in and gets an
 //! id back, so this never learns what a host is, and a listing that lands while
 //! the popup is up can be swapped in with [`Picker::replace`] without the
@@ -51,6 +59,12 @@ const WIDEST: u16 = 60;
 
 /// Columns a row moves in per level of the tree.
 const STEP: u16 = 2;
+
+/// Columns the digit column takes where a list has one: the digit and the space
+/// after it. A column rather than something in front of the name, so the names
+/// of numbered and unnumbered rows stay in line, and taken back off a list where
+/// nothing is numbered, which is both group lists.
+const GUTTER: u16 = 2;
 
 /// Columns of gap inside a session row, and the width of the note pinned to its
 /// right. What is left over after the name column is the detail's.
@@ -98,6 +112,9 @@ pub struct Row {
     pub detail: String,
     /// Right column: idle time and bells, or the mark on the row you are in.
     pub note: String,
+    /// The digit that reaches this row from control mode, if one does. The
+    /// caller works it out; all this does is draw it. See [`GUTTER`].
+    pub number: Option<u8>,
     /// A heading rather than something you can land on: a group's name above
     /// the sessions in it, or a machine's above the ones in no group. Skipped
     /// by the highlight, since Enter on one would have nothing to attach to.
@@ -114,6 +131,7 @@ impl Row {
             label: label.into(),
             detail: String::new(),
             note: String::new(),
+            number: None,
             heading: false,
             indent: 0,
         }
@@ -126,6 +144,12 @@ impl Row {
 
     pub fn note(mut self, note: impl Into<String>) -> Self {
         self.note = note.into();
+        self
+    }
+
+    /// The digit that reaches this row. See [`Row::number`].
+    pub fn number(mut self, number: u8) -> Self {
+        self.number = Some(number);
         self
     }
 
@@ -253,6 +277,17 @@ impl Picker {
         }
     }
 
+    /// The row this digit reaches, if a row wears it.
+    ///
+    /// Headings are skipped for the same reason the highlight skips them: a
+    /// digit that landed on one would have nothing to attach to. They carry no
+    /// number anyway, which makes this belt and braces.
+    pub fn at_number(&self, number: u8) -> Option<&Row> {
+        self.rows
+            .iter()
+            .find(|row| !row.heading && row.number == Some(number))
+    }
+
     fn landable(&self, index: usize) -> Option<&Row> {
         self.rows.get(index).filter(|row| !row.heading)
     }
@@ -330,9 +365,11 @@ impl Picker {
             return String::new();
         };
         let mut out = String::from("\x1b7");
+        let gutter = self.gutter();
         let layout = Layout {
             width: shape.inner,
             label: self.label_width(shape.inner),
+            gutter,
             colour: style::coloured(),
         };
         let width = layout.width;
@@ -405,6 +442,15 @@ impl Picker {
             .collect()
     }
 
+    /// Whether this list has a digit column at all. See [`GUTTER`].
+    fn gutter(&self) -> u16 {
+        if self.rows.iter().any(|row| row.number.is_some()) {
+            GUTTER
+        } else {
+            0
+        }
+    }
+
     /// How wide the name column is for this list. See [`MIN_LABEL`].
     fn label_width(&self, width: u16) -> u16 {
         let widest = self
@@ -416,7 +462,7 @@ impl Picker {
             .unwrap_or(MIN_LABEL);
         widest
             .clamp(MIN_LABEL, MAX_LABEL)
-            .min(width.saturating_sub(GAPS + NOTE))
+            .min(width.saturating_sub(GAPS + NOTE + self.gutter()))
     }
 
     /// One row, exactly `layout.width` columns wide.
@@ -431,15 +477,27 @@ impl Picker {
         // The tree, and the whole of it: a row says where it sits by how far in
         // it starts, and nothing else in the box draws the shape.
         let inset = " ".repeat(usize::from(row.indent * STEP));
+        // The digit column, blank on a row no digit reaches. Headings sit
+        // behind it as well, or the tree would start at two different columns
+        // depending on whether the list had numbers in it.
+        let gutter = match row.number {
+            Some(n) if layout.gutter > 0 => format!("{n} "),
+            _ => " ".repeat(usize::from(layout.gutter)),
+        };
         if row.heading {
-            let label = fit(&format!("{inset}{}", row.label), layout.width - 2);
-            return format!("  {}", style::host(&label));
+            let label = fit(
+                &format!("{inset}{}", row.label),
+                layout.width - 2 - layout.gutter,
+            );
+            return format!("  {gutter}{}", style::host(&label));
         }
 
         // The note is pinned to the right. The detail gives way first and the
         // label is clipped last: which session it is matters more than what it
         // is doing.
-        let detail_width = layout.width.saturating_sub(GAPS + NOTE + layout.label);
+        let detail_width = layout
+            .width
+            .saturating_sub(GAPS + NOTE + layout.gutter + layout.label);
         // Inside the label's column rather than in front of it, so the detail
         // and the note stay in line down the box however deep the row is.
         let label = fit(&format!("{inset}{}", row.label), layout.label);
@@ -448,7 +506,8 @@ impl Picker {
 
         if !here {
             return format!(
-                "  {} {}  {} ",
+                "  {}{} {}  {} ",
+                style::faint(&gutter),
                 style::bold(&label),
                 style::faint(&detail),
                 style::faint(&note)
@@ -458,15 +517,17 @@ impl Picker {
             // Reverse video, which is the one way of pointing at a row that
             // needs no palette at all: `NO_COLOR`, and anything that is not a
             // terminal, both land here.
-            return format!("\x1b[7m  {label} {detail}  {note} \x1b[27m");
+            return format!("\x1b[7m  {gutter}{label} {detail}  {note} \x1b[27m");
         }
         // The band, and the row lifted onto it rather than repainted: the name
         // is still the brightest thing on the line and the detail is still the
         // quieter one, which is the hierarchy every other row is drawn with and
         // the one thing reverse video threw away. One run of SGR per column and
         // no reset until the end, since a reset would take the ground with it.
+        // The digit is the quieter half of the row even under the cursor: it
+        // says how to get here, not which session this is.
         format!(
-            "\x1b[0;{ground}m\x1b[{NAME}m{POINT} {label} \x1b[{REST}m{detail}  {note} \x1b[0m",
+            "\x1b[0;{ground}m\x1b[{REST}m{POINT} {gutter}\x1b[{NAME}m{label} \x1b[{REST}m{detail}  {note} \x1b[0m",
             ground = ground(),
         )
     }
@@ -514,6 +575,8 @@ struct Layout {
     width: u16,
     /// What the name column was sized to.
     label: u16,
+    /// [`GUTTER`], or nothing where no row in this list is numbered.
+    gutter: u16,
     /// Whether the cursor can be a band. See [`Picker::paint`].
     colour: bool,
 }
@@ -644,6 +707,7 @@ mod tests {
         let layout = Layout {
             width: 40,
             label: MIN_LABEL,
+            gutter: picker.gutter(),
             colour,
         };
         picker.paint(&picker.rows[0], layout, here)
@@ -967,5 +1031,65 @@ mod tests {
             widths.windows(2).all(|pair| pair[0] == pair[1]),
             "ragged box: {widths:?} from {lines:#?}"
         );
+    }
+    /// The digit that reaches this row, in a column of its own: it is neither
+    /// the name nor what the session is doing, and putting it in front of the
+    /// name would leave the names of numbered and unnumbered rows out of line.
+    #[test]
+    fn a_numbered_row_wears_its_digit_in_the_gutter() {
+        let picker = picker(vec![Row::new(0, "build").number(2)], 0);
+        let drawn = plain(&row_of(&picker, true, false));
+        assert!(drawn.contains("2 build"), "{drawn:?}");
+    }
+
+    /// A gutter every row shares, or it is not a column: an unnumbered row
+    /// leaves it blank and its name still lines up with the numbered one above.
+    #[test]
+    fn an_unnumbered_row_keeps_the_gutter_and_leaves_it_blank() {
+        let mut p = picker(vec![Row::new(0, "build").number(1), Row::new(1, "api")], 0);
+        let lines = seen(&mut p, BIG);
+        let numbered = lines.iter().find(|l| l.contains("build")).unwrap();
+        let bare = lines.iter().find(|l| l.contains("api")).unwrap();
+        assert_eq!(
+            plain(numbered).find("build"),
+            plain(bare).find("api"),
+            "the names are out of line: {numbered:?} {bare:?}"
+        );
+    }
+
+    /// A list with no numbers in it at all is the group list, which has nothing
+    /// to number: it must not pay two columns for a gutter nobody fills.
+    #[test]
+    fn a_list_with_nothing_numbered_has_no_gutter() {
+        let picker = picker(vec![Row::new(0, "build")], 0);
+        let drawn = plain(&row_of(&picker, true, false));
+        assert!(drawn.starts_with("  build"), "{drawn:?}");
+    }
+
+    /// Whichever way the cursor row is spelt. The gutter is a column like the
+    /// others, and a row that is two columns narrower under the cursor is a box
+    /// with a ragged edge.
+    #[test]
+    fn the_cursor_row_keeps_the_gutter() {
+        let picker = picker(vec![Row::new(0, "build").number(3)], 0);
+        for colour in [true, false] {
+            let drawn = plain(&row_of(&picker, colour, true));
+            assert!(drawn.contains("3 build"), "colour {colour}: {drawn:?}");
+        }
+    }
+
+    #[test]
+    fn a_digit_finds_the_row_it_was_put_on() {
+        let p = picker(
+            vec![
+                Row::heading("box"),
+                Row::new(7, "build").number(1),
+                Row::new(8, "api").number(2),
+                Row::new(9, "web"),
+            ],
+            1,
+        );
+        assert_eq!(p.at_number(2).map(|row| row.id), Some(8));
+        assert_eq!(p.at_number(3), None, "no row wears a 3");
     }
 }

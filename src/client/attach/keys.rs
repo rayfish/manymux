@@ -374,6 +374,10 @@ pub enum Pick {
     PreviousGroup,
     /// Enter: go to the highlighted session, or take the highlighted group.
     Go,
+    /// `1` to `9`: go to the session wearing that digit, without moving the
+    /// highlight there first. The same landing Enter makes, reached in one key
+    /// rather than in as many presses as the row is rows away.
+    Number(u8),
     /// `m`: move the highlighted session into a group, which opens the group
     /// list over this one.
     Move,
@@ -1014,7 +1018,9 @@ impl KeyFilter {
             Action::Switch(_) => Mode::Control,
             // The popup stays up while the highlight is moving, and both ways
             // out of it go back to the session.
-            Action::Pick(Pick::Go) => Mode::Focus,
+            // A digit lands the same way Enter does, and for the same reason
+            // leaves the mode: what follows arriving somewhere is typing.
+            Action::Pick(Pick::Go | Pick::Number(_)) => Mode::Focus,
             // Except that a group list was opened *over* the session list, so
             // the way out of one is back to the other: the hints on both of
             // them say `esc` and mean it. Told apart by the mode the key
@@ -1073,6 +1079,12 @@ impl KeyFilter {
             b'\t' | b'j' | b'J' => Action::Pick(Pick::Down),
             b'k' | b'K' => Action::Pick(Pick::Up),
             b'\r' | b'\n' => Action::Pick(Pick::Go),
+            // The digits, which are the sessions you have been in this run,
+            // most recent first: `1` is this one and `2` is the one you came
+            // from, so going back is one key wherever you have walked to. Zero
+            // is not among them, there being no zeroth session, and it goes to
+            // the session like any other unbound key.
+            b'1'..=b'9' => Action::Pick(Pick::Number(b - b'0')),
             // Move the highlighted session into a group, and narrow to one.
             // Two verbs, and which list you came from is what says which:
             // no row in either means two things.
@@ -3369,5 +3381,60 @@ mod tests {
             }
         );
         assert_eq!(f.filter(b"d"), asked(Action::Detach, Mode::Focus));
+    }
+
+    /// The digits, which are the whole of going back: `1` is the session you
+    /// are in and `2` the one you came from, whatever the box happens to be
+    /// showing.
+    #[test]
+    fn a_digit_in_control_mode_goes_to_the_session_wearing_it() {
+        for (byte, number) in [(b'1', 1), (b'5', 5), (b'9', 9)] {
+            let mut f = KeyFilter::default();
+            assert_eq!(f.filter(&[KEY]), held());
+            assert_eq!(
+                f.filter(&[byte]),
+                asked(Action::Pick(Pick::Number(number)), Mode::Focus),
+                "{byte:?}"
+            );
+        }
+    }
+
+    /// There is no zeroth session, so the key is the session's like any other
+    /// unbound one: control mode drops back to focus and the keystrokes go
+    /// through, mode key and all.
+    #[test]
+    fn zero_is_not_a_session_and_goes_to_the_session() {
+        let mut f = KeyFilter::default();
+        assert_eq!(f.filter(&[KEY, b'0']), forwarded(&[KEY, b'0']));
+    }
+
+    /// The group list has no digits: its rows are groups, and a key that acted
+    /// on whatever session was highlighted behind it would act on one nobody
+    /// can see. Unbound there, the same as every other session key.
+    #[test]
+    fn a_digit_does_nothing_in_the_group_list() {
+        let mut f = picking();
+        assert_eq!(
+            f.filter(b"2"),
+            Keystrokes {
+                forward: Vec::new(),
+                action: None,
+                mode: Mode::Picking,
+                rest: Vec::new(),
+            }
+        );
+    }
+
+    /// A digit is spelt the long way too while a program has the terminal in
+    /// an extended-keys mode, and a key that only worked in one spelling would
+    /// be a key that stops working while `pi` is running.
+    #[test]
+    fn a_digit_arrives_the_long_way_round_as_well() {
+        let mut f = KeyFilter::default();
+        assert_eq!(f.filter(&[KEY]), held());
+        assert_eq!(
+            f.filter(b"\x1b[50;1u"),
+            asked(Action::Pick(Pick::Number(2)), Mode::Focus)
+        );
     }
 }
