@@ -1036,7 +1036,8 @@ impl KeyFilter {
             Action::GroupName(_) => Mode::Rename,
             Action::Scroll(Scroll::Leave) => Mode::Focus,
             // Every other move keeps the view up, wherever it was opened from:
-            // a wheel notch in focus mode opens it and stays.
+            // a wheel notch back in focus mode opens it and stays. Only back:
+            // a notch down there is dropped in `mousing` and never arrives.
             Action::Scroll(_) => Mode::Scroll,
             // A search is something you do to the view, so it puts you in it
             // and leaves you there. Cancelling the prompt is cancelling the
@@ -1197,6 +1198,15 @@ impl KeyFilter {
             return match net {
                 0 => None,
                 net if net > 0 => Some(Action::Scroll(Scroll::Up(net as u64))),
+                // Down with no view up is the wheel spinning past the live
+                // screen, which is already what is being looked at. Answered
+                // it costs a round trip a notch: the view opens, lands at the
+                // bottom in the same breath, and closing it asks the node for
+                // the screen again. A hand that scrolled back a little and
+                // then spun down hard sends far more notches than it went up,
+                // and every one past the bottom held the keyboard for the time
+                // that repaint took. Nothing to look at is nothing to move.
+                _ if self.mode == Mode::Focus => None,
                 net => Some(Action::Scroll(Scroll::Down(net.unsigned_abs()))),
             };
         }
@@ -1766,6 +1776,48 @@ mod tests {
             Keystrokes {
                 forward: Vec::new(),
                 action: Some(Action::Scroll(Scroll::Up(scroll::WHEEL))),
+                mode: Mode::Scroll,
+                rest: Vec::new(),
+            }
+        );
+    }
+
+    /// Down there is nothing to open: the live screen is the bottom, and the
+    /// notch that would land on it lands on it already. Answering it opens a
+    /// view and shuts it again, which asks the node for the screen once per
+    /// notch, so a hand that spun down hard after a short look back held the
+    /// keyboard for a repaint a notch until the spin ran out.
+    #[test]
+    fn a_notch_down_on_the_live_session_does_nothing_at_all() {
+        let mut f = KeyFilter::new(KEY);
+        f.set_scroll(true);
+        f.set_wheel(true);
+        assert_eq!(f.filter(b"\x1b[<65;10;5M"), forwarded(b""));
+        assert_eq!(f.mode, Mode::Focus, "and the keyboard stays the session's");
+
+        // A spin of them, the way one arrives, and one that changed its mind
+        // on the way and is still going down.
+        let mut f = KeyFilter::new(KEY);
+        f.set_scroll(true);
+        f.set_wheel(true);
+        let down = b"\x1b[<65;1;1M\x1b[<65;1;1M\x1b[<64;1;1M\x1b[<65;1;1M";
+        assert_eq!(f.filter(down), forwarded(b""));
+        assert_eq!(f.mode, Mode::Focus);
+    }
+
+    /// Inside the view it moves as it always did: down there is a window with
+    /// somewhere to go, and the client at the bottom is what closes it.
+    #[test]
+    fn a_notch_down_inside_the_view_still_moves_it() {
+        let mut f = KeyFilter::new(KEY);
+        f.set_scroll(true);
+        f.filter(&[KEY, SCROLL_KEY]);
+        f.set_wheel(true);
+        assert_eq!(
+            f.filter(b"\x1b[<65;10;5M"),
+            Keystrokes {
+                forward: Vec::new(),
+                action: Some(Action::Scroll(Scroll::Down(scroll::WHEEL))),
                 mode: Mode::Scroll,
                 rest: Vec::new(),
             }
