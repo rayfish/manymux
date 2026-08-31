@@ -1527,6 +1527,101 @@ fn a_resize_repaints_the_screen_at_the_size_it_now_has() {
     let _ = client.wait();
 }
 
+/// The wheel opens the history view from the live screen and the first notch
+/// moves it. This needs a real terminal: mouse tracking is an escape sequence
+/// written to the terminal, then read back as a report on its stdin.
+#[test]
+fn a_wheel_notch_opens_and_moves_the_history_view() {
+    use std::io::{Read, Write};
+    use std::os::fd::AsFd;
+    use std::sync::mpsc;
+
+    let world = World::new("wheel-history");
+    world.ok("laptop", &["config", "mouse", "client"]);
+    world.ok(
+        "laptop",
+        &[
+            "new",
+            "-d",
+            "-n",
+            "lines",
+            "sh",
+            "-c",
+            "i=1; while [ $i -le 80 ]; do echo line $i; i=$((i+1)); done; sleep 30",
+        ],
+    );
+    world.wait_for_node("laptop");
+
+    let (mut pty, pts) = pty_process::blocking::open().unwrap();
+    pty.resize(pty_process::Size::new(24, 80)).unwrap();
+    let mut client = pty_process::blocking::Command::new(MM)
+        .arg("--socket")
+        .arg(world.socket("laptop"))
+        .args(["attach", "lines"])
+        .env("MM_CONFIG_DIR", world.dir.join("laptop"))
+        .env("MM_SSH", world.ssh_stub())
+        .env("MM_LOG", "manymux=warn")
+        .env("TERM", "xterm-256color")
+        .spawn(pts)
+        .expect("attaching on a terminal");
+
+    let (seen_tx, seen_rx) = mpsc::channel();
+    let mut reading =
+        unsafe { pty_process::blocking::Pty::from_fd(pty.as_fd().try_clone_to_owned().unwrap()) };
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 1024];
+        while let Ok(read @ 1..) = reading.read(&mut buf) {
+            if seen_tx.send(buf[..read].to_vec()).is_err() {
+                return;
+            }
+        }
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut seen = String::new();
+    while !seen.contains("\x1b[?1000h") {
+        if let Ok(chunk) = seen_rx.recv_timeout(Duration::from_millis(200)) {
+            seen.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the client never took the wheel; saw: {seen:?}"
+        );
+    }
+
+    // The latest selection path opens a view for the first press, then sees a
+    // second press before its history block returns. It must hand the session
+    // back after the copy without giving the wheel back to the terminal.
+    pty.write_all(b"\x1b[<0;2;22M\x1b[<0;2;22m\x1b[<0;2;22M\x1b[<0;2;22m")
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !seen.contains("copied") {
+        if let Ok(chunk) = seen_rx.recv_timeout(Duration::from_millis(200)) {
+            seen.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the double click did not finish; saw: {seen:?}"
+        );
+    }
+
+    seen.clear();
+    pty.write_all(b"\x1b[<64;1;1M").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !seen.contains("3 back") {
+        if let Ok(chunk) = seen_rx.recv_timeout(Duration::from_millis(200)) {
+            seen.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the wheel did not move the history view; saw: {seen:?}"
+        );
+    }
+
+    let _ = client.kill();
+    let _ = client.wait();
+}
+
 /// Attaching to a session sitting in a full-screen program paints that program
 /// on a screen with nothing else on it.
 ///
