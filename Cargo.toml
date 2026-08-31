@@ -82,6 +82,7 @@ tracing-appender = { version = "0.2.5", optional = true }
 tracing-subscriber = { version = "0.3.23", features = [
     "env-filter",
 ], optional = true }
+unicode-width = "0.1.14"
 
 [dev-dependencies]
 # A terminal to run the binary on, for the prompts it only puts to a person.

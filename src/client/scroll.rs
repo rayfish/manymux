@@ -47,6 +47,7 @@
 use crate::client::attach::Spot;
 use crate::client::pen;
 use crate::proto::{Found, Size, View as Window, ViewRequest};
+use unicode_width::UnicodeWidthChar;
 
 /// Screenfuls fetched at a time. Enough that a page up or down lands inside
 /// what is already here, so the common gesture never waits on the network.
@@ -799,21 +800,23 @@ impl Scrollback {
     /// The columns of the word around a cell, both ends included, or nothing
     /// where the cell is not in a word or its line is not in the block.
     fn word_on(&self, at: Cell) -> Option<(u16, u16)> {
-        let text: Vec<char> = plain(self.line(at.line)?, 0, u16::MAX).chars().collect();
-        let col = usize::from(at.col);
-        if !text.get(col).is_some_and(|c| in_a_word(*c)) {
+        let text = cells(self.line(at.line)?);
+        let at = text
+            .iter()
+            .position(|cell| cell.col <= at.col && at.col < cell.col.saturating_add(cell.width))?;
+        if !in_a_word(text[at].char) {
             return None;
         }
-        let start = text[..col]
+        let start = text[..at]
             .iter()
-            .rposition(|c| !in_a_word(*c))
+            .rposition(|cell| !in_a_word(cell.char))
             .map_or(0, |before| before + 1);
-        let end = text[col..]
+        let end = text[at..]
             .iter()
-            .position(|c| !in_a_word(*c))
-            .map_or(text.len(), |after| col + after)
+            .position(|cell| !in_a_word(cell.char))
+            .map_or(text.len(), |after| at + after)
             - 1;
-        Some((column(start), column(end)))
+        Some((text[start].col, text[end].end()))
     }
 
     /// Whether the line at `offset` is here and has anything on it.
@@ -828,10 +831,11 @@ impl Scrollback {
     /// The last column of a line with anything on it, which is where a line
     /// selection stops: the blanks past it are the screen rather than the text.
     fn line_ends(&self, offset: u64) -> u16 {
-        let end = self.line(offset).map_or(0, |line| {
-            plain(line, 0, u16::MAX).trim_end().chars().count()
-        });
-        column(end.saturating_sub(1))
+        cells(self.line(offset).unwrap_or(""))
+            .into_iter()
+            .rev()
+            .find(|cell| !cell.char.is_whitespace())
+            .map_or(0, |cell| cell.end())
     }
 
     /// The two ends of a selection in reading order, each grown to the grain
@@ -1174,10 +1178,6 @@ fn in_a_word(c: char) -> bool {
     c.is_alphanumeric() || "_-./+@:~=".contains(c)
 }
 
-fn column(at: usize) -> u16 {
-    u16::try_from(at).unwrap_or(u16::MAX)
-}
-
 /// Walk a rendered line and hand back the text of the cells from `from` up to
 /// but not including `to`.
 ///
@@ -1186,18 +1186,17 @@ fn column(at: usize) -> u16 {
 /// not character offsets either. The sequences go by without counting, which is
 /// the whole of the difference.
 ///
-/// Columns are counted in characters, as everything else in this client counts
-/// them (`status::columns`): a double-width character throws the count off by
-/// one, which costs a selection a cell at the end of a line of CJK and nothing
-/// anywhere else.
+/// Columns are terminal cells, the same unit the node's `avt` screen uses.
+/// A wide glyph occupies its two cells as one piece: a pointer on either half
+/// selects the glyph rather than cutting it in two, which keeps the highlight
+/// and copied text under the cursor together for CJK and emoji.
 fn plain(line: &str, from: u16, to: u16) -> String {
     let mut out = String::new();
     walk(line, |piece| {
-        if let Piece::Char(c, col) = piece
-            && col >= from
-            && col < to
+        if let Piece::Char(cell) = piece
+            && cell.overlaps(from, to)
         {
-            out.push(c);
+            out.push(cell.char);
         }
     });
     out
@@ -1235,8 +1234,8 @@ fn highlighted(line: &str, from: u16, to: u16) -> String {
                 out.push_str(seq);
             }
         }
-        Piece::Char(c, col) => {
-            let wanted = col >= from && col < to;
+        Piece::Char(cell) => {
+            let wanted = cell.overlaps(from, to);
             if wanted {
                 let known = band.is_some();
                 let band = band.get_or_insert_with(|| pen::selected(&pen));
@@ -1248,7 +1247,7 @@ fn highlighted(line: &str, from: u16, to: u16) -> String {
                 out.push_str(&pen);
             }
             inside = wanted;
-            out.push(c);
+            out.push(cell.char);
         }
     });
     // A selection that runs past the end of the text takes the blanks with it,
@@ -1277,10 +1276,54 @@ fn highlighted(line: &str, from: u16, to: u16) -> String {
 
 /// A rendered line comes in two kinds of piece.
 enum Piece<'a> {
-    /// A character that takes a cell, and the column it takes.
-    Char(char, u16),
+    /// A character, and the cells it occupies.
+    Char(RenderedCell),
     /// A sequence that takes none: the pen the line was written with.
     Pen(&'a str),
+}
+
+/// One rendered character and the terminal cells it occupies.
+///
+/// `avt` treats every character except a Unicode-width-two one as a single
+/// cell. Mirroring that rule exactly matters more than a broader notion of
+/// display width: these coordinates came from the same `avt` screen.
+#[derive(Debug, Clone, Copy)]
+struct RenderedCell {
+    char: char,
+    col: u16,
+    width: u16,
+}
+
+impl RenderedCell {
+    fn end(self) -> u16 {
+        self.col.saturating_add(self.width).saturating_sub(1)
+    }
+
+    fn overlaps(self, from: u16, to: u16) -> bool {
+        self.col < to && self.col.saturating_add(self.width) > from
+    }
+}
+
+/// `avt`'s cell width for a character. Keep the renderer and the source screen
+/// in lockstep, including its deliberate one-cell treatment of combining and
+/// other non-wide Unicode characters.
+fn width(c: char) -> u16 {
+    if c > '\u{7e}' && c.width().unwrap_or(1) == 2 {
+        2
+    } else {
+        1
+    }
+}
+
+/// The rendered characters in a line, without its pen sequences.
+fn cells(line: &str) -> Vec<RenderedCell> {
+    let mut cells: Vec<RenderedCell> = Vec::new();
+    walk(line, |piece| {
+        if let Piece::Char(cell) = piece {
+            cells.push(cell);
+        }
+    });
+    cells
 }
 
 /// Hand a line to `each` a piece at a time, and answer with the column it ends
@@ -1295,8 +1338,13 @@ fn walk(line: &str, mut each: impl FnMut(Piece<'_>)) -> u16 {
     let mut chars = line.char_indices().peekable();
     while let Some((at, c)) = chars.next() {
         if c != '\x1b' {
-            each(Piece::Char(c, col));
-            col = col.saturating_add(1);
+            let width = width(c);
+            each(Piece::Char(RenderedCell {
+                char: c,
+                col,
+                width,
+            }));
+            col = col.saturating_add(width);
             continue;
         }
         // A control sequence runs to a byte in `@` to `~` and an OSC to a bell
@@ -2049,6 +2097,37 @@ mod tests {
         assert_eq!(plain(line, 0, 2), "ok");
         assert_eq!(plain(line, 4, 8), "done");
         assert_eq!(plain(line, 0, u16::MAX), "ok: done");
+    }
+
+    /// A mouse report is in terminal cells, not Unicode scalar values. `avt`
+    /// gives this glyph two cells, so either half has to mean the same glyph:
+    /// starting on its tail used to select the following character instead.
+    #[test]
+    fn wide_glyphs_stay_under_either_half_of_the_cursor() {
+        let line = "a界b";
+        assert_eq!(plain(line, 1, 2), "界", "its first cell");
+        assert_eq!(plain(line, 2, 3), "界", "and its second");
+        assert_eq!(plain(line, 3, 4), "b", "the cell after it");
+
+        let painted = highlighted(line, 2, 3);
+        assert!(
+            painted.contains(&format!("{}界", pen::selected(""))),
+            "the whole glyph wears the band: {painted:?}"
+        );
+    }
+
+    /// Word selection reads the same cell coordinates as ordinary selection:
+    /// a double click on the tail of a wide character still names its word.
+    #[test]
+    fn a_word_under_a_wide_cursor_cell_is_not_shifted() {
+        let mut view = Scrollback::new(SIZE);
+        view.take(Window {
+            from: 0,
+            total: 1,
+            lines: vec!["a界b".to_string()],
+        });
+        view.select_word(at(24, 3));
+        assert_eq!(view.copied().as_deref(), Some("a界b"));
     }
 
     /// A selection that runs past the end of a short line takes the blanks with
