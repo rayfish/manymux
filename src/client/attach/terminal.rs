@@ -16,6 +16,7 @@ use crossterm::terminal;
 use tokio::io::{AsyncWriteExt, Stdout};
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::mpsc;
+use tracing::debug;
 
 use super::keys::wheel_is_ours;
 use super::{Action, Chose, Find, KeyFilter, Mode, Outcome, Pick, Rename, Rows, Scroll, Select};
@@ -23,7 +24,7 @@ use crate::client::picker::Picker;
 use crate::client::screen::ScreenMode;
 use crate::client::scroll::{self, Chased, Owed, Scrollback, Selected};
 use crate::client::status::{self, Filter, Popped, Status};
-use crate::client::{Attached, SessionHalves, SessionReader, SessionWriter, Update};
+use crate::client::{Attached, Gone, SessionHalves, SessionReader, SessionWriter, Update};
 use crate::clipboard;
 use crate::notify;
 use crate::proto::{HostedEvent, Renamed, Size};
@@ -384,9 +385,39 @@ pub async fn run(
             fresh,
         },
     )
-    .await?;
+    .await;
+    let outcome = match outcome {
+        Ok(outcome) => outcome,
+        Err(e) => stopped(e)?,
+    };
     let renamed = called != session_of(target);
     Ok((outcome, renamed.then_some(called)))
+}
+
+/// What a pump that stopped with an error leaves the run.
+///
+/// A connection that went is [`Outcome::Disconnected`] like any other drop, and
+/// everything else is the error it was. The reading half notices most drops and
+/// answers with `Disconnected` already; the writing half is the one that gets
+/// there first while somebody is typing, an ssh whose network has gone
+/// answering EPIPE to the next keystroke written at it long before the end of
+/// its stdout arrives. Reported rather than waited out, that put the shell back
+/// with `Broken pipe` on it, over a session still running on a machine that
+/// never noticed anybody left, which is the one thing this client is for.
+///
+/// The same for a stream cut mid-frame, which is what a dropped connection
+/// usually is: a session printing does not stop on a frame boundary to suit
+/// anybody, and the truncated frame is rightly an error rather than a clean end
+/// of stream.
+fn stopped(e: anyhow::Error) -> Result<Outcome> {
+    if !Gone::marked(&e) {
+        return Err(e);
+    }
+    // The only place it is ever said. The screen is the session's and stays
+    // exactly as it was painted, so there is nowhere on it for what ssh had to
+    // say about the machine.
+    debug!("the connection went while attached: {e:#}");
+    Ok(Outcome::Disconnected)
 }
 
 /// Which session the client is sitting in, as the mark row names it: the
@@ -1985,6 +2016,27 @@ mod tests {
     use super::*;
     use crate::client::picker::Row;
     use crate::settings::Screen;
+
+    /// The whole point of the project is that the session outlives the
+    /// connection, so a drop noticed on the way out is waited for exactly like
+    /// one noticed on the way in. Before this, a keystroke typed into an ssh
+    /// that had already gone ended the run and handed back a shell with
+    /// `Broken pipe` on it.
+    #[test]
+    fn a_connection_that_went_ends_the_attach_without_ending_the_run() {
+        let broken = std::io::Error::from(std::io::ErrorKind::BrokenPipe);
+        let gone = Gone::mark(anyhow::Error::new(broken));
+        assert_eq!(stopped(gone).unwrap(), Outcome::Disconnected);
+    }
+
+    /// And nothing else is read as one. A client that waited out every failure
+    /// would sit reconnecting forever over something no reconnect can mend, on
+    /// a terminal saying only that it is trying.
+    #[test]
+    fn anything_else_is_still_the_error_it_was() {
+        let e = anyhow::anyhow!("the node said something this build cannot read");
+        assert!(stopped(e).is_err());
+    }
 
     /// A window with no room for a box leaves the mark row to say what the
     /// popup would have: which list is open, and which row Enter would take.

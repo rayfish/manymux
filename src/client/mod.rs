@@ -16,10 +16,13 @@ pub mod scroll;
 pub mod status;
 pub mod switch;
 
+use std::fmt::{self, Display, Formatter};
+use std::io;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, bail};
+use serde::Serialize;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::process::{Child, ChildStderr};
@@ -676,6 +679,47 @@ pub enum Update {
     Disconnected,
 }
 
+/// A read or a write on an attach stream that failed because the connection
+/// did.
+///
+/// Put on the error here rather than read off its kind where it lands, because
+/// the attached client writes to a terminal as well as to the node, and a
+/// broken pipe on stdout is a different thing entirely. Only io failures carry
+/// it: a frame that will not decode is a node saying something this build
+/// cannot make sense of, which reattaching would only hear again.
+///
+/// The keystroke is the case it exists for. An ssh whose network has gone
+/// answers EPIPE to the next byte written at it, well before the end of its
+/// stdout arrives, so the writing half is what notices a drop while somebody is
+/// typing. Both halves have to mean the same thing by it: the session is still
+/// running on a machine that never noticed the client left.
+#[derive(Debug)]
+pub struct Gone;
+
+impl Display for Gone {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(f, "the connection to the host went")
+    }
+}
+
+impl Gone {
+    /// Mark what the connection failing looks like, and leave everything else
+    /// as it was.
+    pub(crate) fn mark(e: anyhow::Error) -> anyhow::Error {
+        match e.downcast_ref::<io::Error>() {
+            Some(_) => e.context(Gone),
+            None => e,
+        }
+    }
+
+    /// Whether the connection going is what this error is, at any depth: the
+    /// mark is context over the io error it was put on, and whoever reads it
+    /// is several `?`s above.
+    pub fn marked(e: &anyhow::Error) -> bool {
+        e.downcast_ref::<Gone>().is_some()
+    }
+}
+
 pub struct SessionReader {
     read: Reader,
     _carrier: Option<Arc<Carrier>>,
@@ -703,10 +747,10 @@ impl SessionReader {
         loop {
             let frame = match self.deadline {
                 Some(at) => match tokio::time::timeout_at(at, self.read.next()).await {
-                    Ok(frame) => frame?,
+                    Ok(frame) => frame.map_err(Gone::mark)?,
                     Err(_) => return Ok(Update::Disconnected),
                 },
-                None => self.read.next().await?,
+                None => self.read.next().await.map_err(Gone::mark)?,
             };
             let Some(frame) = frame else {
                 return Ok(Update::Disconnected);
@@ -750,8 +794,25 @@ pub struct SessionWriter {
 }
 
 impl SessionWriter {
+    /// One frame onto the attach stream, with a write that did not go marked
+    /// as the connection going. There is nothing else an io failure here can
+    /// be: this half only ever writes at the node, and what the node has to say
+    /// back arrives on the other one.
+    async fn frame(&mut self, tag: u8, body: &[u8]) -> Result<()> {
+        proto::write_frame(&mut self.write, tag, body)
+            .await
+            .map_err(Gone::mark)
+    }
+
+    /// The same, for a frame whose body is a message rather than raw bytes.
+    async fn msg(&mut self, tag: u8, msg: &impl Serialize) -> Result<()> {
+        proto::write_msg(&mut self.write, tag, msg)
+            .await
+            .map_err(Gone::mark)
+    }
+
     pub async fn send_input(&mut self, bytes: &[u8]) -> Result<()> {
-        proto::write_frame(&mut self.write, tag::DATA, bytes).await
+        self.frame(tag::DATA, bytes).await
     }
 
     /// Send a file from this machine's clipboard to the session's host, which
@@ -762,20 +823,31 @@ impl SessionWriter {
     /// off part way through is one the host never acts on.
     pub async fn send_paste(&mut self, kind: &str, data: &[u8]) -> Result<()> {
         for chunk in data.chunks(proto::PASTE_CHUNK) {
-            proto::write_frame(&mut self.write, tag::PASTE, chunk).await?;
+            self.frame(tag::PASTE, chunk).await?;
         }
         let info = PasteInfo {
             kind: kind.to_string(),
         };
-        proto::write_msg(&mut self.write, tag::PASTE_END, &info).await
+        self.msg(tag::PASTE_END, &info).await
     }
 
     pub async fn resize(&mut self, size: Size) -> Result<()> {
-        proto::write_msg(&mut self.write, tag::RESIZE, &size).await
+        self.msg(tag::RESIZE, &size).await
     }
 
+    /// Say goodbye, if there is still a connection to say it down.
+    ///
+    /// The one write here that a dead connection must not turn into a wait.
+    /// Everything else this half sends is part of being attached, and a drop
+    /// under one of those is a session to get back to; this is somebody
+    /// pressing the key that means leave, and they have left whether or not the
+    /// frame went. The node finds out the same way a moment later, from the
+    /// stream ending.
     pub async fn detach(&mut self) -> Result<()> {
-        proto::write_frame(&mut self.write, tag::DETACH, &[]).await
+        match self.frame(tag::DETACH, &[]).await {
+            Err(e) if Gone::marked(&e) => Ok(()),
+            said => said,
+        }
     }
 
     /// Ask for the screen again, answered with an [`Update::Screen`].
@@ -785,7 +857,7 @@ impl SessionWriter {
     /// screens never reaches the terminal, so the picture on the other side of
     /// the switch has to come from the node's model instead.
     pub async fn resync(&mut self) -> Result<()> {
-        proto::write_frame(&mut self.write, tag::RESYNC, &[]).await
+        self.frame(tag::RESYNC, &[]).await
     }
 
     /// Ask for a window of the session's history, answered with an
@@ -795,7 +867,7 @@ impl SessionWriter {
     /// arrived costs nothing, and a request per wheel notch would be a round
     /// trip over ssh per wheel notch.
     pub async fn view(&mut self, request: &ViewRequest) -> Result<()> {
-        proto::write_msg(&mut self.write, tag::VIEW, request).await
+        self.msg(tag::VIEW, request).await
     }
 
     /// Search everything the session has printed, answered with an
@@ -804,7 +876,7 @@ impl SessionWriter {
         let request = FindRequest {
             needle: needle.to_string(),
         };
-        proto::write_msg(&mut self.write, tag::FIND, &request).await
+        self.msg(tag::FIND, &request).await
     }
 
     /// Rename the session, the same thing `mm rename` asks for from outside,
@@ -815,13 +887,13 @@ impl SessionWriter {
     /// Until the answer arrives the client is still showing the old name, which
     /// is the right thing to be showing.
     pub async fn rename(&mut self, name: &str) -> Result<()> {
-        proto::write_msg(&mut self.write, tag::RENAME, &name).await
+        self.msg(tag::RENAME, &name).await
     }
 
     /// Answer an [`Update::Ping`], which is how the host tells a client that is
     /// still there from one whose connection died without closing.
     pub async fn pong(&mut self) -> Result<()> {
-        proto::write_frame(&mut self.write, tag::PONG, &[]).await
+        self.frame(tag::PONG, &[]).await
     }
 }
 
@@ -842,6 +914,102 @@ mod tests {
             _carrier: None,
             deadline: None,
         }
+    }
+
+    fn writing(stream: impl AsyncWrite + Unpin + Send + 'static) -> SessionWriter {
+        SessionWriter {
+            write: Box::new(stream),
+            _carrier: None,
+        }
+    }
+
+    /// The case the mark exists for. A keystroke typed at an ssh whose network
+    /// has gone answers EPIPE straight away, well before the end of its stdout
+    /// reaches the reading half, and the attached client has to read that as
+    /// the same drop it waits out rather than as a command that failed.
+    #[tokio::test]
+    async fn a_keystroke_into_a_connection_that_went_says_so() {
+        let (host, client) = tokio::io::duplex(4096);
+        drop(host);
+        let mut writer = writing(client);
+
+        let e = writer
+            .send_input(b"x")
+            .await
+            .expect_err("a write to a closed connection should fail");
+        assert!(Gone::marked(&e), "got {e:#}");
+    }
+
+    /// Leaving is the one thing that does not want waiting out. Somebody
+    /// pressing the detach key at a session whose connection has already gone
+    /// has said what they want, and the goodbye frame is a courtesy: the node
+    /// finds out by itself a moment later, from the same connection.
+    #[tokio::test]
+    async fn a_goodbye_that_cannot_be_said_is_still_a_goodbye() {
+        let (host, client) = tokio::io::duplex(4096);
+        drop(host);
+        let mut writer = writing(client);
+
+        writer
+            .detach()
+            .await
+            .expect("a detach nobody can hear is still a detach");
+    }
+
+    /// A connection cut in the middle of a frame, which is what a dropped ssh
+    /// usually is: the output the session was printing does not stop on a frame
+    /// boundary to suit anybody. The frame is rightly an error rather than a
+    /// clean end of stream, and it is still the host going away.
+    #[tokio::test]
+    async fn a_connection_cut_off_mid_frame_is_a_connection_that_went() {
+        let (mut host, client) = tokio::io::duplex(4096);
+        let mut reader = reading(client);
+
+        // A header promising five bytes, two of them, and then nothing.
+        host.write_all(&[tag::DATA, 0, 0, 0, 5, b'h', b'i'])
+            .await
+            .unwrap();
+        drop(host);
+
+        let e = reader
+            .next()
+            .await
+            .expect_err("a frame that never finished is an error");
+        assert!(Gone::marked(&e), "got {e:#}");
+    }
+
+    /// And what is not the connection stays what it is. A node saying something
+    /// this build cannot make sense of would say it again on every reattach, so
+    /// reading it as a drop is a client that reconnects forever instead of
+    /// reporting it once.
+    #[tokio::test]
+    async fn a_frame_that_will_not_decode_is_not_a_connection_that_went() {
+        let (mut host, client) = tokio::io::duplex(4096);
+        let mut reader = reading(client);
+
+        // Longer than any frame may be, which the codec refuses on the header
+        // alone rather than waiting for a body nobody is going to send.
+        host.write_all(&[tag::DATA, 0xff, 0xff, 0xff, 0xff])
+            .await
+            .unwrap();
+
+        let e = reader
+            .next()
+            .await
+            .expect_err("an oversized frame is refused");
+        assert!(!Gone::marked(&e), "got {e:#}");
+    }
+
+    /// The mark is context over the error it was put on, and the attached
+    /// client reads it after that error has been handed up through a pump that
+    /// is free to say more about it.
+    #[test]
+    fn the_mark_survives_being_said_more_about() {
+        let e = Gone::mark(anyhow::Error::new(io::Error::from(
+            io::ErrorKind::BrokenPipe,
+        )))
+        .context("sending a keystroke");
+        assert!(Gone::marked(&e), "got {e:#}");
     }
 
     /// The reason the client cannot simply wait for the stream to end. A lid

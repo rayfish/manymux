@@ -286,6 +286,24 @@ things that must simply never be done.
   to anything at all, a failed reattach is another lost attempt rather than an
   error (`attached` in `do_attach`); only the first attach may fail outright,
   that one being a command that did not work rather than a connection that went.
+- **Which half of the attach stream notices the drop makes no difference to
+  it.** The reading half answers `Update::Disconnected` for a stream that ends
+  or a host that stops answering pings, and that is the tidy case. Every other
+  drop arrives as an error: a keystroke written at an ssh whose network has gone
+  answers EPIPE well before the end of its stdout gets here, and a connection
+  cut in the middle of a frame is what a dropped one usually is, a session
+  printing not stopping on a frame boundary to suit anybody. Both were reported,
+  so typing at a session that had just dropped ended the run and handed back a
+  shell with `Broken pipe` on it. So `client::Gone` marks an io failure on
+  either half of the stream, and `terminal::stopped` reads the mark and comes to
+  `Outcome::Disconnected`. It is a mark rather than the error's kind because
+  this client writes to a terminal too, and it is put on io failures alone: a
+  frame that will not decode is a node saying something this build cannot read,
+  which every reattach would hear again. `SessionWriter::detach` is the one
+  write that swallows the mark instead of passing it on: everything else this
+  half sends is part of being attached and a drop under one is a session to get
+  back to, while that one is somebody pressing the key that means leave, and
+  they have left whether or not the frame went.
 - **An attempt to get back has a deadline, because the waiting does not**
   (`main::REACH_FOR`, ten seconds, applied by `reaching` and only once
   `attached`). The wait reads the keyboard throughout; the *attempt* reads
