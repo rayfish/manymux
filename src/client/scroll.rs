@@ -32,9 +32,13 @@
 //! double or a third click sets a [`Grain`] that the drag after it goes on
 //! asking for, so words are dragged out by the word and lines by the line, the
 //! way they are everywhere else. It is applied where the ends are read rather
-//! than written into them as they move, because the hand goes back and forth
-//! over the same word and a grain baked in on the way out could not be undone
-//! on the way back.
+//! than written into them as they move, for two reasons. The hand goes back
+//! and forth over the same word, and a grain baked in on the way out could not
+//! be undone on the way back. And whether there is a word there at all, and
+//! where it ends, are facts about the text, which on the live screen is a
+//! round trip away: the first press of a double click is what opens the view,
+//! so the second one lands before the lines it is pointing at have arrived,
+//! and a word worked out then is one character long.
 //!
 //! The window moves locally inside a block that has already arrived, and a
 //! block is a few screenfuls. A request per wheel notch would be a round trip
@@ -230,6 +234,11 @@ pub enum Owed {
     /// gesture is over, the clipboard still holds whatever it held, and the
     /// highlight on the screen says otherwise.
     Lost,
+    /// The lines arrived and there was nothing on them: a double click on a
+    /// blank, which could not be told from one on a word until now, or a drag
+    /// over the empty end of a line. The gesture is over and took nothing,
+    /// which is what a click does, so there is nothing to say about it either.
+    Empty,
 }
 
 /// One cell of the buffer: a line counted back from the newest the way
@@ -617,6 +626,7 @@ impl Scrollback {
     pub fn select_from(&mut self, spot: Spot) {
         let at = self.cell(spot);
         self.stop_chasing();
+        self.forget_the_copy();
         self.selection = Some(Selection {
             anchor: at,
             head: at,
@@ -733,21 +743,22 @@ impl Scrollback {
     /// outside a word, though: there is no word under the pointer to walk by,
     /// and a grain that means nothing at the end it started from would take
     /// the blank the hand happened to stop on as the whole of a copy.
+    ///
+    /// Both of those are questions about the text, which on the live screen is
+    /// a round trip away: the first press of the double click is what opens
+    /// the view, and its block is behind the second. Asked at the press, every
+    /// double click on the screen somebody is working on found no word and
+    /// took one character. So nothing is asked here. The ends are left on the
+    /// cell the hand pointed at and the grain is put on, and [`Self::grained`]
+    /// answers both questions where it grows them, by which time the lines are
+    /// here however far away the machine is.
     pub fn select_word(&mut self, spot: Spot) {
         let at = self.cell(spot);
         self.chasing = None;
-        let Some((from, to)) = self.word_on(at) else {
-            return self.select_from(spot);
-        };
+        self.forget_the_copy();
         self.selection = Some(Selection {
-            anchor: Cell {
-                line: at.line,
-                col: from,
-            },
-            head: Cell {
-                line: at.line,
-                col: to,
-            },
+            anchor: at,
+            head: at,
             grain: Grain::Word,
         });
     }
@@ -758,6 +769,7 @@ impl Scrollback {
     pub fn select_line(&mut self, spot: Spot) {
         let at = self.cell(spot);
         self.chasing = None;
+        self.forget_the_copy();
         self.selection = Some(Selection {
             anchor: Cell {
                 line: at.line,
@@ -769,6 +781,19 @@ impl Scrollback {
             },
             grain: Grain::Line,
         });
+    }
+
+    /// Drop the copy a gesture owed, its release having landed before the
+    /// lines it was to be made out of.
+    ///
+    /// A press starts a new one, and what the last one asked for is nobody's
+    /// business by then. Left standing, the block arriving mid-drag was
+    /// answered out of what the *new* gesture has selected so far, which is
+    /// the cell under a press: a character on the clipboard in place of
+    /// whatever was about to be pasted, and the view handed back with the
+    /// button still down.
+    fn forget_the_copy(&mut self) {
+        self.owed = false;
     }
 
     /// The columns of the word around a cell, both ends included, or nothing
@@ -789,6 +814,15 @@ impl Scrollback {
             .map_or(text.len(), |after| col + after)
             - 1;
         Some((column(start), column(end)))
+    }
+
+    /// Whether the line at `offset` is here and has anything on it.
+    ///
+    /// [`Self::line_ends`] cannot say: it answers zero for a line with one
+    /// character on it, for an empty one, and for one that has not arrived.
+    fn anything_on(&self, offset: u64) -> bool {
+        self.line(offset)
+            .is_some_and(|line| !plain(line, 0, u16::MAX).trim_end().is_empty())
     }
 
     /// The last column of a line with anything on it, which is where a line
@@ -816,7 +850,13 @@ impl Scrollback {
             // start of its word, the one that reads last on to the end of its
             // own. A cell in no word is left where it is, so dragging over the
             // space between two words does not swallow either of them.
-            Grain::Word => (
+            //
+            // And a double click that landed on no word is not a word gesture
+            // at all: there is nothing under the end it started from to walk
+            // by, so it drags by the cell. Asked of the anchor here rather
+            // than at the press, because at the press the lines it is asked
+            // about may still be coming.
+            Grain::Word if self.word_on(selection.anchor).is_some() => (
                 Cell {
                     col: self.word_on(first).map_or(first.col, |(from, _)| from),
                     ..first
@@ -826,6 +866,7 @@ impl Scrollback {
                     ..last
                 },
             ),
+            Grain::Word => (first, last),
             Grain::Line => (
                 Cell { col: 0, ..first },
                 Cell {
@@ -836,6 +877,12 @@ impl Scrollback {
         }
     }
 
+    /// Whether anything is selected, which is what the highlight on the screen
+    /// is showing.
+    pub fn selecting(&self) -> bool {
+        self.selection.is_some()
+    }
+
     /// What letting go of the button has to copy, if it has anything.
     ///
     /// A click that never became a drag selects the one cell under it, and
@@ -843,13 +890,9 @@ impl Scrollback {
     /// than doing nothing: it throws away whatever was on the clipboard, which
     /// is often the thing they were about to paste. So a one-cell selection is
     /// read as a click and dropped, unless it is a word or a line that came out
-    /// one cell wide, which is a gesture somebody made twice.
-    /// Whether anything is selected, which is what the highlight on the screen
-    /// is showing.
-    pub fn selecting(&self) -> bool {
-        self.selection.is_some()
-    }
-
+    /// one cell wide, which is a gesture somebody made twice. Which of the two
+    /// a double click was is [`Self::took`]'s to say: it needs the text, and
+    /// the text is a round trip away when the click is made.
     pub fn copied(&mut self) -> Option<String> {
         let selection = self.selection?;
         if selection.grain == Grain::Cell && selection.anchor == selection.head {
@@ -860,7 +903,33 @@ impl Scrollback {
             self.owed = true;
             return None;
         }
-        self.selected()
+        self.took()
+    }
+
+    /// The text under the highlight, and the highlight itself where there is
+    /// none: a gesture that took nothing is a click, and the caller reads a
+    /// selection still standing as somebody who meant to be in the view.
+    ///
+    /// Nothing is what a double click on a blank comes to, and on a comma, and
+    /// on anything else [`in_a_word`] is not: what a hand points at in a
+    /// terminal is a path or a flag, and the punctuation between two of them
+    /// is a cell somebody clicked twice. It is knowable only here, the word
+    /// being a fact about lines that may not have arrived when the click was
+    /// made. A drag over the empty end of a line and a third click on an empty
+    /// one come to the same thing by the same route.
+    ///
+    /// Which is why it is [`Self::selected_size`] that says whether there is
+    /// anything here rather than a test of its own: that is what the mark row
+    /// is showing, and a release that copies what the row says is not selected
+    /// is two answers to one question. Left selected instead, all of these
+    /// ended with the session paused behind a one-cell highlight and nothing
+    /// to press but Esc.
+    fn took(&mut self) -> Option<String> {
+        let text = self.selected_size().and_then(|_| self.selected());
+        if text.is_none() {
+            self.selection = None;
+        }
+        text
     }
 
     /// How much is under the highlight, while anything is.
@@ -876,7 +945,18 @@ impl Scrollback {
     /// is usually a click and whose release is going to throw it away.
     pub fn selected_size(&self) -> Option<Selected> {
         let selection = self.selection?;
-        if selection.grain == Grain::Cell && selection.anchor == selection.head {
+        // A click's word or line is the same nothing until it is found: while
+        // the lines are still on their way there is nothing to measure, and on
+        // a blank there is never going to be anything. Both ends sit on the
+        // cell that was clicked until then, which counted as `1 char selected`
+        // for a gesture that is about to say sixty.
+        if selection.anchor == selection.head
+            && match selection.grain {
+                Grain::Cell => true,
+                Grain::Word => self.word_on(selection.anchor).is_none(),
+                Grain::Line => !self.anything_on(selection.anchor.line),
+            }
+        {
             return None;
         }
         let (first, last) = self.grained(&selection);
@@ -893,10 +973,16 @@ impl Scrollback {
     /// The block on its way is the one the press asked for, so a block that
     /// does not cover the selection is a selection nothing later will cover
     /// either, and a request left standing would put a copy nobody asked for on
-    /// the clipboard the next time the view moved. Which is why the failure is
+    /// the clipboard the next time the view moved. Which is why that failure is
     /// [`Owed::Lost`] rather than another nothing: there is a release behind it
     /// that took nothing and said nothing, and the highlight still on the
     /// screen claims otherwise.
+    ///
+    /// [`Owed::Empty`] is the other end of the same thing, and says the
+    /// opposite: there was nothing to take. A gesture that never moved is a
+    /// click wherever it landed, and a block that covers the lines and has
+    /// nothing on them has answered the question rather than failed to. Both
+    /// leave the clipboard alone; only one is worth a word on the row.
     pub fn owed_copy(&mut self) -> Owed {
         if !std::mem::take(&mut self.owed) {
             return Owed::Nothing;
@@ -905,11 +991,22 @@ impl Scrollback {
             return Owed::Nothing;
         };
         if !self.holds(&selection) {
+            // Unless it never moved: the word a double click asked for is out
+            // where no block reaches, so there was never a copy there to
+            // lose. `g` and then a double click, inside one round trip.
+            if selection.anchor == selection.head {
+                self.selection = None;
+                return Owed::Empty;
+            }
             return Owed::Lost;
         }
-        match self.selected() {
+        match self.took() {
             Some(text) => Owed::Copied(text),
-            None => Owed::Lost,
+            // The block covers the lines and there was nothing on them: the
+            // word a double click asked for was a blank after all, or a drag
+            // ran over the empty end of one. Nothing was lost, there being
+            // nothing there to take.
+            None => Owed::Empty,
         }
     }
 
@@ -1637,6 +1734,38 @@ mod tests {
         assert_eq!(view.copied(), None);
     }
 
+    /// A word is what a hand in a terminal points at, so the punctuation
+    /// between two of them is in none: a double click on a comma is a click,
+    /// and a click takes nothing. Taken, it is one character on the clipboard
+    /// in place of whatever was about to be pasted, which is the whole of what
+    /// [`Scrollback::copied`] is written to avoid.
+    #[test]
+    fn a_double_click_on_punctuation_takes_nothing() {
+        let text = "a, b".to_string();
+        let mut view = Scrollback::new(SIZE);
+        view.take(Window {
+            from: 0,
+            total: 1,
+            lines: vec![text.clone()],
+        });
+        view.select_word(at(24, 2));
+        assert_eq!(view.copied(), None);
+        assert!(!view.selecting(), "and the highlight goes with it");
+
+        // And the same on the live screen, where the lines come after the
+        // release and the answer is owed.
+        let mut view = Scrollback::new(SIZE);
+        view.select_word(at(24, 2));
+        assert_eq!(view.copied(), None);
+        view.take(Window {
+            from: 0,
+            total: 1,
+            lines: vec![text],
+        });
+        assert_eq!(view.owed_copy(), Owed::Empty);
+        assert!(!view.selecting());
+    }
+
     /// And a third takes the line, to the end of what is on it.
     #[test]
     fn a_third_click_takes_the_line() {
@@ -2056,6 +2185,140 @@ mod tests {
         assert_eq!(view.copied().as_deref(), Some(" 9"));
     }
 
+    /// Whether there was a word under it is asked of the text, so it cannot be
+    /// asked while the lines are still coming: the same gesture on the live
+    /// screen has to answer the same way, or a double click drags by the word
+    /// or by the cell depending on how far away the machine is.
+    #[test]
+    fn a_double_click_off_a_word_drags_by_the_cell_whenever_the_lines_arrive() {
+        let mut view = Scrollback::new(SIZE);
+        view.select_word(at(24, 5));
+        view.select_to(at(24, 6));
+        answer(&mut view, 100);
+        assert_eq!(view.copied().as_deref(), Some(" 9"));
+    }
+
+    /// The double click nobody could make: on the live screen the press that
+    /// opens the view is a round trip ahead of the lines it opens on, so the
+    /// second one lands with no block to look for a word in. Read as no word
+    /// at all it took the cell under the pointer, which is a double click that
+    /// selects one character.
+    #[test]
+    fn a_double_click_takes_its_word_out_of_a_block_that_had_not_arrived() {
+        let mut view = Scrollback::new(SIZE);
+        view.select_word(at(24, 2));
+        assert_eq!(view.copied(), None, "nothing to take it out of yet");
+
+        answer(&mut view, 100);
+        assert_eq!(view.owed_copy(), Owed::Copied("line".to_string()));
+    }
+
+    /// And it may turn out to have landed on nothing, which is only knowable
+    /// once the lines are here. A click takes nothing; so does this, rather
+    /// than the blank it landed on or a notice saying a copy was lost.
+    #[test]
+    fn a_double_click_on_a_blank_takes_nothing_once_the_lines_arrive() {
+        let mut view = Scrollback::new(SIZE);
+        view.select_word(at(24, 5));
+        assert_eq!(view.copied(), None);
+
+        answer(&mut view, 100);
+        assert_eq!(view.owed_copy(), Owed::Empty);
+        assert!(!view.selecting(), "and the highlight goes with it");
+    }
+
+    /// And the lines usually beat the button up: a release is a hand's tens of
+    /// milliseconds away and a block is a round trip, which on a local node is
+    /// nothing at all. So the same double click on a blank has to be read as a
+    /// click on the way out of `copied` as well, or the release takes nothing,
+    /// says nothing, and leaves the view up over a session that has stopped
+    /// being painted with a one-cell highlight on it.
+    #[test]
+    fn a_double_click_on_a_blank_lets_go_when_the_lines_beat_the_button_up() {
+        let mut view = Scrollback::new(SIZE);
+        view.select_word(at(24, 5));
+        answer(&mut view, 100);
+        assert_eq!(view.copied(), None);
+        assert!(!view.selecting(), "and the view is handed back");
+    }
+
+    /// Which is the general shape of it: a selection whose cells are blank
+    /// takes nothing whatever gesture made it, and a highlight over nothing is
+    /// not a reason to stay in the view.
+    #[test]
+    fn a_selection_with_nothing_on_it_lets_go_of_the_view() {
+        let mut view = Scrollback::new(SIZE);
+        view.take(Window {
+            from: 0,
+            total: 2,
+            lines: vec![String::new(), "        ".to_string()],
+        });
+        view.select_line(at(24, 3));
+        assert_eq!(view.copied(), None, "an empty line has nothing on it");
+        assert!(!view.selecting());
+
+        view.select_from(at(24, 2));
+        view.select_to(at(24, 6));
+        assert_eq!(view.copied(), None, "and neither have blanks dragged over");
+        assert!(!view.selecting());
+    }
+
+    /// The same answer when the lines arrive late. A block that covers the
+    /// selection and has nothing on it is not a copy that was lost: nothing
+    /// was there to take, which is what a click does and what a click says.
+    #[test]
+    fn an_owed_copy_of_blanks_is_nothing_rather_than_a_copy_lost() {
+        let mut view = Scrollback::new(SIZE);
+        view.select_from(at(24, 3));
+        view.select_to(at(24, 9));
+        assert_eq!(view.copied(), None, "nothing to take it out of yet");
+
+        view.take(Window {
+            from: 0,
+            total: 3,
+            lines: vec![String::new(); 3],
+        });
+        assert_eq!(view.owed_copy(), Owed::Empty);
+        assert!(!view.selecting());
+    }
+
+    /// A press starts a gesture, and the one before it is over: a copy its
+    /// release could not be answered out of an empty block belongs to that
+    /// gesture and to nothing after it. Left standing, the block arriving
+    /// mid-drag answered it out of whatever is selected *now*, which is a
+    /// character on the clipboard and the view handed back with the button
+    /// still down.
+    #[test]
+    fn a_new_press_drops_the_copy_the_last_one_never_finished() {
+        let mut view = Scrollback::new(SIZE);
+        view.select_word(at(24, 2));
+        assert_eq!(view.copied(), None, "owed until the lines arrive");
+
+        view.select_line(at(24, 2));
+        answer(&mut view, 100);
+        assert_eq!(view.owed_copy(), Owed::Nothing, "the double click's, gone");
+        assert_eq!(
+            view.copied().as_deref(),
+            Some("line 99"),
+            "and the release of the gesture in hand says what to take"
+        );
+    }
+
+    /// And a gesture whose lines no block will ever hold has lost nothing if
+    /// it never moved: `g` and a double click inside the same round trip are a
+    /// click on a screen nobody has been told the size of.
+    #[test]
+    fn a_double_click_out_where_no_block_reaches_lost_nothing() {
+        let mut view = Scrollback::new(SIZE);
+        view.top();
+        view.select_word(at(24, 2));
+        assert_eq!(view.copied(), None);
+
+        answer(&mut view, 100);
+        assert_eq!(view.owed_copy(), Owed::Empty);
+        assert!(!view.selecting(), "and the highlight goes with it");
+    }
+
     /// What the row says while a hand is still drawing a selection. Counted in
     /// the units the selection is in: how much of this line, or how many lines.
     #[test]
@@ -2084,6 +2347,38 @@ mod tests {
         let mut view = view(100);
         view.select_word(at(24, 2));
         assert_eq!(view.selected_size(), Some(Selected::Chars(4)));
+
+        // And says nothing about a word that turned out not to be there, or
+        // about one nobody can see yet: `1 char selected` is what a click
+        // would say, and a click says nothing.
+        view.select_word(at(24, 5));
+        assert_eq!(view.selected_size(), None, "a blank is not a word");
+
+        let mut coming = Scrollback::new(SIZE);
+        coming.select_word(at(24, 2));
+        assert_eq!(coming.selected_size(), None, "the lines are still coming");
+        answer(&mut coming, 100);
+        assert_eq!(coming.selected_size(), Some(Selected::Chars(4)));
+    }
+
+    /// And a line selection is the same question again: a third click says
+    /// nothing about a line it cannot see, and nothing about an empty one.
+    #[test]
+    fn a_line_selection_is_counted_once_there_is_a_line_to_count() {
+        let mut view = Scrollback::new(SIZE);
+        view.select_line(at(24, 2));
+        assert_eq!(view.selected_size(), None, "the lines are still coming");
+        answer(&mut view, 100);
+        assert_eq!(view.selected_size(), Some(Selected::Chars(7)), "line 99");
+
+        let mut view = Scrollback::new(SIZE);
+        view.take(Window {
+            from: 0,
+            total: 1,
+            lines: vec![String::new()],
+        });
+        view.select_line(at(24, 2));
+        assert_eq!(view.selected_size(), None, "nothing on the line");
     }
 
     /// One of anything is one of it. Said in the row and in the notice that

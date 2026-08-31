@@ -1641,7 +1641,12 @@ async fn pump(
                         // one thing either of these has to do, which is be
                         // read, is the one thing it never did.
                         match &owing {
-                            Owed::Nothing => {}
+                            // Nothing to say either way: nothing was waiting,
+                            // or what was waiting turned out to have no text
+                            // under it, which takes nothing the way a click
+                            // does. The view still goes, the gesture being
+                            // over.
+                            Owed::Nothing | Owed::Empty => {}
                             Owed::Copied(text) => {
                                 stdout
                                     .write_all(clipboard::to_terminal(text).as_bytes())
