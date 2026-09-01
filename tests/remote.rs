@@ -1589,6 +1589,22 @@ fn a_wheel_notch_opens_and_moves_the_history_view() {
         );
     }
 
+    // A node starts a detached session before it has necessarily read every
+    // byte the child immediately writes.  The first press asks it for a
+    // history block, so wait until the last line has reached the node before
+    // asking that block to make the double-click test about the gesture rather
+    // than whether this runner scheduled the shell yet.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !seen.contains("line 80") {
+        if let Ok(chunk) = seen_rx.recv_timeout(Duration::from_millis(200)) {
+            seen.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the session never filled its history; saw: {seen:?}"
+        );
+    }
+
     // The latest selection path opens a view for the first press, then sees a
     // second press before its history block returns. It must hand the session
     // back after the copy without giving the wheel back to the terminal.
