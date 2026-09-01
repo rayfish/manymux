@@ -1214,6 +1214,12 @@ impl KeyFilter {
             return None;
         }
         if first.motion {
+            // A drag starts with the same press as a click, but it is not the
+            // first half of a double click. Leaving that press in `clicked`
+            // made a new selection from the same cell, begun quickly after a
+            // drag, become a word or line selection instead of the ordinary
+            // drag the hand made.
+            self.clicked = None;
             let mut at = first.at;
             while let Some(next) = Report::parse(&input[*i..]) {
                 if !next.motion || next.button != LEFT {
@@ -1931,6 +1937,38 @@ mod tests {
             f.filter(&moved.rest).action,
             Some(Action::Select(Select::Done)),
             "the release was handed back rather than eaten"
+        );
+    }
+
+    /// The press that starts a drag is not a click to carry into the next
+    /// gesture. Otherwise another ordinary selection from the same cell soon
+    /// afterwards was read as a double click and unexpectedly selected a word.
+    #[test]
+    fn a_drag_does_not_turn_the_next_selection_into_a_double_click() {
+        let mut f = KeyFilter::new(KEY);
+        f.set_scroll(true);
+        f.set_wheel(true);
+        let at = Instant::now();
+        let spot = Spot { col: 10, row: 5 };
+
+        assert_eq!(
+            f.filter_at(b"\x1b[<0;10;5M", at).action,
+            Some(Action::Select(Select::From(spot)))
+        );
+        assert_eq!(
+            f.filter_at(b"\x1b[<32;14;5M", at + Duration::from_millis(20))
+                .action,
+            Some(Action::Select(Select::To(Spot { col: 14, row: 5 })))
+        );
+        assert_eq!(
+            f.filter_at(b"\x1b[<0;14;5m", at + Duration::from_millis(30))
+                .action,
+            Some(Action::Select(Select::Done))
+        );
+        assert_eq!(
+            f.filter_at(b"\x1b[<0;10;5M", at + Duration::from_millis(100))
+                .action,
+            Some(Action::Select(Select::From(spot)))
         );
     }
 
