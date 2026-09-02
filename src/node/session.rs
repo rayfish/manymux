@@ -20,7 +20,8 @@ use tracing::{debug, warn};
 use super::events::{Event, Scanner, Utf8Decoder};
 use crate::lock::held;
 use crate::proto::{
-    Doing, EventKind, Found, Peek, SessionEvent, SessionInfo, Size, SpawnSpec, View, ViewRequest,
+    self, Doing, EventKind, Found, Peek, SessionEvent, SessionInfo, Size, SpawnSpec, View,
+    ViewRequest,
 };
 use crate::shell;
 use crate::user;
@@ -71,6 +72,20 @@ struct State {
     vt: Vt,
     scanner: Scanner,
     decoder: Utf8Decoder,
+    /// Lines the buffer has thrown away since the session started.
+    ///
+    /// `avt` keeps [`SCROLLBACK`] lines and drops the oldest to stay inside
+    /// that, so how many lines it holds stops saying how many the session has
+    /// printed the moment it is full. Counted here because the count of
+    /// dropped lines is only offered once, as the feed that dropped them
+    /// returns, and a client scrolled back needs it: see [`View::printed`].
+    trimmed: u64,
+    /// What `trimmed` plus the lines in the buffer came to when the count was
+    /// last worked out, so that only what has been added since is added on.
+    counted: u64,
+    /// Where the newest line has got to, which is what a client is told and is
+    /// worked out rather than measured: see [`Self::printed`].
+    printed: u64,
     bells: u64,
     last_activity: Instant,
     /// Requested size per attached client. The effective size is the smallest
@@ -98,6 +113,52 @@ impl State {
     /// leave its mouse dead.
     fn repaint(&self) -> String {
         format!("{}{}", self.vt.dump(), self.scanner.replay())
+    }
+
+    /// How far the newest line has got, for a client working out how far it
+    /// moved since the last time it asked ([`View::printed`]).
+    ///
+    /// Lines thrown away plus lines still here is what the session has printed,
+    /// and while it goes on printing that is the whole of it. What this is for
+    /// is the three things that put lines *back*, none of which is a session
+    /// unprinting anything:
+    ///
+    /// A full-screen program takes a screen of its own and the history is put
+    /// aside behind it, so there are two dozen lines here and no scrollback at
+    /// all until it quits. Counted, quitting `less` would read as nine
+    /// thousand lines printed at once and throw a view somebody was holding to
+    /// the top of the buffer, so nothing is counted while one is up: the
+    /// buffer this counts is untouched throughout, and is the same size on the
+    /// way out as it was on the way in.
+    ///
+    /// A reset (`\ec`) empties the buffer without trimming it, which is not
+    /// anything a count of lines can describe: what a client was reading is
+    /// not there to be found by any number. So the count stands where it was
+    /// and goes on from what is here now, which keeps it counting the lines
+    /// printed after one rather than stopping until the buffer has grown back
+    /// past where it was. A reflow is the same and is dealt with where it
+    /// happens, in [`Self::rebase`].
+    fn printed(&mut self, total: u64) -> u64 {
+        if self.scanner.on_alternate() {
+            return self.printed;
+        }
+        let here = self.trimmed + total;
+        self.printed += here.saturating_sub(self.counted);
+        self.counted = here;
+        self.printed
+    }
+
+    /// Resize the screen model, and go on counting from whatever the reflow
+    /// left rather than from what was here before it.
+    ///
+    /// A reflow is not the session printing or unprinting anything: a narrower
+    /// screen splits the lines that were wrapped and a wider one rejoins them,
+    /// so the buffer comes out of one a different length either way. Counted, a
+    /// phone attaching would have said a thousand lines had just been printed
+    /// and thrown every view of the session back by a thousand.
+    fn resize(&mut self, size: Size) {
+        self.vt.resize(size.cols as usize, size.rows as usize);
+        self.counted = self.trimmed + self.vt.lines().count() as u64;
     }
 
     /// Smallest size across attached clients, or the current size when nothing
@@ -194,15 +255,33 @@ impl Attachment {
 
     /// A window of the session's history, for a client scrolling back through
     /// it on a screen the terminal keeps no scrollback for.
+    ///
+    /// The request is brought into this instant before it is answered: `from`
+    /// counts back from the newest line as the client last heard it, and the
+    /// newest line has moved by however much printed since (see
+    /// [`ViewRequest::printed`]). Corrected here rather than left to the
+    /// client, which can only correct the answer after it arrives, and a
+    /// correction that lands after the fact is a block that does not cover the
+    /// window it was asked for.
     pub fn window(&self, request: &ViewRequest) -> View {
-        let state = held(&self.session.state);
-        super::history::window(&state.vt, request)
+        let mut state = held(&self.session.state);
+        let total = state.vt.lines().count() as u64;
+        let printed = state.printed(total);
+        let asked = ViewRequest {
+            from: request
+                .from
+                .saturating_add(proto::moved(printed, request.printed)),
+            ..request.clone()
+        };
+        super::history::window(&state.vt, printed, &asked)
     }
 
     /// Every line of that history holding `needle`.
     pub fn find(&self, needle: &str) -> Found {
-        let state = held(&self.session.state);
-        super::history::find(&state.vt, needle)
+        let mut state = held(&self.session.state);
+        let total = state.vt.lines().count() as u64;
+        let printed = state.printed(total);
+        super::history::find(&state.vt, printed, needle)
     }
 
     /// What the session is called, which is what a rename asked for from here
@@ -284,6 +363,9 @@ impl Session {
                     .build(),
                 scanner: Scanner::new(),
                 decoder: Utf8Decoder::new(),
+                trimmed: 0,
+                counted: 0,
+                printed: 0,
                 bells: 0,
                 last_activity: Instant::now(),
                 clients: HashMap::new(),
@@ -358,7 +440,12 @@ impl Session {
 
         state.scanner.feed(chunk, |e| events.push(e));
         let text = state.decoder.decode(chunk);
-        state.vt.feed_str(&text);
+        // The lines this chunk pushed out of the buffer, counted as they go:
+        // `avt` hands them over once, here, and nowhere else says they existed
+        // (see `State::trimmed`). Consuming the iterator is what drops them,
+        // so this is the count of work already being done.
+        let trimmed = state.vt.feed_str(&text).scrollback.count() as u64;
+        state.trimmed += trimmed;
         state.last_activity = Instant::now();
 
         state.bells += events.iter().filter(|e| **e == Event::Bell).count() as u64;
@@ -439,7 +526,7 @@ impl Session {
             return;
         }
         state.size = size;
-        state.vt.resize(size.cols as usize, size.rows as usize);
+        state.resize(size);
         let _ = self.input_tx.send(Input::Resize(size));
     }
 
@@ -666,12 +753,101 @@ mod tests {
             vt: Vt::new(80, 24),
             scanner: Scanner::new(),
             decoder: Utf8Decoder::new(),
+            trimmed: 0,
+            counted: 0,
+            printed: 0,
             bells: 0,
             last_activity: Instant::now(),
             clients,
             size: Size::new(80, 24),
         };
         assert_eq!(state.effective_size(), Size::new(80, 40));
+    }
+
+    /// A reflow is not the session printing: a narrower screen splits the
+    /// lines that were wrapped and a wider one rejoins them, so the buffer
+    /// comes out a different length either way. Counted, a phone attaching to
+    /// a session somebody is reading would say a thousand lines had just been
+    /// printed and throw their view back by a thousand.
+    #[test]
+    fn a_reflow_prints_nothing() {
+        let mut state = State {
+            vt: Vt::builder()
+                .size(80, 24)
+                .scrollback_limit(SCROLLBACK)
+                .build(),
+            scanner: Scanner::new(),
+            decoder: Utf8Decoder::new(),
+            trimmed: 0,
+            counted: 0,
+            printed: 0,
+            bells: 0,
+            last_activity: Instant::now(),
+            clients: HashMap::new(),
+            size: Size::new(80, 24),
+        };
+        for i in 0..50 {
+            state.vt.feed_str(&format!(
+                "{i}: a line long enough to be folded in two by a narrower screen
+"
+            ));
+        }
+        let total = state.vt.lines().count() as u64;
+        let before = state.printed(total);
+        assert!(before >= 50, "fifty lines and the screen: {before}");
+
+        // A phone attaching, which is the smallest attached client and so the
+        // one the session takes its size from.
+        state.resize(Size::new(40, 24));
+        let total = state.vt.lines().count() as u64;
+        assert!(total > before, "the lines were folded: {total}");
+        assert_eq!(state.printed(total), before, "and none of it was printed");
+
+        // And the phone leaving again, which folds them back.
+        state.resize(Size::new(80, 24));
+        let total = state.vt.lines().count() as u64;
+        assert_eq!(state.printed(total), before, "nor is undoing one");
+
+        state.vt.feed_str(
+            "one more
+",
+        );
+        let total = state.vt.lines().count() as u64;
+        assert_eq!(state.printed(total), before + 1, "what follows one counts");
+    }
+
+    /// The count a scrolling client anchors on counts what the session
+    /// printed, and nothing else the buffer does.
+    #[test]
+    fn what_a_session_has_printed_does_not_go_back() {
+        let mut state = State {
+            vt: Vt::new(80, 24),
+            scanner: Scanner::new(),
+            decoder: Utf8Decoder::new(),
+            trimmed: 40,
+            counted: 0,
+            printed: 0,
+            bells: 0,
+            last_activity: Instant::now(),
+            clients: HashMap::new(),
+            size: Size::new(80, 24),
+        };
+        assert_eq!(state.printed(1000), 1040, "the forty that scrolled off");
+        assert_eq!(state.printed(1010), 1050, "ten lines printed since");
+
+        // A full-screen program, which has the scrollback put aside and a
+        // screen of its own, and then quits.
+        state.scanner.feed(b"\x1b[?1049h", |_| {});
+        assert_eq!(state.printed(24), 1050, "not a session unprinting");
+        state.scanner.feed(b"\x1b[?1049l", |_| {});
+        assert_eq!(state.printed(1010), 1050, "nor printing it all again");
+
+        // A reset, which empties the buffer without trimming it, and then five
+        // hundred lines printed after it. Counting those is what a high-water
+        // mark could not do: it would have said nothing had been printed until
+        // the buffer had grown back past a thousand.
+        assert_eq!(state.printed(24), 1050, "a reset prints nothing");
+        assert_eq!(state.printed(524), 1550, "and what follows one counts");
     }
 
     /// The title is the program's to set and nobody else's: renaming a session
@@ -682,6 +858,9 @@ mod tests {
             vt: Vt::new(80, 24),
             scanner: Scanner::new(),
             decoder: Utf8Decoder::new(),
+            trimmed: 0,
+            counted: 0,
+            printed: 0,
             bells: 0,
             last_activity: Instant::now(),
             clients: HashMap::new(),

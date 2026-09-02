@@ -43,10 +43,28 @@
 //! The window moves locally inside a block that has already arrived, and a
 //! block is a few screenfuls. A request per wheel notch would be a round trip
 //! over ssh per wheel notch, on machines that are usually two hops away.
+//!
+//! Everything in here is a count back from the newest line, which is the only
+//! end of a buffer that trims from the top can be counted from, and the newest
+//! line moves whenever the session prints. So the numbers a view holds go stale
+//! by themselves, without anybody touching anything, and a session worth
+//! scrolling back through is usually one that is still printing. Without an
+//! answer to that, reading back through a busy session snapped forward a block
+//! at a time and walked over the same lines again and again.
+//!
+//! The answer is in two halves, because a round trip has two ends. Every
+//! question says which instant it is asked in ([`ViewRequest::printed`]) and
+//! the node answers about that window rather than about wherever the offset
+//! points by the time it arrives, so what comes back covers what was asked
+//! about however hard the session is printing. And every answer says which
+//! instant it is answered in ([`Window::printed`]), which is what
+//! [`Scrollback::follow`] moves everything here by: what is on the screen, what
+//! is selected and where the matches are all name text, and text does not move
+//! because more of it was printed underneath.
 
 use crate::client::attach::Spot;
 use crate::client::pen;
-use crate::proto::{Found, Size, View as Window, ViewRequest};
+use crate::proto::{Found, Size, View as Window, ViewRequest, moved};
 use unicode_width::UnicodeWidthChar;
 
 /// Screenfuls fetched at a time. Enough that a page up or down lands inside
@@ -81,6 +99,15 @@ pub struct Scrollback {
     /// arithmetic, and an `Option` in the middle of it would be unwrapped to
     /// zero at each one and mean nothing.
     total: u64,
+    /// Lines the session had printed when the last answer came back, trimmed
+    /// ones included, which is the count [`Self::follow`] reads to see how far
+    /// the bottom has moved. Zero from a node too old to send it.
+    printed: u64,
+    /// Whether the buffer is trimming: the last answer held as many lines as
+    /// the one before it while the newest line moved, so every line printed
+    /// pushes one off the top. Which is what makes the oldest line an end to
+    /// hold rather than a line to read: see [`Self::pinned`].
+    trimming: bool,
     /// Whether the host has answered once, and so whether `total` is worth
     /// clamping against.
     ///
@@ -361,6 +388,8 @@ impl Scrollback {
         Self {
             offset: 0,
             total: 0,
+            printed: 0,
+            trimming: false,
             answered: false,
             block: None,
             asked: None,
@@ -382,6 +411,13 @@ impl Scrollback {
     /// there is anything to find in: everything below the view is on the screen
     /// already.
     pub fn found(&mut self, found: Found) -> bool {
+        // The offsets are counts back from the newest line as the node had it
+        // when it looked, which is not the instant this view is holding: a
+        // search asks its own question and takes its own answer, and the
+        // session went on printing throughout. Brought into step before any of
+        // them is read, so that what lands here is one set of numbers rather
+        // than two frames added together.
+        self.follow(found.printed);
         let mut search = Search {
             needle: found.needle,
             lines: found.lines,
@@ -576,9 +612,19 @@ impl Scrollback {
         let request = ViewRequest {
             from,
             lines: u32::try_from((top - from).min(COPY_LINES + span)).unwrap_or(u32::MAX),
+            // Which instant `from` is counted from, since the newest line will
+            // have moved again by the time this is read (see
+            // [`ViewRequest::printed`]). A window holding an end of the buffer
+            // is asking about the end rather than about its lines, so it asks
+            // for wherever that is now: see [`Self::pinned`].
+            printed: if self.pinned() { 0 } else { self.printed },
         };
         // The same request twice means the answer to the first one was all
-        // there is, and asking again would only get it again, forever.
+        // there is, and asking again would only get it again, forever. Still
+        // true with an instant on these: a question that carries one is a
+        // different question in the next instant and is asked again on its own,
+        // and one that does not is a window on an end of the buffer, where the
+        // answer covers whatever it is asked about.
         if self.asked.as_ref() == Some(&request) {
             return None;
         }
@@ -586,8 +632,11 @@ impl Scrollback {
         Some(request)
     }
 
-    /// Take a block the host sent, and learn from it where the ends are.
+    /// Take a block the host sent, and learn from it where the ends are, and
+    /// how far the newest line has moved since the last one.
     pub fn take(&mut self, window: Window) {
+        self.trimming = moved(window.printed, self.printed) > 0 && window.total == self.total;
+        self.follow(window.printed);
         self.total = window.total;
         self.answered = true;
         // A buffer that trimmed under the request, or one shorter than a
@@ -598,6 +647,82 @@ impl Scrollback {
             from: window.from,
             lines: window.lines,
         });
+    }
+
+    /// Move everything back by whatever the session printed since the last
+    /// answer, so that what is being read stays where it is being read.
+    ///
+    /// Every number here is a count back from the newest line, and the newest
+    /// line moves whenever the session prints. That is invisible while nothing
+    /// is asked for, since a block is a few screenfuls and moving inside one is
+    /// local, and then the next block comes back measured from a bottom that
+    /// has moved: scrolling back through a session that was still printing
+    /// snapped forward a block at a time and walked over the same lines again
+    /// and again. `printed` is the one count that does not move
+    /// ([`Window::printed`]), so two answers say how far the bottom went.
+    ///
+    /// Everything that names lines moves: what is selected, where the matches
+    /// are, and the block in hand, whose `from` is a count from the newest line
+    /// like all the rest. The block is replaced two lines later when this is
+    /// called from [`Self::take`], and is not when it is called from
+    /// [`Self::found`], where a match landing inside the block already here is
+    /// painted straight out of it.
+    ///
+    /// The window is the exception, and only at the bottom: there it is
+    /// following the session rather than reading it. A press on the live screen
+    /// opens a view under itself and is handed back at the release, which only
+    /// happens while it is still at the bottom, so a window moved up by
+    /// whatever printed inside that round trip would leave a click sitting in
+    /// front of a session nobody asked to stop watching. At the top the move is
+    /// made and then taken back by the clamp below, there being nothing further
+    /// back to move to.
+    ///
+    /// Nothing to follow before the first answer, and nothing from a node too
+    /// old to count, which sends a zero and leaves this where it always was.
+    fn follow(&mut self, printed: u64) {
+        let moved = moved(printed, self.printed);
+        if printed != 0 {
+            self.printed = printed;
+        }
+        if !self.answered || moved == 0 {
+            return;
+        }
+        if self.offset != 0 {
+            self.offset = self.offset.saturating_add(moved);
+        }
+        if let Some(block) = &mut self.block {
+            block.from = block.from.saturating_add(moved);
+        }
+        if let Some(selection) = &mut self.selection {
+            selection.anchor.line = selection.anchor.line.saturating_add(moved);
+            selection.head.line = selection.head.line.saturating_add(moved);
+        }
+        if let Some(search) = &mut self.search {
+            for line in &mut search.lines {
+                *line = line.saturating_add(moved);
+            }
+        }
+    }
+
+    /// Whether the window is holding an end of the buffer rather than the lines
+    /// it is showing, and so is asking about the end.
+    ///
+    /// Such a question goes without an instant on it ([`ViewRequest::printed`])
+    /// and is answered from where the end is now. Stamped with one, it is
+    /// answered where the view is *not* going to be looking, because both ends
+    /// move while the answer is on its way and the view is put back on them:
+    /// the block never covers the window, nothing is painted, and a client that
+    /// asks again whenever it is uncovered goes on asking for as long as the
+    /// session keeps printing.
+    ///
+    /// The bottom is always an end: it is the live screen, and a view there is
+    /// following the session. The top is one only while the buffer is
+    /// trimming, which is the case where the oldest line is a different line
+    /// every time somebody prints and [`Self::take`]'s clamp holds the window
+    /// against it. A buffer still growing has the same oldest line it had, so a
+    /// view sitting on it is reading lines like any other and moves with them.
+    fn pinned(&self) -> bool {
+        self.offset == 0 || (self.trimming && self.offset >= self.total.saturating_sub(self.page()))
     }
 
     /// Where a cell of the screen sits in the buffer.
@@ -1395,17 +1520,42 @@ mod tests {
     /// does. Answering by hand instead would let the tests agree with
     /// themselves about arithmetic the node does differently.
     fn answer(view: &mut Scrollback, total: u64) {
+        answer_at(view, total, total);
+    }
+
+    /// The same host, some way into a session that has gone on printing:
+    /// `printed` lines have been through the buffer and `total` of them are
+    /// still in it. Lines are named by where they sit in everything the
+    /// session ever printed rather than by where they sit in the buffer, so a
+    /// window that has held on to its lines shows the same names it did.
+    fn answer_at(view: &mut Scrollback, printed: u64, total: u64) -> bool {
         let Some(request) = view.wanted() else {
-            return;
+            return false;
         };
-        let from = request.from.min(total.saturating_sub(1));
+        // What `node::session::Attachment::window` does before answering: the
+        // question was asked in an older instant than the one it arrived in.
+        let from = request.from + moved(printed, request.printed);
+        let from = from.min(total.saturating_sub(1));
         let bottom = total - from;
         let top = bottom.saturating_sub(u64::from(request.lines));
+        let trimmed = printed - total;
         view.take(Window {
             from,
             total,
-            lines: (top..bottom).map(|i| format!("line {i}")).collect(),
+            printed,
+            lines: (top..bottom)
+                .map(|i| format!("line {}", trimmed + i))
+                .collect(),
         });
+        true
+    }
+
+    /// The lines the window is showing, out of the block in hand.
+    fn showing(view: &Scrollback) -> Vec<String> {
+        let Some(block) = &view.block else {
+            return Vec::new();
+        };
+        block.window(view.offset, view.page()).to_vec()
     }
 
     fn view(total: u64) -> Scrollback {
@@ -1583,9 +1733,240 @@ mod tests {
         view.take(Window {
             from: 0,
             total: 100,
+            printed: 100,
             lines: (0..100).map(|i| format!("line {i}")).collect(),
         });
         assert_eq!(view.offset(), 76, "the oldest line there is now");
+    }
+
+    /// The bug this was written for: a session that goes on printing while
+    /// somebody reads what it printed earlier. Every count in here is a count
+    /// back from the newest line, so the lines a window holds change under it
+    /// whenever the session prints, and the next block to arrive is measured
+    /// from a bottom that has moved. Scrolling back through a busy session
+    /// walked over the same lines again and again, each block snapping the
+    /// view forward by whatever had printed since the last one.
+    #[test]
+    fn a_view_scrolled_back_holds_on_to_its_lines_while_the_session_prints() {
+        let mut view = view(1000);
+        view.up(WHEEL);
+        answer(&mut view, 1000);
+        let reading = showing(&view);
+        assert!(reading.contains(&"line 990".to_string()), "{reading:?}");
+
+        // Away and back, far enough that the way back needs a block, with
+        // forty lines printed in between.
+        let page = u64::from(SIZE.rows) * 2;
+        view.up(page);
+        answer_at(&mut view, 1040, 1000);
+        view.down(page);
+        answer_at(&mut view, 1040, 1000);
+        assert_eq!(showing(&view), reading, "the same lines it was reading");
+        assert_eq!(view.offset(), WHEEL + 40, "forty further back than it was");
+    }
+
+    /// Except the window itself at the bottom, where the view is following the
+    /// session rather than reading it: a click on the live screen opens one
+    /// under itself, and a view moved up by what printed while its block was on
+    /// the way would be a click that left the session paused behind a window
+    /// nobody asked for.
+    ///
+    /// What was selected moves all the same, because a selection names text: a
+    /// drag begun at the bottom of a session that was still printing used to
+    /// copy whatever had landed on those rows by the time the lines arrived.
+    #[test]
+    fn a_view_at_the_live_screen_stays_there_but_a_selection_holds_its_lines() {
+        let mut view = view(1000);
+        // A drag over the three rows above the bottom of the live screen.
+        view.select_from(at(21, 1));
+        view.select_to(at(23, 8));
+        assert_eq!(
+            view.copied().as_deref(),
+            Some("line 996\nline 997\nline 998"),
+            "the lines that were under it"
+        );
+
+        // Forty lines printed while the block it needs was on its way.
+        view.take(Window {
+            from: 0,
+            total: 1000,
+            printed: 1040,
+            lines: (40..1040).map(|i| format!("line {i}")).collect(),
+        });
+        assert_eq!(view.offset(), 0, "the window is still the live screen");
+        assert!(view.at_bottom());
+        assert_eq!(
+            view.copied().as_deref(),
+            Some("line 996\nline 997\nline 998"),
+            "and the drag still holds the lines it was drawn over"
+        );
+    }
+
+    /// A search answers in the instant it looked, which is not the instant the
+    /// view is holding: it asks its own question, and the session goes on
+    /// printing while it is out. Added together, the two counts landed the view
+    /// somewhere neither of them named, and far enough off that the match the
+    /// row said it had found was below the bottom of the screen.
+    #[test]
+    fn a_search_lands_on_its_match_however_much_printed_while_it_looked() {
+        let mut view = view(1000);
+        view.up(WHEEL);
+        answer(&mut view, 1000);
+
+        // Forty lines printed, and then a match 539 back from where the newest
+        // line is now.
+        assert!(view.found(found_at(vec![539], 1040)));
+        let landed = view.offset();
+        answer_at(&mut view, 1040, 1000);
+        assert_eq!(view.offset(), landed, "the block does not move it again");
+        assert!(
+            showing(&view).contains(&"line 500".to_string()),
+            "the match is on the screen: {:?}",
+            showing(&view)
+        );
+    }
+
+    /// A view at the live screen is asking for the live screen, and the live
+    /// screen is wherever the session has got to. Asked as the window that was
+    /// at the bottom a round trip ago, the answer comes back centred on lines
+    /// the view is not on: it never covers, there is nothing to paint, and a
+    /// client that asks again whenever it is uncovered goes on asking for as
+    /// long as the session keeps printing.
+    #[test]
+    fn a_view_at_the_live_screen_paints_it_while_the_session_prints() {
+        let mut view = view(1000);
+        let mut printed = 1000;
+        // Away and back, far enough that the block in hand is nowhere near the
+        // bottom by the time the view is put back on it.
+        view.page_up();
+        view.page_up();
+        view.page_up();
+        printed += 40;
+        answer_at(&mut view, printed, 1000);
+        view.bottom();
+
+        printed += 40;
+        assert!(
+            answer_at(&mut view, printed, 1000),
+            "the bottom needs a block"
+        );
+        assert_eq!(
+            showing(&view).last().map(String::as_str),
+            Some(format!("line {}", printed - 1).as_str()),
+            "the newest line is on the bottom row"
+        );
+
+        // And with that in hand there is nothing left to ask: what is on the
+        // screen is the screen, however long the session goes on printing.
+        let mut asks = 0;
+        for _ in 0..4 {
+            printed += 40;
+            if answer_at(&mut view, printed, 1000) {
+                asks += 1;
+            }
+        }
+        assert_eq!(asks, 0, "asked {asks} times with nobody touching it");
+
+        // Away and back a second time. The same question in words, and a
+        // different one in fact: the live screen is not the lines it was.
+        view.page_up();
+        view.page_up();
+        view.page_up();
+        printed += 40;
+        answer_at(&mut view, printed, 1000);
+        view.bottom();
+        printed += 40;
+        assert!(answer_at(&mut view, printed, 1000), "asked again");
+        assert_eq!(
+            showing(&view).last().map(String::as_str),
+            Some(format!("line {}", printed - 1).as_str()),
+            "and painted the live screen as it is now"
+        );
+    }
+
+    /// And the same at the other end, where a buffer that is full trims a line
+    /// off the top for every line printed and the view is put back on whatever
+    /// is oldest now.
+    #[test]
+    fn a_view_at_the_oldest_line_paints_it_while_the_session_prints() {
+        let mut view = view(1000);
+        view.top();
+        let mut printed = 1000;
+
+        // A hundred lines a round trip, out of a buffer that is full, which is
+        // four times the slack a block is centred with. The first answer is
+        // what says the buffer is trimming rather than growing, so it takes one
+        // round trip to settle and then takes none.
+        let mut asks = 0;
+        let mut answered = printed;
+        for _ in 0..6 {
+            printed += 100;
+            if answer_at(&mut view, printed, 1000) {
+                asks += 1;
+                answered = printed;
+            }
+        }
+        assert!(asks <= 2, "asked {asks} times with nobody touching it");
+
+        let showing = showing(&view);
+        assert_eq!(showing.len(), SIZE.rows as usize, "a windowful");
+        assert_eq!(
+            showing.first().map(String::as_str),
+            Some(format!("line {}", answered - 1000).as_str()),
+            "the oldest line there was when it last asked, on the top row"
+        );
+    }
+
+    /// A search moves the view into the instant its matches were counted in,
+    /// and the block in hand is counted from the newest line like everything
+    /// else here. Left where it was, a match that landed inside it was painted
+    /// out of it against the wrong offset, which is the same wrong screen the
+    /// double shift gave and reached without asking for anything.
+    #[test]
+    fn a_search_that_lands_inside_the_block_in_hand_paints_the_right_lines() {
+        let mut view = view(1000);
+        view.up(30);
+        answer(&mut view, 1000);
+
+        // Twenty-nine lines printed while the search was out, and a match
+        // sixty back from where the newest line is now.
+        assert!(view.found(found_at(vec![60], 1029)));
+        assert!(view.wanted().is_none(), "the block in hand covers it");
+        let showing = showing(&view);
+        assert_eq!(
+            showing.last().map(String::as_str),
+            Some("line 980"),
+            "the window ends 48 back from `line 1028`"
+        );
+        assert!(
+            showing.contains(&"line 968".to_string()),
+            "and the match is on it: {showing:?}"
+        );
+    }
+
+    /// A block is centred on the window that was asked about, however much
+    /// printed while the question was in flight. Left to the client to correct
+    /// afterwards, anything past a screenful inside one round trip put the
+    /// window outside the block that had just arrived, and a session printing
+    /// that hard is one nobody could scroll back through at all: every notch
+    /// asked again and nothing was ever painted.
+    #[test]
+    fn a_block_covers_the_window_however_hard_the_session_is_printing() {
+        let mut view = view(10_000);
+        let mut printed = 10_000;
+        for _ in 0..8 {
+            view.page_up();
+            // A hundred lines a round trip, which is a build over a link with
+            // any latency at all, and four times the slack a block has.
+            printed += 100;
+            answer_at(&mut view, printed, 10_000);
+            assert_eq!(
+                showing(&view).len(),
+                SIZE.rows as usize,
+                "a windowful at {} back",
+                view.offset()
+            );
+        }
     }
 
     #[test]
@@ -1647,9 +2028,15 @@ mod tests {
     }
 
     fn found(lines: Vec<u64>) -> Found {
+        found_at(lines, 0)
+    }
+
+    /// The same, from a node that says which instant it counted them in.
+    fn found_at(lines: Vec<u64>, printed: u64) -> Found {
         Found {
             needle: "boom".to_string(),
             lines,
+            printed,
         }
     }
 
@@ -1772,6 +2159,7 @@ mod tests {
         view.take(Window {
             from: 0,
             total: 1,
+            printed: 1,
             lines: vec!["cd src/client/scroll.rs and go".to_string()],
         });
         view.select_word(at(24, 6));
@@ -1794,6 +2182,7 @@ mod tests {
         view.take(Window {
             from: 0,
             total: 1,
+            printed: 1,
             lines: vec![text.clone()],
         });
         view.select_word(at(24, 2));
@@ -1808,6 +2197,7 @@ mod tests {
         view.take(Window {
             from: 0,
             total: 1,
+            printed: 1,
             lines: vec![text],
         });
         assert_eq!(view.owed_copy(), Owed::Empty);
@@ -1821,6 +2211,7 @@ mod tests {
         view.take(Window {
             from: 0,
             total: 1,
+            printed: 1,
             lines: vec!["cd src and go".to_string()],
         });
         view.select_line(at(24, 6));
@@ -2124,6 +2515,7 @@ mod tests {
         view.take(Window {
             from: 0,
             total: 1,
+            printed: 1,
             lines: vec!["a界b".to_string()],
         });
         view.select_word(at(24, 3));
@@ -2330,6 +2722,7 @@ mod tests {
         view.take(Window {
             from: 0,
             total: 2,
+            printed: 2,
             lines: vec![String::new(), "        ".to_string()],
         });
         view.select_line(at(24, 3));
@@ -2355,6 +2748,7 @@ mod tests {
         view.take(Window {
             from: 0,
             total: 3,
+            printed: 3,
             lines: vec![String::new(); 3],
         });
         assert_eq!(view.owed_copy(), Owed::Empty);
@@ -2454,6 +2848,7 @@ mod tests {
         view.take(Window {
             from: 0,
             total: 1,
+            printed: 1,
             lines: vec![String::new()],
         });
         view.select_line(at(24, 2));

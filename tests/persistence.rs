@@ -292,6 +292,97 @@ async fn history_reaches_a_client_that_asks_before_the_screen_does() {
     assert!(!history.contains("line 60"), "{history:?}");
 }
 
+/// What a window is counted from moves while it is being read, so the node
+/// says where the newest line has got to and answers the question in the
+/// instant it was asked in.
+///
+/// Both halves of that are here because both are arithmetic done on the node
+/// and neither shows up as anything but the wrong lines: a count that says
+/// twice what the session printed drifts twice as fast as no count at all, and
+/// a window answered where the offset points now rather than where it pointed
+/// then is a block that does not cover the window it was asked for.
+#[tokio::test]
+async fn a_window_is_answered_in_the_instant_it_was_asked_in() {
+    let node = test_node().await;
+    let Spawned { name, .. } = spawn_session(&node, &["/bin/sh"]).await;
+
+    let mut client = Client::connect(&node);
+    client
+        .send(&Request::Attach {
+            name: name.clone(),
+            size: Size::new(80, 24),
+            history: 0,
+            read_only: false,
+        })
+        .await
+        .unwrap();
+    client
+        .type_line("i=1; while [ $i -le 60 ]; do echo line $i; i=$((i+1)); done")
+        .await
+        .unwrap();
+    client.read_until("line 60").await;
+
+    let first = client
+        .ask_for_view(&ViewRequest {
+            from: 3,
+            lines: 5,
+            printed: 0,
+        })
+        .await;
+    assert_eq!(
+        first.printed, first.total,
+        "a session that has printed less than it holds has trimmed nothing"
+    );
+    let reading = first.lines.clone();
+
+    // Twenty lines printed while somebody reads those five.
+    client
+        .type_line("i=1; while [ $i -le 20 ]; do echo more $i; i=$((i+1)); done")
+        .await
+        .unwrap();
+    client.read_until("more 20").await;
+
+    let again = client
+        .ask_for_view(&ViewRequest {
+            from: 3,
+            lines: 5,
+            printed: first.printed,
+        })
+        .await;
+    assert!(
+        again.printed > first.printed,
+        "the newest line moved: {} then {}",
+        first.printed,
+        again.printed
+    );
+    assert_eq!(
+        again.lines, reading,
+        "and the same question answers with the same lines"
+    );
+
+    // A search counts its offsets from the same line, so the two answers can
+    // be read against each other.
+    let found = client.search("line 1").await;
+    assert!(
+        found.printed >= again.printed,
+        "a search says which instant it looked in: {} against {}",
+        found.printed,
+        again.printed
+    );
+    let at_the_match = client
+        .ask_for_view(&ViewRequest {
+            from: found.lines[0],
+            lines: 1,
+            printed: found.printed,
+        })
+        .await;
+    assert!(
+        at_the_match.lines[0].contains("line 1"),
+        "the match is where the search said: {:?}",
+        at_the_match.lines
+    );
+}
+
 /// Scrolling back on a screen the terminal keeps no scrollback for: the lines
 /// come from the node's model, counted back from the newest so that a buffer
 /// trimming under the reader still means the same thing.
@@ -321,7 +412,11 @@ async fn a_client_can_scroll_back_through_what_a_session_printed() {
     client.read_until("line 60").await;
 
     let view = client
-        .ask_for_view(&ViewRequest { from: 30, lines: 5 })
+        .ask_for_view(&ViewRequest {
+            from: 30,
+            lines: 5,
+            printed: 0,
+        })
         .await;
     assert_eq!(view.lines.len(), 5);
     assert_eq!(view.from, 30);
@@ -340,6 +435,7 @@ async fn a_client_can_scroll_back_through_what_a_session_printed() {
         .ask_for_view(&ViewRequest {
             from: u64::MAX,
             lines: 5,
+            printed: 0,
         })
         .await;
     assert_eq!(top.lines.len(), 1, "one line left above the top");
@@ -388,6 +484,7 @@ async fn a_client_can_search_everything_a_session_printed() {
         .ask_for_view(&ViewRequest {
             from: found.lines[0],
             lines: 1,
+            printed: 0,
         })
         .await;
     assert_eq!(view.lines, vec!["line 49"]);

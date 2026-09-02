@@ -201,6 +201,7 @@ mod tests {
             view.took(View {
                 from,
                 total,
+                printed: total,
                 lines: (top..bottom).map(|i| format!("line {i}")).collect(),
             });
         }
@@ -326,6 +327,7 @@ mod tests {
         view.took(View {
             from: 1,
             total: 9,
+            printed: 9,
             lines,
         });
         let window = view.take_window();

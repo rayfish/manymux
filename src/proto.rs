@@ -489,6 +489,10 @@ pub struct Doing {
 /// because the buffer trims from the top as the session keeps printing: an
 /// index from the start would name a different line a minute later, and the
 /// view would drift while you read it.
+///
+/// The newest line moves too, though, which is the other half of the same
+/// problem and is what [`View::printed`] answers: an offset is only worth
+/// anything with the count of a bottom that only goes up beside it.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct ViewRequest {
     /// Lines back from the newest line that the window's bottom edge sits at.
@@ -496,6 +500,22 @@ pub struct ViewRequest {
     pub from: u64,
     /// How many lines to send, ending at `from` and going back.
     pub lines: u32,
+    /// What `from` is counted against: the [`View::printed`] the client last
+    /// heard. The node moves `from` on by however far the newest line has gone
+    /// since, so the block it sends back is centred on the window that was
+    /// asked about rather than on wherever that offset points by the time the
+    /// question arrives.
+    ///
+    /// Which matters exactly when the session is printing hard: a client that
+    /// has to correct the answer itself is left holding a window its own block
+    /// does not cover once more than a screenful arrives inside a round trip,
+    /// and there is nothing to paint until the printing slows down.
+    ///
+    /// Zero from a client that does not say, and from the first request of a
+    /// view, which has nothing to count against yet. Then `from` is taken as it
+    /// stands, which is what every node did before this was here.
+    #[serde(default)]
+    pub printed: u64,
 }
 
 /// The answer: rendered lines, oldest first, with the pen sequences that
@@ -508,7 +528,37 @@ pub struct View {
     /// Lines in the whole buffer, screen included, so a client knows where the
     /// ends are without asking.
     pub total: u64,
+    /// Lines the session has printed since it started, the ones the buffer has
+    /// since trimmed included. `total` says how many are still here; this says
+    /// where the newest of them sits on a count that only goes up.
+    ///
+    /// Which is what a client scrolled back needs and cannot work out: every
+    /// number it holds is a count back from the newest line, and the newest
+    /// line moves whenever the session prints. Two answers with this in them
+    /// say how far it moved between them, so the view can hold on to the lines
+    /// somebody is reading. `total` cannot: it stops growing when the buffer
+    /// fills, and the buffer of a session worth scrolling back through is
+    /// usually full.
+    ///
+    /// Zero from a node too old to count, which reads as a bottom that never
+    /// moves and leaves such a host scrolling the way it always did.
+    #[serde(default)]
+    pub printed: u64,
     pub lines: Vec<String>,
+}
+
+/// How far the newest line moved between two counts of it, and so how much
+/// further back a line named against the first one is now.
+///
+/// Zero on either side is an end that does not count at all: a node too old to
+/// send [`View::printed`], or a client that has not been told one yet, and
+/// there is nothing to move. Saturating, so an answer from before a node
+/// restart cannot move anything backwards either.
+pub fn moved(printed: u64, since: u64) -> u64 {
+    if printed == 0 || since == 0 {
+        return 0;
+    }
+    printed.saturating_sub(since)
 }
 
 /// What to look for in everything a session has printed.
@@ -526,6 +576,18 @@ pub struct FindRequest {
 pub struct Found {
     pub needle: String,
     pub lines: Vec<u64>,
+    /// Where the newest line had got to when these were counted
+    /// ([`View::printed`]).
+    ///
+    /// They are counts back from it, and a client scrolled back is holding
+    /// counts from whenever it last asked for a window, which is not the same
+    /// instant. Without this the two are added together and the view jumps to
+    /// somewhere neither of them named.
+    ///
+    /// Zero from a node too old to say, which reads as the frame the client is
+    /// already in: that is what it had to assume before this was here.
+    #[serde(default)]
+    pub printed: u64,
 }
 
 /// What came of a rename asked for on [`tag::RENAME`].
@@ -768,9 +830,9 @@ mod tests {
         assert_eq!(Size::new(9000, 9000).sane(), Size::new(1000, 1000));
     }
 
-    /// The one place a field was added to an existing message, and the reason
-    /// it could be: both directions of a fleet halfway through an update have
-    /// to keep working, and neither end negotiates anything.
+    /// A field added to an existing message, and the reason it could be: both
+    /// directions of a fleet halfway through an update have to keep working,
+    /// and neither end negotiates anything.
     #[test]
     fn an_older_hosts_attach_answer_still_decodes() {
         /// `Response::Attached` as it was before pasting existed.
@@ -835,6 +897,86 @@ mod tests {
         })
         .unwrap();
         assert!(matches!(decode::<Old>(&new).unwrap(), Old::Attached { .. }));
+    }
+
+    /// The same rule for a window of the history, where the field says how far
+    /// the newest line has moved. A node that cannot count says zero, which
+    /// reads as a bottom that never moves: the client scrolls the way it did
+    /// before anybody counted rather than following a number nobody sent.
+    #[test]
+    fn an_older_hosts_window_still_decodes() {
+        /// `View` as it was before the newest line was worth counting.
+        #[derive(Serialize, Deserialize)]
+        struct Old {
+            from: u64,
+            total: u64,
+            lines: Vec<String>,
+        }
+
+        let old = encode(&Old {
+            from: 3,
+            total: 100,
+            lines: vec!["line".to_string()],
+        })
+        .unwrap();
+        let decoded: View = decode(&old).unwrap();
+        assert_eq!(decoded.from, 3);
+        assert_eq!(decoded.total, 100);
+        assert_eq!(decoded.printed, 0, "a bottom that never moves");
+
+        // And an old client reading a new node's window, which is the half of
+        // a fleet update that happens first on the machine being scrolled.
+        let new = encode(&View {
+            from: 3,
+            total: 100,
+            printed: 10_000,
+            lines: vec!["line".to_string()],
+        })
+        .unwrap();
+        assert_eq!(decode::<Old>(&new).unwrap().total, 100);
+    }
+
+    /// And for the two counts that go with a window: the instant a client's
+    /// question was asked in, which an old node has no field for and answers
+    /// as it always did, and the instant a search counted its matches in.
+    #[test]
+    fn an_older_node_ignores_the_instant_a_window_is_asked_about() {
+        /// `ViewRequest` and `Found` as they were before the newest line was
+        /// worth counting.
+        #[derive(Serialize, Deserialize)]
+        struct OldRequest {
+            from: u64,
+            lines: u32,
+        }
+        #[derive(Serialize, Deserialize)]
+        struct OldFound {
+            needle: String,
+            lines: Vec<u64>,
+        }
+
+        let new = encode(&ViewRequest {
+            from: 30,
+            lines: 5,
+            printed: 10_000,
+        })
+        .unwrap();
+        let old: OldRequest = decode(&new).unwrap();
+        assert_eq!(old.from, 30, "answered where it was asked, as before");
+
+        let old = encode(&OldFound {
+            needle: "boom".to_string(),
+            lines: vec![3],
+        })
+        .unwrap();
+        let found: Found = decode(&old).unwrap();
+        assert_eq!(found.lines, vec![3]);
+        assert_eq!(
+            found.printed, 0,
+            "which reads as the frame the client is in"
+        );
+        assert_eq!(moved(0, 900), 0, "and moves nothing");
+        assert_eq!(moved(1000, 0), 0, "nor does a client that never heard one");
+        assert_eq!(moved(1040, 1000), 40);
     }
 
     /// The same rule for the event feed: a node that predates the host-wide

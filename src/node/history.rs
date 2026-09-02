@@ -38,7 +38,13 @@ pub fn render(vt: &Vt, lines: usize) -> String {
 /// Both ends are clamped rather than refused. A client asking past the top of a
 /// buffer that has trimmed under it gets what is there, and the `total` it
 /// comes back with is how it learns where the end went.
-pub fn window(vt: &Vt, request: &ViewRequest) -> View {
+///
+/// `printed` is where the newest line has got to, worked out by the caller
+/// (`node::session::State::printed`) because it is a fact about the session
+/// over time rather than about the buffer as it stands. It goes back with the
+/// window because everything in one is counted from that line: see
+/// [`View::printed`], and the client that reads it in `client::scroll`.
+pub fn window(vt: &Vt, printed: u64, request: &ViewRequest) -> View {
     let all: Vec<&Line> = vt.lines().collect();
     let total = all.len() as u64;
     let from = request.from.min(total.saturating_sub(1));
@@ -55,7 +61,12 @@ pub fn window(vt: &Vt, request: &ViewRequest) -> View {
             rendered.trim_end_matches("\r\n").to_string()
         })
         .collect();
-    View { from, total, lines }
+    View {
+        from,
+        total,
+        printed,
+        lines,
+    }
 }
 
 /// Every line of the buffer holding `needle`, as offsets back from the newest
@@ -68,12 +79,17 @@ pub fn window(vt: &Vt, request: &ViewRequest) -> View {
 ///
 /// Smartcase, the way `less` and vim do it: an all-lowercase needle ignores
 /// case, and one with a capital in it means the capital.
-pub fn find(vt: &Vt, needle: &str) -> Found {
+///
+/// `printed` is where the newest line has got to, which goes back with the
+/// offsets because they are counts from it and the client is holding counts
+/// from another instant: see [`Found::printed`].
+pub fn find(vt: &Vt, printed: u64, needle: &str) -> Found {
     let mut lines = Vec::new();
     if needle.is_empty() {
         return Found {
             needle: needle.to_string(),
             lines,
+            printed,
         };
     }
     let folded = needle.to_lowercase();
@@ -99,6 +115,7 @@ pub fn find(vt: &Vt, needle: &str) -> Found {
     Found {
         needle: needle.to_string(),
         lines,
+        printed,
     }
 }
 
@@ -249,13 +266,29 @@ mod tests {
             vt.feed_str(&format!("line {i}\r\n"));
         }
         // Seven lines: six printed and the one the cursor sits on.
-        let view = window(&vt, &ViewRequest { from: 0, lines: 3 });
+        let view = window(
+            &vt,
+            0,
+            &ViewRequest {
+                from: 0,
+                lines: 3,
+                printed: 0,
+            },
+        );
         assert_eq!(view.total, 7);
         assert_eq!(view.from, 0);
         assert_eq!(view.lines, vec!["line 5", "line 6", ""]);
 
         // Two lines further back.
-        let view = window(&vt, &ViewRequest { from: 2, lines: 3 });
+        let view = window(
+            &vt,
+            0,
+            &ViewRequest {
+                from: 2,
+                lines: 3,
+                printed: 0,
+            },
+        );
         assert_eq!(view.lines, vec!["line 3", "line 4", "line 5"]);
     }
 
@@ -269,15 +302,25 @@ mod tests {
         }
         let view = window(
             &vt,
+            0,
             &ViewRequest {
                 from: 999,
                 lines: 3,
+                printed: 0,
             },
         );
         assert_eq!(view.from, 4, "the top of a five line buffer");
         assert_eq!(view.lines, vec!["line 1"]);
 
-        let view = window(&vt, &ViewRequest { from: 0, lines: 99 });
+        let view = window(
+            &vt,
+            0,
+            &ViewRequest {
+                from: 0,
+                lines: 99,
+                printed: 0,
+            },
+        );
         assert_eq!(view.lines.len(), 5, "everything there is");
     }
 
@@ -291,18 +334,18 @@ mod tests {
         }
         // Seven lines, the last being the one the cursor sits on. `line 6` is
         // index 5 of 7, so it is one back from the newest.
-        let found = find(&vt, "line 6");
+        let found = find(&vt, 0, "line 6");
         assert_eq!(found.lines, vec![1]);
         assert_eq!(found.needle, "line 6");
 
         // Nearest the bottom first: that is the order a search back through
         // the history walks them in.
-        let found = find(&vt, "line");
+        let found = find(&vt, 0, "line");
         assert_eq!(found.lines, vec![1, 2, 3, 4, 5, 6]);
 
-        assert!(find(&vt, "nothing here").lines.is_empty());
+        assert!(find(&vt, 0, "nothing here").lines.is_empty());
         assert!(
-            find(&vt, "").lines.is_empty(),
+            find(&vt, 0, "").lines.is_empty(),
             "an empty needle is nobody having typed yet, not everything"
         );
     }
@@ -316,9 +359,9 @@ mod tests {
         for i in 1..=4 {
             vt.feed_str(&format!("line {i}\r\n"));
         }
-        assert_eq!(find(&vt, "warning").lines.len(), 1);
-        assert_eq!(find(&vt, "Warning").lines.len(), 1);
-        assert!(find(&vt, "WARNING").lines.is_empty());
+        assert_eq!(find(&vt, 0, "warning").lines.len(), 1);
+        assert_eq!(find(&vt, 0, "Warning").lines.len(), 1);
+        assert!(find(&vt, 0, "WARNING").lines.is_empty());
     }
 
     #[test]

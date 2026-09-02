@@ -60,6 +60,13 @@ enum State {
 /// in it when the program is expecting that.
 pub const BRACKETED_PASTE: u16 = 2004;
 
+/// The private modes that put a program on a screen of its own: xterm's, its
+/// older spelling, and the one that saves the cursor with it. All three are
+/// what `avt` switches its buffer on, and this list has to keep saying the
+/// same thing as `avt`'s or the count of what a session printed would go on
+/// counting a buffer that is not there.
+const ALTERNATE_SCREEN: &[u16] = &[47, 1047, 1049];
+
 pub const REPLAYED_MODES: &[u16] = &[
     9,    // X10 mouse reporting
     66,   // application keypad
@@ -100,6 +107,15 @@ pub struct Scanner {
     title: Option<String>,
     /// What the program asked the keyboard to do.
     keyboard: Keyboard,
+    /// Whether the program has the terminal on a screen of its own.
+    ///
+    /// Nothing is replayed for this (`avt`'s dump paints both screens), and it
+    /// is not about input at all. It is here because this is the only thing on
+    /// the node reading the stream for what the screen model will not say
+    /// afterwards, and a session on the alternate screen has its scrollback
+    /// put aside: what the buffer holds then says nothing about what the
+    /// session has printed. `node::session::State::printed` is what reads it.
+    on_alternate: bool,
 }
 
 /// The extended-keys protocols: kitty's stack of enhancement flags, and
@@ -181,6 +197,7 @@ impl Scanner {
             cursor_style: None,
             title: None,
             keyboard: Keyboard::default(),
+            on_alternate: false,
         }
     }
 
@@ -217,6 +234,12 @@ impl Scanner {
         self.modes.contains(&BRACKETED_PASTE)
     }
 
+    /// Whether the session is on a screen of its own rather than the one its
+    /// history is behind.
+    pub fn on_alternate(&self) -> bool {
+        self.on_alternate
+    }
+
     /// Feed a chunk of output. Partial sequences are carried across calls, so
     /// chunk boundaries never split a title.
     pub fn feed(&mut self, chunk: &[u8], mut out: impl FnMut(Event)) {
@@ -241,6 +264,15 @@ impl Scanner {
                 // don't need to model the parameter bytes of CSI here because
                 // no CSI sequence can contain a bare BEL.
                 (State::Escape, 0x1b) => {}
+                // RIS, which `reset` sends: the terminal is put back to how it
+                // started, and `avt` puts the screen back to the primary one
+                // with it. The only buffer switch here that is not a private
+                // mode, and so the one way this could go on saying a session
+                // has a screen of its own after it has given it back.
+                (State::Escape, b'c') => {
+                    self.on_alternate = false;
+                    self.state = State::Ground;
+                }
                 (State::Escape, _) => self.state = State::Ground,
 
                 // xterm executes C0 controls inside a CSI rather than
@@ -355,6 +387,12 @@ impl Scanner {
             return;
         };
         for mode in text.split(';').filter_map(|p| p.parse::<u16>().ok()) {
+            // The three spellings of "a screen of my own", which are the three
+            // `avt` switches its buffer on. Read rather than replayed, and so
+            // ahead of the list rather than in it.
+            if ALTERNATE_SCREEN.contains(&mode) {
+                self.on_alternate = enable;
+            }
             if !REPLAYED_MODES.contains(&mode) {
                 continue;
             }
@@ -563,6 +601,33 @@ mod tests {
     fn a_mode_the_program_turned_off_is_not_replayed() {
         let s = scanner_after(b"\x1b[?1002h\x1b[?2004h\x1b[?1002l");
         assert_eq!(s.replay(), "\x1b[?2004h");
+    }
+
+    /// `reset` sends RIS, which puts the terminal back to how it started, and
+    /// `avt` puts the screen back to the primary one with it. Left saying a
+    /// program still has a screen of its own, the count of what the session
+    /// has printed stops moving for good and a client scrolling it silently
+    /// goes back to drifting.
+    #[test]
+    fn a_reset_gives_back_the_screen_a_program_took() {
+        let mut scanner = Scanner::new();
+        scanner.feed(b"\x1b[?1049h", |_| {});
+        assert!(scanner.on_alternate(), "a program took the screen");
+        scanner.feed(b"\x1bc", |_| {});
+        assert!(!scanner.on_alternate(), "and a reset takes it back");
+
+        // The ordinary way out, and the two older spellings.
+        for (on, off) in [
+            (&b"\x1b[?1049h"[..], &b"\x1b[?1049l"[..]),
+            (b"\x1b[?1047h", b"\x1b[?1047l"),
+            (b"\x1b[?6;47h", b"\x1b[?47l"),
+        ] {
+            let mut scanner = Scanner::new();
+            scanner.feed(on, |_| {});
+            assert!(scanner.on_alternate(), "{on:?}");
+            scanner.feed(off, |_| {});
+            assert!(!scanner.on_alternate(), "{off:?}");
+        }
     }
 
     #[test]
