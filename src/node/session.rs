@@ -137,7 +137,7 @@ impl State {
     /// and goes on from what is here now, which keeps it counting the lines
     /// printed after one rather than stopping until the buffer has grown back
     /// past where it was. A reflow is the same and is dealt with where it
-    /// happens, in [`Self::rebase`].
+    /// happens, in [`Self::resize`].
     fn printed(&mut self, total: u64) -> u64 {
         if self.scanner.on_alternate() {
             return self.printed;
@@ -156,9 +156,19 @@ impl State {
     /// so the buffer comes out of one a different length either way. Counted, a
     /// phone attaching would have said a thousand lines had just been printed
     /// and thrown every view of the session back by a thousand.
+    ///
+    /// Not while a full-screen program has the screen, though, and for the
+    /// reason [`Self::printed`] does not count then either: `avt` reflows the
+    /// buffer that is showing and leaves the other one alone, so what is being
+    /// resized here is the program's own screen and the session's is put aside
+    /// at the length it already had. Counting from the program's screen instead
+    /// left the count anchored two dozen lines up, and the first answer after
+    /// the program quit read the whole buffer as printed at once.
     fn resize(&mut self, size: Size) {
         self.vt.resize(size.cols as usize, size.rows as usize);
-        self.counted = self.trimmed + self.vt.lines().count() as u64;
+        if !self.scanner.on_alternate() {
+            self.counted = self.trimmed + self.vt.lines().count() as u64;
+        }
     }
 
     /// Smallest size across attached clients, or the current size when nothing
@@ -764,14 +774,9 @@ mod tests {
         assert_eq!(state.effective_size(), Size::new(80, 40));
     }
 
-    /// A reflow is not the session printing: a narrower screen splits the
-    /// lines that were wrapped and a wider one rejoins them, so the buffer
-    /// comes out a different length either way. Counted, a phone attaching to
-    /// a session somebody is reading would say a thousand lines had just been
-    /// printed and throw their view back by a thousand.
-    #[test]
-    fn a_reflow_prints_nothing() {
-        let mut state = State {
+    /// A session's state as [`Session::new`] builds one.
+    fn state() -> State {
+        State {
             vt: Vt::builder()
                 .size(80, 24)
                 .scrollback_limit(SCROLLBACK)
@@ -785,35 +790,86 @@ mod tests {
             last_activity: Instant::now(),
             clients: HashMap::new(),
             size: Size::new(80, 24),
-        };
-        for i in 0..50 {
-            state.vt.feed_str(&format!(
-                "{i}: a line long enough to be folded in two by a narrower screen
-"
-            ));
         }
+    }
+
+    /// What [`Session::ingest`] does with a chunk of output, without the
+    /// fan-out to clients: both halves see it, which is what keeps the scanner
+    /// and the screen model saying the same thing about which screen is up.
+    fn feed(state: &mut State, text: &str) {
+        state.scanner.feed(text.as_bytes(), |_| {});
+        state.trimmed += state.vt.feed_str(text).scrollback.count() as u64;
+    }
+
+    /// What [`Attachment::window`] asks it for.
+    fn printed(state: &mut State) -> u64 {
         let total = state.vt.lines().count() as u64;
-        let before = state.printed(total);
+        state.printed(total)
+    }
+
+    /// A reflow is not the session printing: a narrower screen splits the
+    /// lines that were wrapped and a wider one rejoins them, so the buffer
+    /// comes out a different length either way. Counted, a phone attaching to
+    /// a session somebody is reading would say a thousand lines had just been
+    /// printed and throw their view back by a thousand.
+    #[test]
+    fn a_reflow_prints_nothing() {
+        let mut state = state();
+        for i in 0..50 {
+            feed(
+                &mut state,
+                &format!("{i}: a line long enough to be folded in two by a narrower screen\r\n"),
+            );
+        }
+        let before = printed(&mut state);
         assert!(before >= 50, "fifty lines and the screen: {before}");
 
         // A phone attaching, which is the smallest attached client and so the
         // one the session takes its size from.
         state.resize(Size::new(40, 24));
-        let total = state.vt.lines().count() as u64;
-        assert!(total > before, "the lines were folded: {total}");
-        assert_eq!(state.printed(total), before, "and none of it was printed");
+        assert!(
+            state.vt.lines().count() as u64 > before,
+            "the lines were folded"
+        );
+        assert_eq!(printed(&mut state), before, "and none of it was printed");
 
         // And the phone leaving again, which folds them back.
         state.resize(Size::new(80, 24));
-        let total = state.vt.lines().count() as u64;
-        assert_eq!(state.printed(total), before, "nor is undoing one");
+        assert_eq!(printed(&mut state), before, "nor is undoing one");
 
-        state.vt.feed_str(
-            "one more
-",
+        feed(&mut state, "one more\r\n");
+        assert_eq!(printed(&mut state), before + 1, "what follows one counts");
+    }
+
+    /// The same resize, made while a full-screen program has the screen. What
+    /// is reflowed then is the program's own screen, two dozen lines with no
+    /// history behind it, and the session's buffer is put aside at the length
+    /// it had. Counted from the program's screen, the first answer after it
+    /// quit read the whole buffer as printed at once and took every view of the
+    /// session to the top of it.
+    #[test]
+    fn a_resize_under_a_full_screen_program_prints_nothing() {
+        let mut state = state();
+        for i in 0..500 {
+            feed(&mut state, &format!("line {i}\r\n"));
+        }
+        let before = printed(&mut state);
+
+        feed(&mut state, "\x1b[?1049h");
+        assert!(state.scanner.on_alternate(), "the program took the screen");
+        assert_eq!(printed(&mut state), before, "and printed nothing taking it");
+
+        // A second client attaching, which is what moves the size under one.
+        state.resize(Size::new(80, 30));
+        assert_eq!(printed(&mut state), before, "nor did the resize");
+
+        feed(&mut state, "\x1b[?1049l");
+        feed(&mut state, "one more\r\n");
+        assert_eq!(
+            printed(&mut state),
+            before + 1,
+            "one line, one line counted"
         );
-        let total = state.vt.lines().count() as u64;
-        assert_eq!(state.printed(total), before + 1, "what follows one counts");
     }
 
     /// The count a scrolling client anchors on counts what the session

@@ -718,9 +718,15 @@ impl Scrollback {
     /// The bottom is always an end: it is the live screen, and a view there is
     /// following the session. The top is one only while the buffer is
     /// trimming, which is the case where the oldest line is a different line
-    /// every time somebody prints and [`Self::take`]'s clamp holds the window
-    /// against it. A buffer still growing has the same oldest line it had, so a
-    /// view sitting on it is reading lines like any other and moves with them.
+    /// every time somebody prints and [`Self::take`]'s clamp puts the window
+    /// back on it. A buffer still growing has the same oldest line it always
+    /// had, so a view sitting on one is reading lines like any other and moves
+    /// with them.
+    ///
+    /// What being on an end does not do is keep up with it on its own. The
+    /// picture is the last answer, here as everywhere else in this file:
+    /// nothing is asked for until something moves, and what is asked for then
+    /// is the end as it is by then.
     fn pinned(&self) -> bool {
         self.offset == 0 || (self.trimming && self.offset >= self.total.saturating_sub(self.page()))
     }
