@@ -679,8 +679,12 @@ const NARROW_HINTS: &str = "⏎ show   esc";
 
 impl Popup {
     fn sessions(rows: &Rows) -> Self {
+        let title = match &rows.narrowed {
+            Some(group) => format!("sessions in @{group}"),
+            None => "sessions".to_string(),
+        };
         Self {
-            picker: Picker::new("sessions", SESSION_HINTS, rows.sessions.clone(), rows.at),
+            picker: Picker::new(title, SESSION_HINTS, rows.sessions.clone(), rows.at),
             what: Showing::Sessions,
         }
     }
@@ -2051,8 +2055,24 @@ mod tests {
             sessions: vec![Row::new(0, "build"), Row::new(1, "api")],
             groups: Vec::new(),
             at: 1,
+            narrowed: None,
         };
         assert_eq!(Popup::sessions(&rows).line(), "sessions: api");
+    }
+
+    /// A narrowed list says so where it says what it is. Everything else it
+    /// draws looks the same as an unnarrowed one, so a run with a group in
+    /// focus looked like a listing that had lost most of the machine's
+    /// sessions.
+    #[test]
+    fn a_list_narrowed_to_a_group_names_it_in_the_title() {
+        let rows = Rows {
+            sessions: vec![Row::new(0, "build")],
+            groups: Vec::new(),
+            at: 0,
+            narrowed: Some("pi".to_string()),
+        };
+        assert_eq!(Popup::sessions(&rows).line(), "sessions in @pi: build");
     }
 
     /// An empty list still has to name itself. Saying nothing there would be a
@@ -2075,6 +2095,7 @@ mod tests {
             sessions: vec![Row::new(0, "build"), Row::new(1, "api")],
             groups: vec![Row::new(0, "pi"), Row::new(1, "web")],
             at: 1,
+            narrowed: None,
         };
         let sessions = Popup::sessions(&rows);
         assert_eq!(sessions.subject(), Some(1), "the highlighted session");

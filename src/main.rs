@@ -2651,6 +2651,7 @@ impl Listed {
                 sessions: rows,
                 groups: group_rows,
                 at: highlight,
+                narrowed: focus.map(str::to_string),
             },
             at,
             groups: names,

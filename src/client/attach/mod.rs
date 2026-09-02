@@ -115,6 +115,15 @@ pub struct Rows {
     /// Which session row is the one being attached to, so the popup opens with
     /// the highlight already on it.
     pub at: usize,
+    /// The group the session list is narrowed to, where it is narrowed at all.
+    ///
+    /// Drawn in the title, because the list itself cannot say it. A run with a
+    /// group in focus sees only that group's sessions, in the popup and under
+    /// the switch keys both, and a box headed `sessions` showing six of the
+    /// nineteen that are running reads as a listing that has gone wrong. The
+    /// `@name` heading over the rows is the only other sign, and it looks
+    /// exactly like the heading an unnarrowed list puts over the same rows.
+    pub narrowed: Option<String>,
 }
 
 /// Everything an attached session produced before it stopped.
