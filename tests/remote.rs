@@ -987,6 +987,43 @@ fn a_machine_ssh_cannot_reach_still_says_why() {
     );
 }
 
+/// The same reason said by `mm` rather than by ssh, which is what a fan-out
+/// needs: a listing asks every machine at once, so ssh saying its piece where
+/// it falls arrives in the middle of the machines that are answering, and the
+/// caller may be an attached client with a session's screen on the terminal.
+/// A watched host whose name had stopped resolving painted ssh over it, once
+/// per machine, every time the popup behind the switch keys was opened.
+#[test]
+fn a_listing_says_which_machine_was_missed_and_lets_ssh_say_nothing() {
+    let world = World::new("fan-out-quiet");
+
+    world.ok("laptop", &["new", "-d", "-n", "here", "sleep", "60"]);
+    world.ok("laptop", &["add", "gpu-box"]);
+    std::fs::write(
+        world.ssh_stub(),
+        "#!/bin/sh\necho 'ssh: Could not resolve hostname gpu-box' >&2\nexit 255\n",
+    )
+    .unwrap();
+
+    let out = world.run("laptop", &["ls"]);
+    let listed = String::from_utf8_lossy(&out.stdout);
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        listed.contains("here"),
+        "the machine that is up should still be listed: {listed}"
+    );
+    assert!(
+        said.contains("gpu-box") && said.contains("Could not resolve hostname"),
+        "the machine that is down, and why, should be named: {said}"
+    );
+    for line in said.lines().filter(|line| !line.trim().is_empty()) {
+        assert!(
+            line.starts_with("mm:"),
+            "ssh spoke for itself in a fan-out: {line}"
+        );
+    }
+}
+
 /// And the half after that: where the caller is a client holding a terminal,
 /// ssh has nowhere to say it. A wait is the whole of what a dropped connection
 /// gets, and the screen under it is the session as it was last painted, so a

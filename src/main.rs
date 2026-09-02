@@ -941,14 +941,18 @@ async fn open(socket: &Path, host: &str) -> Result<Stream> {
     Stream::over_ssh(host, Some(Arc::new(offer_to_install))).await
 }
 
-/// Like [`open`], but for the client that is holding the terminal.
+/// Like [`open`], but for a caller with somewhere better to put what ssh says.
 ///
-/// An attach paints a session over the screen and a dropped connection leaves
-/// that paint exactly where it was, which is what a wait is for. ssh printing
-/// its account of a machine it cannot reach lands there, once per attempt, on
-/// a terminal in raw mode; kept instead, the same words go into the error,
-/// which reaches the person on the first attach of a run and the log on every
-/// reconnect after it. See [`manymux::client::Heard`].
+/// Two of them. An attach paints a session over the screen and a dropped
+/// connection leaves that paint exactly where it was, which is what a wait is
+/// for; ssh printing its account of a machine it cannot reach lands there,
+/// once per attempt, on a terminal in raw mode. And a listing asks every
+/// watched machine at once, so the same account arrives interleaved with the
+/// other machines' answers, from a client that may well be an attached one:
+/// see [`sessions_on`]. Kept instead, the same words go into the error, which
+/// reaches the person on the first attach of a run, the log on every reconnect
+/// after it, and the `mm: <host>: <why>` line under a listing.
+/// See [`manymux::client::Heard`].
 async fn open_hushed(socket: &Path, host: &str) -> Result<Stream> {
     if is_this_machine(host) {
         return Stream::local(socket).await;

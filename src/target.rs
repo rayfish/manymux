@@ -23,7 +23,7 @@ use manymux::client::switch::Located;
 use manymux::hosts::{Hosts, LOCAL, Named, Target, is_this_machine, this_machine};
 use manymux::proto::{HostedSession, Request, Response, SessionInfo};
 
-use crate::open;
+use crate::open_hushed;
 
 /// Sessions found, and machines that could not be asked. One being asleep must
 /// not hide the others.
@@ -85,6 +85,27 @@ impl Listing {
         hosts.sort();
         hosts.dedup();
         hosts
+    }
+
+    /// The machines this listing could not ask, named for an error that is
+    /// about not finding something.
+    ///
+    /// `mm ls` prints why each one was missed, a line apiece. Everything else
+    /// asking about every machine is looking for one session, and reports the
+    /// one thing it did not find: a listing with a hole in it makes "no session
+    /// named build" a guess rather than an answer, and which machine is not
+    /// answering is what turns it back into one.
+    pub(crate) fn missed(&self) -> Option<String> {
+        let hosts: Vec<&str> = self
+            .unreachable
+            .iter()
+            .map(|host| host.host.as_str())
+            .collect();
+        match hosts.len() {
+            0 => None,
+            1 => Some(format!("{} did not answer", hosts[0])),
+            _ => Some(format!("{} did not answer", hosts.join(", "))),
+        }
     }
 }
 
@@ -176,6 +197,17 @@ pub(crate) async fn everywhere(socket: &Path) -> Result<Listing> {
     Ok(listing)
 }
 
+/// What one machine is running, asked without letting ssh speak for itself.
+///
+/// Hushed rather than aloud, which is the one thing here that is not about
+/// which machine was meant. A listing is a fan-out, so ssh's own account of a
+/// machine it could not reach arrives in the middle of the others' answers,
+/// and the caller may be an attached client that has a session's screen on the
+/// terminal: the popup behind the switch keys lists every machine, and a
+/// watched host whose name stopped resolving painted ssh over whatever was
+/// there, once per machine per keypress. Kept, the same words come back inside
+/// the error, which is where a listing wants them anyway: [`Listing`] reports
+/// per machine, in one place, after the sessions that did answer.
 pub(crate) async fn sessions_on(socket: &Path, host: &str) -> Result<Vec<SessionInfo>> {
     // No node here means no sessions here, which is an answer rather than a
     // failure. Starting one just to be told that would be rude.
@@ -185,7 +217,11 @@ pub(crate) async fn sessions_on(socket: &Path, host: &str) -> Result<Vec<Session
         manymux::node::note_a_node_left_behind(socket).await;
         return Ok(Vec::new());
     }
-    match open(socket, host).await?.call(&Request::List).await? {
+    match open_hushed(socket, host)
+        .await?
+        .call(&Request::List)
+        .await?
+    {
         Response::Sessions(sessions) => Ok(sessions),
         other => bail!("unexpected response to list: {other:?}"),
     }
@@ -269,7 +305,10 @@ pub(crate) async fn locate(socket: &Path, target: &str, bare: Bare) -> Result<Lo
         0 if bare == Bare::OrMachine && names_a_machine(&wanted) => {
             on_that_machine(&listing, &wanted)
         }
-        0 => bail!("no session named {wanted}; see `mm ls`"),
+        0 => match listing.missed() {
+            Some(missed) => bail!("no session named {wanted} ({missed}); see `mm ls`"),
+            None => bail!("no session named {wanted}; see `mm ls`"),
+        },
         // Two machines can each have a `build`. Say which, rather than guessing.
         _ => bail!(
             "{wanted} is on more than one machine ({}); say which, like `{}/{wanted}`",

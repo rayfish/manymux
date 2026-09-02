@@ -41,18 +41,25 @@ type Writer = Box<dyn AsyncWrite + Unpin + Send>;
 
 /// Where what ssh says on the way to a machine ends up.
 ///
-/// Printed is the answer for a command somebody typed: it has a terminal of
-/// its own to fail on, and ssh's account of a machine it could not reach is
-/// the only account there is.
+/// Printed is the answer for a command that asked about one machine and has a
+/// terminal of its own to fail on: ssh's account of a machine it could not
+/// reach is the only account there is, and there is nothing else on the screen
+/// for it to land in the middle of.
 ///
-/// Kept is the answer for a client holding a terminal. An attach puts a
-/// session's screen on it and a dropped connection leaves that screen exactly
-/// as it was painted, which is the whole of what a wait is; a retry printing
-/// `connect to host` there ruins that picture once per attempt, and does it on
-/// a raw terminal, so each line lands a column further along than the last.
+/// Kept is the answer for everything else, and there are two of those. A
+/// client holding a terminal, where an attach puts a session's screen on it
+/// and a dropped connection leaves that screen exactly as it was painted,
+/// which is the whole of what a wait is; a retry printing `connect to host`
+/// there ruins that picture once per attempt, and does it on a raw terminal,
+/// so each line lands a column further along than the last. And a fan-out,
+/// which asks every watched machine at once: one that is off the network says
+/// its piece while the others are still answering, and the caller is as likely
+/// to be the popup behind an attached client's switch keys as a shell.
+///
 /// Kept, the same words go into the error instead, which is where they are
 /// worth having: the first attach of a run reports it once the terminal has
-/// been given back, and a reconnect puts it in the log rather than anywhere.
+/// been given back, a reconnect puts it in the log rather than anywhere, and a
+/// listing reports it per machine, under the sessions that did answer.
 #[derive(Clone, Copy)]
 pub enum Heard {
     Aloud,
