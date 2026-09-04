@@ -88,10 +88,17 @@ impl Entry {
 /// A third thing narrows both: the focus. While a group is active the cycle
 /// sees only its sessions, and every motion keeps its meaning applied to what
 /// is left. A group is the work rather than the machine, so tab crosses
-/// machines inside one. The narrowing and the session the run is in have to
-/// agree, and [`Cycle::refresh`] is what holds them together: a focus the
-/// listing says you are outside of is a focus that has stopped meaning
-/// anything, and it is dropped.
+/// machines inside one.
+///
+/// The narrowing and the session the run is in have to agree, and
+/// [`Cycle::refresh`] is what holds them together, by two rules that read a
+/// listing's silence in opposite ways on purpose. A group the listing has
+/// nothing of is dropped whatever the silence behind it means, because the
+/// switch keys have nowhere to go *now* and a narrowing that walks nothing is
+/// worse than no narrowing at all. A session the listing does not mention is
+/// not read that way, because nothing is going wrong on the screen while the
+/// run waits to be told, and a machine that has said nothing has not said its
+/// sessions left their groups.
 ///
 /// The listing is a snapshot the caller refreshes; it is deliberately allowed
 /// to be stale, because a keystroke must not wait on a machine that is asleep.
@@ -177,11 +184,7 @@ impl Cycle {
         // A group is a set of live sessions and nothing else, so one that has
         // lost its last member has stopped existing. Left focused, the cycle
         // would have nowhere at all to go and every switch key would do
-        // nothing, with no way to find out why. A listing with nothing of the
-        // group in it is read that way whatever the silence behind it means,
-        // and that is deliberate: what makes this worth acting on is that the
-        // keys have nowhere to go *now*, which is as true of a machine that
-        // has gone quiet as of a group whose last session ended.
+        // nothing, with no way to find out why.
         let gone = !self
             .sessions
             .iter()
@@ -192,17 +195,13 @@ impl Cycle {
         // group off the session it arrived in and the popup's `g` moving you
         // into whatever you chose, and two things break the pair afterwards:
         // `m` on the session you are in, and the window next door moving it.
-        // (`n` is the third and answers for itself, a client that has just
-        // started a session needing nothing to tell it the session is in no
-        // group.) What is left is a list of sessions you are not in with no row
-        // wearing the mark, tab hopping you out of the session you are in, and
-        // `g` the only way back, which the box gives no reason to look for.
+        // (`n` is the third and answers for itself, in [`Cycle::started`].)
+        // What is left is a list of sessions you are not in with no row wearing
+        // the mark, tab hopping you out of the session you are in, and `g` the
+        // only way back, which the box gives no reason to look for.
         //
-        // Absence is not enough here, and that is what separates this from the
-        // rule above: a machine that has said nothing has not said its sessions
-        // left their groups, the same silence `prune` reads that way, and
-        // nothing is going wrong on the screen while the run waits to be told.
-        // Read the other way, a laptop closing its lid would widen the run.
+        // Read off the entry rather than its absence, which is the asymmetry
+        // the type's doc argues for: the same silence `prune` leaves alone.
         let left = self
             .sessions
             .iter()
@@ -267,6 +266,28 @@ impl Cycle {
         self.trail.retain(|at| *at != next);
         let was = std::mem::replace(&mut self.current, next);
         self.trail.insert(0, was);
+    }
+
+    /// The same, for a session this run has just started.
+    ///
+    /// A hop like any other, and a narrowing that has to go with it: a session
+    /// started a moment ago is in no group, so a run narrowed to one has left
+    /// it. [`Cycle::refresh`] would say the same thing off the next listing,
+    /// and this does not wait for one because it does not have to: waiting
+    /// would rest on a fan-out landing inside the half second a keystroke
+    /// allows, and on a fleet slower than that the trap stays shut for the life
+    /// of that attach.
+    ///
+    /// Put in no group rather than into the one the run was narrowed to, which
+    /// is the other reading of the key and the one not taken. `groups.toml` is
+    /// shared with every other client on this machine, and a key for moving
+    /// around must not write it: `mm new` from a shell puts a session in no
+    /// group, and `n` is the same act with the same answer. What that owes is
+    /// that the widening be visible, and it is, the mark row naming the group
+    /// it is narrowed to and dropping it here.
+    pub fn started(&mut self, at: Located) {
+        self.moved_to(at);
+        self.focus = None;
     }
 
     /// The sessions this run has been in, most recent first, starting with the
@@ -651,6 +672,19 @@ mod tests {
             Entry::new(Located::new("box", "build"), None),
         ]);
         assert_eq!(cycle.focused(), Some("pi"));
+    }
+
+    /// A session started from inside a group is in no group, so the run that
+    /// started it would be narrowed to work it is no longer doing. Said here
+    /// rather than waited for, a listing being allowed to be slow.
+    #[test]
+    fn a_session_this_run_started_widens_it() {
+        let mut cycle = grouped(&[("box", "api", Some("pi"))], ("box", "api"));
+        cycle.focus(Some("pi".into()));
+        cycle.started(Located::new("box", "new"));
+        assert_eq!(cycle.focused(), None);
+        // And it is a hop like any other, so the way back is recorded.
+        assert_eq!(hop(&cycle, Motion::Last).as_deref(), Some("box/api"));
     }
 
     /// Membership changing under the run rather than the session moving: `m` on

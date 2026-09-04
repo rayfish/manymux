@@ -1939,6 +1939,17 @@ async fn do_attach(
         // bytes read once per keystroke that goes anywhere. Kept if it will not
         // read, a broken file being no reason to forget what is in hand.
         groups = Groups::load().unwrap_or(groups);
+        // Which is only half of it until the cycle is told: the rows below are
+        // built from the file just read, and the narrowing they are drawn under
+        // is whatever the last listing left behind. So the entries are made
+        // again, against the same snapshot and the membership as it now is,
+        // which is what lets a session the window next door moved out of this
+        // run's group widen the run rather than waiting on a fan-out to say so.
+        // Only against a snapshot that says something: an empty one is a run
+        // whose listing has never landed, and every group is missing from it.
+        if !snapshot.is_empty() {
+            cycle.refresh(entries(&snapshot, &groups));
+        }
         if !settled {
             settled = true;
             if let Some(info) = snapshot.info(cycle.current()) {
@@ -2160,17 +2171,10 @@ async fn do_attach(
             // machines say they are running.
             Outcome::New => match start_beside(socket, &target.host).await {
                 Ok(name) => {
-                    cycle.moved_to(Located::new(&target.host, &name));
-                    // A session that has just been started is in no group, so a
-                    // run narrowed to one has left it. `Cycle::refresh` says the
-                    // same thing off a listing and covers the ways membership
-                    // moves without the run doing anything, but this one is said
-                    // here because it is known here: waiting to be told would
-                    // rest on a fan-out landing inside `LISTING_WAIT`, and a
-                    // fleet slower than half a second would leave you looking at
-                    // a list of the sessions you are not in, with tab hopping
-                    // you back out of the one you just asked for.
-                    cycle.focus(None);
+                    // A hop, and the narrowing that has to go with it: what
+                    // has just been started is in no group. `Cycle::started`
+                    // is both, and says why there rather than here.
+                    cycle.started(Located::new(&target.host, &name));
                     hopped = true;
                     listing = Some(spawn_listing(socket));
                     mode = Mode::Focus;

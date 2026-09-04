@@ -3355,9 +3355,11 @@ fn a_new_session_started_inside_a_group_widens_the_run() {
         !seen.contains("sessions in @field"),
         "the run is still narrowed to a group it has left: {seen:?}"
     );
-    // And the session it is in is in the list, with everything else.
+    // And it is the whole listing that is up: the plain title is the one an
+    // unnarrowed box paints, and it is the only row of the box the run's own
+    // shell cannot spell by accident.
     assert!(
-        seen.contains(&started),
-        "the session the run is in is not in the list: {seen:?}"
+        seen.contains("┌ sessions ─"),
+        "the popup is not the unnarrowed one: {seen:?}"
     );
 }
