@@ -3245,3 +3245,119 @@ fn what_comes_back_over_a_shell_survives_nuls_and_spaces() {
         "a directory with spaces in its name"
     );
 }
+
+/// A session started from inside a group leaves the run narrowed to work it is
+/// no longer doing.
+///
+/// The popup then lists sessions you are not in, no row wears the mark, no row
+/// wears a digit, and tab hops you out of the session you just asked for. `g`
+/// and `(none)` is the way back and the box gives no reason to look for it. So
+/// starting one widens the run.
+#[test]
+fn a_new_session_started_inside_a_group_widens_the_run() {
+    use std::io::{Read, Write};
+    use std::os::fd::AsFd;
+    use std::sync::mpsc;
+
+    let world = World::new("new-in-group");
+    for name in ["alpha", "beta"] {
+        world.ok("laptop", &["new", "-d", "-n", name, "sh"]);
+    }
+    world.wait_for_node("laptop");
+    world.ok("laptop", &["group", "alpha", "field"]);
+    world.ok("laptop", &["group", "beta", "field"]);
+
+    let (pty, pts) = pty_process::blocking::open().unwrap();
+    pty.resize(pty_process::Size::new(24, 80)).unwrap();
+    let mut client = pty_process::blocking::Command::new(MM)
+        .arg("--socket")
+        .arg(world.socket("laptop"))
+        .args(["attach", "alpha"])
+        .env("MM_CONFIG_DIR", world.dir.join("laptop"))
+        .env("MM_SSH", world.ssh_stub())
+        .env("MM_LOG", "manymux=warn")
+        .env("TERM", "xterm-256color")
+        .spawn(pts)
+        .expect("attaching on a terminal");
+
+    // The terminal on a thread of its own: a read on a pty blocks until
+    // something is painted, and what is painted is the whole of the test.
+    let mut writer = std::fs::File::from(pty.as_fd().try_clone_to_owned().unwrap());
+    let (seen_tx, seen_rx) = mpsc::channel();
+    let mut reader = pty;
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        while let Ok(read @ 1..) = reader.read(&mut buf) {
+            if seen_tx.send(buf[..read].to_vec()).is_err() {
+                return;
+            }
+        }
+    });
+
+    // Wait on what is on the screen rather than on a clock: the keys below are
+    // typed at a client that has painted, and the popup is read once it is up.
+    let mut seen = String::new();
+    let wait_for = |seen: &mut String, what: &str| {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            if let Ok(chunk) = seen_rx.recv_timeout(Duration::from_millis(200)) {
+                seen.push_str(&String::from_utf8_lossy(&chunk));
+            }
+            if seen.contains(what) {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "never saw {what:?} on the terminal; saw: {seen:?}"
+            );
+        }
+    };
+
+    // The status row of the session named on the command line, which is where
+    // the run starts and the one thing that says the client is up.
+    wait_for(&mut seen, "field · alpha");
+    seen.clear();
+
+    // A session of its own, in no group. The node names it after the login
+    // shell it started, which is whatever the machine running the tests uses,
+    // so it is read back rather than guessed at. The row names it once the run
+    // has landed in it, which is what says the reattach is over.
+    writer.write_all(&[0x1d, b'n']).unwrap();
+    let started = {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let listed = world.ok("laptop", &["ls", "local"]);
+            let fresh = listed
+                .lines()
+                .skip(1)
+                .filter_map(|line| line.split_whitespace().next())
+                .find(|name| !["alpha", "beta"].contains(name));
+            if let Some(name) = fresh {
+                break name.to_string();
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the new session never appeared: {listed}"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    };
+    wait_for(&mut seen, &started);
+    seen.clear();
+
+    // And the popup over it, which is where the narrowing shows.
+    writer.write_all(&[0x1d, b'\t']).unwrap();
+    wait_for(&mut seen, "┌ sessions");
+    let _ = client.kill();
+    let _ = client.wait();
+
+    assert!(
+        !seen.contains("sessions in @field"),
+        "the run is still narrowed to a group it has left: {seen:?}"
+    );
+    // And the session it is in is in the list, with everything else.
+    assert!(
+        seen.contains(&started),
+        "the session the run is in is not in the list: {seen:?}"
+    );
+}

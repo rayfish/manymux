@@ -88,7 +88,10 @@ impl Entry {
 /// A third thing narrows both: the focus. While a group is active the cycle
 /// sees only its sessions, and every motion keeps its meaning applied to what
 /// is left. A group is the work rather than the machine, so tab crosses
-/// machines inside one.
+/// machines inside one. The narrowing and the session the run is in have to
+/// agree, and [`Cycle::refresh`] is what holds them together: a focus the
+/// listing says you are outside of is a focus that has stopped meaning
+/// anything, and it is dropped.
 ///
 /// The listing is a snapshot the caller refreshes; it is deliberately allowed
 /// to be stale, because a keystroke must not wait on a machine that is asleep.
@@ -168,16 +171,44 @@ impl Cycle {
     /// changes.
     pub fn refresh(&mut self, sessions: Vec<Entry>) {
         self.sessions = sessions;
+        let Some(group) = self.focus.as_deref() else {
+            return;
+        };
         // A group is a set of live sessions and nothing else, so one that has
         // lost its last member has stopped existing. Left focused, the cycle
         // would have nowhere at all to go and every switch key would do
-        // nothing, with no way to find out why.
-        if let Some(group) = &self.focus
-            && !self
-                .sessions
-                .iter()
-                .any(|entry| entry.group.as_deref() == Some(group.as_str()))
-        {
+        // nothing, with no way to find out why. A listing with nothing of the
+        // group in it is read that way whatever the silence behind it means,
+        // and that is deliberate: what makes this worth acting on is that the
+        // keys have nowhere to go *now*, which is as true of a machine that
+        // has gone quiet as of a group whose last session ended.
+        let gone = !self
+            .sessions
+            .iter()
+            .any(|entry| entry.group.as_deref() == Some(group));
+        // The same failure the other way round: the group is still there, but
+        // the session the run is in has left it. Every other way the focus is
+        // set puts the two together, the narrowing on the way in reading the
+        // group off the session it arrived in and the popup's `g` moving you
+        // into whatever you chose, and two things break the pair afterwards:
+        // `m` on the session you are in, and the window next door moving it.
+        // (`n` is the third and answers for itself, a client that has just
+        // started a session needing nothing to tell it the session is in no
+        // group.) What is left is a list of sessions you are not in with no row
+        // wearing the mark, tab hopping you out of the session you are in, and
+        // `g` the only way back, which the box gives no reason to look for.
+        //
+        // Absence is not enough here, and that is what separates this from the
+        // rule above: a machine that has said nothing has not said its sessions
+        // left their groups, the same silence `prune` reads that way, and
+        // nothing is going wrong on the screen while the run waits to be told.
+        // Read the other way, a laptop closing its lid would widen the run.
+        let left = self
+            .sessions
+            .iter()
+            .find(|entry| entry.at == self.current)
+            .is_some_and(|here| here.group.as_deref() != Some(group));
+        if gone || left {
             self.focus = None;
         }
     }
@@ -602,6 +633,60 @@ mod tests {
         cycle.focus(Some("pi".into()));
         cycle.refresh(vec![Entry::new(Located::new("box", "api"), None)]);
         assert_eq!(cycle.focused(), None);
+    }
+
+    /// A narrowing the run is still inside is left alone, which is the path
+    /// every landing and every switch key takes. Asserted on its own because
+    /// the two rules below only ever check that a focus went: one that cleared
+    /// on every listing would pass all of them.
+    #[test]
+    fn a_listing_that_still_holds_this_session_keeps_the_focus() {
+        let mut cycle = grouped(
+            &[("box", "api", Some("pi")), ("box", "build", None)],
+            ("box", "api"),
+        );
+        cycle.focus(Some("pi".into()));
+        cycle.refresh(vec![
+            Entry::new(Located::new("box", "api"), Some("pi".into())),
+            Entry::new(Located::new("box", "build"), None),
+        ]);
+        assert_eq!(cycle.focused(), Some("pi"));
+    }
+
+    /// Membership changing under the run rather than the session moving: `m` on
+    /// the session you are in, or the window next door moving it. The run is
+    /// then narrowed to work it is no longer doing, and the list shows sessions
+    /// you are not in with no row wearing the mark.
+    #[test]
+    fn a_session_moved_out_of_the_group_clears_the_focus() {
+        let mut cycle = grouped(
+            &[("box", "api", Some("pi")), ("box", "build", Some("pi"))],
+            ("box", "api"),
+        );
+        cycle.focus(Some("pi".into()));
+        cycle.refresh(vec![
+            Entry::new(Located::new("box", "api"), Some("other".into())),
+            Entry::new(Located::new("box", "build"), Some("pi".into())),
+        ]);
+        assert_eq!(cycle.focused(), None);
+    }
+
+    /// A machine that has said nothing is not a machine that has answered, so
+    /// the session the run is in being absent from a listing is silence rather
+    /// than news. Widening on it would drop the narrowing every time a laptop
+    /// closed its lid.
+    #[test]
+    fn a_listing_that_never_mentions_this_session_leaves_the_focus_alone() {
+        let mut cycle = grouped(
+            &[("box", "api", Some("pi")), ("far", "train", Some("pi"))],
+            ("far", "train"),
+        );
+        cycle.focus(Some("pi".into()));
+        cycle.refresh(vec![Entry::new(
+            Located::new("box", "api"),
+            Some("pi".into()),
+        )]);
+        assert_eq!(cycle.focused(), Some("pi"));
     }
 
     /// A hop inside a group is a hop: the way back is recorded the same way,

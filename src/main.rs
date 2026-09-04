@@ -2161,6 +2161,16 @@ async fn do_attach(
             Outcome::New => match start_beside(socket, &target.host).await {
                 Ok(name) => {
                     cycle.moved_to(Located::new(&target.host, &name));
+                    // A session that has just been started is in no group, so a
+                    // run narrowed to one has left it. `Cycle::refresh` says the
+                    // same thing off a listing and covers the ways membership
+                    // moves without the run doing anything, but this one is said
+                    // here because it is known here: waiting to be told would
+                    // rest on a fan-out landing inside `LISTING_WAIT`, and a
+                    // fleet slower than half a second would leave you looking at
+                    // a list of the sessions you are not in, with tab hopping
+                    // you back out of the one you just asked for.
+                    cycle.focus(None);
                     hopped = true;
                     listing = Some(spawn_listing(socket));
                     mode = Mode::Focus;
@@ -2795,7 +2805,11 @@ fn spawn_listing(socket: &Path) -> JoinHandle<Snapshot> {
 ///
 /// This is also where the group file gets tidied: the listing is the only thing
 /// that says which sessions are still running, and only the machines that
-/// answered count towards it.
+/// answered count towards it. The tidying is load-bearing beyond tidiness:
+/// `Groups::update` reads the file before it writes it, so the copy the entries
+/// below are built from is the one on disk rather than the one this run started
+/// with. That is what lets `Cycle::refresh` see a session the window next door
+/// moved out of the group this run is narrowed to.
 async fn take_listing(
     pending: &mut Option<JoinHandle<Snapshot>>,
     cycle: &mut Cycle,
