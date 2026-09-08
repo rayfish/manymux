@@ -1959,7 +1959,12 @@ async fn do_attach(
                 cycle.focus(group);
             }
         }
-        let listed = Listed::new(&snapshot, &groups, &cycle);
+        // The machines `n` offers, read here for the same reason `groups.toml`
+        // is: the file is shared with every other client on this box, and a
+        // host added from the window next door should be in the list this
+        // attach opens.
+        let machines = Hosts::load().map(|hosts| hosts.names()).unwrap_or_default();
+        let listed = Listed::new(&snapshot, &groups, &machines, &cycle);
         // The popup's way of asking what the machines are running, since the
         // attach owns this task for as long as it lasts and cannot go and look
         // itself. The narrowing cannot change under it, every way of changing
@@ -2002,7 +2007,8 @@ async fn do_attach(
                         continue;
                     }
                     let held = Groups::load().unwrap_or_else(|_| groups.clone());
-                    let listed = Listed::of(&snapshot, &held, focus.as_deref(), &recent);
+                    let machines = Hosts::load().map(|hosts| hosts.names()).unwrap_or_default();
+                    let listed = Listed::of(&snapshot, &held, &machines, focus.as_deref(), &recent);
                     // Kept where the caller can read it once the attach ends:
                     // the ids the popup hands back are this listing's, and
                     // looking them up in the one it opened with would name the
@@ -2099,6 +2105,40 @@ async fn do_attach(
                             hopped = true;
                         }
                     }
+                    // A session on the machine that was picked, and straight
+                    // into it. The listing is asked for again rather than
+                    // corrected here: the node picked the name, and what the
+                    // switch keys walk is what the machines say they are
+                    // running.
+                    Chose::On(row) => {
+                        // A row with no machine behind it cannot happen, the
+                        // ids being this listing's own, and it is worth nothing
+                        // more than staying where you are if it ever does.
+                        let host = listed.hosts.get(row).cloned().unwrap_or_default();
+                        match starting(start_on(socket, &host)).await {
+                            Ok(name) => {
+                                // The one that goes somewhere, so it leaves you
+                                // in the session rather than over it, the way
+                                // Enter on a session row does. A hop, and the
+                                // narrowing that has to go with it: what has
+                                // just been started is in no group.
+                                // `Cycle::started` is both, and says why there
+                                // rather than here.
+                                cycle.started(Located::new(&host, &name));
+                                hopped = true;
+                                mode = Mode::Focus;
+                            }
+                            // Stay where you were and say so on the row. A key
+                            // that does nothing and says nothing reads as a
+                            // broken client, and the machine is worth naming:
+                            // the one that would not answer is usually not the
+                            // one you are sitting on.
+                            Err(e) => {
+                                debug!("could not start a session on {host}: {e:#}");
+                                notice = Some(format!("could not start a session on {host}"));
+                            }
+                        }
+                    }
                     // A local file write and a redraw: nothing detaches for
                     // this, which is why `m` acts on the highlighted row rather
                     // than the session you are attached to.
@@ -2165,30 +2205,6 @@ async fn do_attach(
                 // key carries on from wherever this one left you.
                 mode = Mode::Control;
             }
-            // A session on the machine you were just on, and straight into it.
-            // The listing is asked for again rather than corrected here: the
-            // node picked the name, and what the switch keys walk is what the
-            // machines say they are running.
-            Outcome::New => match start_beside(socket, &target.host).await {
-                Ok(name) => {
-                    // A hop, and the narrowing that has to go with it: what
-                    // has just been started is in no group. `Cycle::started`
-                    // is both, and says why there rather than here.
-                    cycle.started(Located::new(&target.host, &name));
-                    hopped = true;
-                    listing = Some(spawn_listing(socket));
-                    mode = Mode::Focus;
-                }
-                // Stay where you were and say so on the row. A key that does
-                // nothing and says nothing reads as a broken client, and there
-                // is no other surface to say it on: the terminal is about to
-                // show the session this key was pressed in.
-                Err(e) => {
-                    debug!("could not start a session on {}: {e:#}", target.host);
-                    notice = Some("could not start a session here".to_string());
-                    mode = Mode::Focus;
-                }
-            },
             // A session this run put you in has ended, so the run has not:
             // back to the one you came from, the way a hop goes. What ended
             // is said on the row you land on, because the line that says it
@@ -2245,7 +2261,7 @@ async fn do_attach(
             println!("[disconnected from {where_}]");
             Ok(FAILED)
         }
-        Outcome::Switch(_) | Outcome::New | Outcome::Chose(_) => {
+        Outcome::Switch(_) | Outcome::Chose(_) => {
             unreachable!("switches never leave the loop above")
         }
     }
@@ -2379,6 +2395,26 @@ async fn reaching(
     }
 }
 
+/// One attempt at starting a session somewhere, with the same deadline a
+/// reconnect gets and for a sharper version of the same reason.
+///
+/// The list the new key opens offers every machine you watch, whether or not it
+/// answered the last listing, so the row under the highlight may well be one
+/// marked `no answer`: pressing Enter on one is an ordinary thing to do. And by
+/// then the popup has been torn down and the attached client has returned, so
+/// the terminal is in raw mode showing the session's last paint with *nothing
+/// reading the keyboard* — worse than the wait a dropped connection gets, which
+/// at least counts down and can be left. `ControlMaster` is enough on its own:
+/// connecting to a wedged control socket has no deadline of any kind.
+///
+/// Dropping the attempt is what ends it, `ssh::spawn` setting `kill_on_drop`.
+async fn starting(attempt: impl Future<Output = Result<String>>) -> Result<String> {
+    match tokio::time::timeout(REACH_FOR, attempt).await {
+        Ok(started) => started,
+        Err(_) => bail!("no answer in {}s", REACH_FOR.as_secs()),
+    }
+}
+
 /// Open a stream to wherever a session is, and attach to it.
 async fn attach_to(
     socket: &Path,
@@ -2395,13 +2431,22 @@ async fn attach_to(
         .map_err(Missed::Gone)
 }
 
-/// Start a session on the machine a client is already sitting on, for the
-/// control key that asks for one.
+/// Start a session on the machine picked from the list, for the control key
+/// that asks for one.
 ///
-/// `open` rather than `open_or_start`: there is a node on that machine and
-/// this client is attached to it. A key pressed inside a session is also no
-/// place to be asking anybody for consent to install anything.
-async fn start_beside(socket: &Path, host: &str) -> Result<String> {
+/// A node is started where there is none, the way `mm new` does. The list
+/// offers every machine you watch and not only the ones this run has been to,
+/// so the machine under the highlight may be one nothing has reached yet: over
+/// ssh the agent starts a node on demand, and here it is started by hand.
+///
+/// What it will not do is install anything. A key pressed inside a session, on
+/// a terminal in raw mode with somebody's screen painted over it, is no place
+/// to be asking for consent to put a binary on a box, so the consent callback
+/// is `None` the way the daemon's and tab completion's are: a machine with no
+/// `mm` on it is an error, and the mark row says so. Hushed for the same
+/// reason, ssh's account of a machine it could not reach belonging in that
+/// error rather than on the painted screen.
+async fn start_on(socket: &Path, host: &str) -> Result<String> {
     let spec = SpawnSpec {
         // The node's counter names it, the way it does for any spawn without
         // one: there is no prompt here and nobody typed anything.
@@ -2415,7 +2460,12 @@ async fn start_beside(socket: &Path, host: &str) -> Result<String> {
         // A login shell, which the node names for itself.
         label: None,
     };
-    let mut stream = open(socket, host).await?;
+    let mut stream = if is_this_machine(host) {
+        manymux::node::ensure_running(socket).await?;
+        Stream::local(socket).await?
+    } else {
+        Stream::over_ssh_hushed(host, None).await?
+    };
     let Response::Spawned { name } = stream.call(&Request::Spawn(spec)).await? else {
         bail!("unexpected response to spawn");
     };
@@ -2473,6 +2523,20 @@ struct Listed {
     /// One per group row. The first is `None`, which is "everything" when you
     /// are narrowing and "no group" when you are moving a session.
     groups: Vec<Option<String>>,
+    /// One per host row: the machine to start a session on, in the spelling a
+    /// listing gives it.
+    hosts: Vec<String>,
+}
+
+/// The machine rows and what each one means, which travel together for the
+/// reason the session rows and [`Listed::at`] do: a row's id is where its
+/// machine sits in `hosts`, so building one without the other would hand back
+/// an id naming a different box.
+struct Machines {
+    rows: Vec<Row>,
+    hosts: Vec<String>,
+    /// The row for the machine the run is on, which the list opens on.
+    at: usize,
 }
 
 /// The id the session the run is in wears in every listing. See [`Listed::of`].
@@ -2496,8 +2560,8 @@ impl Listed {
     ///
     /// Narrowed to the focused group when there is one, because that is what
     /// every other way of moving around is narrowed to.
-    fn new(snapshot: &Snapshot, groups: &Groups, cycle: &Cycle) -> Self {
-        Self::of(snapshot, groups, cycle.focused(), &cycle.recent())
+    fn new(snapshot: &Snapshot, groups: &Groups, hosts: &[String], cycle: &Cycle) -> Self {
+        Self::of(snapshot, groups, hosts, cycle.focused(), &cycle.recent())
     }
 
     /// The same, from the two things about the cycle that matter, so a task
@@ -2507,7 +2571,13 @@ impl Listed {
     /// recent first, so its head is the session the run is in now and the rest
     /// is what the digits are handed out along. It is never empty; an empty one
     /// is a listing with nothing to look out from, and there is no list to draw.
-    fn of(snapshot: &Snapshot, groups: &Groups, focus: Option<&str>, recent: &[Located]) -> Self {
+    fn of(
+        snapshot: &Snapshot,
+        groups: &Groups,
+        hosts: &[String],
+        focus: Option<&str>,
+        recent: &[Located],
+    ) -> Self {
         let Some(current) = recent.first() else {
             return Self::default();
         };
@@ -2660,15 +2730,75 @@ impl Listed {
             names.push(Some(name));
         }
 
+        let machines = Self::machines(snapshot, hosts, current);
+
         Self {
             rows: Rows {
                 sessions: rows,
                 groups: group_rows,
+                hosts: machines.rows,
                 at: highlight,
+                machine: machines.at,
                 narrowed: focus.map(str::to_string),
             },
             at,
             groups: names,
+            hosts: machines.hosts,
+        }
+    }
+
+    /// The machines a session could be started on, and the row the list opens
+    /// on.
+    ///
+    /// The host list rather than what the last listing heard back from: a
+    /// machine that was asleep half a second ago is still a machine you meant
+    /// to start something on, and leaving it out makes the key quietly unable
+    /// to reach it. What the listing decides is the detail beside each name,
+    /// which is what a machine that said nothing has none of.
+    ///
+    /// In one order with this machine among the rest rather than pinned to the
+    /// top, because that is the order the session list's headings are in and
+    /// two lists one key apart must not disagree about where a machine sits.
+    fn machines(snapshot: &Snapshot, hosts: &[String], current: &Located) -> Machines {
+        let mut names: Vec<String> = hosts.to_vec();
+        if !names.iter().any(|host| is_this_machine(host)) {
+            names.push(this_machine().to_string());
+        }
+        names.sort();
+        names.dedup();
+        let mut rows = Vec::new();
+        for name in &names {
+            let answered = snapshot
+                .answered
+                .iter()
+                .any(|host| same_machine(host, name));
+            let held = snapshot
+                .sessions
+                .iter()
+                .filter(|hosted| same_machine(&hosted.host, name))
+                .count();
+            let detail = match (answered, held) {
+                (false, _) => "no answer".to_string(),
+                (true, 0) => "no sessions".to_string(),
+                (true, 1) => "1 session".to_string(),
+                (true, held) => format!("{held} sessions"),
+            };
+            let here = same_machine(name, &current.host);
+            rows.push(
+                Row::new(rows.len(), name)
+                    .detail(detail)
+                    // The mark every list here puts on where you are.
+                    .note(if here { "●" } else { "" }),
+            );
+        }
+        let at = rows
+            .iter()
+            .position(|row| same_machine(&names[row.id], &current.host))
+            .unwrap_or(0);
+        Machines {
+            rows,
+            hosts: names,
+            at,
         }
     }
 
@@ -2882,6 +3012,28 @@ mod tests {
         assert!(at.elapsed() >= REACH_FOR, "it waited {:?}", at.elapsed());
     }
 
+    /// A session started on a machine that never answers must not take the
+    /// terminal with it. The list offers every machine you watch, so a row
+    /// marked `no answer` is one you would press Enter on, and the attempt
+    /// reads no keyboard: the popup is gone by then and the row is not being
+    /// written. Held open by a wedged `ControlMaster` it was a terminal in raw
+    /// mode with nothing reading it and no way out.
+    #[tokio::test(start_paused = true)]
+    async fn starting_a_session_on_a_machine_that_never_answers_is_given_up_on() {
+        async fn never() -> Result<String> {
+            std::future::pending().await
+        }
+        // tokio's clock, so the ten seconds cost nothing. The outer wait is
+        // there to fail rather than hang if the deadline goes.
+        let at = tokio::time::Instant::now();
+        let ended = tokio::time::timeout(REACH_FOR * 10, starting(never())).await;
+        assert!(
+            ended.expect("the attempt was never given up on").is_err(),
+            "a machine that said nothing was read as a session started"
+        );
+        assert!(at.elapsed() >= REACH_FOR, "it waited {:?}", at.elapsed());
+    }
+
     fn hosted(name: &str) -> HostedSession {
         HostedSession {
             host: this_machine().to_string(),
@@ -2910,7 +3062,7 @@ mod tests {
             answered: vec![this_machine().to_string()],
         };
         let current = Located::new(as_listed(LOCAL), "test");
-        let listed = Listed::of(&snapshot, &Groups::default(), None, from_ref(&current));
+        let listed = Listed::of(&snapshot, &Groups::default(), &[], None, from_ref(&current));
         let row = &listed.rows.sessions[listed.rows.at];
         assert_eq!(row.label, "test");
         // And the same row is the one wearing the mark, since both are the same
@@ -2949,7 +3101,7 @@ mod tests {
             answered: vec!["gpu-box".to_string()],
         };
         let current = Located::new(as_listed(LOCAL), "test");
-        let listed = Listed::of(&snapshot, &Groups::default(), None, from_ref(&current));
+        let listed = Listed::of(&snapshot, &Groups::default(), &[], None, from_ref(&current));
         let row = &listed.rows.sessions[listed.rows.at];
         assert_eq!(row.label, "test");
         assert_eq!(row.note, "●");
@@ -2969,7 +3121,7 @@ mod tests {
             sessions: vec![hosted_on("gpu-box", "build")],
             answered: vec!["gpu-box".to_string()],
         };
-        let first = Listed::of(&partial, &Groups::default(), None, from_ref(&current));
+        let first = Listed::of(&partial, &Groups::default(), &[], None, from_ref(&current));
         let mut popup = manymux::client::picker::Picker::new(
             "sessions",
             "⏎ go",
@@ -2980,11 +3132,62 @@ mod tests {
             sessions: vec![hosted_on("gpu-box", "build"), hosted("api"), hosted("test")],
             answered: vec!["gpu-box".to_string(), this_machine().to_string()],
         };
-        let then = Listed::of(&full, &Groups::default(), None, from_ref(&current));
+        let then = Listed::of(&full, &Groups::default(), &[], None, from_ref(&current));
         popup.replace(then.rows.sessions.clone(), then.rows.at);
         let row = popup.chosen().expect("a row to be under the cursor");
         assert_eq!(row.label, "test");
         assert_eq!(then.at[row.id], current);
+    }
+
+    /// The list the new key opens: every machine you watch, whether or not it
+    /// answered the last listing, with the one you are on under the highlight.
+    ///
+    /// The hosts rather than what the listing heard back from, because a
+    /// machine that was asleep half a second ago is still one you meant to
+    /// start something on, and a key that cannot reach it is a key that has
+    /// quietly stopped covering half the fleet.
+    #[test]
+    fn the_new_session_list_holds_every_machine_and_opens_on_the_one_you_are_on() {
+        let snapshot = Snapshot {
+            sessions: vec![hosted("build")],
+            answered: vec![this_machine().to_string()],
+        };
+        let current = Located::new(as_listed(LOCAL), "build");
+        let hosts = ["gpu-box".to_string()];
+        let listed = Listed::of(
+            &snapshot,
+            &Groups::default(),
+            &hosts,
+            None,
+            from_ref(&current),
+        );
+
+        // One order for both lists, this machine among the rest rather than
+        // pinned on top: the session list heads its machines the same way.
+        let drawn: Vec<&str> = listed
+            .rows
+            .hosts
+            .iter()
+            .map(|row| row.label.as_str())
+            .collect();
+        let mut expected = vec!["gpu-box", this_machine()];
+        expected.sort_unstable();
+        assert_eq!(drawn, expected);
+
+        let row = &listed.rows.hosts[listed.rows.machine];
+        assert_eq!(row.label, this_machine(), "opened on another machine");
+        assert_eq!(row.note, "●");
+        assert_eq!(listed.hosts[row.id], this_machine());
+        // What the listing has to say about each one, which for a machine that
+        // said nothing is that it said nothing.
+        assert_eq!(row.detail, "1 session");
+        let asleep = listed
+            .rows
+            .hosts
+            .iter()
+            .find(|row| row.label == "gpu-box")
+            .expect("a row for a machine that did not answer");
+        assert_eq!(asleep.detail, "no answer");
     }
 
     /// A machine that answered and did not mention it is a session that has
@@ -2997,7 +3200,7 @@ mod tests {
             answered: vec![this_machine().to_string()],
         };
         let current = Located::new(as_listed(LOCAL), "gone");
-        let listed = Listed::of(&snapshot, &Groups::default(), None, from_ref(&current));
+        let listed = Listed::of(&snapshot, &Groups::default(), &[], None, from_ref(&current));
         let landable = listed
             .rows
             .sessions
@@ -3033,7 +3236,7 @@ mod tests {
             Located::new(as_listed(LOCAL), "test"),
             Located::new(as_listed(LOCAL), "build"),
         ];
-        let listed = Listed::of(&snapshot, &Groups::default(), None, &recent);
+        let listed = Listed::of(&snapshot, &Groups::default(), &[], None, &recent);
         assert_eq!(numbered(&listed), [("test", 1), ("build", 2)]);
     }
 
@@ -3051,7 +3254,7 @@ mod tests {
             Located::new(as_listed(LOCAL), "gone"),
             Located::new(as_listed(LOCAL), "build"),
         ];
-        let listed = Listed::of(&snapshot, &Groups::default(), None, &recent);
+        let listed = Listed::of(&snapshot, &Groups::default(), &[], None, &recent);
         assert_eq!(numbered(&listed), [("test", 1), ("build", 2)]);
     }
 
@@ -3069,7 +3272,7 @@ mod tests {
             .iter()
             .map(|n| Located::new(as_listed(LOCAL), n))
             .collect();
-        let listed = Listed::of(&snapshot, &Groups::default(), None, &recent);
+        let listed = Listed::of(&snapshot, &Groups::default(), &[], None, &recent);
         let numbers = numbered(&listed);
         assert_eq!(numbers.len(), 9);
         assert_eq!(numbers.last(), Some(&("s8", 9)));

@@ -129,7 +129,7 @@ read its `//!` first, and update it in the same commit:
 | the wire, and what a node of another age does with it | `src/proto.rs` |
 | groups, and why they are the client's | `src/client/groups.rs` |
 | checkpoints, restarts, and reading `/proc` | `src/client/checkpoint.rs`, `src/foreground.rs` |
-| the popup and its two lists | `src/client/picker.rs` |
+| the popup and its three lists | `src/client/picker.rs` |
 | where a switch key lands, and in what order | `src/client/switch.rs` |
 | the two screen modes | `src/client/screen.rs` |
 | the history view, selection and the mouse | `src/client/scroll.rs` |
@@ -383,10 +383,12 @@ things that must simply never be done.
   from knowing, and a mobile app drives the same type. So `tag::RENAME` carries
   a name the way `tag::VIEW` and `tag::FIND` carry their questions, and the node
   has the session right there at the other end. What does *not* go on the stream
-  is the key that starts a session (`Action::New`, `Outcome::New`), which looks
+  is the key that starts a session (`Pick::Hosts`, `Chose::On`), which looks
   like the same shape and is not: a new one needs a host to start it on, a name
-  back and a fresh attach, none of which this half may know. So it is handed
-  back the way a switch is, and `main::start_beside` does the work.
+  back and a fresh attach, none of which this half may know. Which is why the
+  key opens a list of machines rather than starting one where you stand: the
+  machine is chosen from rows handed in, the way every other row in that popup
+  is, and what comes back is an id. `main::start_on` does the work.
 - **Every key the client reads has three spellings, not one.** A program that
   asks for the kitty keyboard protocol (`CSI > 7 u`, which `pi` sends on
   startup) or for xterm's `modifyOtherKeys` changes how the *terminal* encodes

@@ -383,6 +383,11 @@ pub enum Pick {
     Move,
     /// `g`: narrow to a group, which opens the same list for the other verb.
     Groups,
+    /// `n`: start a session, which opens the list of machines to start it on.
+    /// Which machines those are and what starting one means is the caller's,
+    /// for the same reason a switch is: this half of the client knows nothing
+    /// about hosts.
+    Hosts,
     /// Esc: close, changing nothing.
     Cancel,
 }
@@ -398,10 +403,6 @@ pub enum Action {
     /// A third prompt rather than a third editor: the typing is identical and
     /// only the action carrying it says which prompt it happened at.
     GroupName(Rename),
-    /// Start a session on the machine this one is on, and go and sit in it.
-    /// Where that is and what it gets called is the caller's, for the same
-    /// reason a switch is: this half of the client knows nothing about hosts.
-    New,
     /// Send this machine's clipboard to the session, if there is an image on
     /// it. Deciding that is the caller's: this half of the client knows nothing
     /// about clipboards.
@@ -1010,11 +1011,7 @@ impl KeyFilter {
     /// detaches, which is the whole reason that mode is separate.
     fn after(action: Action, now: Mode) -> Mode {
         match action {
-            // A new session is a fresh shell waiting to be typed into, which
-            // is why it is the one key here that does not leave the mode on:
-            // what follows a hop is often another hop, what follows this is
-            // a command.
-            Action::Detach | Action::Paste | Action::New => Mode::Focus,
+            Action::Detach | Action::Paste => Mode::Focus,
             Action::Switch(_) => Mode::Control,
             // The popup stays up while the highlight is moving, and both ways
             // out of it go back to the session.
@@ -1027,7 +1024,7 @@ impl KeyFilter {
             // arrived in, which is what the group lists have of their own.
             Action::Pick(Pick::Cancel) if now == Mode::Picking => Mode::Control,
             Action::Pick(Pick::Cancel) => Mode::Focus,
-            Action::Pick(Pick::Move | Pick::Groups) => Mode::Picking,
+            Action::Pick(Pick::Move | Pick::Groups | Pick::Hosts) => Mode::Picking,
             Action::Pick(_) => now,
             // Back to the group list rather than to the session: naming a group
             // was one step of choosing one, and the list it was chosen from is
@@ -1092,7 +1089,11 @@ impl KeyFilter {
             b'm' | b'M' => Action::Pick(Pick::Move),
             b'g' => Action::Pick(Pick::Groups),
             b'l' | b'L' => Action::Switch(Motion::Last),
-            b'n' | b'N' => Action::New,
+            // The machines you could start a session on, which is a list like
+            // the other two rather than a session started where you happen to
+            // be standing: the machine is the thing being chosen, and the one
+            // you are on is only the likeliest answer.
+            b'n' | b'N' => Action::Pick(Pick::Hosts),
             // The one key that reads its own case, because shift already means
             // backwards here: `H` is to `h` what shift-tab is to tab, rather
             // than a second letter to remember.
@@ -2382,7 +2383,7 @@ mod tests {
         let mut f = KeyFilter::new(KEY);
         assert_eq!(
             f.filter(b"\x1b[93;5u\x1b[110u"),
-            asked(Action::New, Mode::Focus)
+            asked(Action::Pick(Pick::Hosts), Mode::Picking)
         );
 
         // Shift is the alternate the terminal reports beside the key, since the
@@ -2792,17 +2793,20 @@ mod tests {
     }
 
     /// And the release of the key control mode acted on is the client's too,
-    /// which is the half the rule above was missing. `Ctrl-] n` starts a
-    /// session and hands the keyboard straight to it, so under a program that
-    /// asked for event types the `n` coming back up was typed into the shell
-    /// that had just started, and `0;1:3u` landed on somebody's prompt.
+    /// which is the half the rule above was missing. `Ctrl-] 1` lands in the
+    /// session wearing that digit and hands the keyboard straight to it, so
+    /// under a program that asked for event types the `1` coming back up was
+    /// typed into the shell it had just landed in, and `49;1:3u` went with it.
     #[test]
     fn the_release_of_the_key_that_acted_does_not_reach_the_session() {
         let mut f = KeyFilter::default();
         assert_eq!(f.filter(b"\x1b[93;5u"), held());
-        assert_eq!(f.filter(b"\x1b[110;1u"), asked(Action::New, Mode::Focus));
-        // Letting go of `n`, once the key has already put us back in focus.
-        assert_eq!(f.filter(b"\x1b[110;1:3u"), forwarded(b""));
+        assert_eq!(
+            f.filter(b"\x1b[49;1u"),
+            asked(Action::Pick(Pick::Number(1)), Mode::Focus)
+        );
+        // Letting go of `1`, once the key has already put us back in focus.
+        assert_eq!(f.filter(b"\x1b[49;1:3u"), forwarded(b""));
     }
 
     /// And it stays the client's for as long as the hand is on it. A key held
@@ -2813,13 +2817,16 @@ mod tests {
     fn a_key_held_after_it_acted_leaks_none_of_its_repeats() {
         let mut f = KeyFilter::default();
         assert_eq!(f.filter(b"\x1b[93;5u"), held());
-        assert_eq!(f.filter(b"\x1b[110;1u"), asked(Action::New, Mode::Focus));
-        assert_eq!(f.filter(b"\x1b[110;1:2u"), forwarded(b""));
-        assert_eq!(f.filter(b"\x1b[110;1:2u"), forwarded(b""));
-        assert_eq!(f.filter(b"\x1b[110;1:3u"), forwarded(b""));
+        assert_eq!(
+            f.filter(b"\x1b[49;1u"),
+            asked(Action::Pick(Pick::Number(1)), Mode::Focus)
+        );
+        assert_eq!(f.filter(b"\x1b[49;1:2u"), forwarded(b""));
+        assert_eq!(f.filter(b"\x1b[49;1:2u"), forwarded(b""));
+        assert_eq!(f.filter(b"\x1b[49;1:3u"), forwarded(b""));
         // Let go of, it is the session's again like any other key.
-        assert_eq!(f.filter(b"\x1b[110;1u"), forwarded(b"\x1b[110;1u"));
-        assert_eq!(f.filter(b"\x1b[110;1:3u"), forwarded(b"\x1b[110;1:3u"));
+        assert_eq!(f.filter(b"\x1b[49;1u"), forwarded(b"\x1b[49;1u"));
+        assert_eq!(f.filter(b"\x1b[49;1:3u"), forwarded(b"\x1b[49;1:3u"));
     }
 
     /// Every key that leaves control mode has the same release to answer for,
@@ -3106,17 +3113,24 @@ mod tests {
         assert_eq!(f.filter(&[KEY, b'p']), forwarded(&[KEY, b'p']));
     }
 
-    /// The one control key that leaves the mode. A hop puts you where another
-    /// session already is and you may well want the next one; a new session is
-    /// a fresh shell, and what comes after it is typing.
+    /// The new key opens a list like the other two rather than starting a
+    /// session where you happen to be standing, so it leaves the keyboard in
+    /// the list's mode: the machine is the thing being chosen, and the Enter
+    /// after it is what commits.
     #[test]
-    fn the_new_key_asks_for_a_session_and_leaves_the_keyboard_in_focus() {
+    fn the_new_key_opens_the_list_of_machines_to_start_on() {
         let mut f = KeyFilter::default();
-        assert_eq!(f.filter(&[KEY, b'n']), asked(Action::New, Mode::Focus));
+        assert_eq!(
+            f.filter(&[KEY, b'n']),
+            asked(Action::Pick(Pick::Hosts), Mode::Picking)
+        );
 
         // Both cases, like every key here but the two that move machine.
         let mut f = KeyFilter::default();
-        assert_eq!(f.filter(&[KEY, b'N']), asked(Action::New, Mode::Focus));
+        assert_eq!(
+            f.filter(&[KEY, b'N']),
+            asked(Action::Pick(Pick::Hosts), Mode::Picking)
+        );
     }
 
     #[test]

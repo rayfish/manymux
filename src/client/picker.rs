@@ -1,9 +1,10 @@
 //! The list control mode puts on the screen.
 //!
 //! A box of rows with one highlighted, drawn over whatever the session last
-//! painted. Two things fill it: the sessions you can reach, and the groups you
-//! can put one in. One widget rather than two, because the movement keys are
-//! the same and the columns differ only in what goes in them.
+//! painted. Three things fill it: the sessions you can reach, the groups you
+//! can put one in, and the machines you can start one on. One widget rather
+//! than three, because the movement keys are the same and the columns differ
+//! only in what goes in them.
 //!
 //! Terminal-free, like [`super::status`]: it answers with a `String` of escape
 //! sequences and never touches stdout, so a caller with no terminal can drive
@@ -27,10 +28,10 @@
 //! A session row can carry a digit, drawn in a column of its own down the left
 //! of the box. It is the key that reaches that row, and the caller works out
 //! which rows get one: this only draws it, and takes the column back off a list
-//! where nothing is numbered, which is both group lists. In front of the name
-//! rather than beside the note, because it is read on the way *to* a row, and
-//! in a column rather than in front of the label, or the names of numbered and
-//! unnumbered rows would sit two columns apart.
+//! where nothing is numbered, which is every list but the sessions. In front of
+//! the name rather than beside the note, because it is read on the way *to* a
+//! row, and in a column rather than in front of the label, or the names of
+//! numbered and unnumbered rows would sit two columns apart.
 //!
 //! [`Row::id`] is opaque here on purpose. The caller hands rows in and gets an
 //! id back, so this never learns what a host is, and a listing that lands while
@@ -63,7 +64,7 @@ const STEP: u16 = 2;
 /// Columns the digit column takes where a list has one: the digit and the space
 /// after it. A column rather than something in front of the name, so the names
 /// of numbered and unnumbered rows stay in line, and taken back off a list where
-/// nothing is numbered, which is both group lists.
+/// nothing is numbered, which is every list but the sessions.
 const GUTTER: u16 = 2;
 
 /// Columns of gap inside a session row, and the width of the note pinned to its

@@ -2248,18 +2248,24 @@ fn a_session_that_ends_puts_you_back_in_the_one_you_came_from() {
         }
     };
 
-    // Ctrl-] n once the client is on the screen, then wait to land in whatever
-    // the node called the session it started.
+    // Ctrl-] n once the client is on the screen, which opens the machines to
+    // start on, then Enter on the one it opens on: the machine this client is
+    // attached to. Then wait to land in whatever the node called the session.
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut pressed = false;
+    let mut committed = false;
     let started = loop {
         catch_up(&mut seen);
         if !pressed && seen.contains("gpu-box/long") {
             pressed = true;
             (&pty).write_all(b"\x1dn").unwrap();
+        }
+        if pressed && !committed && seen.contains("new session on") {
+            committed = true;
+            (&pty).write_all(b"\r").unwrap();
             seen.clear();
         }
-        if pressed {
+        if committed {
             let listing = world.ok("gpu-box", &["ls", "local"]);
             let started: Vec<&str> = listing
                 .lines()
@@ -2309,11 +2315,13 @@ fn a_session_that_ends_puts_you_back_in_the_one_you_came_from() {
     let _ = client.wait();
 }
 
-/// The control key that starts a session starts it on the machine the client
-/// is on, not the one it was typed from, and lands you in it. Two hops away
-/// here: the key is pressed on the laptop and the session appears on gpu-box.
+/// The control key that starts a session opens the machines to start it on,
+/// with the one the client is attached to under the highlight: Enter there
+/// starts it where the session you are in is, not on the machine the key was
+/// typed from. Two hops away here, the key being pressed on the laptop and the
+/// session appearing on gpu-box.
 #[test]
-fn the_new_key_starts_a_session_on_the_machine_you_are_on() {
+fn the_new_key_starts_a_session_on_the_machine_the_list_opens_on() {
     use std::io::{Read, Write};
     use std::os::fd::AsFd;
     use std::sync::mpsc;
@@ -2351,18 +2359,25 @@ fn the_new_key_starts_a_session_on_the_machine_you_are_on() {
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut seen = String::new();
     let mut pressed = false;
+    let mut committed = false;
     let started = loop {
         if let Ok(chunk) = seen_rx.recv_timeout(Duration::from_millis(200)) {
             seen.push_str(&String::from_utf8_lossy(&chunk));
         }
-        // Once the client is on the screen, Ctrl-] n.
+        // Once the client is on the screen, Ctrl-] n, and then Enter on the
+        // row the list opens on: the machine the client is attached to, which
+        // is gpu-box and not the laptop the key was typed on.
         if !pressed && seen.contains("gpu-box/long") {
             pressed = true;
             (&pty).write_all(b"\x1dn").unwrap();
+        }
+        if pressed && !committed && seen.contains("new session on") {
+            committed = true;
+            (&pty).write_all(b"\r").unwrap();
             seen.clear();
         }
         // The node picked the name, so the listing is what says which it is.
-        if pressed {
+        if committed {
             let listing = world.ok("gpu-box", &["ls", "local"]);
             let started: Vec<&str> = listing
                 .lines()
@@ -2395,6 +2410,208 @@ fn the_new_key_starts_a_session_on_the_machine_you_are_on() {
 
     let _ = client.kill();
     let _ = client.wait();
+}
+
+/// And the machine under the highlight is the one it starts on, which is the
+/// whole reason the list is there: the key used to start a session wherever
+/// you happened to be standing, so getting a shell on the box next door meant
+/// leaving the one you were in. Two machines here, so one tab off the row it
+/// opens on is the other one whichever way the names sort.
+#[test]
+fn the_new_key_starts_a_session_on_the_machine_you_walked_to() {
+    use std::io::{Read, Write};
+    use std::os::fd::AsFd;
+    use std::sync::mpsc;
+
+    let world = World::new("control-new-elsewhere");
+    world.ok("laptop", &["add", "gpu-box"]);
+    world.ok("gpu-box", &["new", "-d", "-n", "long", "sleep", "300"]);
+    world.wait_for_node("gpu-box");
+
+    let (pty, pts) = pty_process::blocking::open().unwrap();
+    pty.resize(pty_process::Size::new(24, 80)).unwrap();
+    let mut client = pty_process::blocking::Command::new(MM)
+        .arg("--socket")
+        .arg(world.socket("laptop"))
+        .args(["attach", "gpu-box/long"])
+        .env("MM_CONFIG_DIR", world.dir.join("laptop"))
+        .env("MM_SSH", world.ssh_stub())
+        .env("MM_LOG", "manymux=warn")
+        .env("TERM", "xterm-256color")
+        .spawn(pts)
+        .expect("attaching on a terminal");
+
+    let (seen_tx, seen_rx) = mpsc::channel();
+    let mut reading =
+        unsafe { pty_process::blocking::Pty::from_fd(pty.as_fd().try_clone_to_owned().unwrap()) };
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 1024];
+        while let Ok(read @ 1..) = reading.read(&mut buf) {
+            if seen_tx.send(buf[..read].to_vec()).is_err() {
+                return;
+            }
+        }
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut seen = String::new();
+    let mut pressed = false;
+    let mut committed = false;
+    let started = loop {
+        if let Ok(chunk) = seen_rx.recv_timeout(Duration::from_millis(200)) {
+            seen.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if !pressed && seen.contains("gpu-box/long") {
+            pressed = true;
+            (&pty).write_all(b"\x1dn").unwrap();
+        }
+        // A tab off gpu-box, which is this laptop, and Enter on it.
+        if pressed && !committed && seen.contains("new session on") {
+            committed = true;
+            (&pty).write_all(b"\t\r").unwrap();
+            seen.clear();
+        }
+        // The node picked the name, so the listing is what says which it is.
+        if committed {
+            let listing = world.ok("laptop", &["ls", "local"]);
+            let here: Vec<&str> = listing
+                .lines()
+                .skip(1)
+                .filter_map(|line| line.split_whitespace().next())
+                .collect();
+            if let [name] = here[..] {
+                break name.to_string();
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "pressed={pressed}; the terminal saw: {seen:?}"
+        );
+    };
+
+    // Started here and nowhere else: the machine that was showing on the
+    // screen is still running the one session it started with.
+    let there = world.ok("gpu-box", &["ls", "local"]);
+    assert_eq!(
+        there
+            .lines()
+            .skip(1)
+            .filter_map(|line| line.split_whitespace().next())
+            .collect::<Vec<_>>(),
+        ["long"],
+        "a session was started on the machine the client was attached to"
+    );
+
+    // And the client went with it, which is what makes this a gesture rather
+    // than a session left running on a machine somewhere. The row names it
+    // without a machine in front, this one being the machine the client is on;
+    // what was on the row up to the Enter was `gpu-box/long`.
+    let landed = Instant::now() + Duration::from_secs(10);
+    while !seen.contains(&started) {
+        if let Ok(chunk) = seen_rx.recv_timeout(Duration::from_millis(200)) {
+            seen.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        assert!(
+            Instant::now() < landed,
+            "started {started} but stayed put; the terminal saw: {seen:?}"
+        );
+    }
+
+    let _ = client.kill();
+    let _ = client.wait();
+}
+
+/// Every hop in a viewing run is another view, so a session started from one is
+/// a session you could not type into: the key is refused, and refused at the
+/// press that opens the list rather than at the Enter that commits it, since
+/// throwing away a machine somebody has just picked is worse than never
+/// offering. What it must also do is put the keyboard back: the key has already
+/// moved the mode on to the list that is not going to open, and a mode with no
+/// list behind it holds every key you press afterwards.
+#[test]
+fn the_new_key_is_refused_in_a_viewing_run_and_hands_the_keyboard_back() {
+    use std::io::{Read, Write};
+    use std::os::fd::AsFd;
+    use std::sync::mpsc;
+
+    let world = World::new("control-new-watching");
+    world.ok("laptop", &["add", "gpu-box"]);
+    world.ok("gpu-box", &["new", "-d", "-n", "long", "sleep", "300"]);
+    world.wait_for_node("gpu-box");
+
+    let (pty, pts) = pty_process::blocking::open().unwrap();
+    pty.resize(pty_process::Size::new(24, 80)).unwrap();
+    let mut client = pty_process::blocking::Command::new(MM)
+        .arg("--socket")
+        .arg(world.socket("laptop"))
+        .args(["view", "gpu-box/long"])
+        .env("MM_CONFIG_DIR", world.dir.join("laptop"))
+        .env("MM_SSH", world.ssh_stub())
+        .env("MM_LOG", "manymux=warn")
+        .env("TERM", "xterm-256color")
+        .spawn(pts)
+        .expect("watching on a terminal");
+
+    let (seen_tx, seen_rx) = mpsc::channel();
+    let mut reading =
+        unsafe { pty_process::blocking::Pty::from_fd(pty.as_fd().try_clone_to_owned().unwrap()) };
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 1024];
+        while let Ok(read @ 1..) = reading.read(&mut buf) {
+            if seen_tx.send(buf[..read].to_vec()).is_err() {
+                return;
+            }
+        }
+    });
+
+    let mut seen = String::new();
+    let wait_for = |seen: &mut String, what: &str| {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if let Ok(chunk) = seen_rx.recv_timeout(Duration::from_millis(200)) {
+                seen.push_str(&String::from_utf8_lossy(&chunk));
+            }
+            if seen.contains(what) {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "never saw {what:?} on the terminal; saw: {seen:?}"
+            );
+        }
+    };
+
+    wait_for(&mut seen, "gpu-box/long");
+    // The mode key and the key after it, as a hand sends them: the popup goes
+    // up on the way into control mode, and it is what the refusal below has to
+    // hand the keyboard back to.
+    (&pty).write_all(b"\x1d").unwrap();
+    wait_for(&mut seen, "┌ sessions");
+    (&pty).write_all(b"n").unwrap();
+    wait_for(&mut seen, "watching, so nothing here can start a session");
+    assert!(
+        !seen.contains("new session on"),
+        "the list opened in a run that cannot type into what it would start"
+    );
+
+    // And the keyboard came back to the list it was refused from, which the
+    // key that leaves says: held in a mode with nothing behind it, this does
+    // nothing at all and the run never ends.
+    (&pty).write_all(b"d").unwrap();
+    let gone = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Some(status) = client.try_wait().expect("checking the client") {
+            assert!(status.success(), "the client left saying {status}");
+            break;
+        }
+        assert!(
+            Instant::now() < gone,
+            "the detach key did nothing; the terminal saw: {seen:?}"
+        );
+        if let Ok(chunk) = seen_rx.recv_timeout(Duration::from_millis(200)) {
+            seen.push_str(&String::from_utf8_lossy(&chunk));
+        }
+    }
 }
 
 /// A group spans machines, and nothing on the wire carries it: this is one
@@ -3323,6 +3540,8 @@ fn a_new_session_started_inside_a_group_widens_the_run() {
     // so it is read back rather than guessed at. The row names it once the run
     // has landed in it, which is what says the reattach is over.
     writer.write_all(&[0x1d, b'n']).unwrap();
+    wait_for(&mut seen, "new session on");
+    writer.write_all(b"\r").unwrap();
     let started = {
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {

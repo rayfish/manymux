@@ -72,9 +72,6 @@ pub enum Outcome {
     /// A switch key was pressed. Which session it lands on is the caller's to
     /// work out: this half of the client knows nothing about hosts.
     Switch(Motion),
-    /// The new key was pressed. Starting the session and landing in it is the
-    /// caller's for the same reason.
-    New,
     /// The session's process exited with this code.
     Exited(i32),
     /// The host went away.
@@ -101,20 +98,35 @@ pub enum Chose {
     /// two, because a group is a set of live sessions and an empty one cannot
     /// exist.
     NewGroup { session: usize, name: String },
+    /// Start a session on the machine on this row, and go and sit in it.
+    ///
+    /// Handed back rather than sent on the attach stream, which is where every
+    /// other thing an attached client asks for goes: a new session needs a
+    /// machine to start it on, a name back and a fresh attach, and this half of
+    /// the client is kept from knowing any of the three.
+    On(usize),
 }
 
 /// The rows a popup is drawn from, handed in per attach.
 ///
-/// Both lists at once because `m` swaps from one to the other without a round
-/// trip, and asking for the groups at that moment would put an ssh in the
-/// middle of a keystroke.
+/// Every list at once because `m`, `g` and `n` swap from one to another without
+/// a round trip, and asking for the groups or the machines at that moment would
+/// put an ssh in the middle of a keystroke.
 #[derive(Debug, Default, Clone)]
 pub struct Rows {
     pub sessions: Vec<picker::Row>,
     pub groups: Vec<picker::Row>,
+    /// The machines a session could be started on, for the list `n` opens.
+    /// Handed in with the other two for the same reason: asking at the
+    /// keystroke would put an ssh in the middle of it.
+    pub hosts: Vec<picker::Row>,
     /// Which session row is the one being attached to, so the popup opens with
     /// the highlight already on it.
     pub at: usize,
+    /// And which host row is the machine that session is on, so the list of
+    /// machines opens the same way: the one you are on is the likeliest answer,
+    /// which makes `n` then Enter the gesture that used to be `n` alone.
+    pub machine: usize,
     /// The group the session list is narrowed to, where it is narrowed at all.
     ///
     /// Drawn in the title, because the list itself cannot say it. A run with a

@@ -51,8 +51,8 @@ const HINTS: &[&str] = &[
     "l last",
 ];
 
-/// What the group lists answer to, for the same row when there is no box to
-/// carry their own hints.
+/// What the lists opened over the session list answer to, for the same row when
+/// there is no box to carry their own hints.
 ///
 /// All or nothing rather than a ladder, being two keys: `choose` because the
 /// highlight sitting beside it already says which list is open, and there is no

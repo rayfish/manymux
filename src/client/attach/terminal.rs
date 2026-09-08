@@ -650,9 +650,9 @@ struct Painting {
 
 /// The popup on the screen, and what the list in it is for.
 ///
-/// Two verbs over one widget, and which list you entered from is what says
-/// which: no row in either means two things, which is what an earlier shape of
-/// this got wrong.
+/// Several verbs over one widget, and which list you entered from is what says
+/// which: no row in any of them means the same thing twice, which is what an
+/// earlier shape of this got wrong.
 struct Popup {
     picker: Picker,
     what: Showing,
@@ -666,6 +666,8 @@ enum Showing {
     Moving { row: usize },
     /// Groups, to narrow to. Enter narrows.
     Narrowing,
+    /// The machines a session could be started on. Enter starts one there.
+    Hosting,
 }
 
 /// The digits are second, after the key every list has: they are the fastest
@@ -676,6 +678,7 @@ enum Showing {
 const SESSION_HINTS: &str = "⏎ go  1-9 recent  r name  m group  g show  n new  d detach";
 const MOVE_HINTS: &str = "⏎ move   n new group   esc";
 const NARROW_HINTS: &str = "⏎ show   esc";
+const HOST_HINTS: &str = "⏎ start   esc";
 
 impl Popup {
     fn sessions(rows: &Rows) -> Self {
@@ -710,24 +713,46 @@ impl Popup {
     fn mode(&self) -> Mode {
         match self.what {
             Showing::Sessions => Mode::Control,
-            Showing::Moving { .. } | Showing::Narrowing => Mode::Picking,
+            Showing::Moving { .. } | Showing::Narrowing | Showing::Hosting => Mode::Picking,
+        }
+    }
+
+    /// Take a listing that has just landed, in whichever list is up.
+    ///
+    /// Each has its own rows and its own row to fall back to, and reading the
+    /// wrong one would swap the list itself out from under the highlight: the
+    /// machines replaced by the groups is what an `else` here would do, and the
+    /// hand on the keyboard would be a keypress away from choosing a group it
+    /// cannot see. The highlight itself is kept by id, which is
+    /// [`Picker::replace`]'s job.
+    fn refreshed(&mut self, rows: &Rows) {
+        match self.what {
+            Showing::Sessions => self.picker.replace(rows.sessions.clone(), rows.at),
+            // The machine you are on is the row this list opened on, and a
+            // listing landing under it does not move it.
+            Showing::Hosting => self.picker.replace(rows.hosts.clone(), rows.machine),
+            // A group list has no such row: `at` is a session's.
+            Showing::Moving { .. } | Showing::Narrowing => {
+                self.picker.replace(rows.groups.clone(), 0);
+            }
         }
     }
 
     /// The session row the popup is acting on, if it is on one.
     ///
-    /// Narrowing, it is on none: the highlighted row there is a *group*, and
-    /// its id indexes the groups. Answered with that id, `n` in the group list
-    /// put whatever session happened to sit at that index in `Listed::at` into
-    /// the new group, silently and on whatever machine it was on, because the
-    /// write succeeded and there was nothing to say. `n` is live in both lists
-    /// only because they share one key table; it is advertised in neither
-    /// list's hints but the move list's.
+    /// Narrowing, it is on none, and nor is it on the machines: the highlighted
+    /// row there is a *group* or a *machine*, and its id indexes those.
+    /// Answered with that id, `n` in the group list put whatever session
+    /// happened to sit at that index in `Listed::at` into the new group,
+    /// silently and on whatever machine it was on, because the write succeeded
+    /// and there was nothing to say. `n` is live in every list that shares the
+    /// picking table; it is advertised in none of their hints but the move
+    /// list's.
     fn subject(&self) -> Option<usize> {
         match self.what {
             Showing::Moving { row } => Some(row),
             Showing::Sessions => self.picker.chosen().map(|row| row.id),
-            Showing::Narrowing => None,
+            Showing::Narrowing | Showing::Hosting => None,
         }
     }
 }
@@ -780,7 +805,7 @@ async fn pump(
     // The view over the session's history, while it is up.
     let mut scrolling: Option<Scrollback> = None;
     // The popup control mode puts on the screen, while it is up, and which of
-    // the two lists it is showing.
+    // the three lists it is showing.
     let mut popup: Option<Popup> = None;
     // Whether the client has mouse tracking on for itself, which it does
     // only while there is a history to look at and the session has asked
@@ -881,17 +906,19 @@ async fn pump(
                     // Every hop in a viewing run is another view, so the
                     // session this would start is one you could not type
                     // into. Said on the row rather than swallowed, the same
-                    // as a rename asked for from here.
-                    Some(Action::New) if watching => {
+                    // as a rename asked for from here, and said at the key
+                    // that opens the list rather than at the Enter that
+                    // commits it: refusing a machine somebody has just picked
+                    // throws away the picking.
+                    Some(Action::Pick(Pick::Hosts)) if watching => {
+                        let back = popup.as_ref().map_or(Mode::Focus, Popup::mode);
+                        keys.set_mode(back);
+                        status.set_mode(back);
                         status.set_notice("watching, so nothing here can start a session");
                         notice_until = Some(tokio::time::Instant::now() + NOTICE_FOR);
                         restate = true;
                         settle(&mut stdout, &output, &status, &mut pending, &mut restate)
                             .await?;
-                    }
-                    Some(Action::New) => {
-                        writer.detach().await?;
-                        return Ok(Outcome::New);
                     }
                     // The popup, which is what control mode looks like. Moving
                     // the highlight is local: walking three sessions used to be
@@ -936,6 +963,25 @@ async fn pump(
                             Pick::Down => up.picker.down(),
                             Pick::NextGroup => up.picker.next_heading(true),
                             Pick::PreviousGroup => up.picker.next_heading(false),
+                            // Off to the machines, over the session list the
+                            // same way the group lists go: Esc comes back to
+                            // where the gesture started. Nothing here is acted
+                            // on, so this asks the list for no row and is the
+                            // one of the three that opens on an empty session
+                            // list.
+                            Pick::Hosts => {
+                                *up = Popup {
+                                    picker: Picker::new(
+                                        "new session on",
+                                        HOST_HINTS,
+                                        rows.hosts.clone(),
+                                        rows.machine,
+                                    ),
+                                    what: Showing::Hosting,
+                                };
+                                keys.set_mode(Mode::Picking);
+                                status.set_mode(Mode::Picking);
+                            }
                             // Off to the group list, over the session list
                             // rather than instead of it: Esc there comes back
                             // to where the gesture started.
@@ -1014,6 +1060,7 @@ async fn pump(
                                     (Showing::Narrowing, _) => {
                                         Outcome::Chose(Chose::Focus(chosen))
                                     }
+                                    (Showing::Hosting, _) => Outcome::Chose(Chose::On(chosen)),
                                 });
                             }
                             // Taken off the screen by the teardown below,
@@ -1465,12 +1512,7 @@ async fn pump(
                 }
                 rows = fresh.borrow_and_update().clone();
                 if let Some(up) = popup.as_mut() {
-                    if up.what == Showing::Sessions {
-                        up.picker.replace(rows.sessions.clone(), rows.at);
-                    } else {
-                        // A group list has no such row: `at` is a session's.
-                        up.picker.replace(rows.groups.clone(), 0);
-                    }
+                    up.refreshed(&rows);
                     draw_popup(&mut stdout, &mut popup, &mut status, &mut restate).await?;
                 }
             }
@@ -2056,6 +2098,7 @@ mod tests {
             groups: Vec::new(),
             at: 1,
             narrowed: None,
+            ..Rows::default()
         };
         assert_eq!(Popup::sessions(&rows).line(), "sessions: api");
     }
@@ -2071,6 +2114,7 @@ mod tests {
             groups: Vec::new(),
             at: 0,
             narrowed: Some("pi".to_string()),
+            ..Rows::default()
         };
         assert_eq!(Popup::sessions(&rows).line(), "sessions in @pi: build");
     }
@@ -2096,6 +2140,7 @@ mod tests {
             groups: vec![Row::new(0, "pi"), Row::new(1, "web")],
             at: 1,
             narrowed: None,
+            ..Rows::default()
         };
         let sessions = Popup::sessions(&rows);
         assert_eq!(sessions.subject(), Some(1), "the highlighted session");
@@ -2123,6 +2168,68 @@ mod tests {
         assert_eq!(sessions.mode(), Mode::Control);
         assert_eq!(narrowing.mode(), Mode::Picking);
         assert_eq!(moving.mode(), Mode::Picking);
+    }
+
+    /// The list of machines is about where a session would be started, not
+    /// about a session, so nothing that acts on one may read a row of it as
+    /// one: its ids index the machines, and `n` there would put a machine into
+    /// a group. Read in the group lists' mode for the same reason.
+    #[test]
+    fn the_machine_list_has_no_session_under_its_highlight() {
+        let rows = Rows {
+            sessions: vec![Row::new(0, "build")],
+            hosts: vec![Row::new(0, "gpu-box"), Row::new(1, "laptop")],
+            machine: 1,
+            ..Rows::default()
+        };
+        let hosting = Popup {
+            picker: Picker::new("new session on", HOST_HINTS, rows.hosts, rows.machine),
+            what: Showing::Hosting,
+        };
+        assert_eq!(hosting.subject(), None);
+        assert_eq!(hosting.mode(), Mode::Picking);
+        // And it opens on the machine the run is on, which is what makes the
+        // key and the Enter behind it the gesture the key alone used to be.
+        assert_eq!(
+            hosting.picker.chosen().map(|row| row.label.as_str()),
+            Some("laptop")
+        );
+    }
+
+    /// A listing landing under an open popup swaps in that list's own rows and
+    /// nobody else's. Read with one branch and an `else`, a listing arriving
+    /// while the machines were up replaced them with the groups: the box still
+    /// said `new session on`, the rows underneath were `@pi` and `@web`, and
+    /// Enter on one would have started a session on whatever machine happened
+    /// to sit at that id.
+    #[test]
+    fn a_listing_that_lands_under_a_list_swaps_in_that_list() {
+        let rows = Rows {
+            sessions: vec![Row::new(0, "build")],
+            groups: vec![Row::new(0, "(none)"), Row::new(1, "@pi")],
+            hosts: vec![Row::new(0, "gpu-box"), Row::new(1, "laptop")],
+            at: 0,
+            machine: 1,
+            narrowed: None,
+        };
+        let list = |what: Showing| {
+            let mut up = Popup {
+                picker: Picker::new("", HOST_HINTS, Vec::new(), 0),
+                what,
+            };
+            up.refreshed(&rows);
+            up.picker
+                .chosen()
+                .map(|row| row.label.clone())
+                .unwrap_or_default()
+        };
+        // Each on the row its own list opens on: the machine you are on, the
+        // session you are in, and a group list's first row, which is the one
+        // that means "everything".
+        assert_eq!(list(Showing::Hosting), "laptop");
+        assert_eq!(list(Showing::Sessions), "build");
+        assert_eq!(list(Showing::Narrowing), "(none)");
+        assert_eq!(list(Showing::Moving { row: 0 }), "(none)");
     }
 
     /// A mode the node turns back on for a session, and the client forgets to
