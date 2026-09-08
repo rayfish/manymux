@@ -2110,12 +2110,13 @@ async fn do_attach(
                     // corrected here: the node picked the name, and what the
                     // switch keys walk is what the machines say they are
                     // running.
-                    Chose::On(row) => {
-                        // A row with no machine behind it cannot happen, the
-                        // ids being this listing's own, and it is worth nothing
-                        // more than staying where you are if it ever does.
-                        let host = listed.hosts.get(row).cloned().unwrap_or_default();
-                        match starting(start_on(socket, &host)).await {
+                    Chose::On(row) => match listed.hosts.get(row).cloned() {
+                        // The host list shrank between the listing this id was
+                        // drawn from and the Enter, which is the only way a row
+                        // has no machine behind it. An ssh to nowhere says less
+                        // than staying where you are and saying so.
+                        None => notice = Some("that machine is no longer listed".to_string()),
+                        Some(host) => match starting(start_on(socket, &host)).await {
                             Ok(name) => {
                                 // The one that goes somewhere, so it leaves you
                                 // in the session rather than over it, the way
@@ -2137,8 +2138,8 @@ async fn do_attach(
                                 debug!("could not start a session on {host}: {e:#}");
                                 notice = Some(format!("could not start a session on {host}"));
                             }
-                        }
-                    }
+                        },
+                    },
                     // A local file write and a redraw: nothing detaches for
                     // this, which is why `m` acts on the highlighted row rather
                     // than the session you are attached to.
@@ -2759,8 +2760,19 @@ impl Listed {
     /// In one order with this machine among the rest rather than pinned to the
     /// top, because that is the order the session list's headings are in and
     /// two lists one key apart must not disagree about where a machine sits.
+    ///
+    /// The machine the run is on is in it whether or not it is watched, and so
+    /// is this one. Naming a session outright asks nothing of the host list
+    /// (`mm attach box/build` on a machine nobody added, or `deploy@box`, which
+    /// is a different node from `box` and rightly a row of its own), and a list
+    /// with no row for where you are standing has no way back to it: the
+    /// highlight falls to the first row, nothing wears the mark, and the Enter
+    /// that used to start a session beside you starts one on a stranger's
+    /// machine instead. Which is the failure [`as_listed`] was written for, one
+    /// list over, and the same spelling answers it.
     fn machines(snapshot: &Snapshot, hosts: &[String], current: &Located) -> Machines {
         let mut names: Vec<String> = hosts.to_vec();
+        names.push(as_listed(&current.host).to_string());
         if !names.iter().any(|host| is_this_machine(host)) {
             names.push(this_machine().to_string());
         }
@@ -3188,6 +3200,37 @@ mod tests {
             .find(|row| row.label == "gpu-box")
             .expect("a row for a machine that did not answer");
         assert_eq!(asleep.detail, "no answer");
+    }
+
+    /// And the machine the run is on is in it whether or not it is watched.
+    ///
+    /// The bug this closes: naming a session outright asks nothing of the host
+    /// list, so `mm attach box/build` works on a machine nobody added, and
+    /// `deploy@box` is a node of its own. Without a row for where you are
+    /// standing the highlight fell to the first row, nothing wore the mark, and
+    /// the Enter that is supposed to start a session beside you started one on
+    /// whichever machine happened to sort first.
+    #[test]
+    fn the_new_session_list_holds_the_machine_the_run_is_on_however_it_was_named() {
+        let snapshot = Snapshot {
+            sessions: vec![hosted_on("deploy@box", "build")],
+            answered: vec!["deploy@box".to_string()],
+        };
+        let current = Located::new("deploy@box", "build");
+        let hosts = ["gpu-box".to_string()];
+        let listed = Listed::of(
+            &snapshot,
+            &Groups::default(),
+            &hosts,
+            None,
+            from_ref(&current),
+        );
+        let row = &listed.rows.hosts[listed.rows.machine];
+        assert_eq!(row.label, "deploy@box", "opened on another machine");
+        assert_eq!(row.note, "●");
+        // And Enter on it starts the session there rather than on whichever
+        // machine that row id happened to name.
+        assert_eq!(listed.hosts[row.id], "deploy@box");
     }
 
     /// A machine that answered and did not mention it is a session that has
