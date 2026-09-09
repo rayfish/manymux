@@ -205,6 +205,7 @@ mod tests {
             idle,
             bells,
             started: SystemTime::now(),
+            node: String::new(),
         }
     }
 

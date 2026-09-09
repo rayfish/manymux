@@ -163,6 +163,7 @@ fn listed() -> SessionInfo {
         idle: 0,
         bells: 0,
         started: SystemTime::UNIX_EPOCH,
+        node: String::new(),
     }
 }
 

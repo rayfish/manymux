@@ -172,6 +172,28 @@ things that must simply never be done.
   being world-writable is why `ensure_runtime_dir` checks owner and mode, and
   why `ipc` touches the socket every few hours: `systemd-tmpfiles` deletes what
   looks unused for ten days.
+- **Two host names can be one machine, and the machine is told apart, not the
+  names.** `box` and `me@box` are two ssh destinations that land in the same
+  place, so a listing asks both and every session on that machine is in it
+  twice. A client comparing the strings has nothing to go on: resolving a
+  destination is ssh's business. So the node answers for it, with a random id
+  made at startup and held in memory (`hosts::node_id`), stamped on every row of
+  a listing (`SessionInfo::node`, whose doc says why it rides there rather than
+  being asked for). Two things about it. It is **never written down**: the
+  question is only "did these two answers come from one node", two destinations
+  reaching one node reach one *process*, and every place a persisted id could
+  live is shared by machines that are not one node (an NFS home, a bind-mounted
+  home, a snapshotted image, two containers with one hostname). A wrong match
+  hides work somebody is doing, so not knowing has to be the only failure there
+  is. And it is **reported, never acted on** (`Listing::note_duplicates`): the
+  host name is the address in this codebase, so taking the second name's rows
+  out of the listing makes `mm attach me@box` say nothing is running on a
+  machine running two things, writes group members and checkpoint entries no
+  later listing can match, and leaves the attached client's cycle keyed on a
+  name that is not there. `mm ls` says which pair it found and which `mm rm`
+  ends it, and `mm add` refuses a second name for a machine already on the list.
+  That check reads the id off a session row, so a machine with nothing running
+  on it says nothing and is added: `mm ls` is what catches that one.
 - **A machine that answers 127 has no `mm`, and that is the only sign there is.**
   `client::PROGRAMS` is the ladder of names to try, and it exists because an
   install without root lands in `~/.local/bin`, which is not on the PATH sshd

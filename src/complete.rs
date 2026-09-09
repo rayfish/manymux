@@ -398,6 +398,7 @@ mod tests {
             idle: 0,
             bells: 0,
             started: SystemTime::now(),
+            node: String::new(),
         }
     }
 

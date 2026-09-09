@@ -267,6 +267,7 @@ mod tests {
             idle: 0,
             bells: 0,
             started: UNIX_EPOCH + Duration::from_secs(started),
+            node: String::new(),
         }
     }
 

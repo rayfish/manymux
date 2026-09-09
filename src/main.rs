@@ -32,8 +32,8 @@ mod completions;
 mod target;
 
 use target::{
-    Bare, Listing, Started, Unreachable, everywhere, locate, note_reached, qualified, sessions_on,
-    where_to_start,
+    Bare, Listing, Started, Unreachable, answer_from, everywhere, locate, note_reached, qualified,
+    sessions_on, where_to_start,
 };
 
 #[derive(Parser)]
@@ -545,24 +545,56 @@ async fn run(cli: Cli) -> Result<u8> {
 
         Command::Add { host } => {
             let mut hosts = Hosts::load()?;
+            // Adding a name already on the list is not an error and never has
+            // been, and it cannot be a *new* duplicate of anything: the check
+            // below is skipped for it, or a machine would refuse to be added a
+            // second time on the grounds of being itself.
+            let listed_already = hosts.has(&host);
             hosts.add(&host)?;
             // Connect once with the terminal attached, so ssh can ask about an
             // unknown host key or a passphrase. Every later command carries the
             // protocol on stdin and has no way to prompt.
             manymux::ssh::greet(&host).await?;
-            hosts.save()?;
             // Prove it works now rather than at the next listing, when the
             // failure would be harder to connect to what you just typed.
-            match sessions_on(&socket, &host).await {
-                Ok(sessions) => {
-                    println!("watching {host} ({} sessions)", sessions.len());
-                    Ok(OK)
-                }
+            let answer = match answer_from(&socket, &host).await {
+                Ok(answer) => answer,
                 Err(e) => {
+                    hosts.save()?;
                     eprintln!("mm: added {host}, but could not reach it: {e:#}");
-                    Ok(FAILED)
+                    return Ok(FAILED);
                 }
+            };
+            // Two ssh destinations can be one machine, and the listing that
+            // results has every session on it in twice. Caught here, where the
+            // answer is a name you already have, rather than left to be
+            // explained by every `mm ls` from now on.
+            //
+            // Only when both ends said which node they are, and a node says so
+            // on its session rows: a machine with nothing running on it says
+            // nothing, and neither does one too old to have the field. Adding a
+            // second name for an idle machine goes through, and `mm ls` says so
+            // as soon as there is a session on it. The alternative is a request
+            // of its own, which every listing would then pay a second ssh per
+            // machine for, the popup relisting at every keypress.
+            //
+            // The fan-out this costs is one machine's worth of ssh apiece, once,
+            // on a command that has just run `greet` on a terminal. Only for a
+            // name that is actually new.
+            if !listed_already
+                && let Some(node) = &answer.node
+                && let Some(already) = everywhere(&socket).await?.watched_as(node)
+            {
+                if is_this_machine(already) {
+                    bail!("`{host}` reaches this machine, which is always listed");
+                }
+                bail!(
+                    "`{host}` and `{already}` are the same machine, which is on the list already"
+                );
             }
+            hosts.save()?;
+            println!("watching {host} ({} sessions)", answer.sessions.len());
+            Ok(OK)
         }
 
         Command::Hosts => {
@@ -1039,7 +1071,7 @@ async fn list(socket: &Path, host: Option<String>) -> Result<u8> {
             } else {
                 &name
             };
-            listing.add(label, sessions_on(socket, &name).await);
+            listing.add(label, answer_from(socket, &name).await);
             note_reached(socket, listing.reached()).await;
             listing
         }
@@ -1077,6 +1109,15 @@ async fn list(socket: &Path, host: Option<String>) -> Result<u8> {
     }
     for host in &listing.unreachable {
         eprintln!("mm: {}: {}", host.host, host.error);
+    }
+    // The rows above have every session on that machine in them twice, and
+    // nothing in the table says why. This is the only thing that does.
+    for both in &listing.duplicates {
+        eprintln!(
+            "mm: {} and {} are the same machine, so its sessions are listed \
+             twice; `mm rm {}`",
+            both.also, both.known_as, both.also
+        );
     }
     Ok(if nothing_answered { FAILED } else { OK })
 }
@@ -3059,6 +3100,7 @@ mod tests {
                 idle: 0,
                 bells: 0,
                 started: std::time::SystemTime::UNIX_EPOCH,
+                node: String::new(),
             },
         }
     }

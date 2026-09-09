@@ -616,6 +616,9 @@ impl Session {
             idle: state.last_activity.elapsed().as_secs(),
             bells: state.bells,
             started: self.started,
+            // The same on every row, and the listing has nowhere else to put
+            // it: see the field.
+            node: crate::hosts::node_id().unwrap_or_default(),
         }
     }
 

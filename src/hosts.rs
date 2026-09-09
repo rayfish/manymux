@@ -5,9 +5,18 @@
 //! already has all of that and knows more about it than we do. This list only
 //! answers "which machines am I interested in", so a listing knows where to
 //! look.
+//!
+//! Which means two entries in it can be one machine, `box` and `me@box` being
+//! two destinations that ssh lands in the same place. Nothing here can tell:
+//! resolving a destination is ssh's business, and the strings say nothing. So
+//! the node says instead, and [`node_id`] is what it says.
 
 use std::collections::BTreeSet;
+use std::fmt::Write as _;
+use std::fs::File;
+use std::io::Read as _;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -49,6 +58,67 @@ pub fn this_machine() -> &'static str {
 /// Whether `name` means this machine rather than one reached over ssh.
 pub fn is_this_machine(name: &str) -> bool {
     name == LOCAL || name == this_machine()
+}
+
+/// Who is answering: an id for this node, made once and held for as long as the
+/// process lives.
+///
+/// Two entries in the host list can be one machine. `box` and `me@box` are
+/// different ssh destinations and the same node, so a listing asks both, gets
+/// the same sessions back twice, and draws them under two names with nothing to
+/// say they are one shell. The client cannot work this out for itself: an ssh
+/// destination is opaque, and what it resolves to is ssh's business rather than
+/// ours. So the node answers for it, and this is what it answers with, stamped
+/// on every row of a listing ([`SessionInfo::node`]).
+///
+/// In memory and never written down, which is the whole of why it is correct.
+/// The question it settles is "did these two answers come from the same node",
+/// and two destinations reaching one node reach one *process*: nothing here has
+/// to survive a restart, and a node that restarted between two halves of a
+/// listing answers differently, which reads as two machines and leaves the
+/// listing exactly as it was.
+///
+/// Written down, it would be wrong. The two obvious places to keep it are the
+/// config directory and something derived from the machine, and both are shared
+/// by machines that are not the same node: a fleet on an NFS home has one
+/// config directory, a container fleet has one bind-mounted home, an image
+/// snapshotted after `mm` ran once has one of everything, and two containers
+/// both called `build` have one hostname between them. Every one of those folds
+/// a running machine's sessions into another's rows and hides work somebody is
+/// doing. Not knowing is always safe, and this cannot know anything it was not
+/// told by the process that is answering.
+///
+/// `None` if the machine will not give us any randomness, which is the same
+/// safe failure: nothing to compare, so nothing is called a duplicate.
+///
+/// [`SessionInfo::node`]: crate::proto::SessionInfo::node
+pub fn node_id() -> Option<String> {
+    static ID: OnceLock<Option<String>> = OnceLock::new();
+    ID.get_or_init(|| match fresh_id() {
+        Ok(id) => Some(id),
+        Err(e) => {
+            tracing::debug!("no identity for this node: {e:#}");
+            None
+        }
+    })
+    .clone()
+}
+
+/// 128 bits of urandom, in hex.
+///
+/// Straight from the device rather than through a crate: this is the only
+/// randomness in the library, and it does not have to be unguessable, only
+/// unique. The id is not a secret, and nothing is authorised by knowing it.
+fn fresh_id() -> Result<String> {
+    let mut bytes = [0u8; 16];
+    File::open("/dev/urandom")
+        .and_then(|mut urandom| urandom.read_exact(&mut bytes))
+        .context("reading /dev/urandom")?;
+    Ok(bytes.iter().fold(String::new(), |mut id, byte| {
+        // Writing to a String cannot fail.
+        let _ = write!(id, "{byte:02x}");
+        id
+    }))
 }
 
 #[derive(Serialize, Deserialize, Default, Debug)]

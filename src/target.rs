@@ -10,6 +10,7 @@
 //! question. `mm attach`, `mm kill` and `mm rename` all want the same thing
 //! from a word, and only differ in what they do once they have it.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::Duration;
 
@@ -31,10 +32,13 @@ use crate::open_hushed;
 pub(crate) struct Listing {
     pub(crate) sessions: Vec<HostedSession>,
     pub(crate) unreachable: Vec<Unreachable>,
+    /// Names that turned out to be a machine already in this listing under
+    /// another name.
+    pub(crate) duplicates: Vec<Duplicate>,
     /// Every machine that answered, whether or not it had anything to say. Kept
     /// separately because a machine with no sessions on it puts nothing in
     /// `sessions` and is every bit as reached as a busy one.
-    answered: Vec<String>,
+    answered: Vec<Answered>,
 }
 
 /// A machine that could not be reached, and why.
@@ -43,13 +47,28 @@ pub(crate) struct Unreachable {
     pub(crate) error: String,
 }
 
+/// One machine that answered, and which node it said it was.
+struct Answered {
+    host: String,
+    node: Option<String>,
+}
+
+/// Two names in the host list that turned out to be one machine.
+pub(crate) struct Duplicate {
+    pub(crate) known_as: String,
+    pub(crate) also: String,
+}
+
 impl Listing {
-    pub(crate) fn add(&mut self, host: &str, found: Result<Vec<SessionInfo>>) {
+    pub(crate) fn add(&mut self, host: &str, found: Result<Answer>) {
         match found {
-            Ok(sessions) => {
-                self.answered.push(host.to_string());
+            Ok(answer) => {
+                self.answered.push(Answered {
+                    host: host.to_string(),
+                    node: answer.node,
+                });
                 self.sessions
-                    .extend(sessions.into_iter().map(|session| HostedSession {
+                    .extend(answer.sessions.into_iter().map(|session| HostedSession {
                         host: host.to_string(),
                         session,
                     }))
@@ -61,12 +80,77 @@ impl Listing {
         }
     }
 
+    /// Notice that two names in the host list are one machine.
+    ///
+    /// `box` and `me@box` are two ssh destinations and one node, so both are
+    /// asked, both answer, and every session on that machine is in this listing
+    /// twice: drawn twice by `mm ls` and by the popup, and visited twice by the
+    /// switch keys, which walk a cycle built from these rows.
+    ///
+    /// Said rather than done, which is the whole shape of this. Dropping the
+    /// second name's rows here would make the listing right and everything
+    /// downstream of it wrong, because the host name *is* the address in this
+    /// codebase: a session is `host/name`, a group member is a host and a name,
+    /// a checkpoint entry is a host and a name, and the attached client's cycle
+    /// is keyed on one. Folded, `mm attach me@box` says nothing is running on a
+    /// machine that is running two things, `mm group me@box/build work` writes a
+    /// member no listing will ever match again, and a checkpoint keeps a shadow
+    /// copy of the machine that nothing can prune. Rewriting the name at every
+    /// one of those instead is a second name space to keep in step, for a
+    /// listing that a person can put right in one command.
+    ///
+    /// So the pair is reported, `mm ls` says which command ends it, and
+    /// [`Listing::watched_as`] stops another one being added. The host list is
+    /// the person's, and this does not edit it.
+    fn note_duplicates(&mut self) {
+        let mut by_node: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+        for answered in &self.answered {
+            if let Some(node) = answered.node.as_deref() {
+                by_node.entry(node).or_default().push(&answered.host);
+            }
+        }
+        let mut duplicates = Vec::new();
+        for (_, mut hosts) in by_node {
+            if hosts.len() < 2 {
+                continue;
+            }
+            // The name to keep is the one worth reading: this machine's own
+            // name if it is in the running, since a machine you are sitting at
+            // is not a host you reach; then the shortest, which is the alias
+            // rather than the `user@host` spelling of it; then whichever sorts
+            // first, so the advice does not move between listings.
+            hosts.sort_by_key(|host| (!is_this_machine(host), host.len(), *host));
+            for also in &hosts[1..] {
+                duplicates.push(Duplicate {
+                    known_as: hosts[0].to_string(),
+                    also: (*also).to_string(),
+                });
+            }
+        }
+        self.duplicates = duplicates;
+    }
+
+    /// The name a machine already in this listing is watched under, if it is
+    /// in it at all. What stops a second name for it being added.
+    pub(crate) fn watched_as(&self, node: &str) -> Option<&str> {
+        self.answered
+            .iter()
+            .find(|answered| answered.node.as_deref() == Some(node))
+            .map(|answered| answered.host.as_str())
+    }
+
     /// The machines worth telling this machine's node about, so it can
     /// resubscribe to any it had given up on. This machine is not one of them:
     /// it is never watched, being where the watching happens.
     pub(crate) fn reached(&self) -> Vec<String> {
-        let mut hosts = self.answering();
-        hosts.retain(|host| !is_this_machine(host));
+        let mut hosts: Vec<String> = self
+            .answered
+            .iter()
+            .map(|answered| answered.host.clone())
+            .filter(|host| !is_this_machine(host))
+            .collect();
+        hosts.sort();
+        hosts.dedup();
         hosts
     }
 
@@ -81,7 +165,11 @@ impl Listing {
     /// sessions the listing knows about, so a dead member is invisible in all
     /// of them.
     pub(crate) fn answering(&self) -> Vec<String> {
-        let mut hosts = self.answered.clone();
+        let mut hosts: Vec<String> = self
+            .answered
+            .iter()
+            .map(|answered| answered.host.clone())
+            .collect();
         hosts.sort();
         hosts.dedup();
         hosts
@@ -135,7 +223,7 @@ pub(crate) async fn note_reached(socket: &Path, hosts: Vec<String>) {
 /// One machine's answer, kept with which machine gave it.
 struct Asked {
     host: String,
-    found: Result<Vec<SessionInfo>>,
+    found: Result<Answer>,
 }
 
 /// How long one machine may take over a full listing before it is reported as
@@ -158,8 +246,8 @@ pub(crate) async fn everywhere(socket: &Path) -> Result<Listing> {
 
     // No node here is ordinary on a machine you only use to reach others, so it
     // is not worth a complaint.
-    match sessions_on(socket, LOCAL).await {
-        Ok(sessions) => listing.add(this_machine(), Ok(sessions)),
+    match answer_from(socket, LOCAL).await {
+        Ok(answer) => listing.add(this_machine(), Ok(answer)),
         Err(e) => debug!("no node here: {e:#}"),
     }
 
@@ -169,7 +257,7 @@ pub(crate) async fn everywhere(socket: &Path) -> Result<Listing> {
         asked.spawn(async move {
             // Giving up drops the query, and with it the ssh carrying it, so a
             // machine that never answers leaves nothing behind.
-            let found = match timeout(HOST_DEADLINE, sessions_on(&socket, &host)).await {
+            let found = match timeout(HOST_DEADLINE, answer_from(&socket, &host)).await {
                 Ok(found) => found,
                 Err(_) => Err(anyhow!("no answer in {}s", HOST_DEADLINE.as_secs())),
             };
@@ -184,6 +272,8 @@ pub(crate) async fn everywhere(socket: &Path) -> Result<Listing> {
     }
     note_reached(socket, listing.reached()).await;
 
+    listing.note_duplicates();
+
     // By machine first, which is what makes each one's sessions a run in the
     // table and in the switch keys' cycle, then oldest first within it.
     listing.sessions.sort_by(|a, b| {
@@ -197,6 +287,22 @@ pub(crate) async fn everywhere(socket: &Path) -> Result<Listing> {
     Ok(listing)
 }
 
+/// What one machine is running.
+pub(crate) async fn sessions_on(socket: &Path, host: &str) -> Result<Vec<SessionInfo>> {
+    Ok(answer_from(socket, host).await?.sessions)
+}
+
+/// What one machine said when it was asked what it is running, and who it was
+/// that said it.
+pub(crate) struct Answer {
+    pub(crate) sessions: Vec<SessionInfo>,
+    /// Which node answered, for telling two names for one machine apart from
+    /// two machines. `None` from a node too old to say, from a machine with no
+    /// sessions to say it on, and from this machine when there is no node here
+    /// to ask; all three mean nothing is claimed about it.
+    pub(crate) node: Option<String>,
+}
+
 /// What one machine is running, asked without letting ssh speak for itself.
 ///
 /// Hushed rather than aloud, which is the one thing here that is not about
@@ -208,23 +314,40 @@ pub(crate) async fn everywhere(socket: &Path) -> Result<Listing> {
 /// there, once per machine per keypress. Kept, the same words come back inside
 /// the error, which is where a listing wants them anyway: [`Listing`] reports
 /// per machine, in one place, after the sessions that did answer.
-pub(crate) async fn sessions_on(socket: &Path, host: &str) -> Result<Vec<SessionInfo>> {
+///
+/// The machine's identity comes back with the sessions rather than being asked
+/// for: a node serves one request per connection, so a second question is a
+/// second ssh, on a listing the popup redoes at every keypress. See
+/// [`SessionInfo::node`].
+pub(crate) async fn answer_from(socket: &Path, host: &str) -> Result<Answer> {
     // No node here means no sessions here, which is an answer rather than a
     // failure. Starting one just to be told that would be rude.
     if is_this_machine(host) && !socket.exists() {
         // Unless the sessions are all sitting in a node an older build left
         // somewhere else, in which case an empty table is a lie.
         manymux::node::note_a_node_left_behind(socket).await;
-        return Ok(Vec::new());
+        return Ok(Answer {
+            sessions: Vec::new(),
+            node: None,
+        });
     }
-    match open_hushed(socket, host)
+    let sessions = match open_hushed(socket, host)
         .await?
         .call(&Request::List)
         .await?
     {
-        Response::Sessions(sessions) => Ok(sessions),
+        Response::Sessions(sessions) => sessions,
         other => bail!("unexpected response to list: {other:?}"),
-    }
+    };
+    // Every session says the same thing, so the first one is the answer. A
+    // machine with nothing running says nothing, and so does one whose node is
+    // older than the field; both leave the listing as it has always been.
+    let node = sessions
+        .iter()
+        .map(|session| session.node.as_str())
+        .find(|node| !node.is_empty())
+        .map(str::to_string);
+    Ok(Answer { sessions, node })
 }
 
 /// What a bare word is allowed to mean besides a session name.
@@ -456,7 +579,25 @@ mod tests {
             idle: 0,
             bells: 0,
             started: std::time::SystemTime::UNIX_EPOCH,
+            node: String::new(),
         }
+    }
+
+    /// A machine that answered without saying which node it is, which is every
+    /// machine in a fleet that has not been updated yet.
+    fn answer(sessions: Vec<SessionInfo>) -> Result<Answer> {
+        Ok(Answer {
+            sessions,
+            node: None,
+        })
+    }
+
+    /// One that did say.
+    fn answer_as(node: &str, sessions: Vec<SessionInfo>) -> Result<Answer> {
+        Ok(Answer {
+            sessions,
+            node: Some(node.to_string()),
+        })
     }
 
     /// What the node is told answered, so it can resubscribe to a machine it
@@ -466,13 +607,103 @@ mod tests {
     #[test]
     fn only_the_machines_that_answered_count_as_reached() {
         let mut listing = Listing::default();
-        listing.add(this_machine(), Ok(vec![session("here")]));
-        listing.add("gpu-box", Ok(vec![session("build")]));
+        listing.add(this_machine(), answer(vec![session("here")]));
+        listing.add("gpu-box", answer(vec![session("build")]));
         // Reachable and idle. Nothing in the table, and still reached.
-        listing.add("api", Ok(Vec::new()));
+        listing.add("api", answer(Vec::new()));
         listing.add("asleep", Err(anyhow!("no answer in 5s")));
 
         assert_eq!(listing.reached(), vec!["api", "gpu-box"]);
+    }
+
+    #[test]
+    fn two_names_for_one_machine_are_noticed() {
+        let mut listing = Listing::default();
+        listing.add("gpu-box", answer_as("n1", vec![session("build")]));
+        listing.add("me@gpu-box", answer_as("n1", vec![session("build")]));
+        listing.note_duplicates();
+
+        assert_eq!(listing.duplicates.len(), 1);
+        assert_eq!(listing.duplicates[0].known_as, "gpu-box");
+        assert_eq!(listing.duplicates[0].also, "me@gpu-box");
+    }
+
+    /// And the rows are left where they are, because the host name is the
+    /// address everywhere else: dropping the second name's sessions here makes
+    /// `mm attach me@gpu-box` say nothing is running on a machine running two
+    /// things, and writes group members and checkpoint entries no later listing
+    /// can match.
+    #[test]
+    fn a_duplicate_is_reported_and_not_taken_out_of_the_listing() {
+        let mut listing = Listing::default();
+        listing.add("gpu-box", answer_as("n1", vec![session("build")]));
+        listing.add("me@gpu-box", answer_as("n1", vec![session("build")]));
+        listing.note_duplicates();
+
+        assert_eq!(listing.sessions.len(), 2);
+        assert_eq!(listing.answering(), vec!["gpu-box", "me@gpu-box"]);
+        assert_eq!(listing.reached(), vec!["gpu-box", "me@gpu-box"]);
+    }
+
+    /// The shorter name is the alias, and the longer one spells out a user that
+    /// ssh was going to work out anyway. Which one is named matters: it is the
+    /// other one `mm ls` tells you to remove.
+    #[test]
+    fn the_name_to_keep_is_the_one_worth_reading() {
+        let mut listing = Listing::default();
+        listing.add("me@gpu-box", answer_as("n1", vec![session("build")]));
+        listing.add("gpu-box", answer_as("n1", vec![session("build")]));
+        listing.note_duplicates();
+
+        assert_eq!(listing.duplicates[0].known_as, "gpu-box");
+        assert_eq!(listing.duplicates[0].also, "me@gpu-box");
+    }
+
+    /// A machine you are sitting at is not a host you reach, whatever else the
+    /// host list calls it.
+    #[test]
+    fn this_machine_is_named_by_its_own_name() {
+        let mut listing = Listing::default();
+        listing.add("a", answer_as("n1", vec![session("here")]));
+        listing.add(this_machine(), answer_as("n1", vec![session("here")]));
+        listing.note_duplicates();
+
+        assert_eq!(listing.duplicates[0].known_as, this_machine());
+        assert_eq!(listing.duplicates[0].also, "a");
+    }
+
+    /// The whole of the compatibility story: a node too old to say which one it
+    /// is says nothing anybody can compare, so a listing including one is the
+    /// listing it has always been.
+    #[test]
+    fn a_machine_that_will_not_say_which_node_it_is_is_left_alone() {
+        let mut listing = Listing::default();
+        listing.add("gpu-box", answer(vec![session("build")]));
+        listing.add("me@gpu-box", answer(vec![session("build")]));
+        listing.note_duplicates();
+
+        assert!(listing.duplicates.is_empty());
+    }
+
+    /// Two machines are two machines. Only an id that matches says anything,
+    /// which is what keeps a wrong answer from hiding somebody's work.
+    #[test]
+    fn different_machines_are_not_called_the_same_one() {
+        let mut listing = Listing::default();
+        listing.add("gpu-box", answer_as("n1", vec![session("build")]));
+        listing.add("api", answer_as("n2", vec![session("build")]));
+        listing.note_duplicates();
+
+        assert!(listing.duplicates.is_empty());
+    }
+
+    /// What `mm add` refuses on: a machine already reached under another name.
+    #[test]
+    fn a_listing_says_what_name_a_node_is_already_watched_under() {
+        let mut listing = Listing::default();
+        listing.add("gpu-box", answer_as("n1", vec![session("build")]));
+        assert_eq!(listing.watched_as("n1"), Some("gpu-box"));
+        assert_eq!(listing.watched_as("n2"), None);
     }
 
     /// And what a group is pruned against, which is the same list with this
@@ -482,8 +713,8 @@ mod tests {
     #[test]
     fn pruning_counts_this_machine_among_the_ones_that_answered() {
         let mut listing = Listing::default();
-        listing.add(this_machine(), Ok(vec![session("here")]));
-        listing.add("gpu-box", Ok(vec![session("build")]));
+        listing.add(this_machine(), answer(vec![session("here")]));
+        listing.add("gpu-box", answer(vec![session("build")]));
         listing.add("asleep", Err(anyhow!("no answer in 5s")));
 
         let answering = listing.answering();

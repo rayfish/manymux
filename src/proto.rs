@@ -690,6 +690,26 @@ pub struct SessionInfo {
     /// always had.
     #[serde(default = "epoch")]
     pub started: SystemTime,
+    /// Which node this session is on: [`node_id`], the same string whichever
+    /// ssh destination the answer came back through.
+    ///
+    /// A property of the machine, repeated on every one of its sessions,
+    /// because the listing has nowhere else to put it.
+    /// [`Response::Sessions`] is a tuple variant, so there is no field to
+    /// default one into, and a struct variant in its place would be
+    /// undecodable by every client older than it, which is the one direction
+    /// this protocol cannot go. A request of its own would answer it properly
+    /// and cost a second stream: a node serves one request per connection, so
+    /// over ssh that is a second ssh per machine, on a listing the popup redoes
+    /// at every keypress.
+    ///
+    /// Empty from a node from before this existed, and from one that could not
+    /// get any randomness out of the machine. Both mean the same thing to a
+    /// client: nothing to compare, so no two names are called one machine.
+    ///
+    /// [`node_id`]: crate::hosts::node_id
+    #[serde(default)]
+    pub node: String,
 }
 
 /// What a host too old to stamp a session with its start time is taken to have
@@ -1057,6 +1077,10 @@ mod tests {
             SystemTime::UNIX_EPOCH,
             "a host that cannot say when a session opened leaves them all tied"
         );
+        assert!(
+            info.node.is_empty(),
+            "a host that cannot say which node it is is never called a duplicate"
+        );
 
         // And an old client reading a new host's listing, which is the same
         // fleet from the other end.
@@ -1070,6 +1094,7 @@ mod tests {
             idle: 0,
             bells: 0,
             started: SystemTime::now(),
+            node: "0123456789abcdef".into(),
         })
         .unwrap();
         assert_eq!(decode::<Old>(&new).unwrap().name, "api");

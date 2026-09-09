@@ -87,6 +87,11 @@ while [ $# -gt 0 ]; do
         *) host="$1"; shift ;;
     esac
 done
+# A destination can name the user as well as the machine, and ssh lands on the
+# same machine either way. Which is how one machine comes to be in a host list
+# twice.
+host="${{host#*@}}"
+
 # `greet` runs `true` to get prompts out of the way; nothing to do for that.
 if [ "$1" = "true" ]; then exit 0; fi
 
@@ -151,6 +156,18 @@ exec env MM_CONFIG_DIR="{dir}/$host" "{mm}" --socket "{dir}/$host.sock" agent
             looked_in.push(rest);
         }
         looked_in
+    }
+
+    /// Put a host list in place directly, for a state `mm add` will not make.
+    fn watches(&self, machine: &str, hosts: &[&str]) {
+        let list = hosts
+            .iter()
+            .map(|host| format!("\"{host}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let dir = self.dir.join(machine);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("hosts.toml"), format!("hosts = [{list}]\n")).unwrap();
     }
 
     /// What the installer was asked to run on `machine`, if it ran at all.
@@ -501,6 +518,101 @@ fn a_bare_name_finds_a_session_on_another_machine() {
     assert!(
         !listed.contains("solo"),
         "the old name is nobody's: {listed}"
+    );
+}
+
+/// `gpu-box` and `me@gpu-box` are two ssh destinations and one node, so every
+/// session on that machine is in the table twice with nothing to say why. The
+/// pair is said, and the command that ends it is given.
+#[test]
+fn one_machine_watched_under_two_names_is_said_so() {
+    let world = World::new("twonames");
+
+    world.ok(
+        "laptop",
+        &["new", "-d", "-n", "build", "gpu-box", "sleep", "60"],
+    );
+    // Behind `mm add`'s back, which now refuses it: a list gets into this state
+    // from an alias added before the check existed, or from an ssh config that
+    // grew a second way to the same machine afterwards.
+    world.watches("laptop", &["gpu-box", "me@gpu-box"]);
+
+    let out = world.run("laptop", &["ls"]);
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        said.contains("me@gpu-box") && said.contains("gpu-box"),
+        "both names, so it is clear which machine: {said}"
+    );
+    assert!(
+        said.contains("mm rm me@gpu-box"),
+        "and the one command that ends it: {said}"
+    );
+}
+
+/// And the rows stay where they are while the second name is still on the list,
+/// because that name is the address everywhere else: dropping its sessions from
+/// the listing is what makes `mm attach me@gpu-box` say the machine is empty.
+#[test]
+fn a_session_stays_reachable_by_the_duplicate_name() {
+    let world = World::new("twonamesreach");
+
+    world.ok(
+        "laptop",
+        &["new", "-d", "-n", "build", "gpu-box", "sleep", "60"],
+    );
+    world.watches("laptop", &["gpu-box", "me@gpu-box"]);
+
+    let listed = world.ok("laptop", &["ls"]);
+    assert!(
+        listed.contains("me@gpu-box/build"),
+        "the second name still holds the session: {listed}"
+    );
+    // The name is a target, not just a row: renaming through it has to land.
+    world.ok("laptop", &["rename", "me@gpu-box/build", "renamed"]);
+    let listed = world.ok("laptop", &["ls", "gpu-box"]);
+    assert!(listed.contains("gpu-box/renamed"), "{listed}");
+}
+
+/// A name already on the list is not a new duplicate of anything, least of all
+/// of itself. Adding one twice has never been an error, and the check for a
+/// second *name* must not make it one.
+#[test]
+fn adding_a_machine_that_is_already_watched_is_still_fine() {
+    let world = World::new("addagain");
+
+    // With a session on it, so the machine says which node it is and there is
+    // something for the check to match against.
+    world.ok(
+        "laptop",
+        &["new", "-d", "-n", "build", "gpu-box", "sleep", "60"],
+    );
+    world.ok("laptop", &["add", "gpu-box"]);
+    world.ok("laptop", &["add", "gpu-box"]);
+
+    let hosts = world.ok("laptop", &["hosts"]);
+    assert_eq!(hosts.lines().collect::<Vec<_>>(), ["gpu-box"], "{hosts}");
+}
+
+/// And the second name is refused at the moment it is typed, which is when it
+/// can still be explained as a machine you already have.
+#[test]
+fn adding_a_machine_already_watched_under_another_name_is_refused() {
+    let world = World::new("addtwice");
+
+    world.ok(
+        "laptop",
+        &["new", "-d", "-n", "build", "gpu-box", "sleep", "60"],
+    );
+
+    let out = world.run("laptop", &["add", "me@gpu-box"]);
+    assert!(!out.status.success(), "adding it twice should fail");
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert!(said.contains("gpu-box"), "say which name it has: {said}");
+
+    let hosts = world.ok("laptop", &["hosts"]);
+    assert!(
+        !hosts.contains("me@gpu-box"),
+        "a refused add adds nothing: {hosts}"
     );
 }
 
