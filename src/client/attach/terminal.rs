@@ -675,7 +675,7 @@ enum Showing {
 /// in the box, and not in [`crate::client::status`]'s ladder for a window too
 /// small to hold one, because the numbers are drawn in the box: a key for rows
 /// you cannot see is a key you cannot aim.
-const SESSION_HINTS: &str = "⏎ go  1-9 recent  r name  m group  g show  n new  d detach";
+const SESSION_HINTS: &str = "⏎ go  / search  1-9 recent  r name  m group  g show  n new  d detach";
 const MOVE_HINTS: &str = "⏎ move   n new group   esc";
 const NARROW_HINTS: &str = "⏎ show   esc";
 const HOST_HINTS: &str = "⏎ start   esc";
@@ -902,6 +902,25 @@ async fn pump(
                     Some(Action::Switch(motion)) => {
                         writer.detach().await?;
                         return Ok(Outcome::Switch(motion));
+                    }
+                    Some(Action::SessionSearch(search)) => {
+                        let up = popup.get_or_insert_with(|| Popup::sessions(&rows));
+                        match search {
+                            Rename::Open | Rename::Typed => {
+                                let query = keys.session_query().unwrap_or_default();
+                                up.picker.search(&query);
+                                status.set_prompt(Some(query));
+                            }
+                            Rename::Run => {
+                                keys.stop_typing();
+                                status.set_prompt(None);
+                            }
+                            Rename::Cancel => {
+                                up.picker.search("");
+                                status.set_prompt(None);
+                            }
+                        }
+                        draw_popup(&mut stdout, &mut popup, &mut status, &mut restate).await?;
                     }
                     // Every hop in a viewing run is another view, so the
                     // session this would start is one you could not type

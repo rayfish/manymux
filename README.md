@@ -169,6 +169,7 @@ one `Ctrl-]` then `tab tab tab` walks through your sessions.
 | `H` | previous machine |
 | `l` | the one you came from |
 | `1`-`9` | the sessions you have been in, most recent first |
+| `/` | search sessions by name or current title; `enter` finishes the query, then `enter` opens the highlighted session |
 | `n` | start a session on this machine and go to it |
 | `r` | rename this session |
 | `d` | detach |
@@ -361,14 +362,14 @@ Code, vim and htop keep every report, wheel and drag alike, under either
 setting. Inside one of those, selecting is that program's business exactly as
 it is over plain ssh.
 
-`Ctrl-] /` searches everything the session has printed, all ten thousand lines
+In the scroll view, `/` searches everything the session has printed, all ten thousand lines
 of it. `n` walks back through the matches and `N` comes back towards the live
 screen. Lowercase ignores case; a capital means it. Every match comes back in
 one answer, so walking them costs nothing even on a machine two hops away.
 
-None of this exists inline, and none of those keys are taken there: your
-terminal's own scrollbar and find bar are already looking at the same lines,
-and they are better at it.
+History search does not exist inline: your terminal's own scrollbar and find
+bar are already looking at the same lines. Session search in the control popup
+works in both screen modes.
 
 ## Keeping it running
 

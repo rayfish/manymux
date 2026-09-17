@@ -37,6 +37,10 @@
 //! id back, so this never learns what a host is, and a listing that lands while
 //! the popup is up can be swapped in with [`Picker::replace`] without the
 //! highlight sliding onto a different session.
+//!
+//! A session search keeps the full listing beside the visible rows. It matches
+//! the name and the title even when the title is clipped in the box, and keeps
+//! the headings above matches so the machine and group remain visible.
 
 use crate::proto::Size;
 use crate::style;
@@ -177,7 +181,9 @@ impl Row {
 pub struct Picker {
     title: String,
     hints: String,
+    source: Vec<Row>,
     rows: Vec<Row>,
+    query: String,
     /// Which row is highlighted. Always a row that can be landed on, unless
     /// there are none at all.
     at: usize,
@@ -204,7 +210,9 @@ impl Picker {
         let mut picker = Self {
             title: title.into(),
             hints: hints.into(),
+            source: rows.clone(),
             rows,
+            query: String::new(),
             at,
             top: 0,
             drawn: None,
@@ -218,8 +226,19 @@ impl Picker {
         picker
     }
 
-    pub fn title(&self) -> &str {
-        &self.title
+    pub fn title(&self) -> String {
+        if self.query.is_empty() {
+            self.title.clone()
+        } else {
+            format!("{} /{}", self.title, self.query)
+        }
+    }
+
+    /// Narrow sessions by name or title, retaining their section headings.
+    pub fn search(&mut self, query: &str) {
+        let was = self.chosen().map(|row| row.id);
+        self.query = query.to_string();
+        self.rebuild(was, None);
     }
 
     /// The highlighted row, or none when there is nothing to land on.
@@ -242,7 +261,13 @@ impl Picker {
     /// neighbour under a hand that had not moved.
     pub fn replace(&mut self, rows: Vec<Row>, at: usize) {
         let was = self.chosen().map(|row| row.id);
-        self.rows = rows;
+        self.source = rows;
+        self.rebuild(was, Some(at));
+    }
+
+    fn rebuild(&mut self, was: Option<usize>, at: Option<usize>) {
+        self.rows = filtered(&self.source, &self.query);
+        let preferred = at.and_then(|index| self.source.get(index).map(|row| row.id));
         self.at = was
             .and_then(|id| {
                 self.rows
@@ -257,7 +282,13 @@ impl Picker {
             // the session you are in is the one you are looking out from, and
             // Enter is the next key. Falling back to the first row hopped you
             // into somebody else's session.
-            .or_else(|| self.landable(at).is_some().then_some(at))
+            .or_else(|| {
+                preferred.and_then(|id| {
+                    self.rows
+                        .iter()
+                        .position(|row| row.id == id && !row.heading)
+                })
+            })
             .or_else(|| self.first())
             .unwrap_or(0);
         self.top = 0;
@@ -389,7 +420,10 @@ impl Picker {
         // the hints, which is the same box drawn two ways.
         put(
             line,
-            &style::faint(&format!("┌{}┐", rule(&format!(" {} ", self.title), width))),
+            &style::faint(&format!(
+                "┌{}┐",
+                rule(&format!(" {} ", self.title()), width)
+            )),
         );
         line += 1;
 
@@ -566,6 +600,36 @@ impl Picker {
     }
 }
 
+fn filtered(source: &[Row], query: &str) -> Vec<Row> {
+    if query.is_empty() {
+        return source.to_vec();
+    }
+    let query = query.to_lowercase();
+    let mut rows = Vec::new();
+    let mut headings: Vec<(usize, &Row)> = Vec::new();
+    let mut last_heading = None;
+    for (index, row) in source.iter().enumerate() {
+        if row.heading {
+            headings.retain(|(_, parent)| parent.indent < row.indent);
+            headings.push((index, row));
+        } else if row.label.to_lowercase().contains(&query)
+            || row.detail.to_lowercase().contains(&query)
+        {
+            for (heading_index, heading) in &headings {
+                if last_heading.is_none_or(|last| *heading_index > last) {
+                    rows.push((*heading).clone());
+                    last_heading = Some(*heading_index);
+                }
+            }
+            rows.push(row.clone());
+        }
+    }
+    if rows.is_empty() {
+        rows.push(Row::heading("no matches"));
+    }
+    rows
+}
+
 /// The measurements every row of one drawing shares.
 ///
 /// Worked out once for the whole box, like [`Picker::label_width`] and for the
@@ -716,6 +780,54 @@ mod tests {
 
     fn one_row() -> Picker {
         picker(vec![Row::new(0, "build").detail("cargo").note("2m")], 0)
+    }
+
+    #[test]
+    fn search_matches_names_and_titles_and_keeps_their_headings() {
+        let mut p = picker(
+            vec![
+                Row::heading("@pi"),
+                Row::heading("web-box").indent(1),
+                Row::new(0, "build").detail("Cargo Test").indent(2),
+                Row::new(1, "api").detail("nvim").indent(2),
+                Row::heading("gpu-box"),
+                Row::new(2, "train").detail("python").indent(1),
+            ],
+            2,
+        );
+        p.search("CARGO");
+        assert_eq!(p.chosen().map(|row| row.id), Some(0));
+        let lines = seen(&mut p, BIG).join("\n");
+        assert!(lines.contains("@pi") && lines.contains("web-box"));
+        assert!(!lines.contains("api") && !lines.contains("gpu-box"));
+
+        p.search("TRAIN");
+        assert_eq!(p.chosen().map(|row| row.id), Some(2));
+        assert_eq!(p.title(), "sessions /TRAIN");
+        p.search("missing");
+        assert!(p.chosen().is_none());
+        assert!(seen(&mut p, BIG).join("\n").contains("no matches"));
+        p.search("");
+        assert_eq!(p.rows.iter().filter(|row| !row.heading).count(), 3);
+    }
+
+    #[test]
+    fn search_survives_a_listing_refresh_and_keeps_the_selected_session() {
+        let mut p = picker(
+            vec![
+                Row::new(0, "api").detail("nvim"),
+                Row::new(1, "test").detail("cargo"),
+            ],
+            0,
+        );
+        p.search("cargo");
+        assert_eq!(p.chosen().map(|row| row.id), Some(1));
+        p.replace(
+            vec![Row::new(2, "new"), Row::new(1, "test").detail("cargo test")],
+            0,
+        );
+        assert_eq!(p.chosen().map(|row| row.id), Some(1));
+        assert_eq!(p.rows.len(), 1);
     }
 
     /// The cursor marks the row, it does not repaint it: reverse video did

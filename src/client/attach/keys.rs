@@ -399,6 +399,8 @@ pub enum Action {
     Switch(Motion),
     /// Something happened to the popup control mode puts on the screen.
     Pick(Pick),
+    /// Filter the session popup by session name or current title.
+    SessionSearch(Rename),
     /// The same four states as a rename, for the prompt that names a new group.
     /// A third prompt rather than a third editor: the typing is identical and
     /// only the action carrying it says which prompt it happened at.
@@ -834,6 +836,8 @@ struct Prompt {
 enum Prompting {
     /// A search through the session's history.
     Find,
+    /// A search through the session popup.
+    Sessions,
     /// The session's title.
     Rename,
     /// A group to put the highlighted session in.
@@ -846,6 +850,7 @@ impl Prompting {
     fn action(self, find: Find, rename: Rename) -> Action {
         match self {
             Prompting::Find => Action::Find(find),
+            Prompting::Sessions => Action::SessionSearch(rename),
             Prompting::Rename => Action::Rename(rename),
             Prompting::Group => Action::GroupName(rename),
         }
@@ -854,12 +859,12 @@ impl Prompting {
 
 /// What is left of a chunk once an action has been taken out of it.
 ///
-/// Only a popup move gives any of it back. See [`Keystrokes::rest`].
+/// Popup moves and opening its search give the remaining bytes back. See
+/// [`Keystrokes::rest`].
 fn rest_after(action: Action, left: &[u8]) -> Vec<u8> {
     match action {
-        Action::Pick(Pick::Up | Pick::Down | Pick::NextGroup | Pick::PreviousGroup) => {
-            left.to_vec()
-        }
+        Action::Pick(Pick::Up | Pick::Down | Pick::NextGroup | Pick::PreviousGroup)
+        | Action::SessionSearch(Rename::Open) => left.to_vec(),
         _ => Vec::new(),
     }
 }
@@ -892,8 +897,8 @@ fn pop_char(typed: &mut Vec<u8>) {
 /// already know it.
 const SCROLL_KEY: u8 = b'[';
 
-/// Opens a search, from control mode or from inside the view. What every pager
-/// and editor uses, for the same reason.
+/// Opens a session search from control mode or a history search in the scroll
+/// view. What every pager and editor uses, for the same reason.
 const FIND_KEY: u8 = b'/';
 
 /// How long after the mode key a second one still means "send me the byte"
@@ -933,8 +938,8 @@ pub struct Keystrokes {
     pub action: Option<Action>,
     /// The mode the client is in now, for the row at the bottom of the screen.
     pub mode: Mode,
-    /// What was left of the chunk, for the two things you do carry on through:
-    /// moving a popup's highlight, and anything the mouse did.
+    /// What was left of the chunk, for moving a popup's highlight, opening its
+    /// search, and anything the mouse did.
     ///
     /// Everything else ends the chunk it was found in, because nobody types
     /// through a detach or a switch. A highlight move is not like those: two
@@ -965,6 +970,10 @@ impl KeyFilter {
     /// What is being typed at the search prompt, if that is the one open.
     pub fn needle(&self) -> Option<String> {
         self.typed(Prompting::Find)
+    }
+
+    pub fn session_query(&self) -> Option<String> {
+        self.typed(Prompting::Sessions)
     }
 
     /// What is being typed at the rename prompt, if that is the one open.
@@ -1026,6 +1035,7 @@ impl KeyFilter {
             Action::Pick(Pick::Cancel) => Mode::Focus,
             Action::Pick(Pick::Move | Pick::Groups | Pick::Hosts) => Mode::Picking,
             Action::Pick(_) => now,
+            Action::SessionSearch(_) => Mode::Control,
             // Back to the group list rather than to the session: naming a group
             // was one step of choosing one, and the list it was chosen from is
             // still what you are looking at.
@@ -1102,9 +1112,9 @@ impl KeyFilter {
             // Only where there is a history to look at. Elsewhere they are
             // unbound keys, and the session gets them.
             SCROLL_KEY if self.scroll => Action::Scroll(Scroll::Up(0)),
-            // Straight from control mode into a search, which is the whole
-            // gesture: `Ctrl-] /`, type, Enter.
-            FIND_KEY if self.scroll => Action::Find(Find::Open),
+            // The popup is already up in control mode, so `/` filters it.
+            // History search remains available from the scroll view.
+            FIND_KEY => Action::SessionSearch(Rename::Open),
             // And the same gesture for the name: `Ctrl-] r`, type, Enter.
             // Nothing here asks the host first, so it is bound whether or not
             // the host turns out to take it: an old one is answered with a
@@ -1257,6 +1267,7 @@ impl KeyFilter {
     fn opening(&mut self, action: Action) {
         match action {
             Action::Find(Find::Open) => self.open(Prompting::Find),
+            Action::SessionSearch(Rename::Open) => self.open(Prompting::Sessions),
             Action::Rename(Rename::Open) => self.open(Prompting::Rename),
             Action::GroupName(Rename::Open) => self.open(Prompting::Group),
             _ => {}
@@ -1505,8 +1516,8 @@ impl KeyFilter {
                 },
             };
             // Whatever is left of the chunk is dropped: nobody types through a
-            // detach or a switch. A popup move is the exception, and hands the
-            // rest back; see `rest_after`.
+            // detach or a switch. Popup moves and opening its search are the
+            // exceptions, and hand the rest back; see `rest_after`.
             if let Some(action) = action {
                 self.mode = Self::after(action, self.mode);
                 return Keystrokes {
@@ -2148,19 +2159,17 @@ mod tests {
         );
     }
 
-    /// Inline the terminal has the history in its own buffer, its own wheel
-    /// scrolls it and its own find bar searches it, so neither key is the
-    /// client's and both go to the session the way any unbound key does. A host
-    /// too old to answer is a different case: the keys stay the client's there,
-    /// so that it can say why nothing happened.
+    /// Inline the terminal has the history in its own buffer, so the client's
+    /// scroll view cannot open. The session popup still has its own search.
     #[test]
-    fn neither_scrolling_nor_searching_is_taken_where_the_terminal_owns_the_history() {
-        for key in [SCROLL_KEY, FIND_KEY] {
-            let mut f = KeyFilter::new(KEY);
-            f.set_scroll(false);
-            assert_eq!(f.filter(&[KEY, key]), forwarded(&[KEY, key]), "{key}");
-            assert_eq!(f.needle(), None, "no prompt was opened either");
-        }
+    fn history_stays_with_the_terminal_but_popup_search_is_available() {
+        let mut f = KeyFilter::new(KEY);
+        f.set_scroll(false);
+        assert_eq!(f.filter(&[KEY, SCROLL_KEY]), forwarded(&[KEY, SCROLL_KEY]));
+        assert_eq!(
+            f.filter(&[KEY, FIND_KEY]),
+            asked(Action::SessionSearch(Rename::Open), Mode::Control)
+        );
     }
 
     /// And the wheel is left alone there too, so the terminal keeps scrolling
@@ -2174,15 +2183,16 @@ mod tests {
         assert_eq!(f.filter(report), forwarded(report));
     }
 
-    /// The whole gesture: `Ctrl-] /`, type, Enter. The needle stays in the
+    /// The whole gesture: `Ctrl-] [ /`, type, Enter. The needle stays in the
     /// filter until it is run, because a chunk holding several typed bytes has
     /// to become one needle rather than an action per byte.
     #[test]
     fn a_search_is_typed_at_the_prompt_and_run_with_enter() {
         let mut f = KeyFilter::new(KEY);
         f.set_scroll(true);
+        f.filter(&[KEY, SCROLL_KEY]);
         assert_eq!(
-            f.filter(&[KEY, FIND_KEY]),
+            f.filter(&[FIND_KEY]),
             asked(Action::Find(Find::Open), Mode::Scroll)
         );
         assert_eq!(f.needle().as_deref(), Some(""));
@@ -2199,13 +2209,48 @@ mod tests {
         );
     }
 
+    #[test]
+    fn slash_searches_sessions_and_keeps_the_popup_open() {
+        let mut f = KeyFilter::new(KEY);
+        f.set_scroll(true);
+        assert_eq!(
+            f.filter(&[KEY, FIND_KEY]),
+            asked(Action::SessionSearch(Rename::Open), Mode::Control)
+        );
+        assert_eq!(
+            f.filter(b"api"),
+            asked(Action::SessionSearch(Rename::Typed), Mode::Control)
+        );
+        assert_eq!(f.session_query().as_deref(), Some("api"));
+        assert_eq!(
+            f.filter(b"\r"),
+            asked(Action::SessionSearch(Rename::Run), Mode::Control)
+        );
+        f.stop_typing();
+        assert_eq!(f.filter(b"\r"), asked(Action::Pick(Pick::Go), Mode::Focus));
+    }
+
+    #[test]
+    fn typing_immediately_after_slash_is_kept_for_session_search() {
+        let mut f = KeyFilter::new(KEY);
+        let opened = f.filter(&[KEY, FIND_KEY, b'a', b'p', b'i']);
+        assert_eq!(opened.action, Some(Action::SessionSearch(Rename::Open)));
+        assert_eq!(opened.rest, b"api");
+        assert_eq!(
+            f.filter(&opened.rest),
+            asked(Action::SessionSearch(Rename::Typed), Mode::Control)
+        );
+        assert_eq!(f.session_query().as_deref(), Some("api"));
+    }
+
     /// The reason the prompt takes every key while it is open. `d` detaches
     /// everywhere else, and a search for `docker` starts with one.
     #[test]
     fn keys_that_do_things_elsewhere_are_just_letters_at_the_prompt() {
         let mut f = KeyFilter::new(KEY);
         f.set_scroll(true);
-        f.filter(&[KEY, FIND_KEY]);
+        f.filter(&[KEY, SCROLL_KEY]);
+        f.filter(&[FIND_KEY]);
         assert_eq!(
             f.filter(b"docker qng"),
             asked(Action::Find(Find::Typed), Mode::Scroll)
@@ -2217,7 +2262,8 @@ mod tests {
     fn a_prompt_can_be_rubbed_out_and_backed_out_of() {
         let mut f = KeyFilter::new(KEY);
         f.set_scroll(true);
-        f.filter(&[KEY, FIND_KEY]);
+        f.filter(&[KEY, SCROLL_KEY]);
+        f.filter(&[FIND_KEY]);
         f.filter(b"abc");
         f.filter(&[0x7f]);
         assert_eq!(f.needle().as_deref(), Some("ab"));
@@ -2244,7 +2290,8 @@ mod tests {
     fn a_needle_can_hold_more_than_ascii() {
         let mut f = KeyFilter::new(KEY);
         f.set_scroll(true);
-        f.filter(&[KEY, FIND_KEY]);
+        f.filter(&[KEY, SCROLL_KEY]);
+        f.filter(&[FIND_KEY]);
         f.filter("Ubicación".as_bytes());
         assert_eq!(f.needle().as_deref(), Some("Ubicación"));
     }
@@ -2271,7 +2318,8 @@ mod tests {
     fn a_rub_takes_a_whole_character_off_however_many_bytes_it_was() {
         let mut f = KeyFilter::new(KEY);
         f.set_scroll(true);
-        f.filter(&[KEY, FIND_KEY]);
+        f.filter(&[KEY, SCROLL_KEY]);
+        f.filter(&[FIND_KEY]);
         f.filter("día".as_bytes());
         f.filter(&[0x7f]);
         assert_eq!(f.needle().as_deref(), Some("dí"));
@@ -2492,8 +2540,9 @@ mod tests {
     fn letting_go_of_the_mode_key_does_not_close_the_search_either() {
         let mut f = KeyFilter::new(KEY);
         f.set_scroll(true);
+        f.filter(b"\x1b[93;5u[");
         assert_eq!(
-            f.filter(b"\x1b[93;5u/"),
+            f.filter(b"/"),
             asked(Action::Find(Find::Open), Mode::Scroll)
         );
         f.filter(b"\x1b[57442;5:3u");
@@ -2634,7 +2683,8 @@ mod tests {
     fn the_two_prompts_do_not_share_what_is_typed_at_them() {
         let mut f = KeyFilter::new(KEY);
         f.set_scroll(true);
-        f.filter(&[KEY, FIND_KEY]);
+        f.filter(&[KEY, SCROLL_KEY]);
+        f.filter(&[FIND_KEY]);
         f.filter(b"error");
         assert_eq!(f.wanted_name(), None, "a needle is not a name");
 
@@ -2873,7 +2923,8 @@ mod tests {
     fn a_held_key_repeats_at_a_prompt() {
         let mut f = KeyFilter::default();
         f.set_scroll(true);
-        f.filter(&[DEFAULT_PREFIX, b'/']);
+        f.filter(&[DEFAULT_PREFIX, SCROLL_KEY]);
+        f.filter(&[FIND_KEY]);
         f.filter(b"\x1b[97;1u");
         f.filter(b"\x1b[97;1:2u");
         assert_eq!(f.needle().as_deref(), Some("aa"));
