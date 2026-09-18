@@ -4,6 +4,8 @@
 //! Everything here is desktop-only. A mobile client drives
 //! [`crate::client::Attached`] directly and paints with its own widget, so none
 //! of this is in the build it links against.
+//! Terminal input is framed before it reaches the key parser, since a read can
+//! end in the middle of an escape sequence.
 
 use std::fmt::Write as _;
 use std::io::IsTerminal;
@@ -13,6 +15,7 @@ use std::time::Duration;
 
 use anyhow::{Result, bail};
 use crossterm::terminal;
+use libc::{POLLIN, STDIN_FILENO, poll, pollfd};
 use tokio::io::{AsyncWriteExt, Stdout};
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::mpsc;
@@ -574,18 +577,103 @@ fn keyboard() -> mpsc::Receiver<Vec<u8>> {
     std::thread::spawn(move || {
         let mut stdin = std::io::stdin().lock();
         let mut buf = [0u8; 8192];
+        let mut frames = InputFrames::default();
         loop {
             match std::io::Read::read(&mut stdin, &mut buf) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
-                    if typed.blocking_send(buf[..n].to_vec()).is_err() {
+                    let complete = frames.push(&buf[..n]);
+                    if !complete.is_empty() && typed.blocking_send(complete).is_err() {
                         break;
+                    }
+                    if frames.pending() && !input_ready() {
+                        let expired = frames.expire();
+                        if !expired.is_empty() && typed.blocking_send(expired).is_err() {
+                            break;
+                        }
                     }
                 }
             }
         }
     });
     keys
+}
+
+/// Keep one terminal report together when a read ends inside its escape
+/// sequence. Otherwise the parser sees the escape as a key and sends the
+/// remaining `;1:3u` to the session as text.
+#[derive(Default)]
+struct InputFrames {
+    tail: Vec<u8>,
+}
+
+impl InputFrames {
+    fn push(&mut self, bytes: &[u8]) -> Vec<u8> {
+        self.tail.extend_from_slice(bytes);
+        let complete = complete_input_len(&self.tail);
+        let ready = self.tail.drain(..complete).collect();
+        if self.tail.len() > 128 {
+            self.tail.clear();
+        }
+        ready
+    }
+
+    fn pending(&self) -> bool {
+        !self.tail.is_empty()
+    }
+
+    fn expire(&mut self) -> Vec<u8> {
+        // A bare Esc is a key. An unfinished report is not text, so discard
+        // it if the terminal never sends its final byte.
+        if self.tail == b"\x1b" {
+            return std::mem::take(&mut self.tail);
+        }
+        self.tail.clear();
+        Vec::new()
+    }
+}
+
+fn complete_input_len(input: &[u8]) -> usize {
+    let mut at = 0;
+    while at < input.len() {
+        if input[at] != 0x1b {
+            at += 1;
+            continue;
+        }
+        let Some(next) = input.get(at + 1) else {
+            break;
+        };
+        match next {
+            b'[' => {
+                let Some(end) = input[at + 2..]
+                    .iter()
+                    .position(|b| (0x40..=0x7e).contains(b))
+                else {
+                    break;
+                };
+                at += end + 3;
+            }
+            b'O' => {
+                if input.get(at + 2).is_none() {
+                    break;
+                }
+                at += 3;
+            }
+            _ => at += 1,
+        }
+    }
+    at
+}
+
+fn input_ready() -> bool {
+    let mut fd = pollfd {
+        fd: STDIN_FILENO,
+        events: POLLIN,
+        revents: 0,
+    };
+    // A terminal writes one report at once, but a PTY read may split it.
+    // Standalone Esc waits this long before it is treated as a key.
+    unsafe { poll(&mut fd, 1, 30) > 0 }
 }
 
 /// Put the popup on the screen, or take the mark row back to saying what it
@@ -2104,6 +2192,37 @@ mod tests {
         let broken = std::io::Error::from(std::io::ErrorKind::BrokenPipe);
         let gone = Gone::mark(anyhow::Error::new(broken));
         assert_eq!(stopped(gone).unwrap(), Outcome::Disconnected);
+    }
+
+    #[test]
+    fn a_key_release_split_across_reads_stays_one_report() {
+        let report = b"\x1b[50;5:3u";
+        for split in 1..report.len() {
+            let mut frames = InputFrames::default();
+            assert!(frames.push(&report[..split]).is_empty(), "split at {split}");
+            let complete = frames.push(&report[split..]);
+            assert_eq!(complete, report, "split at {split}");
+            let mut keys = KeyFilter::default();
+            assert!(
+                keys.filter(&complete).forward.is_empty(),
+                "split at {split}"
+            );
+        }
+    }
+
+    #[test]
+    fn complete_input_precedes_an_unfinished_report() {
+        let mut frames = InputFrames::default();
+        assert_eq!(frames.push(b"abc\x1b[50;"), b"abc");
+        assert_eq!(frames.push(b"5:3u"), b"\x1b[50;5:3u");
+    }
+
+    #[test]
+    fn a_standalone_escape_is_still_a_key() {
+        let mut frames = InputFrames::default();
+        assert!(frames.push(b"\x1b").is_empty());
+        assert_eq!(frames.expire(), b"\x1b");
+        assert!(!frames.pending());
     }
 
     /// And nothing else is read as one. A client that waited out every failure
