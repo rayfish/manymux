@@ -11,6 +11,7 @@
 //! [`Encoded::byte`] puts each back to the byte the short spelling would have
 //! been, so the tables below are written once and cannot answer two ways.
 
+use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 use crate::client::scroll;
@@ -819,6 +820,9 @@ pub struct KeyFilter {
     /// of while the client still owns the keyboard, where [`Encoded::down`]
     /// drops it.
     acted: Option<u32>,
+    /// Key presses forwarded to this session. A release after a hop belongs
+    /// to the session that received its press, not the one now on screen.
+    forwarded: HashSet<u32>,
 }
 
 /// A line being typed at one of the client's prompts.
@@ -964,6 +968,7 @@ impl KeyFilter {
             clicked: None,
             prompt: None,
             acted: None,
+            forwarded: HashSet::new(),
         }
     }
 
@@ -1009,6 +1014,15 @@ impl KeyFilter {
     fn spell(&mut self, bytes: &[u8]) {
         self.spelling.clear();
         self.spelling.extend_from_slice(bytes);
+    }
+
+    fn remember_forwarded(&mut self, code: u32) {
+        // A plain press has the same spelling whether or not release reports
+        // are enabled. Bound this for programs that never ask for releases.
+        if self.forwarded.len() == 32 {
+            self.forwarded.clear();
+        }
+        self.forwarded.insert(code);
     }
 
     /// Where an action leaves the keyboard. A switch stays in control mode, so
@@ -1300,6 +1314,17 @@ impl KeyFilter {
     pub fn set_mode(&mut self, mode: Mode) {
         self.mode = mode;
         self.pressed = None;
+    }
+
+    /// Start another attach without forgetting a key whose release still
+    /// belongs to the client. The same key can come up after the new session
+    /// is already on screen.
+    pub fn begin_attach(&mut self, mode: Mode, scroll: bool) {
+        self.set_mode(mode);
+        self.prompt = None;
+        self.wheel = false;
+        self.forwarded.clear();
+        self.set_scroll(scroll);
     }
 
     pub fn filter(&mut self, input: &[u8]) -> Keystrokes {
@@ -1627,17 +1652,12 @@ impl KeyFilter {
     ) -> Option<Action> {
         if self.mode == Mode::Focus {
             if key.event != PRESS {
-                // The session's own keys keep their releases, since it asked to
-                // be told about them. The client's do not: the press they
-                // belong to never got there either. Three keys are the
-                // client's, and the third is the one this mode cannot see for
-                // itself: a key control mode acted on, since the action that
-                // ran is usually the one that handed the keyboard back, and by
-                // the time the hand comes off the key this is where it is read.
+                // Only the session that received a press gets its repeat or
+                // release. It may have ended before the release arrived.
                 let ours = key.is(self.prefix)
                     || (self.paste && key.is(PASTE_KEY))
                     || self.acted == Some(key.code);
-                if !ours {
+                if !ours && self.forwarded.contains(&key.code) {
                     forward.extend_from_slice(spelling);
                 }
                 // A repeat is the key still being held, so it stays the
@@ -1647,6 +1667,9 @@ impl KeyFilter {
                 // a line with them.
                 if key.event != REPEAT && self.acted == Some(key.code) {
                     self.acted = None;
+                }
+                if key.event != REPEAT {
+                    self.forwarded.remove(&key.code);
                 }
                 return None;
             }
@@ -1660,6 +1683,10 @@ impl KeyFilter {
                 self.spell(spelling);
                 return Some(Action::Paste);
             }
+            if self.acted == Some(key.code) {
+                self.acted = None;
+            }
+            self.remember_forwarded(key.code);
             forward.extend_from_slice(spelling);
             return None;
         }
@@ -1672,6 +1699,9 @@ impl KeyFilter {
         // held, which is how a long list gets walked, and dropping it meant
         // holding tab moved the highlight once and then stopped.
         if !key.down() || key.is_modifier() {
+            if !key.down() {
+                self.forwarded.remove(&key.code);
+            }
             return None;
         }
         // From here the press is the client's: every path below either acts on
@@ -1735,6 +1765,7 @@ impl KeyFilter {
         // The press went to the session, so its release belongs there too.
         self.mode = Mode::Focus;
         self.acted = None;
+        self.remember_forwarded(key.code);
         forward.extend_from_slice(&self.spelling);
         forward.extend_from_slice(spelling);
         None
@@ -2859,6 +2890,28 @@ mod tests {
         assert_eq!(f.filter(b"\x1b[49;1:3u"), forwarded(b""));
     }
 
+    #[test]
+    fn a_new_attach_keeps_the_previous_actions_release_out_of_the_session() {
+        let mut f = KeyFilter::default();
+        assert_eq!(f.filter(b"\x1b[93;5u"), held());
+        assert_eq!(
+            f.filter(b"\x1b[49;1u"),
+            asked(Action::Pick(Pick::Number(1)), Mode::Focus)
+        );
+        f.begin_attach(Mode::Focus, true);
+        assert_eq!(f.filter(b"\x1b[49;1:3u"), forwarded(b""));
+        assert_eq!(f.filter(b"\x1b[49;1u"), forwarded(b"\x1b[49;1u"));
+        assert_eq!(f.filter(b"\x1b[49;1:3u"), forwarded(b"\x1b[49;1:3u"));
+    }
+
+    #[test]
+    fn a_new_attach_drops_a_release_from_a_session_that_exited() {
+        let mut f = KeyFilter::default();
+        assert_eq!(f.filter(b"\x1b[13;1u"), forwarded(b"\x1b[13;1u"));
+        f.begin_attach(Mode::Focus, true);
+        assert_eq!(f.filter(b"\x1b[13;1:3u"), forwarded(b""));
+    }
+
     /// And it stays the client's for as long as the hand is on it. A key held
     /// past the repeat threshold reports every repeat, so a slot given up on
     /// the first one leaks all the rest: the same stray sequence, once a
@@ -2935,6 +2988,7 @@ mod tests {
     #[test]
     fn the_session_keeps_the_releases_of_its_own_keys() {
         let mut f = KeyFilter::default();
+        assert_eq!(f.filter(b"\x1b[97;5u"), forwarded(b"\x1b[97;5u"));
         assert_eq!(f.filter(b"\x1b[97;5:3u"), forwarded(b"\x1b[97;5:3u"));
         assert_eq!(f.filter(b"\x1b[93;5:3u"), forwarded(b""));
     }

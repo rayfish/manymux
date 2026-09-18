@@ -186,6 +186,7 @@ pub struct Held {
     /// The keyboard, owned here rather than by an attach, because it
     /// outlives one. See [`keyboard`].
     keys: mpsc::Receiver<Vec<u8>>,
+    filter: KeyFilter,
     screen: Screen,
     /// Whether the session has the terminal on its own alternate screen,
     /// which only the attach loop can see and which both the teardown and
@@ -205,14 +206,14 @@ pub fn hold(screen: Screen) -> Result<Held> {
     let previous = std::panic::take_hook();
     let flagged = Arc::clone(&on_alternate);
     std::panic::set_hook(Box::new(move |panic| {
-        let _ = terminal::disable_raw_mode();
-        write_now(&reset(screen.mode(), flagged.load(Ordering::Relaxed)));
+        give_back(screen, flagged.load(Ordering::Relaxed));
         previous(panic);
     }));
     terminal::enable_raw_mode()?;
     write_now(&setup(screen.mode()));
     Ok(Held {
         keys: keyboard(),
+        filter: KeyFilter::default(),
         screen,
         on_alternate,
     })
@@ -220,12 +221,18 @@ pub fn hold(screen: Screen) -> Result<Held> {
 
 impl Drop for Held {
     fn drop(&mut self) {
-        let _ = terminal::disable_raw_mode();
-        write_now(&reset(
-            self.screen.mode(),
-            self.on_alternate.load(Ordering::Relaxed),
-        ));
+        give_back(self.screen, self.on_alternate.load(Ordering::Relaxed));
     }
+}
+
+fn give_back(screen: Screen, on_alternate: bool) {
+    // Turn off keyboard event reporting before restoring the shell's input
+    // mode. A release already queued while it was on must not reach the shell.
+    write_now(&reset(screen.mode(), on_alternate));
+    unsafe {
+        libc::tcflush(libc::STDIN_FILENO, libc::TCIFLUSH);
+    }
+    let _ = terminal::disable_raw_mode();
 }
 
 /// Write straight to the real stdout: the async handle may have buffered
@@ -370,6 +377,7 @@ pub async fn run(
     let mut called = session_of(target).to_string();
     let outcome = pump(
         &mut held.keys,
+        &mut held.filter,
         session,
         status,
         mode,
@@ -761,6 +769,7 @@ impl Popup {
 /// is not the only thing that has to follow it.
 async fn pump(
     keyboard: &mut mpsc::Receiver<Vec<u8>>,
+    keys: &mut KeyFilter,
     session: Attached,
     mut status: Status,
     mode: Mode,
@@ -784,15 +793,13 @@ async fn pump(
     } = session.split();
     let mut stdout = tokio::io::stdout();
     let mut winch = signal(SignalKind::window_change())?;
-    let mut keys = KeyFilter::default();
-    keys.set_mode(mode);
+    keys.begin_attach(mode, screen.mode().owns_the_screen());
     // The key is the client's on a screen the client owns, whether or not
     // the host can answer for a window: a host that cannot is worth saying
     // out loud, and a key that quietly does nothing is the one thing worse
     // than not having it. Inline it is the session's, since the terminal
     // has the lines in its own buffer and its own wheel is better than
     // anything here.
-    keys.set_scroll(screen.mode().owns_the_screen());
     // The wheel is a stricter question than the key, and asked for rather than
     // assumed: taking the mouse off the terminal costs it the bare-drag
     // selection, which nothing here can give back. So it wants somebody to have
@@ -1516,7 +1523,7 @@ async fn pump(
                 // and the wheel goes with that: a program that wants reports
                 // gets every one of them, the wheel included.
                 let ours = wheel_is_ours(history, output.session_mouse());
-                own_the_wheel(&mut stdout, &mut keys, &mut wheel, ours).await?;
+                own_the_wheel(&mut stdout, keys, &mut wheel, ours).await?;
                 if chunk.is_empty() {
                     break 'chunk;
                 }
@@ -1569,7 +1576,7 @@ async fn pump(
                     // given it back. Only between sequences, like the mark.
                     if output.at_boundary() {
                         let ours = wheel_is_ours(history, output.session_mouse());
-                        own_the_wheel(&mut stdout, &mut keys, &mut wheel, ours).await?;
+                        own_the_wheel(&mut stdout, keys, &mut wheel, ours).await?;
                     }
                     // A screen switch went no further than this client, so
                     // the terminal is still showing the screen the session
