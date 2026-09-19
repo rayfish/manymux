@@ -2288,6 +2288,7 @@ async fn do_attach(
         }
     };
     // Before the message, which belongs on the screen the shell gets back.
+    held.release().await;
     drop(held);
 
     match outcome {

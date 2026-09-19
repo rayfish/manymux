@@ -195,6 +195,7 @@ pub struct Held {
     /// which only the attach loop can see and which both the teardown and
     /// the panic hook need.
     on_alternate: Arc<AtomicBool>,
+    released: bool,
 }
 
 pub fn hold(screen: Screen) -> Result<Held> {
@@ -219,12 +220,50 @@ pub fn hold(screen: Screen) -> Result<Held> {
         filter: KeyFilter::default(),
         screen,
         on_alternate,
+        released: false,
     })
+}
+
+impl Held {
+    /// Restore the terminal and wait until it has processed the keyboard-mode
+    /// reset before the shell can read stdin again.
+    pub async fn release(&mut self) {
+        let reset = reset(
+            self.screen.mode(),
+            self.on_alternate.load(Ordering::Relaxed),
+        );
+        while self.keys.try_recv().is_ok() {}
+        // The device-attributes reply is an in-band fence. A release already
+        // in flight reaches stdin before this reply because the terminal
+        // processes both streams in order.
+        write_now(&format!("{reset}\x1b[c"));
+        let fenced = tokio::time::timeout(Duration::from_secs(1), async {
+            while let Some(input) = self.keys.recv().await {
+                if contains_device_attributes(&input) {
+                    return true;
+                }
+            }
+            false
+        })
+        .await
+        .unwrap_or(false);
+        while self.keys.try_recv().is_ok() {}
+        unsafe {
+            libc::tcflush(libc::STDIN_FILENO, libc::TCIFLUSH);
+        }
+        let _ = terminal::disable_raw_mode();
+        self.released = true;
+        if !fenced {
+            debug!("the terminal did not answer the cleanup fence");
+        }
+    }
 }
 
 impl Drop for Held {
     fn drop(&mut self) {
-        give_back(self.screen, self.on_alternate.load(Ordering::Relaxed));
+        if !self.released {
+            give_back(self.screen, self.on_alternate.load(Ordering::Relaxed));
+        }
     }
 }
 
@@ -674,6 +713,24 @@ fn input_ready() -> bool {
     // A terminal writes one report at once, but a PTY read may split it.
     // Standalone Esc waits this long before it is treated as a key.
     unsafe { poll(&mut fd, 1, 30) > 0 }
+}
+
+fn contains_device_attributes(input: &[u8]) -> bool {
+    let mut at = 0;
+    while let Some(start) = input[at..].windows(3).position(|bytes| bytes == b"\x1b[?") {
+        let parameters = &input[at + start + 3..];
+        let Some(end) = parameters
+            .iter()
+            .position(|byte| (0x40..=0x7e).contains(byte))
+        else {
+            return false;
+        };
+        if parameters[end] == b'c' {
+            return true;
+        }
+        at += start + end + 4;
+    }
+    false
 }
 
 /// Put the popup on the screen, or take the mark row back to saying what it
@@ -2223,6 +2280,15 @@ mod tests {
         assert!(frames.push(b"\x1b").is_empty());
         assert_eq!(frames.expire(), b"\x1b");
         assert!(!frames.pending());
+    }
+
+    #[test]
+    fn device_attributes_fence_is_found_after_a_key_release() {
+        assert!(contains_device_attributes(b"\x1b[50;5:3u\x1b[?1;2c"));
+        assert!(contains_device_attributes(b"\x1b[?62;4;6;22c"));
+        assert!(!contains_device_attributes(b"\x1b[50;5:3u"));
+        assert!(!contains_device_attributes(b"plain c"));
+        assert!(!contains_device_attributes(b"\x1b[?1;2"));
     }
 
     /// And nothing else is read as one. A client that waited out every failure
