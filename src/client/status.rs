@@ -600,7 +600,9 @@ const SWITCHED: &str = concat!(
 /// alternate screens are swallowed, because that screen is the client's, and
 /// [`SWITCHED`] is written in their place before whatever paints next.
 /// Keyboard protocol changes are tracked too, so a release from a program that
-/// just stopped reading them does not land in the shell behind it.
+/// just stopped reading them does not land in the shell behind it. On terminals
+/// known to leak those releases, the release-reporting flag is removed before
+/// the sequence reaches the terminal.
 ///
 /// Everything else passes through byte for byte. This is not a terminal
 /// emulator and must never become one: it tracks just enough state to know a
@@ -625,6 +627,8 @@ pub struct Filter {
     mouse: bool,
     /// The keyboard reporting flags the program currently has in force.
     keyboard: Keyboard,
+    /// Whether the terminal may be asked to report key releases.
+    allow_key_releases: bool,
     /// Whether the program stopped asking for key releases since this was
     /// last taken.
     releases_ended: bool,
@@ -682,6 +686,7 @@ impl Filter {
             alternate: false,
             mouse: false,
             keyboard: Keyboard::default(),
+            allow_key_releases: true,
             releases_ended: false,
             owed: false,
         }
@@ -697,6 +702,14 @@ impl Filter {
     /// Whether the program currently asks the terminal to report key releases.
     pub fn reports_key_releases(&self) -> bool {
         self.keyboard.reports_releases()
+    }
+
+    /// Remove key-release reporting from keyboard mode changes before they
+    /// reach the terminal. Some terminals can send a shortcut's release after
+    /// the program that requested it has exited.
+    pub fn without_key_releases(mut self) -> Self {
+        self.allow_key_releases = false;
+        self
     }
 
     pub fn take_releases_ended(&mut self) -> bool {
@@ -849,6 +862,10 @@ impl Filter {
             b'p' if params == b"!" => self.dirty = true,
             b'h' | b'l' => return self.note_modes(final_byte),
             b'u' => {
+                if !self.allow_key_releases {
+                    remove_key_release_flag(&mut self.held);
+                }
+                let params = &self.held[2..self.held.len() - 1];
                 let reported = self.keyboard.reports_releases();
                 self.keyboard.note(params);
                 self.releases_ended |= reported && !self.keyboard.reports_releases();
@@ -945,6 +962,44 @@ impl Filter {
         self.flush(out);
         self.state = State::Ground;
     }
+}
+
+/// Kitty keyboard protocol flag 2 asks for press, repeat and release events.
+/// Keep press disambiguation and alternate key reporting, but take that flag
+/// out of pushes and assignments. Removing flags is always safe to pass on.
+fn remove_key_release_flag(sequence: &mut Vec<u8>) {
+    const REPORT_EVENT_TYPES: u16 = 2;
+
+    let params = &sequence[2..sequence.len() - 1];
+    let Some((&lead, rest)) = params.split_first() else {
+        return;
+    };
+    if !matches!(lead, b'>' | b'=') {
+        return;
+    }
+    let Ok(text) = std::str::from_utf8(rest) else {
+        return;
+    };
+    let (flags, rest) = text
+        .split_once(';')
+        .map_or((text, None), |(flags, rest)| (flags, Some(rest)));
+    let Ok(flags) = flags.parse::<u16>() else {
+        return;
+    };
+    let mode = rest
+        .and_then(|fields| fields.split(';').next())
+        .and_then(|field| field.parse::<u16>().ok());
+    if lead == b'=' && mode == Some(3) {
+        return;
+    }
+    let flags = flags & !REPORT_EVENT_TYPES;
+    let mut replacement = format!("\x1b[{}{flags}", char::from(lead));
+    if let Some(rest) = rest {
+        replacement.push(';');
+        replacement.push_str(rest);
+    }
+    replacement.push('u');
+    *sequence = replacement.into_bytes();
 }
 
 #[cfg(test)]
@@ -1203,6 +1258,25 @@ mod tests {
         assert!(!filter.reports_key_releases());
         assert!(filter.take_releases_ended());
         assert!(!filter.take_releases_ended(), "the flag is taken");
+    }
+
+    #[test]
+    fn key_release_requests_can_be_removed_for_terminals_that_leak_them() {
+        let mut filter = Filter::default().without_key_releases();
+        assert_eq!(through(&mut filter, "\x1b[>7u"), "\x1b[>5u");
+        assert!(!filter.reports_key_releases());
+        assert_eq!(through(&mut filter, "\x1b[=7;1u"), "\x1b[=5;1u");
+        assert_eq!(through(&mut filter, "\x1b[=2;2u"), "\x1b[=0;2u");
+        assert_eq!(through(&mut filter, "\x1b[=2;3u"), "\x1b[=2;3u");
+        assert_eq!(through(&mut filter, "\x1b[<u"), "\x1b[<u");
+        assert!(!filter.reports_key_releases());
+    }
+
+    #[test]
+    fn key_release_requests_pass_through_for_other_terminals() {
+        let mut filter = Filter::default();
+        assert_eq!(through(&mut filter, "\x1b[>7u"), "\x1b[>7u");
+        assert!(filter.reports_key_releases());
     }
 
     /// The screen the mark is drawn on belongs to the client. A session that

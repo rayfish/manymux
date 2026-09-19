@@ -6,7 +6,10 @@
 //! of this is in the build it links against.
 //! Terminal input is framed before it reaches the key parser, since a read can
 //! end in the middle of an escape sequence.
+//! iTerm2 is never asked for key releases because it can deliver a shortcut's
+//! release after the program that requested it has exited.
 
+use std::env;
 use std::fmt::Write as _;
 use std::io::IsTerminal;
 use std::sync::Arc;
@@ -910,6 +913,25 @@ impl Popup {
     }
 }
 
+fn running_in_iterm() -> bool {
+    let term_program = env::var("TERM_PROGRAM").ok();
+    is_iterm(
+        term_program.as_deref(),
+        ["ITERM_SESSION_ID", "ITERM_PROFILE", "ITERM_PROFILE_NAME"]
+            .iter()
+            .any(|name| env::var_os(name).is_some()),
+    )
+}
+
+fn is_iterm(term_program: Option<&str>, has_iterm_variable: bool) -> bool {
+    has_iterm_variable
+        || term_program.is_some_and(|name| {
+            name.eq_ignore_ascii_case("iTerm.app")
+                || name.eq_ignore_ascii_case("iTerm")
+                || name.eq_ignore_ascii_case("iTerm2")
+        })
+}
+
 /// The name in `naming` is written back when a rename lands: the mark row
 /// is not the only thing that has to follow it.
 async fn pump(
@@ -954,6 +976,9 @@ async fn pump(
     let history =
         scrolls && screen.mode().owns_the_screen() && Settings::or_default().mouse == Mouse::Client;
     let mut output = Filter::new(screen);
+    if running_in_iterm() {
+        output = output.without_key_releases();
+    }
     // The view over the session's history, while it is up.
     let mut scrolling: Option<Scrollback> = None;
     // The popup control mode puts on the screen, while it is up, and which of
@@ -2247,6 +2272,13 @@ mod tests {
     use super::*;
     use crate::client::picker::Row;
     use crate::settings::Screen;
+
+    #[test]
+    fn iterm_is_identified_before_keyboard_modes_are_forwarded() {
+        assert!(is_iterm(Some("iTerm.app"), false));
+        assert!(is_iterm(None, true));
+        assert!(!is_iterm(Some("WezTerm"), false));
+    }
 
     /// The whole point of the project is that the session outlives the
     /// connection, so a drop noticed on the way out is waited for exactly like
