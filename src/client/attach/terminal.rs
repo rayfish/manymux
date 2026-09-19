@@ -1618,6 +1618,7 @@ async fn pump(
                             takes_pastes,
                             &key,
                         ).await?;
+                        drop_finished_releases(&mut output, keys);
                         notice_until = Some(tokio::time::Instant::now() + NOTICE_FOR);
                         // The paste had the writing half to itself, so a
                         // switch swallowed while it ran is only now
@@ -1700,6 +1701,7 @@ async fn pump(
                         stdout.write_all(before.as_bytes()).await?;
                     }
                     let bytes = output.feed(&bytes);
+                    drop_finished_releases(&mut output, keys);
                     // Fed to the filter either way, so its parser stays in
                     // step with the byte stream, but not written while
                     // something of the client's owns the screen. The view is
@@ -1783,6 +1785,7 @@ async fn pump(
                         }
                     }
                     let bytes = output.feed(&bytes);
+                    drop_finished_releases(&mut output, keys);
                     if ours {
                         stdout.write_all(&bytes).await?;
                     }
@@ -2052,6 +2055,12 @@ async fn pump(
     }
 }
 
+fn drop_finished_releases(output: &mut Filter, keys: &mut KeyFilter) {
+    if output.take_releases_ended() {
+        keys.release_reports_ended();
+    }
+}
+
 /// Write what has been held back until it was safe to write, and flush.
 ///
 /// Both things here would corrupt a sequence the session is halfway through
@@ -2289,6 +2298,18 @@ mod tests {
         assert!(!contains_device_attributes(b"\x1b[50;5:3u"));
         assert!(!contains_device_attributes(b"plain c"));
         assert!(!contains_device_attributes(b"\x1b[?1;2"));
+    }
+
+    #[test]
+    fn a_programs_release_does_not_reach_the_shell_after_it_pops_keyboard_mode() {
+        let mut output = Filter::default();
+        let mut keys = KeyFilter::default();
+        output.feed(b"\x1b[>7u");
+        assert_eq!(keys.filter(b"\x1b[100;5u").forward, b"\x1b[100;5u");
+
+        output.feed(b"\x1b[<u");
+        drop_finished_releases(&mut output, &mut keys);
+        assert!(keys.filter(b"\x1b[100;5:3u").forward.is_empty());
     }
 
     /// And nothing else is read as one. A client that waited out every failure

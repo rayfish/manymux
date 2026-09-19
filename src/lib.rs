@@ -20,6 +20,7 @@ pub mod client;
 pub mod config;
 pub mod foreground;
 pub mod hosts;
+mod keyboard;
 pub mod lock;
 pub mod notify;
 pub mod proto;

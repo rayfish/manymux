@@ -1327,6 +1327,13 @@ impl KeyFilter {
         self.set_scroll(scroll);
     }
 
+    /// The program that received these presses stopped asking for releases.
+    /// Any release still in flight belongs to it, not to what reads next.
+    pub fn release_reports_ended(&mut self) {
+        self.forwarded.clear();
+        self.acted = None;
+    }
+
     pub fn filter(&mut self, input: &[u8]) -> Keystrokes {
         self.filter_at(input, Instant::now())
     }

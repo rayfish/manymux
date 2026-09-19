@@ -13,6 +13,7 @@ use std::time::Duration;
 
 use crate::client::attach::Mode;
 use crate::client::scroll::Selected;
+use crate::keyboard::Keyboard;
 use crate::proto::Size;
 use crate::settings::Screen;
 use crate::style;
@@ -592,12 +593,14 @@ const SWITCHED: &str = concat!(
 
 /// Rewrites the session's output on its way to the terminal.
 ///
-/// Three jobs, all needing the same parse. Titles get the prefix, so the tab
+/// Four jobs, all needing the same parse. Titles get the prefix, so the tab
 /// says `mm` however often the remote shell renames it. Sequences that would
 /// take the mark or its scrolling region with them are noted, so the client can
 /// put both back. And the session's own switches between the primary and
 /// alternate screens are swallowed, because that screen is the client's, and
 /// [`SWITCHED`] is written in their place before whatever paints next.
+/// Keyboard protocol changes are tracked too, so a release from a program that
+/// just stopped reading them does not land in the shell behind it.
 ///
 /// Everything else passes through byte for byte. This is not a terminal
 /// emulator and must never become one: it tracks just enough state to know a
@@ -620,6 +623,11 @@ pub struct Filter {
     /// mouse. While it has, the wheel is its business and the client neither
     /// turns tracking on nor reads a report.
     mouse: bool,
+    /// The keyboard reporting flags the program currently has in force.
+    keyboard: Keyboard,
+    /// Whether the program stopped asking for key releases since this was
+    /// last taken.
+    releases_ended: bool,
     /// Whether a swallowed switch has left the screen owing an erase, taken by
     /// the next byte that paints.
     ///
@@ -673,6 +681,8 @@ impl Filter {
             switched: false,
             alternate: false,
             mouse: false,
+            keyboard: Keyboard::default(),
+            releases_ended: false,
             owed: false,
         }
     }
@@ -682,6 +692,15 @@ impl Filter {
     /// one of them reading keystrokes meant for the other.
     pub fn session_mouse(&self) -> bool {
         self.mouse
+    }
+
+    /// Whether the program currently asks the terminal to report key releases.
+    pub fn reports_key_releases(&self) -> bool {
+        self.keyboard.reports_releases()
+    }
+
+    pub fn take_releases_ended(&mut self) -> bool {
+        std::mem::take(&mut self.releases_ended)
     }
 
     /// Whether the session is sitting in a full-screen program's alternate
@@ -829,6 +848,11 @@ impl Filter {
             // Soft reset, which includes the margins.
             b'p' if params == b"!" => self.dirty = true,
             b'h' | b'l' => return self.note_modes(final_byte),
+            b'u' => {
+                let reported = self.keyboard.reports_releases();
+                self.keyboard.note(params);
+                self.releases_ended |= reported && !self.keyboard.reports_releases();
+            }
             _ => {}
         }
         true
@@ -1166,6 +1190,19 @@ mod tests {
         // Modes that have nothing to do with the screen do not.
         through(&mut filter, "\x1b[?2004h");
         assert!(!filter.take_dirty());
+    }
+
+    #[test]
+    fn ending_key_release_reports_is_carried_to_the_input_filter() {
+        let mut filter = Filter::default();
+        through(&mut filter, "\x1b[>7u");
+        assert!(filter.reports_key_releases());
+        assert!(!filter.take_releases_ended());
+
+        through(&mut filter, "\x1b[<u");
+        assert!(!filter.reports_key_releases());
+        assert!(filter.take_releases_ended());
+        assert!(!filter.take_releases_ended(), "the flag is taken");
     }
 
     /// The screen the mark is drawn on belongs to the client. A session that

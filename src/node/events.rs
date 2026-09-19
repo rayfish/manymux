@@ -16,6 +16,8 @@
 //! same bytes mean different things in different states: `ESC ] 0 ; title BEL`
 //! sets a title and must not count as a bell.
 
+use crate::keyboard::Keyboard;
+
 /// What the scanner found in a chunk of output.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
@@ -116,68 +118,6 @@ pub struct Scanner {
     /// put aside: what the buffer holds then says nothing about what the
     /// session has printed. `node::session::State::printed` is what reads it.
     on_alternate: bool,
-}
-
-/// The extended-keys protocols: kitty's stack of enhancement flags, and
-/// xterm's older `modifyOtherKeys`. Both change how the *terminal* spells a
-/// keystroke, so a program that turned one on and then found itself painted
-/// onto a fresh terminal would be reading Enter where it asked for
-/// Shift-Enter, and Ctrl-] as the byte it stopped expecting.
-///
-/// `client::attach` undoes all of this on detach, the same pairing the private
-/// modes have.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
-struct Keyboard {
-    /// Flags set without pushing, with `CSI = flags ; mode u`.
-    base: u16,
-    /// Flags pushed with `CSI > flags u`, outermost first. The current flags
-    /// are the last of these, or `base` when nothing is pushed.
-    stack: Vec<u16>,
-    /// The level asked for with xterm's `CSI > 4 ; Pv m`.
-    modify_other_keys: Option<u16>,
-}
-
-/// How deep kitty's stack goes. A program that pushes past it loses the oldest
-/// entry rather than growing the node's memory on a stream that never pops.
-const KEYBOARD_STACK: usize = 16;
-
-impl Keyboard {
-    fn push(&mut self, flags: u16) {
-        if self.stack.len() == KEYBOARD_STACK {
-            self.stack.remove(0);
-        }
-        self.stack.push(flags);
-    }
-
-    fn pop(&mut self, count: usize) {
-        self.stack.truncate(self.stack.len().saturating_sub(count));
-    }
-
-    /// `CSI = flags ; mode u`: 1 sets the flags to exactly this, 2 turns the
-    /// named ones on, 3 turns them off. It changes the current entry rather
-    /// than pushing one.
-    fn set(&mut self, flags: u16, mode: u16) {
-        let current = self.stack.last_mut().unwrap_or(&mut self.base);
-        *current = match mode {
-            2 => *current | flags,
-            3 => *current & !flags,
-            _ => flags,
-        };
-    }
-
-    fn replay(&self, out: &mut String) {
-        use std::fmt::Write as _;
-
-        if self.base != 0 {
-            let _ = write!(out, "\x1b[={};1u", self.base);
-        }
-        for flags in &self.stack {
-            let _ = write!(out, "\x1b[>{flags}u");
-        }
-        if let Some(level) = self.modify_other_keys.filter(|level| *level != 0) {
-            let _ = write!(out, "\x1b[>4;{level}m");
-        }
-    }
 }
 
 impl Default for Scanner {
@@ -342,25 +282,7 @@ impl Scanner {
         // `CSI < n u` pops n of them, `CSI = flags ; mode u` changes the ones
         // in force. `CSI ? u` is the query for them and changes nothing.
         if final_byte == b'u' {
-            let Some((&lead, rest)) = params.split_first() else {
-                return;
-            };
-            let Ok(text) = std::str::from_utf8(rest) else {
-                return;
-            };
-            let mut fields = text.split(';');
-            let first = fields.next().unwrap_or_default().parse::<u16>();
-            match lead {
-                b'>' => self.keyboard.push(first.unwrap_or(0)),
-                b'<' => self.keyboard.pop(first.unwrap_or(1).into()),
-                b'=' => {
-                    if let Ok(flags) = first {
-                        let mode = fields.next().and_then(|m| m.parse().ok()).unwrap_or(1);
-                        self.keyboard.set(flags, mode);
-                    }
-                }
-                _ => {}
-            }
+            self.keyboard.note(&params);
             return;
         }
 
@@ -374,7 +296,8 @@ impl Scanner {
             if fields.next().and_then(|r| r.parse::<u16>().ok()) != Some(4) {
                 return;
             }
-            self.keyboard.modify_other_keys = fields.next().and_then(|v| v.parse().ok());
+            self.keyboard
+                .set_modify_other_keys(fields.next().and_then(|v| v.parse().ok()));
             return;
         }
 
