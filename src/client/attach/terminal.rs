@@ -831,7 +831,8 @@ enum Showing {
 /// in the box, and not in [`crate::client::status`]'s ladder for a window too
 /// small to hold one, because the numbers are drawn in the box: a key for rows
 /// you cannot see is a key you cannot aim.
-const SESSION_HINTS: &str = "⏎ go  / search  1-9 recent  r name  m group  g show  n new  d detach";
+const SESSION_HINTS: &str =
+    "⏎ go  / search  1-9 recent  r name  m group  g show  n new  N here  d detach";
 const MOVE_HINTS: &str = "⏎ move   n new group   esc";
 const NARROW_HINTS: &str = "⏎ show   esc";
 const HOST_HINTS: &str = "⏎ start   esc";
@@ -1106,7 +1107,7 @@ async fn pump(
                     // that opens the list rather than at the Enter that
                     // commits it: refusing a machine somebody has just picked
                     // throws away the picking.
-                    Some(Action::Pick(Pick::Hosts)) if watching => {
+                    Some(Action::Pick(Pick::Hosts) | Action::New) if watching => {
                         let back = popup.as_ref().map_or(Mode::Focus, Popup::mode);
                         keys.set_mode(back);
                         status.set_mode(back);
@@ -1115,6 +1116,10 @@ async fn pump(
                         restate = true;
                         settle(&mut stdout, &output, &status, &mut pending, &mut restate)
                             .await?;
+                    }
+                    Some(Action::New) => {
+                        writer.detach().await?;
+                        return Ok(Outcome::New);
                     }
                     // The popup, which is what control mode looks like. Moving
                     // the highlight is local: walking three sessions used to be

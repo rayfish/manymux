@@ -10,6 +10,9 @@
 //! and starts arriving as an escape sequence. [`Encoded`] reads all of them and
 //! [`Encoded::byte`] puts each back to the byte the short spelling would have
 //! been, so the tables below are written once and cannot answer two ways.
+//!
+//! In control mode, `n` chooses a host; `N` starts beside the attached session
+//! on its host and in its current directory, regardless of the highlighted row.
 
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
@@ -397,6 +400,8 @@ pub enum Pick {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
     Detach,
+    /// Start a shell beside the attached session.
+    New,
     Switch(Motion),
     /// Something happened to the popup control mode puts on the screen.
     Pick(Pick),
@@ -1034,7 +1039,7 @@ impl KeyFilter {
     /// detaches, which is the whole reason that mode is separate.
     fn after(action: Action, now: Mode) -> Mode {
         match action {
-            Action::Detach | Action::Paste => Mode::Focus,
+            Action::Detach | Action::Paste | Action::New => Mode::Focus,
             Action::Switch(_) => Mode::Control,
             // The popup stays up while the highlight is moving, and both ways
             // out of it go back to the session.
@@ -1117,10 +1122,10 @@ impl KeyFilter {
             // the other two rather than a session started where you happen to
             // be standing: the machine is the thing being chosen, and the one
             // you are on is only the likeliest answer.
-            b'n' | b'N' => Action::Pick(Pick::Hosts),
-            // The one key that reads its own case, because shift already means
-            // backwards here: `H` is to `h` what shift-tab is to tab, rather
-            // than a second letter to remember.
+            b'n' => Action::Pick(Pick::Hosts),
+            b'N' => Action::New,
+            // Shift means backwards here: `H` is to `h` what shift-tab is to
+            // tab, rather than a second letter to remember.
             b'h' => Action::Pick(Pick::NextGroup),
             b'H' => Action::Pick(Pick::PreviousGroup),
             // Only where there is a history to look at. Elsewhere they are
@@ -3236,18 +3241,26 @@ mod tests {
             f.filter(&[KEY, b'n']),
             asked(Action::Pick(Pick::Hosts), Mode::Picking)
         );
+    }
 
-        // Both cases, like every key here but the two that move machine.
-        let mut f = KeyFilter::default();
-        assert_eq!(
-            f.filter(&[KEY, b'N']),
-            asked(Action::Pick(Pick::Hosts), Mode::Picking)
-        );
+    #[test]
+    fn uppercase_new_starts_beside_the_attached_session() {
+        for key in [
+            &b"N"[..],
+            b"\x1b[78u",
+            b"\x1b[110;2u",
+            b"\x1b[110:78;2u",
+            b"\x1b[27;2;78~",
+        ] {
+            let mut f = KeyFilter::default();
+            f.filter(&[KEY]);
+            assert_eq!(f.filter(key), asked(Action::New, Mode::Focus));
+        }
     }
 
     #[test]
     fn the_host_keys_move_machine_and_leave_control_mode_on() {
-        // The one binding that reads its own case, so both spellings are keys
+        // This binding reads its own case, so both spellings are keys
         // rather than `H` dropping back to focus as an unbound one would.
         //
         // A bigger step of the same gesture now that the machines are drawn as

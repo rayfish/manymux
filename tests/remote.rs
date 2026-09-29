@@ -2633,6 +2633,124 @@ fn the_new_key_starts_a_session_on_the_machine_you_walked_to() {
     let _ = client.wait();
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn uppercase_new_uses_the_attached_sessions_live_directory() {
+    use std::fs::{create_dir, read_to_string, remove_dir};
+    use std::io::{Read, Write};
+    use std::os::fd::AsFd;
+    use std::sync::mpsc;
+
+    use manymux::shell::quote;
+
+    for (machine, deleted) in [("laptop", false), ("gpu-box", false), ("gpu-box", true)] {
+        let world = World::new(&format!("new-here-{machine}-{deleted}"));
+        let directory = world.dir.join("work with 'quotes'");
+        create_dir(&directory).unwrap();
+        world.ok("laptop", &["add", "gpu-box"]);
+        world.ok(machine, &["new", "-d", "-n", "source", "sh"]);
+        world.wait_for_node(machine);
+        let target = if machine == "laptop" {
+            "source"
+        } else {
+            "gpu-box/source"
+        };
+        let (pty, pts) = pty_process::blocking::open().unwrap();
+        pty.resize(pty_process::Size::new(24, 120)).unwrap();
+        let mut client = pty_process::blocking::Command::new(MM)
+            .arg("--socket")
+            .arg(world.socket("laptop"))
+            .args(["attach", target])
+            .env("MM_CONFIG_DIR", world.dir.join("laptop"))
+            .env("MM_SSH", world.ssh_stub())
+            .env("MM_LOG", "manymux=warn")
+            .env("TERM", "xterm-256color")
+            .spawn(pts)
+            .expect("attaching on a terminal");
+
+        let (seen_tx, seen_rx) = mpsc::channel();
+        let mut reader = unsafe {
+            pty_process::blocking::Pty::from_fd(pty.as_fd().try_clone_to_owned().unwrap())
+        };
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            while let Ok(read @ 1..) = reader.read(&mut buf) {
+                if seen_tx.send(buf[..read].to_vec()).is_err() {
+                    return;
+                }
+            }
+        });
+        let wait_for = |seen: &mut String, text: &str| {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while !seen.contains(text) {
+                if let Ok(chunk) = seen_rx.recv_timeout(Duration::from_millis(100)) {
+                    seen.push_str(&String::from_utf8_lossy(&chunk));
+                }
+                assert!(Instant::now() < deadline, "never saw {text:?}: {seen:?}");
+            }
+        };
+        let mut seen = String::new();
+        wait_for(&mut seen, "source");
+
+        // Change directory after spawning. Split the marker so terminal echo
+        // cannot pass the wait before the shell has actually run the command.
+        let command = format!(
+            "cd {} && printf '%s%s\\n' directory- ready\n",
+            quote(directory.to_str().unwrap())
+        );
+        (&pty).write_all(command.as_bytes()).unwrap();
+        wait_for(&mut seen, "directory-ready");
+        if deleted {
+            remove_dir(&directory).unwrap();
+        }
+        seen.clear();
+        (&pty).write_all(b"\x1dN").unwrap();
+
+        if deleted {
+            wait_for(&mut seen, "cannot read the current session's directory");
+            assert_eq!(sessions(&world.ok(machine, &["ls", "local"])), ["source"]);
+            (&pty).write_all(b"d").unwrap();
+        } else {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            let name = loop {
+                let listed = world.ok(machine, &["ls", "local"]);
+                if let Some(name) = sessions(&listed).into_iter().find(|name| *name != "source") {
+                    break name.to_string();
+                }
+                assert!(Instant::now() < deadline, "no session started: {seen:?}");
+                std::thread::sleep(Duration::from_millis(100));
+            };
+            wait_for(&mut seen, &name);
+            assert!(!seen.contains("new session on"), "N opened the host picker");
+            let result = world.dir.join("new-cwd");
+            (&pty)
+                .write_all(format!("pwd -P > {}\n", quote(result.to_str().unwrap())).as_bytes())
+                .unwrap();
+            loop {
+                if let Ok(cwd) = read_to_string(&result)
+                    && !cwd.is_empty()
+                {
+                    assert_eq!(cwd.trim_end(), directory.to_str().unwrap());
+                    break;
+                }
+                assert!(Instant::now() < deadline, "new shell did not answer pwd");
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            // Ending the new shell returns to the session that N came from.
+            seen.clear();
+            (&pty).write_all(b"exit\n").unwrap();
+            wait_for(&mut seen, "exited with status 0");
+            wait_for(&mut seen, "source");
+            (&pty).write_all(b"\x1dd").unwrap();
+        }
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while client.try_wait().unwrap().is_none() {
+            assert!(Instant::now() < deadline, "client did not detach");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+}
+
 /// Every hop in a viewing run is another view, so a session started from one is
 /// a session you could not type into: the key is refused, and refused at the
 /// press that opens the list rather than at the Enter that commits it, since
@@ -2699,12 +2817,15 @@ fn the_new_key_is_refused_in_a_viewing_run_and_hands_the_keyboard_back() {
     // hand the keyboard back to.
     (&pty).write_all(b"\x1d").unwrap();
     wait_for(&mut seen, "┌ sessions");
-    (&pty).write_all(b"n").unwrap();
-    wait_for(&mut seen, "watching, so nothing here can start a session");
-    assert!(
-        !seen.contains("new session on"),
-        "the list opened in a run that cannot type into what it would start"
-    );
+    for &key in b"nN" {
+        seen.clear();
+        (&pty).write_all(&[key]).unwrap();
+        wait_for(&mut seen, "watching, so nothing here can start a session");
+        assert!(
+            !seen.contains("new session on"),
+            "the list opened in a run that cannot type into what it would start"
+        );
+    }
 
     // And the keyboard came back to the list it was refused from, which the
     // key that leaves says: held in a mode with nothing behind it, this does

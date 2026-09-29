@@ -170,7 +170,8 @@ one `Ctrl-]` then `tab tab tab` walks through your sessions.
 | `l` | the one you came from |
 | `1`-`9` | the sessions you have been in, most recent first |
 | `/` | search sessions by name or current title; `enter` finishes the query, then `enter` opens the highlighted session |
-| `n` | start a session on this machine and go to it |
+| `n` | choose a machine, start a session and go to it |
+| `N` | start a session on the current host in the current session's directory |
 | `r` | rename this session |
 | `d` | detach |
 | `esc`, `enter`, `Ctrl-]` | back to focus |
@@ -184,10 +185,10 @@ rather than leaving a hole. Sessions you have not been in this run wear no digit
 and are a `tab` away. Nothing on disk remembers any of this: a fresh `mm attach`
 starts with a trail of one.
 
-`n` starts a shell on the machine you are on, the way `mm new` would, and puts
-you in it in focus mode: it is the one control key that does not leave the mode
-on, because what follows a new session is typing rather than another hop. The
-node picks the name, and `mm ls` has it from then on.
+`n` opens the host picker. `N` starts a shell beside the attached session, using
+its live working directory (currently available on Linux hosts). Both put you
+in the new shell in focus mode. If the directory cannot be read, `N` reports
+the error and stays in the current session. The node picks the new name.
 
 Ending a session you moved to puts you back in the one you came from, rather
 than back at your shell: type `exit` in the session `n` just started and you are

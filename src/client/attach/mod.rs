@@ -65,6 +65,8 @@ const SLOWEST: u64 = 10;
 #[derive(Debug, PartialEq, Eq)]
 pub enum Outcome {
     Detached,
+    /// Start and attach to a shell on the current host in the current directory.
+    New,
     /// A popup was closed with something chosen. What each row means is the
     /// caller's: it handed the rows in and gets their ids back, so this half of
     /// the client never learns what a host, a group or a pid is.

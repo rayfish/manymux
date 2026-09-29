@@ -1705,9 +1705,8 @@ async fn restore_checkpoint(socket: &Path, host: Option<String>, dry_run: bool) 
 
 /// Start one saved session, or answer `None` if that name is already running.
 ///
-/// The one caller that sends a `cwd` to another machine. `mm new` deliberately
-/// does not, having no idea whether a directory of yours exists there; here the
-/// directory came off that same machine a moment ago and is the whole point.
+/// Like `N` in control mode, this sends a directory read from the destination
+/// machine. `mm new` has only the caller's directory, so it sends it locally.
 async fn spawn_kept(socket: &Path, kept: &Kept) -> Result<Option<String>> {
     let spec = SpawnSpec {
         name: Some(kept.name.clone()),
@@ -2157,7 +2156,7 @@ async fn do_attach(
                         // has no machine behind it. An ssh to nowhere says less
                         // than staying where you are and saying so.
                         None => notice = Some("that machine is no longer listed".to_string()),
-                        Some(host) => match starting(start_on(socket, &host)).await {
+                        Some(host) => match starting(start_on(socket, &host, None)).await {
                             Ok(name) => {
                                 // The one that goes somewhere, so it leaves you
                                 // in the session rather than over it, the way
@@ -2220,6 +2219,21 @@ async fn do_attach(
                 }
                 // Whatever it was, what the machines are running may have moved
                 // under it, and a press is the only thing that ever asks.
+                listing = Some(spawn_listing(socket));
+            }
+            Outcome::New => {
+                hopped = false;
+                mode = Mode::Control;
+                // A rename during this attach has already updated the cycle.
+                let at = cycle.current().clone();
+                match starting(start_beside(socket, &at)).await {
+                    Ok(name) => {
+                        cycle.started(Located::new(&at.host, &name));
+                        hopped = true;
+                        mode = Mode::Focus;
+                    }
+                    Err(e) => notice = Some(format!("could not start a session: {e:#}")),
+                }
                 listing = Some(spawn_listing(socket));
             }
             Outcome::Switch(motion) => {
@@ -2304,7 +2318,7 @@ async fn do_attach(
             println!("[disconnected from {where_}]");
             Ok(FAILED)
         }
-        Outcome::Switch(_) | Outcome::Chose(_) => {
+        Outcome::Switch(_) | Outcome::Chose(_) | Outcome::New => {
             unreachable!("switches never leave the loop above")
         }
     }
@@ -2489,16 +2503,16 @@ async fn attach_to(
 /// `mm` on it is an error, and the mark row says so. Hushed for the same
 /// reason, ssh's account of a machine it could not reach belonging in that
 /// error rather than on the painted screen.
-async fn start_on(socket: &Path, host: &str) -> Result<String> {
+async fn start_on(socket: &Path, host: &str, cwd: Option<String>) -> Result<String> {
     let spec = SpawnSpec {
         // The node's counter names it, the way it does for any spawn without
         // one: there is no prompt here and nobody typed anything.
         name: None,
         // The login shell.
         command: Vec::new(),
-        // Only meaningful on this machine; elsewhere the session starts in the
-        // node's own working directory. The rule `mm new` follows.
-        cwd: is_this_machine(host).then(current_dir).flatten(),
+        // An explicit directory came from this host's snapshot. Otherwise use
+        // the caller's directory only locally, as `mm new` does.
+        cwd: cwd.or_else(|| is_this_machine(host).then(current_dir).flatten()),
         size: attach::session_size(),
         // A login shell, which the node names for itself.
         label: None,
@@ -2513,6 +2527,26 @@ async fn start_on(socket: &Path, host: &str) -> Result<String> {
         bail!("unexpected response to spawn");
     };
     Ok(name)
+}
+
+/// Read the live directory from the same host that will start the new shell.
+/// Missing information is an error, never permission to start in another place.
+async fn start_beside(socket: &Path, at: &Located) -> Result<String> {
+    let Response::Snapshot(sessions) = open_hushed(socket, &at.host)
+        .await?
+        .call(&Request::Snapshot)
+        .await?
+    else {
+        bail!("unexpected response to snapshot");
+    };
+    let session = sessions
+        .into_iter()
+        .find(|session| session.name == at.session)
+        .ok_or_else(|| anyhow!("session {} is no longer running", at.session))?;
+    let cwd = session
+        .cwd
+        .ok_or_else(|| anyhow!("this host cannot read the current session's directory"))?;
+    start_on(socket, &at.host, Some(cwd)).await
 }
 
 /// What every machine said it was running, and which machines said anything.

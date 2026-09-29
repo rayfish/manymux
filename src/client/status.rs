@@ -47,6 +47,7 @@ const HINTS: &[&str] = &[
     "n new",
     "r rename",
     "d detach",
+    "N here",
     "esc focus",
     "h host",
     "l last",
