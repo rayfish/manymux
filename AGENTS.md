@@ -108,13 +108,23 @@ Three consequences run through the whole codebase and are worth keeping intact:
   `src/client/groups.rs` are terminal-free for the same reason.
 - `src/client/groups.rs` is `groups.toml`, beside the host list: which sessions
   you are treating as one piece of work, spanning machines. `src/client/picker.rs`
-  is the list control mode draws, filled with sessions or with groups.
+  is the list control mode draws, filled with sessions or with groups, and
+  `src/client/listed.rs` is what fills it: one fan-out's answers, and the tree of
+  rows built from them.
 - `src/main.rs` is the CLI, and the only place that decides local versus remote:
   `open()` picks socket or ssh, `open_or_start()` is for commands that ask a
   machine to hold something new. Beside it and belonging to the binary rather
   than the library: `src/target.rs` turns a typed word into a machine and a
   session, `src/complete.rs` answers a tab, `src/completions.rs` works out
   where a shell reads its completion script from.
+- **What the binary keeps is the asking and the words.** A command here is three
+  things: putting questions to machines, deciding what the answers come to, and
+  saying so. The middle one belongs in the library, where it can be tested
+  without a fleet and where a mobile client can reach it. `mm checkpoint save` is
+  the worked example: `src/main.rs` lists the machines and asks each what its
+  sessions are doing, `client::checkpoint::taking` decides what to write down and
+  what was lost, and `main` turns each reason it answers with into the line
+  somebody reads. A rule that lives in a `println!` is a rule no test can see.
 
 ### Rules that are easy to break
 
@@ -128,8 +138,9 @@ read its `//!` first, and update it in the same commit:
 | --- | --- |
 | the wire, and what a node of another age does with it | `src/proto.rs` |
 | groups, and why they are the client's | `src/client/groups.rs` |
-| checkpoints, restarts, and reading `/proc` | `src/client/checkpoint.rs`, `src/foreground.rs` |
-| the popup and its three lists | `src/client/picker.rs` |
+| checkpoints, restarts, and reading `/proc` | `src/client/checkpoint/`, `src/foreground.rs` |
+| what a save writes down, and what it leaves out | `src/client/checkpoint/taking.rs` |
+| the popup and its three lists | `src/client/picker.rs`, `src/client/listed.rs` |
 | where a switch key lands, and in what order | `src/client/switch.rs` |
 | the two screen modes | `src/client/screen.rs` |
 | the history view, selection and the mouse | `src/client/scroll.rs` |

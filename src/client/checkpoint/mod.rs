@@ -39,6 +39,10 @@
 //! what a ` (deleted)` suffix meant, would be a second implementation of rules
 //! that took three review rounds to get right, and it would drift.
 
+pub mod taking;
+
+pub use taking::{Dropped, Shared, Taken, Taking, Unsaid, take};
+
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -46,6 +50,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::config;
+use crate::proto::{Size, SpawnSpec};
 
 /// A program that can be asked to pick up where it left off.
 pub struct Resumable {
@@ -491,6 +496,26 @@ pub fn to_spawn(command: &[String]) -> Vec<String> {
     ];
     argv.extend_from_slice(command);
     argv
+}
+
+/// One entry as a spawn, which is the only place a `Kept` becomes a request.
+///
+/// `size` comes from the caller because it is a fact about the terminal the
+/// restore was typed at rather than about the entry.
+///
+/// The label is the command as somebody would say it, since the one being run
+/// is a wrapper ([`to_spawn`]): without it every restored row says
+/// `sh -mc '…' sh claude --continue`, which is a row about the machinery
+/// instead of about the work. Empty for a session that comes back as a prompt,
+/// where the node's own answer is already the right one.
+pub fn spec_for(kept: &Kept, size: Size) -> SpawnSpec {
+    SpawnSpec {
+        name: Some(kept.name.clone()),
+        command: to_spawn(&kept.command),
+        cwd: Some(kept.cwd.clone()),
+        size,
+        label: (!kept.command.is_empty()).then(|| kept.command.join(" ")),
+    }
 }
 
 /// The command inside one of our own wrappers, or the argv unchanged.

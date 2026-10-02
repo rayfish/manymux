@@ -29,7 +29,7 @@
 use crate::client::attach::Motion;
 
 /// A session addressed absolutely: which machine, and which name on it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Located {
     pub host: String,
     pub session: String,

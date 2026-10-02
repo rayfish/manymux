@@ -60,6 +60,39 @@ pub fn is_this_machine(name: &str) -> bool {
     name == LOCAL || name == this_machine()
 }
 
+/// Whether two names on hand are the same machine.
+///
+/// `local` and this machine's own name are the same machine, which is the rule
+/// every command follows. Compared rather than string-matched wherever a name
+/// somebody typed meets a name something else wrote down: a checkpoint file
+/// spelling this machine `local` is a spelling `--host` documents and a
+/// hand-edited file is likely to use, and a raw compare missed it twice, once
+/// carrying a stale entry over beside the fresh one and once saying a group had
+/// been put back when nothing had been.
+pub fn same_machine(named: &str, at: &str) -> bool {
+    named == at || (is_this_machine(named) && is_this_machine(at))
+}
+
+/// A machine named on a command line, under the name a listing gives it.
+///
+/// The two spellings of this machine are not the same string, and an attach
+/// compares them as one: `mm new` with no host says `local`, `mm attach
+/// local/build` says it outright, and every listing labels this machine with
+/// its own short name. A `Located` whose host is the other spelling matches no
+/// row of the listing, so the session the run is *in* was in none of it: the
+/// popup opened highlighting somebody else's session with Enter over it, no row
+/// wore the mark, and the group the run narrows to on the way in was read off a
+/// session nothing could find. Applied where a typed word stops being one and
+/// becomes the address a whole run compares against, rather than at each of the
+/// places that compare.
+pub fn as_listed(host: &str) -> &str {
+    if is_this_machine(host) {
+        this_machine()
+    } else {
+        host
+    }
+}
+
 /// Who is answering: an id for this node, made once and held for as long as the
 /// process lives.
 ///

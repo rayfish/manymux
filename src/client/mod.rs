@@ -9,6 +9,7 @@
 pub mod attach;
 pub mod checkpoint;
 pub mod groups;
+pub mod listed;
 pub mod pen;
 pub mod picker;
 pub mod screen;
