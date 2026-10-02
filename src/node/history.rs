@@ -13,6 +13,22 @@ use avt::{Color, Line, Pen, Vt};
 
 use crate::proto::{Found, View, ViewRequest};
 
+/// How many lines the buffer holds, the screen included.
+///
+/// Counted rather than collected, and the difference is the allocation rather
+/// than the walk: `avt` keeps its lines in a `VecDeque`, whose iterator has no
+/// length to read, so the count is a walk that a release build folds away and a
+/// debug one does not. What it never does is allocate.
+///
+/// The windows below are taken with `skip` and `take` for the reason that is
+/// cheap either way: that iterator implements `advance_by`, so a skip lands by
+/// pointer arithmetic however far in it starts. Collected first, as these were,
+/// every one of them built a `Vec` of all ten thousand lines to render the fifty
+/// a client had asked for, once per keystroke of somebody scrolling.
+fn held(vt: &Vt) -> usize {
+    vt.lines().count()
+}
+
 /// The last `lines` lines of history, rendered with the pen sequences that
 /// coloured them, each ending in a carriage return and a newline.
 ///
@@ -21,11 +37,11 @@ use crate::proto::{Found, View, ViewRequest};
 /// terminal's scrollback and nothing else.
 pub fn render(vt: &Vt, lines: usize) -> String {
     let (_, rows) = vt.size();
-    let all: Vec<&Line> = vt.lines().collect();
     // The view is the last `rows` of them, and the dump paints those.
-    let history = all.len().saturating_sub(rows);
+    let history = held(vt).saturating_sub(rows);
+    let from = history.saturating_sub(lines);
     let mut out = String::new();
-    for line in &all[history.saturating_sub(lines)..history] {
+    for line in vt.lines().skip(from).take(history - from) {
         write_line(line, &mut out);
     }
     out
@@ -45,14 +61,15 @@ pub fn render(vt: &Vt, lines: usize) -> String {
 /// window because everything in one is counted from that line: see
 /// [`View::printed`], and the client that reads it in `client::scroll`.
 pub fn window(vt: &Vt, printed: u64, request: &ViewRequest) -> View {
-    let all: Vec<&Line> = vt.lines().collect();
-    let total = all.len() as u64;
+    let total = held(vt) as u64;
     let from = request.from.min(total.saturating_sub(1));
     // `from` counts back from the newest line, so the window ends here.
     let bottom = total.saturating_sub(from);
     let top = bottom.saturating_sub(u64::from(request.lines));
-    let lines = all[top as usize..bottom as usize]
-        .iter()
+    let lines = vt
+        .lines()
+        .skip(top as usize)
+        .take((bottom - top) as usize)
         .map(|line| {
             let mut rendered = String::new();
             write_line(line, &mut rendered);
@@ -94,9 +111,8 @@ pub fn find(vt: &Vt, printed: u64, needle: &str) -> Found {
     }
     let folded = needle.to_lowercase();
     let cased = needle != folded;
-    let all: Vec<&Line> = vt.lines().collect();
-    let total = all.len() as u64;
-    for (i, line) in all.iter().enumerate() {
+    let total = held(vt) as u64;
+    for (i, line) in vt.lines().enumerate() {
         let text = line.text();
         let found = if cased {
             text.contains(needle)
