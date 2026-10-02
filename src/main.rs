@@ -2142,7 +2142,7 @@ async fn do_attach(
 
     match outcome {
         Outcome::Detached => {
-            println!("[detached from {where_}]");
+            println!("[detached from {where_}]  {}", way_back(&where_, watching));
             Ok(OK)
         }
         Outcome::Exited(code) => {
@@ -2157,6 +2157,23 @@ async fn do_attach(
             unreachable!("switches never leave the loop above")
         }
     }
+}
+
+/// How to get back to the session just left, beside the line saying it has been.
+///
+/// A detach is the one moment somebody is certainly reading, and the name they
+/// want is on the screen in front of them: without this the way back is `mm ls`
+/// and a second look at a name they had a moment ago. Spelled with
+/// [`qualified`], so it is what they would type rather than what the code calls
+/// it: a session on this machine is its bare name.
+///
+/// The short alias, because this is a reminder and not documentation. And `v`
+/// for a run that was a view: `mm a` would put a keyboard into a session
+/// somebody else is working in, which is the one thing whoever typed `mm view`
+/// did not ask for.
+fn way_back(where_: &str, watching: bool) -> String {
+    let verb = if watching { "v" } else { "a" };
+    style::faint(&format!("`mm {verb} {where_}` to come back"))
 }
 
 /// Count one failed attempt at a lost session and sit out the delay it earns.

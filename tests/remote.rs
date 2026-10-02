@@ -1896,6 +1896,37 @@ fn a_machine_on_its_own_attaches_to_the_first_session_on_it() {
     );
 }
 
+/// Leaving says how to come back, in the words somebody would type.
+///
+/// The name is on the screen at the moment of the detach and gone a command
+/// later, so without this the way back is `mm ls` and a second look at a name
+/// they had in front of them. Spelled with the verb the run was: a viewer is
+/// told `mm v`, since `mm a` would put a keyboard into a session somebody else
+/// is working in.
+#[test]
+fn leaving_a_session_says_how_to_come_back() {
+    let world = World::new("detach-way-back");
+
+    world.ok(
+        "laptop",
+        &["new", "-d", "-n", "build", "gpu-box", "sleep", "60"],
+    );
+
+    let (left, seen) = world.on_a_terminal("laptop", &["attach", "gpu-box/build"], "\x1dd");
+    assert!(left, "attaching to gpu-box/build failed: {seen}");
+    assert!(
+        seen.contains("`mm a gpu-box/build` to come back"),
+        "a detach should say how to get back: {seen}"
+    );
+
+    let (left, seen) = world.on_a_terminal("laptop", &["view", "gpu-box/build"], "\x1dd");
+    assert!(left, "viewing gpu-box/build failed: {seen}");
+    assert!(
+        seen.contains("`mm v gpu-box/build` to come back"),
+        "a view should offer a view to come back to, not a keyboard: {seen}"
+    );
+}
+
 /// The machine has to be one that is already watched. Anything else is a
 /// session name that is not running, and going out to ssh for a typo would
 /// hang on a name that resolves to nothing.
