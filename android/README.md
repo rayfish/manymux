@@ -19,10 +19,17 @@ Two halves:
 
 ## What is in this version
 
+Save SSH hosts in the app, then tap one to open its sessions. Hosts survive
+app restarts; the previous single host is kept when upgrading. Back from the
+session list returns to the saved hosts. Add host and SSH key have separate
+pages; wider screens show hosts in two columns.
+
 One machine at a time. Reach it, see what is running, attach to one, type in
 it, resize it, scroll back through what it printed, hop to the session next
-door, leave it, and survive a connection that drops. The drawer, the app-bar
-swipes, groups, selection and notifications are the next ones.
+door, leave it, and survive a connection that drops.
+
+Long press freezes the visible text for selection; drag to extend it, then Copy.
+Groups and notifications are still pending.
 
 What is running is a wall of tiles rather than a list of names, each showing
 that session's screen: a name is what somebody called it weeks ago and the
@@ -38,8 +45,9 @@ Inside a session the bar carries a button for the others on that machine,
 which is where the desktop has `Ctrl-] tab`. It opens on the listing already
 in hand rather than on a round trip, so it costs nothing to press.
 
-Scrolling is a drag on the terminal itself, and there is nothing behind it
-here: the node holds the history and hands over a window of it, which is why
+Scrolling is a drag on the terminal itself. Programs reading the mouse receive
+wheel reports; other programs on the alternate screen receive cursor keys.
+For shell history, there is nothing behind the screen here: the node holds the history and hands over a window of it, which is why
 the app keeps no scrollback of its own and cannot be grown out of memory by a
 session that prints for a week. A tap or anything typed goes back to the live
 screen, and so does dragging back down to it. A machine running a build from
@@ -85,12 +93,16 @@ The app:
 ```bash
 export ANDROID_HOME=/path/to/android/sdk
 ./gradlew assembleDebug            # builds the shim for both ABIs first
+./gradlew assembleRelease -PtargetAbis=arm64-v8a   # unsigned phone APK
 ```
 
 `build-rust.sh` is what Gradle runs. It builds the library for `arm64-v8a` and
 `x86_64` and generates the Kotlin that calls it, from the compiled library
 rather than from the source: what the app calls and what the app links cannot
 disagree.
+
+Release builds shrink code and resources, compress native libraries, and
+optimize Rust for size. Sign the release APK before installing it.
 
 API 24, matching the root crate's own Android target.
 

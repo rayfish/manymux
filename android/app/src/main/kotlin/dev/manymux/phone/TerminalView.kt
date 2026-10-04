@@ -1,10 +1,15 @@
 package dev.manymux.phone
 
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Context
 import android.content.res.Configuration
 import android.graphics.Canvas
 import android.graphics.Paint
 import android.graphics.Typeface
+import android.view.ActionMode
+import android.view.Menu
+import android.view.MenuItem
 import android.view.Choreographer
 import android.view.GestureDetector
 import android.view.KeyEvent
@@ -16,6 +21,8 @@ import android.view.inputmethod.InputConnection
 import android.view.inputmethod.InputMethodManager
 import uniffi.manymux_android.At
 import uniffi.manymux_android.Attach
+import uniffi.manymux_android.Direction
+import uniffi.manymux_android.selectionText
 import uniffi.manymux_android.Dragged
 import uniffi.manymux_android.Grid
 import uniffi.manymux_android.Row
@@ -58,6 +65,7 @@ class TerminalView(context: Context) : View(context), Choreographer.FrameCallbac
     /** What the session is attached through, once there is one. */
     var attach: Attach? = null
         set(value) {
+            selectionMode?.finish()
             field = value
             rows.clear()
             history.clear()
@@ -67,6 +75,10 @@ class TerminalView(context: Context) : View(context), Choreographer.FrameCallbac
             speed = 0f
             pending = 0f
             said = false
+            control = false
+            cursorOn = false
+            viewFrom = 0L
+            viewTotal = 0L
             // A fresh attach has been told nothing, whatever the last one knew.
             told = null
             tellGrid()
@@ -162,14 +174,15 @@ class TerminalView(context: Context) : View(context), Choreographer.FrameCallbac
     override fun onConfigurationChanged(config: Configuration?) {
         super.onConfigurationChanged(config)
         measureCell()
-        rows.clear()
         tellGrid()
+        invalidate()
     }
 
     /** Tell the far end the shape, if it is not the shape it was already told. */
     private fun tellGrid() {
         val grid = grid()
         if (grid == told) return
+        selectionMode?.finish()
         told = grid
         forget(grid.rows.toInt())
         attach?.resize(grid)
@@ -221,6 +234,7 @@ class TerminalView(context: Context) : View(context), Choreographer.FrameCallbac
     }
 
     override fun onDetachedFromWindow() {
+        selectionMode?.finish()
         super.onDetachedFromWindow()
         Choreographer.getInstance().removeFrameCallback(this)
     }
@@ -236,6 +250,7 @@ class TerminalView(context: Context) : View(context), Choreographer.FrameCallbac
                 frame.cursor.row.toInt() != cursorRow ||
                 frame.cursor.visible != cursorOn
             if (frame.changed.isNotEmpty() || moved) {
+                forget(frame.rows.toInt())
                 for (row: Row in frame.changed) {
                     rows[row.at.toInt()] = row.runs
                 }
@@ -275,7 +290,7 @@ class TerminalView(context: Context) : View(context), Choreographer.FrameCallbac
 
     override fun onDraw(canvas: Canvas) {
         canvas.drawColor(Palette.GROUND)
-        for ((at, runs) in if (viewing) history else rows) {
+        for ((at, runs) in selectionRows ?: if (viewing) history else rows) {
             var x = 0f
             val top = at * lineHeight
             for (run in runs) {
@@ -300,6 +315,10 @@ class TerminalView(context: Context) : View(context), Choreographer.FrameCallbac
                 canvas.drawText(run.text, x, top + baseline, ink)
                 x += across
             }
+        }
+        if (selectionRows != null) {
+            drawSelection(canvas)
+            return
         }
         if (viewing) {
             drawMark(canvas)
@@ -346,6 +365,13 @@ class TerminalView(context: Context) : View(context), Choreographer.FrameCallbac
 
     /** Whether the next key is a control chord, set by the extra-keys row. */
     var control = false
+        set(value) {
+            if (field == value) return
+            field = value
+            onControlChanged?.invoke(value)
+        }
+
+    var onControlChanged: ((Boolean) -> Unit)? = null
 
     /** A keyboard asked for before this view had a size to be focused at. */
     private var wanted = false
@@ -385,6 +411,17 @@ class TerminalView(context: Context) : View(context), Choreographer.FrameCallbac
     }
 
     override fun onTouchEvent(event: MotionEvent): Boolean {
+        if (selectionRows != null) {
+            when (event.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    selectionStart = cellUnder(event)
+                    selectionEnd = selectionStart
+                }
+                MotionEvent.ACTION_MOVE, MotionEvent.ACTION_UP -> selectionEnd = cellUnder(event)
+            }
+            invalidate()
+            return true
+        }
         gestures.onTouchEvent(event)
         if (event.actionMasked == MotionEvent.ACTION_UP ||
             event.actionMasked == MotionEvent.ACTION_CANCEL
@@ -414,6 +451,72 @@ class TerminalView(context: Context) : View(context), Choreographer.FrameCallbac
         return true
     }
 
+    private var selectionRows: Map<Int, List<Run>>? = null
+    private var selectionStart = At(0u, 0u)
+    private var selectionEnd = At(0u, 0u)
+    private var selectionMode: ActionMode? = null
+
+    /** Long press freezes the picture; dragging selects cells until Copy. */
+    private fun beginSelection(at: At) {
+        speed = 0f
+        pending = 0f
+        selectionRows = (if (viewing) history else rows).toMap()
+        selectionStart = at
+        selectionEnd = at
+        selectionMode = startActionMode(object : ActionMode.Callback {
+            override fun onCreateActionMode(mode: ActionMode, menu: Menu): Boolean {
+                menu.add(0, 1, 0, "Copy").setShowAsAction(MenuItem.SHOW_AS_ACTION_ALWAYS)
+                menu.add(0, 2, 1, "Select all")
+                return true
+            }
+
+            override fun onPrepareActionMode(mode: ActionMode, menu: Menu) = false
+
+            override fun onActionItemClicked(mode: ActionMode, item: MenuItem): Boolean {
+                if (item.itemId == 2) {
+                    val grid = told ?: return false
+                    selectionStart = At(0u, 0u)
+                    selectionEnd = At((grid.cols - 1u).toUShort(), (grid.rows - 1u).toUShort())
+                    invalidate()
+                    return true
+                }
+                val frozen = selectionRows ?: return false
+                val text = selectionText(
+                    frozen.map { (at, runs) -> Row(at.toUShort(), runs) },
+                    selectionStart, selectionEnd,
+                )
+                val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                clipboard.setPrimaryClip(ClipData.newPlainText("Terminal", text))
+                mode.finish()
+                return true
+            }
+
+            override fun onDestroyActionMode(mode: ActionMode) {
+                selectionMode = null
+                selectionRows = null
+                invalidate()
+            }
+        }, ActionMode.TYPE_FLOATING)
+        if (selectionMode == null) selectionRows = null
+        invalidate()
+    }
+
+    private fun drawSelection(canvas: Canvas) {
+        val grid = told ?: return
+        val a = selectionStart.row.toInt() * grid.cols.toInt() + selectionStart.col.toInt()
+        val b = selectionEnd.row.toInt() * grid.cols.toInt() + selectionEnd.col.toInt()
+        val first = minOf(a, b)
+        val last = maxOf(a, b)
+        block.color = Palette.TEXT
+        block.alpha = 0x55
+        for (row in first / grid.cols.toInt()..last / grid.cols.toInt()) {
+            val left = if (row == first / grid.cols.toInt()) first % grid.cols.toInt() else 0
+            val right = if (row == last / grid.cols.toInt()) last % grid.cols.toInt() + 1 else grid.cols.toInt()
+            canvas.drawRect(left * cellWidth, row * lineHeight, right * cellWidth, (row + 1) * lineHeight, block)
+        }
+        block.alpha = 0xFF
+    }
+
     // ---- the history ----------------------------------------------------
 
     /** Pixels dragged that have not yet added up to a whole line. */
@@ -434,6 +537,10 @@ class TerminalView(context: Context) : View(context), Choreographer.FrameCallbac
                 pending = 0f
                 pointer = cellUnder(event)
                 return true
+            }
+
+            override fun onLongPress(event: MotionEvent) {
+                beginSelection(cellUnder(event))
             }
 
             override fun onSingleTapUp(event: MotionEvent): Boolean {
@@ -592,14 +699,10 @@ class TerminalView(context: Context) : View(context), Choreographer.FrameCallbac
         KeyEvent.KEYCODE_DEL -> byteArrayOf(0x7f)
         KeyEvent.KEYCODE_TAB -> byteArrayOf(0x09)
         KeyEvent.KEYCODE_ESCAPE -> byteArrayOf(0x1b)
-        // The plain spellings. A session in application cursor mode wants the
-        // SS3 ones instead, which this build does not know it is in: the
-        // emulator answers for that and the answer does not cross the boundary
-        // yet.
-        KeyEvent.KEYCODE_DPAD_UP -> "\u001b[A".toByteArray()
-        KeyEvent.KEYCODE_DPAD_DOWN -> "\u001b[B".toByteArray()
-        KeyEvent.KEYCODE_DPAD_RIGHT -> "\u001b[C".toByteArray()
-        KeyEvent.KEYCODE_DPAD_LEFT -> "\u001b[D".toByteArray()
+        KeyEvent.KEYCODE_DPAD_UP -> cursorKey(Direction.UP)
+        KeyEvent.KEYCODE_DPAD_DOWN -> cursorKey(Direction.DOWN)
+        KeyEvent.KEYCODE_DPAD_RIGHT -> cursorKey(Direction.RIGHT)
+        KeyEvent.KEYCODE_DPAD_LEFT -> cursorKey(Direction.LEFT)
         // Volume down is a second ctrl, the way Termux does it: a phone
         // keyboard has none, and a good half of what anybody types at a shell
         // is one.
@@ -611,6 +714,12 @@ class TerminalView(context: Context) : View(context), Choreographer.FrameCallbac
             val typed = event.unicodeChar
             if (typed == 0) null else charOf(typed.toChar())
         }
+    }
+
+    fun cursorKey(direction: Direction): ByteArray {
+        leaveHistory()
+        attach?.cursorKey(direction)
+        return ByteArray(0)
     }
 
     /** Text from a keyboard that composes rather than sending key events. */
@@ -637,6 +746,17 @@ class TerminalView(context: Context) : View(context), Choreographer.FrameCallbac
 
     fun send(bytes: ByteArray) {
         if (bytes.isEmpty()) return
+        leaveHistory()
+        attach?.send(bytes)
+    }
+
+    fun paste(text: String) {
+        leaveHistory()
+        attach?.paste(text)
+    }
+
+    private fun leaveHistory() {
+        selectionMode?.finish()
         // Typing is asking for the session and not for the history: what is
         // typed lands in a shell that has moved on since the lines being read
         // were printed, and a screen that stayed on them would be one where
@@ -646,6 +766,5 @@ class TerminalView(context: Context) : View(context), Choreographer.FrameCallbac
             speed = 0f
             pending = 0f
         }
-        attach?.send(bytes)
     }
 }

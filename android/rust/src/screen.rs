@@ -9,6 +9,9 @@
 //! drawn coalesces in the emulator on its own, which is the backpressure: bytes
 //! pile into a grid of a fixed size rather than into a queue, and one call
 //! collapses however many arrived.
+//!
+//! Cursor keys follow the emulator's application mode, including wheel
+//! gestures translated into keys on the alternate screen.
 
 use std::collections::BTreeSet;
 
@@ -156,6 +159,26 @@ impl Screen {
     /// What the session has asked to be told about the mouse.
     pub fn mouse(&self) -> &Tracking {
         &self.mouse
+    }
+
+    pub fn cursor_key(&self, final_byte: u8) -> Vec<u8> {
+        vec![
+            0x1b,
+            if self.vt.cursor_key_app_mode() {
+                b'O'
+            } else {
+                b'['
+            },
+            final_byte,
+        ]
+    }
+
+    pub fn paste(&self, text: &str) -> Vec<u8> {
+        if self.mouse.bracketed_paste() {
+            format!("\x1b[200~{}\x1b[201~", text.replace('\x1b', "")).into_bytes()
+        } else {
+            text.as_bytes().to_vec()
+        }
     }
 
     /// The session settled on a different size.
@@ -323,6 +346,29 @@ mod tests {
             .find(|row| row.at == at)
             .map(|row| row.runs.iter().map(|run| run.text.as_str()).collect())
             .unwrap_or_default()
+    }
+
+    #[test]
+    fn paste_obeys_the_programs_bracketing_mode() {
+        let mut screen = Screen::at(Size::new(12, 4));
+        assert_eq!(screen.paste("one\ntwo"), b"one\ntwo");
+        screen.feed(b"\x1b[?2004h");
+        assert_eq!(screen.paste("one\ntwo"), b"\x1b[200~one\ntwo\x1b[201~");
+        assert_eq!(screen.paste("\x1b[201~"), b"\x1b[200~[201~\x1b[201~");
+    }
+
+    #[test]
+    fn cursor_keys_follow_application_mode_after_repaint() {
+        let mut screen = Screen::at(Size::new(12, 4));
+        assert_eq!(screen.cursor_key(b'A'), b"\x1b[A");
+        screen.feed(b"\x1b[?1h");
+        assert_eq!(screen.cursor_key(b'B'), b"\x1bOB");
+        screen.repaint(b"\x1b[?1h\x1b[?1049h");
+        assert!(screen.mouse().alternate_scroll());
+        assert_eq!(screen.cursor_key(b'A'), b"\x1bOA");
+        screen.repaint(b"prompt");
+        assert!(!screen.mouse().alternate_scroll());
+        assert_eq!(screen.cursor_key(b'A'), b"\x1b[A");
     }
 
     #[test]

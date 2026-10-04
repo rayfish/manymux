@@ -20,5 +20,6 @@
     <!-- The bright green of the 16, which is what the mark row draws a live
          session with. Everything that means "this one" or "go" is this. -->
     <color name="accent">#FF77DD77</color>
+    <color name="accentSurface">#FF294032</color>
     <color name="warn">#FFFFDD77</color>
 </resources>

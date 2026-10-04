@@ -30,6 +30,7 @@ pub mod machine;
 pub mod mouse;
 pub mod screen;
 pub mod scroll;
+mod selection;
 pub mod session;
 pub mod ssh;
 

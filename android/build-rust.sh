@@ -42,17 +42,18 @@ build() {
 build aarch64-linux-android arm64-v8a aarch64-linux-android
 build x86_64-linux-android x86_64 x86_64-linux-android
 
-# The bindings, from a host build of the same crate: uniffi reads the library's
-# own metadata, and a host library carries the same metadata as a cross one.
-cargo build --release --locked --manifest-path "$crate/Cargo.toml"
+# The host library keeps the metadata that symbol stripping removes from
+# shipped libraries. Bindings use this build and never enter the APK.
+cargo build --quiet --locked --manifest-path "$crate/Cargo.toml"
 case "$(uname -s)" in
-    Darwin) host_library="$crate/target/release/libmanymux_android.dylib" ;;
-    *) host_library="$crate/target/release/libmanymux_android.so" ;;
+    Darwin) host_library="$crate/target/debug/libmanymux_android.dylib" ;;
+    *) host_library="$crate/target/debug/libmanymux_android.so" ;;
 esac
 rm -rf "$out/uniffi"
-cargo run --release --locked --quiet --manifest-path "$crate/Cargo.toml" --bin uniffi-bindgen -- \
+cargo run --locked --quiet --manifest-path "$crate/Cargo.toml" --bin uniffi-bindgen -- \
     generate \
     --library "$host_library" \
+    --config "$crate/uniffi.toml" \
     --language kotlin \
     --no-format \
     --out-dir "$out/uniffi"

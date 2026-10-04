@@ -14,6 +14,9 @@
 //! somebody's pocket draws nothing for hours and must stay attached throughout.
 //! The screen is fed on a task of its own for the same reason, since a burst of
 //! output is the one thing that could put the answer behind a queue.
+//!
+//! A drag goes to mouse tracking first, then to cursor keys on the alternate
+//! screen, and otherwise to the node's history.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -233,6 +236,14 @@ impl Session {
         let _ = self.say.send(Say::Input(bytes));
     }
 
+    pub fn cursor_key(&self, final_byte: u8) {
+        self.send(held(&self.screen).cursor_key(final_byte));
+    }
+
+    pub fn paste(&self, text: &str) {
+        self.send(held(&self.screen).paste(text));
+    }
+
     /// The phone's screen is a different shape now.
     pub fn resize(&self, size: Size) {
         let _ = self.say.send(Say::Resize(size));
@@ -281,12 +292,16 @@ impl Session {
     /// the only order these two are ever taken in.
     fn wheel(&self, lines: i64, at: At) -> Option<Vec<u8>> {
         let screen = held(&self.screen);
-        if !screen.mouse().wanted() {
-            return None;
-        }
         let up = lines > 0;
-        let notch = screen.mouse().wheel(up, at.col, at.row);
-        Some(notch.repeat(lines.unsigned_abs() as usize))
+        let notch = if screen.mouse().wanted() {
+            screen.mouse().wheel(up, at.col, at.row)
+        } else if screen.mouse().alternate_scroll() {
+            screen.cursor_key(if up { b'A' } else { b'B' })
+        } else {
+            return None;
+        };
+        // A gesture cannot allocate an arbitrary amount through the FFI.
+        Some(notch.repeat(lines.unsigned_abs().min(256) as usize))
     }
 
     /// Back to the live screen.

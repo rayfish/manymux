@@ -17,7 +17,8 @@ use std::time::Duration;
 use manymux::proto::Size;
 use manymux_android::keys::{Identity, KnownHosts, generate};
 use manymux_android::machine::{Connections, Machine};
-use manymux_android::session::{Session, State};
+use manymux_android::mouse::At;
+use manymux_android::session::{Dragged, Session, State};
 use sshd::{Serving, Sshd};
 use world::{Mm, World};
 
@@ -34,6 +35,7 @@ use world::{Mm, World};
 enum How {
     /// Answers, and stays.
     Steady,
+    Keys,
     /// Goes away without a word after the first attach, and behaves after.
     Drops,
     /// Goes away, and by the time anybody comes back the session has ended.
@@ -51,6 +53,7 @@ impl How {
     fn script(&self) -> &'static str {
         match self {
             How::Steady => "",
+            How::Keys => "ok,keys",
             How::Drops => "ok,drop",
             How::Gone => "ok,drop,gone",
             How::Vanishes => "ok,drop,ok,vanish",
@@ -223,6 +226,16 @@ async fn what_is_typed_reaches_the_far_end() {
 
     let screen = until_it_says(&session, "hello there").await;
     assert!(screen.contains("hello there"), "{screen}");
+}
+
+#[tokio::test]
+async fn alternate_screen_drags_reach_the_program_as_cursor_keys() {
+    let session = attached("attach-alt-scroll", How::Keys).await;
+    until_it_says(&session, "ready").await;
+    assert_eq!(session.drag(-2, At { col: 0, row: 0 }), Dragged::Wheeled);
+    let screen = until_it_says(&session, "1b4f421b4f42").await;
+    assert!(screen.contains("1b4f421b4f42"));
+    assert!(!session.take_window().open);
 }
 
 #[tokio::test]

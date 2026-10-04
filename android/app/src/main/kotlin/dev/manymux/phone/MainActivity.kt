@@ -5,21 +5,26 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.SharedPreferences
+import android.content.res.ColorStateList
 import android.graphics.Color
 import android.graphics.Rect
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
+import android.graphics.drawable.RippleDrawable
+import android.graphics.drawable.StateListDrawable
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.text.InputType
+import android.text.TextUtils
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup.LayoutParams.MATCH_PARENT
 import android.view.ViewGroup.LayoutParams.WRAP_CONTENT
 import android.view.WindowInsets
 import android.view.WindowInsetsAnimation
+import android.view.inputmethod.InputMethodManager
 import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.PopupMenu
@@ -29,6 +34,7 @@ import android.widget.Toast
 import android.window.OnBackInvokedDispatcher
 import java.util.concurrent.Executors
 import uniffi.manymux_android.Attach
+import uniffi.manymux_android.Direction
 import uniffi.manymux_android.Grid
 import uniffi.manymux_android.Machine
 import uniffi.manymux_android.Phone
@@ -73,6 +79,7 @@ class MainActivity : Activity() {
 
     /** The machine being looked at, kept so the list can be reopened. */
     private var machine: Machine? = null
+    private var homeDetails = false
 
     /** The bar's own clock, kept so it can be stopped. */
     private var ticking: Runnable? = null
@@ -121,6 +128,10 @@ class MainActivity : Activity() {
     /** Whether everything has been let go of, so late work stays away. */
     private var gone = false
 
+    private var surface = 0L
+    private var wallRefresh: Runnable? = null
+
+    private lateinit var hosts: HostStore
     private lateinit var remembered: SharedPreferences
 
     override fun onCreate(saved: Bundle?) {
@@ -142,19 +153,12 @@ class MainActivity : Activity() {
         // nowhere else.
         phone = Phone.keptIn(filesDir.absolutePath)
         remembered = getSharedPreferences("manymux", MODE_PRIVATE)
+        hosts = HostStore(remembered)
         tiles = remembered.getBoolean("tiles", true)
         takeBack()
 
-        // Straight to what is running, if there is somewhere to ask. Opening on
-        // a form asking for an address every time would be asking somebody to
-        // type what the app already knows in order to see what it is for.
-        val known = lastMachine()
-        if (known == null) {
-            showMachine()
-        } else {
-            machine = known
-            listSessions(known)
-        }
+        showMachine()
+
     }
 
     override fun onDestroy() {
@@ -162,9 +166,17 @@ class MainActivity : Activity() {
         // The session goes on running on the machine. This only stops watching
         // it, which is the whole point of the thing.
         gone = true
+        wallRefresh?.let { here.removeCallbacks(it) }
         letGo()
         phone.close()
         elsewhere.shutdownNow()
+    }
+
+    override fun onWindowFocusChanged(focused: Boolean) {
+        super.onWindowFocusChanged(focused)
+        if (focused && attach == null && answered != null && wallRefresh != null) {
+            wallRefresh?.let { here.removeCallbacks(it); here.post(it) }
+        }
     }
 
     // ---- back ------------------------------------------------------------
@@ -191,7 +203,7 @@ class MainActivity : Activity() {
     /** Leave the session for the list, or the list for whatever came before. */
     private fun goBack() {
         if (attach == null) {
-            finish()
+            if (machine != null || homeDetails) showMachine() else finish()
             return
         }
         letGo()
@@ -206,114 +218,270 @@ class MainActivity : Activity() {
 
     // ---- the machine ---------------------------------------------------
 
-    private fun lastMachine(): Machine? {
-        val address = remembered.getString("address", "") ?: ""
-        if (address.isBlank()) return null
-        return Machine(
-            address,
-            remembered.getInt("port", 22).toUShort(),
-            remembered.getString("user", "") ?: "",
-        )
-    }
+    private fun lastMachine(): Machine? = hosts.all().firstOrNull()
 
-    private fun remember(machine: Machine) {
-        remembered.edit()
-            .putString("address", machine.address)
-            .putInt("port", machine.port.toInt())
-            .putString("user", machine.user)
-            .apply()
-    }
+    private fun remember(machine: Machine) = hosts.remember(machine)
 
-    /** The form: which machine, and this device's key. */
+    /** Saved hosts are the home screen; setup has its own pages. */
     private fun showMachine() {
-        val known = lastMachine()
-        val address = field("address", known?.address ?: "", "gpu-box.example")
-        val port = field("port", (known?.port ?: 22u).toString(), "22").apply {
-            inputType = InputType.TYPE_CLASS_NUMBER
+        hideKeyboard()
+        machine = null
+        homeDetails = false
+        answered = null
+        val saved = hosts.all()
+        val body = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(20), dp(8), dp(20), dp(24))
+            if (saved.isEmpty()) {
+                addView(TextView(this@MainActivity).apply {
+                    text = "No hosts yet"
+                    textSize = 20f
+                    setTextColor(colour(R.color.text))
+                    setPadding(dp(4), dp(36), dp(4), dp(8))
+                })
+                addView(note("Save an SSH host to open its running sessions."))
+            }
+            val columns = if (resources.configuration.screenWidthDp >= 600) 2 else 1
+            for (group in saved.chunked(columns)) {
+                val row = LinearLayout(this@MainActivity).apply { orientation = LinearLayout.HORIZONTAL }
+                for (host in group) row.addView(hostCard(host), LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f).apply {
+                    setMargins(0, 0, if (columns == 2 && host == group.first()) dp(12) else 0, dp(12))
+                })
+                if (columns == 2 && group.size == 1) row.addView(View(this@MainActivity), LinearLayout.LayoutParams(0, 0, 1f))
+                addView(row, wide())
+            }
         }
-        val user = field("user", known?.user ?: "", "who to be there")
-
-        val layout = column().apply {
-            addView(title("manymux"))
-            addView(
-                note(
-                    "A terminal you can work in, on machines you reach over ssh. " +
-                        "Sessions keep running when you leave.",
-                ),
-            )
-
-            addView(label("Machine"))
-            addView(address)
-            addView(port)
-            addView(user)
-            addView(
-                primary("see what is running") {
-                    val reaching = Machine(
-                        address.text.toString().trim(),
-                        (port.text.toString().toUShortOrNull() ?: 22u),
-                        user.text.toString().trim(),
-                    )
-                    if (reaching.address.isBlank() || reaching.user.isBlank()) {
-                        say("it wants an address and a user")
-                    } else {
-                        machine = reaching
-                        remember(reaching)
-                        listSessions(reaching)
-                    }
-                },
-            )
-
-            addView(label("This device's key"))
-            addView(
-                note("That machine will not let this in until the line below is in the account's authorized_keys."),
-            )
-            addView(deviceKey(), wide().apply { topMargin = dp(6) })
-            addView(copyTheKey())
-            addView(
-                TextView(this@MainActivity).apply {
-                    text = version()
-                    textSize = 11f
-                    setTextColor(colour(R.color.hint))
-                    setPadding(0, dp(28), 0, 0)
-                },
-            )
+        val add = primary("+  Add host") { showHostForm() }.apply {
+            contentDescription = "add host"
+            textSize = 13f
+            setPadding(dp(16), 0, dp(16), 0)
         }
-
-        show(scrolling(layout))
+        show(homePage("Hosts", "${saved.size} saved", body, add))
     }
 
-    /** What this build is, so an install can be told from the one before it. */
-    private fun version(): String {
-        val app = packageManager.getPackageInfo(packageName, 0).versionName ?: "?"
-        return "app $app  ·  core ${uniffi.manymux_android.coreVersion()}"
+    private fun showHostForm() {
+        homeDetails = true
+        val address = field("address", "", "gpu-box.example")
+        val port = field("port", "22", "22").apply { inputType = InputType.TYPE_CLASS_NUMBER }
+        val user = field("user", lastMachine()?.user ?: "", "user")
+        fun destination(): Machine? {
+            val host = address.text.toString().trim()
+            val account = user.text.toString().trim()
+            val number = port.text.toString().toUShortOrNull()
+            if (host.isBlank() || account.isBlank()) {
+                say("it wants an address and a user")
+                return null
+            }
+            if (number == null || number == 0.toUShort()) {
+                say("port must be between 1 and 65535")
+                return null
+            }
+            return Machine(host, number, account)
+        }
+        val body = column().apply {
+            addView(label("Address"))
+            addView(address)
+            addView(label("Username"))
+            addView(user)
+            addView(label("Port"))
+            addView(port)
+            addView(primary("save host") {
+                destination()?.let { remember(it); showMachine() }
+            })
+            addView(secondary("Connect now") {
+                destination()?.let {
+                    homeDetails = false
+                    machine = it
+                    remember(it)
+                    listSessions(it)
+                }
+            })
+        }
+        show(homePage("Add host", "SSH connection", body, back = true))
+    }
+
+    private fun showDeviceKey() {
+        homeDetails = true
+        val body = column().apply {
+            addView(note("Add this public key to the host's authorized_keys to allow access."))
+            addView(deviceKey(), wide().apply { topMargin = dp(16) })
+            addView(copyTheKey())
+        }
+        show(homePage("SSH key", "This device's public key", body, back = true))
+    }
+
+    private fun homePage(heading: String, detail: String, body: View, action: View? = null, back: Boolean = false): View {
+        val top = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(20), dp(8), dp(20), dp(8))
+            addView(TextView(this@MainActivity).apply {
+                text = if (back) "Back" else "manymux"
+                textSize = 14f
+                typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+                setTextColor(colour(if (back) R.color.accent else R.color.dim))
+                gravity = Gravity.CENTER_VERTICAL
+                minHeight = dp(48)
+                if (back) {
+                    isClickable = true
+                    setBackgroundResource(pressable())
+                    setOnClickListener { showMachine() }
+                }
+            }, LinearLayout.LayoutParams(0, dp(48), 1f))
+            if (!back) addView(TextView(this@MainActivity).apply {
+                text = "SSH key"
+                textSize = 13f
+                setTextColor(colour(R.color.dim))
+                gravity = Gravity.CENTER
+                contentDescription = "show SSH public key"
+                isClickable = true
+                setPadding(dp(12), 0, 0, 0)
+                setBackgroundResource(pressable())
+                setOnClickListener { showDeviceKey() }
+            }, LinearLayout.LayoutParams(WRAP_CONTENT, dp(48)))
+        }
+        val headingRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(20), dp(8), dp(20), dp(24))
+            addView(LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.VERTICAL
+                addView(TextView(this@MainActivity).apply {
+                    text = heading
+                    textSize = 30f
+                    typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+                    setTextColor(colour(R.color.text))
+                })
+                addView(TextView(this@MainActivity).apply {
+                    text = detail
+                    textSize = 12f
+                    setTextColor(colour(R.color.dim))
+                    setPadding(0, dp(6), 0, 0)
+                })
+            }, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
+            action?.let { addView(it, LinearLayout.LayoutParams(WRAP_CONTENT, dp(48))) }
+        }
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(colour(R.color.ground))
+            addView(top, wide())
+            addView(headingRow, wide())
+            addView(scrolling(body), LinearLayout.LayoutParams(MATCH_PARENT, 0, 1f))
+        }
+    }
+
+    private fun hostCard(host: Machine): View {
+        val destination = "${host.user}@${host.address}" +
+            if (host.port == 22.toUShort()) "" else ":${host.port}"
+        val words = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(16), dp(22), dp(4), dp(22))
+            addView(TextView(this@MainActivity).apply {
+                text = host.address
+                textSize = 16f
+                typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+                setTextColor(colour(R.color.text))
+                maxLines = 1
+                ellipsize = TextUtils.TruncateAt.END
+            })
+            addView(TextView(this@MainActivity).apply {
+                text = "${host.user}  ·  port ${host.port}"
+                textSize = 12f
+                setTextColor(colour(R.color.dim))
+                setPadding(0, dp(7), 0, 0)
+                maxLines = 1
+                ellipsize = TextUtils.TruncateAt.END
+            })
+
+        }
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            background = panel(R.color.raised, dp(16))
+            foreground = resources.getDrawable(pressable(), theme)
+            contentDescription = "connect $destination"
+            isClickable = true
+            setOnClickListener {
+                machine = host
+                remember(host)
+                listSessions(host)
+            }
+            addView(TextView(this@MainActivity).apply {
+                text = ">_"
+                textSize = 17f
+                typeface = Typeface.MONOSPACE
+                gravity = Gravity.CENTER
+                setTextColor(colour(R.color.accent))
+                background = panel(R.color.accentSurface, dp(12))
+                importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+            }, LinearLayout.LayoutParams(dp(44), dp(44)).apply { leftMargin = dp(16) })
+            addView(words, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
+            addView(TextView(this@MainActivity).apply {
+                text = "⋮"
+                textSize = 22f
+                gravity = Gravity.CENTER
+                setTextColor(colour(R.color.dim))
+                contentDescription = "options for $destination"
+                isClickable = true
+                setBackgroundResource(pressable())
+                setOnClickListener { under ->
+                    PopupMenu(this@MainActivity, under).apply {
+                        menu.add("Remove host").setOnMenuItemClickListener {
+                            hosts.remove(host)
+                            showMachine()
+                            true
+                        }
+                        show()
+                    }
+                }
+            }, LinearLayout.LayoutParams(dp(48), dp(64)))
+        }
     }
 
     // ---- what is running -----------------------------------------------
 
     /** The main screen: everything running on that machine. */
     private fun listSessions(machine: Machine) {
+        hideKeyboard()
         answered = null
         show(overview(machine, column().apply { addView(note("reaching ${machine.address}")) }))
 
+        loadWall(machine, surface)
+    }
+
+    private fun loadWall(machine: Machine, expected: Long) {
         elsewhere.execute {
             val answer = runCatching { phone.wall(machine) }
             here.post {
-                // The answer can arrive after somebody left: the executor
-                // cannot interrupt a thread sitting in a call across the
-                // boundary, so this lands on an activity that has already let
-                // go of everything.
-                if (isFinishing || gone) return@post
+                if (isFinishing || gone || surface != expected) return@post
+                val previous = (findViewById<android.view.ViewGroup>(android.R.id.content)
+                    .getChildAt(0) as? LinearLayout)?.getChildAt(1) as? ScrollView
+                val position = previous?.scrollY ?: 0
                 val body = answer.fold(
                     onSuccess = { wall ->
                         seen = wall.running
                         answered = wall
                         sessions(machine, wall)
                     },
-                    onFailure = { why -> trouble(machine, why) },
+                    onFailure = { why ->
+                        answered?.let { sessions(machine, it) } ?: trouble(machine, why)
+                    },
                 )
-                show(overview(machine, body))
+                val overview = overview(machine, body)
+                show(overview)
+                (overview as LinearLayout).getChildAt(1).let { scroll ->
+                    scroll.post { scroll.scrollTo(0, position) }
+                }
+                scheduleWallRefresh(machine)
             }
         }
+    }
+
+    private fun scheduleWallRefresh(machine: Machine) {
+        val current = surface
+        wallRefresh = Runnable {
+            if (surface == current && !gone && hasWindowFocus()) loadWall(machine, current)
+        }.also { here.postDelayed(it, 2000) }
     }
 
     /**
@@ -329,6 +497,7 @@ class MainActivity : Activity() {
         tiles = !tiles
         remembered.edit().putBoolean("tiles", tiles).apply()
         show(overview(machine, sessions(machine, wall)))
+        scheduleWallRefresh(machine)
     }
 
     /** The screen the list sits in: a bar with the machine and a `+`. */
@@ -341,13 +510,17 @@ class MainActivity : Activity() {
         }
         val who = TextView(this).apply {
             text = machine.user
-            textSize = 11f
-            setTextColor(colour(R.color.hint))
+            textSize = 12f
+            setTextColor(colour(R.color.dim))
         }
         val words = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             addView(name)
             addView(who)
+            isClickable = true
+            contentDescription = "saved hosts"
+            setBackgroundResource(pressable())
+            setOnClickListener { showMachine() }
         }
         val add = TextView(this).apply {
             text = "+"
@@ -564,7 +737,7 @@ class MainActivity : Activity() {
             background = panel(R.color.raised, round = dp(10))
             foreground = resources.getDrawable(pressable(), theme)
             clipToOutline = true
-            addView(glass, wide())
+            addView(glass)
             addView(under, wide())
             setOnClickListener { open(machine, session.name) }
         }
@@ -652,16 +825,23 @@ class MainActivity : Activity() {
     /** A login shell on that machine, opened as soon as it has a name. */
     private fun start(machine: Machine) {
         say("starting one")
+        surface += 1
+        wallRefresh?.let { here.removeCallbacks(it) }
+        wallRefresh = null
+        val expected = surface
         elsewhere.execute {
             // A size to start it at. The real one is sent the moment the view
             // knows its own, which is a resize the session has not printed
             // anything into yet.
             val answer = runCatching { phone.startOn(machine, Grid(80u, 24u)) }
             here.post {
-                if (isFinishing || gone) return@post
+                if (isFinishing || gone || surface != expected) return@post
                 answer
                     .onSuccess { name -> open(machine, name) }
-                    .onFailure { why -> say(why.message ?: "could not start one") }
+                    .onFailure { why ->
+                        say(why.message ?: "could not start one")
+                        scheduleWallRefresh(machine)
+                    }
             }
         }
     }
@@ -799,10 +979,12 @@ class MainActivity : Activity() {
     private fun refresh(machine: Machine) {
         if (asking) return
         asking = true
+        val expected = surface
         elsewhere.execute {
             val answer = runCatching { phone.runningOn(machine) }
             here.post {
                 asking = false
+                if (surface != expected) return@post
                 if (isFinishing || gone) return@post
                 // A failure says nothing: nobody asked for this, and the
                 // session on the screen is the thing being used. The copy that
@@ -868,47 +1050,59 @@ class MainActivity : Activity() {
     /** The keys a phone keyboard has not got. */
     private fun extraKeys(screen: TerminalView): View {
         val keys = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
+            orientation = LinearLayout.VERTICAL
             setBackgroundColor(colour(R.color.panel))
+            setPadding(dp(6), dp(6), dp(6), dp(6))
         }
-        fun key(label: String, press: (TextView) -> Unit) {
+        fun row(): LinearLayout = LinearLayout(this).also {
+            it.orientation = LinearLayout.HORIZONTAL
+            keys.addView(it, wide())
+        }
+        fun space(row: LinearLayout) {
+            row.addView(View(this), LinearLayout.LayoutParams(0, dp(48), 1f).apply { setMargins(dp(2), dp(2), dp(2), dp(2)) })
+        }
+        fun key(row: LinearLayout, label: String, description: String = label, press: (TextView) -> Unit): TextView {
             val button = TextView(this).apply {
                 text = label
-                textSize = 13f
+                contentDescription = description
+                textSize = if (description in listOf("up", "down", "left", "right")) 21f else 13f
                 gravity = Gravity.CENTER
                 setTextColor(colour(R.color.text))
-                setPadding(0, dp(14), 0, dp(14))
                 isClickable = true
-                setBackgroundResource(pressable())
+                background = buttonBackground(R.color.raised, selectable = true)
             }
             button.setOnClickListener { press(button) }
-            keys.addView(
-                button,
-                LinearLayout.LayoutParams(0, WRAP_CONTENT).apply { weight = 1f },
-            )
+            row.addView(button, LinearLayout.LayoutParams(0, dp(48), 1f).apply { setMargins(dp(2), dp(2), dp(2), dp(2)) })
+            return button
         }
-        key("esc") { screen.send(byteArrayOf(0x1b)) }
-        key("tab") { screen.send(byteArrayOf(0x09)) }
+        val top = row()
+        key(top, "esc") { screen.send(byteArrayOf(0x1b)) }
+        key(top, "tab") { screen.send(byteArrayOf(0x09)) }
         // Held rather than pressed with something: the next character typed is
         // the chord, which is the only way a soft keyboard can spell one. It
         // says so by staying lit, since a modifier you cannot see the state of
         // is one you press twice.
-        key("ctrl") { button ->
-            screen.control = !screen.control
-            button.setTextColor(
-                if (screen.control) colour(R.color.accent) else colour(R.color.text),
-            )
+        val ctrl = key(top, "ctrl") { screen.control = !screen.control }
+        fun showControl(held: Boolean) {
+            ctrl.isSelected = held
+            ctrl.setTextColor(if (held) colour(R.color.accent) else colour(R.color.text))
         }
-        key("↑") { screen.send("\u001b[A".toByteArray()) }
-        key("↓") { screen.send("\u001b[B".toByteArray()) }
-        key("←") { screen.send("\u001b[D".toByteArray()) }
-        key("→") { screen.send("\u001b[C".toByteArray()) }
-        key("paste") {
+        screen.onControlChanged = ::showControl
+        showControl(screen.control)
+        space(top)
+        key(top, "↑", "up") { screen.cursorKey(Direction.UP) }
+        space(top)
+        val bottom = row()
+        key(bottom, "paste") {
             val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
             val text = clipboard.primaryClip?.getItemAt(0)?.coerceToText(this)?.toString()
-            if (!text.isNullOrEmpty()) screen.send(text.toByteArray())
+            if (!text.isNullOrEmpty()) screen.paste(text)
         }
-        key("⌨") { screen.openKeyboard() }
+        key(bottom, "⌨", "keyboard") { screen.openKeyboard() }
+        space(bottom)
+        key(bottom, "←", "left") { screen.cursorKey(Direction.LEFT) }
+        key(bottom, "↓", "down") { screen.cursorKey(Direction.DOWN) }
+        key(bottom, "→", "right") { screen.cursorKey(Direction.RIGHT) }
         return keys
     }
 
@@ -932,6 +1126,9 @@ class MainActivity : Activity() {
      * [onCreate] now says outright rather than leaving to the platform.
      */
     private fun show(view: View) {
+        surface += 1
+        wallRefresh?.let { here.removeCallbacks(it) }
+        wallRefresh = null
         // Whatever was moving was moving on the screen this replaces, and its
         // callback goes with it: a view taken out of the hierarchy part way
         // through an animation is never told the animation ended, so the flag
@@ -1043,6 +1240,15 @@ class MainActivity : Activity() {
         cornerRadius = round.toFloat()
     }
 
+    private fun buttonBackground(fill: Int, selectable: Boolean = false): RippleDrawable {
+        fun shape(colour: Int) = panel(colour, dp(12)).apply { setStroke(dp(1), this@MainActivity.colour(R.color.line)) }
+        val states = StateListDrawable().apply {
+            if (selectable) addState(intArrayOf(android.R.attr.state_selected), shape(R.color.accentSurface))
+            addState(intArrayOf(), shape(fill))
+        }
+        return RippleDrawable(ColorStateList.valueOf(colour(R.color.line)), states, panel(R.color.text, dp(12)))
+    }
+
     /** The platform's own press feedback, so a row looks like something to tap. */
     private fun pressable(): Int {
         val out = android.util.TypedValue()
@@ -1065,10 +1271,10 @@ class MainActivity : Activity() {
 
     private fun title(what: String) = TextView(this).apply {
         text = what
-        textSize = 30f
-        typeface = Typeface.create("sans-serif-light", Typeface.NORMAL)
+        textSize = 32f
+        typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
         setTextColor(colour(R.color.text))
-        setPadding(0, dp(20), 0, dp(6))
+        setPadding(0, dp(8), 0, dp(4))
     }
 
     /** A small uppercase heading, which is what separates the sections. */
@@ -1077,14 +1283,14 @@ class MainActivity : Activity() {
         textSize = 11f
         letterSpacing = 0.14f
         setTextColor(colour(R.color.accent))
-        setPadding(0, dp(28), 0, dp(10))
+        setPadding(0, dp(20), 0, dp(10))
     }
 
     private fun note(what: String) = TextView(this).apply {
         text = what
         textSize = 13f
         setTextColor(colour(R.color.dim))
-        setPadding(dp(20), dp(20), dp(20), dp(8))
+        setPadding(0, dp(8), 0, dp(12))
     }
 
     private fun field(what: String, filled: String, example: String) = EditText(this).apply {
@@ -1095,7 +1301,7 @@ class MainActivity : Activity() {
         textSize = 15f
         setTextColor(colour(R.color.text))
         setHintTextColor(colour(R.color.hint))
-        background = panel(R.color.raised)
+        background = panel(R.color.raised, dp(12))
         setPadding(dp(14), dp(14), dp(14), dp(14))
         layoutParams = wide().apply { bottomMargin = dp(8) }
     }
@@ -1106,7 +1312,8 @@ class MainActivity : Activity() {
         textSize = 15f
         gravity = Gravity.CENTER
         setTextColor(colour(R.color.ground))
-        background = panel(R.color.accent)
+        background = buttonBackground(R.color.accent)
+        minHeight = dp(48)
         setPadding(dp(16), dp(15), dp(16), dp(15))
         isClickable = true
         setOnClickListener { press() }
@@ -1118,15 +1325,18 @@ class MainActivity : Activity() {
         textSize = 14f
         gravity = Gravity.CENTER
         setTextColor(colour(R.color.text))
-        background = GradientDrawable().apply {
-            setColor(Color.TRANSPARENT)
-            cornerRadius = dp(6).toFloat()
-            setStroke(dp(1), colour(R.color.line))
-        }
+        background = buttonBackground(R.color.ground)
+        minHeight = dp(48)
         setPadding(dp(16), dp(13), dp(16), dp(13))
         isClickable = true
         setOnClickListener { press() }
         layoutParams = wide().apply { topMargin = dp(8) }
+    }
+
+    private fun hideKeyboard() {
+        val token = currentFocus?.windowToken ?: return
+        val keyboard = getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
+        keyboard.hideSoftInputFromWindow(token, 0)
     }
 
     private fun say(what: String) {

@@ -94,6 +94,9 @@ async fn main() -> anyhow::Result<()> {
                     attached = true;
                     // The repaint, then a probe. Both are what a node sends
                     // straight after an attach.
+                    if doing == "keys" {
+                        proto::write_frame(&mut out, tag::DATA, b"\x1b[?1049h\x1b[?1h").await?;
+                    }
                     proto::write_frame(&mut out, tag::DATA, painted().as_bytes()).await?;
                     proto::write_frame(&mut out, tag::PING, &[]).await?;
                     out.flush().await?;
@@ -119,7 +122,17 @@ async fn main() -> anyhow::Result<()> {
             // Typed at. Echoed the way a shell echoes, so a test can see that
             // what it sent reached the far end and came back.
             tag::DATA if attached => {
-                proto::write_frame(&mut out, tag::DATA, &frame.body).await?;
+                let bytes = if doing == "keys" {
+                    frame
+                        .body
+                        .iter()
+                        .map(|byte| format!("{byte:02x}"))
+                        .collect::<String>()
+                        .into_bytes()
+                } else {
+                    frame.body
+                };
+                proto::write_frame(&mut out, tag::DATA, &bytes).await?;
                 out.flush().await?;
             }
             // The client is alive. Saying so on the screen is how a test sees

@@ -57,6 +57,7 @@ getrandom = { version = "0.4", features = ["sys_rng"] }
 # uses one directory up: the screen a phone paints and the screen the node
 # paints have to be the same screen.
 avt = "0.18.0"
+unicode-width = "0.1.14"
 
 # The Kotlin side of the boundary, generated from the types below rather than
 # written twice.
@@ -90,3 +91,9 @@ tokio-stream = { version = "0.1", features = ["net"] }
 # that calls it. A binary of its own because that is how uniffi is driven.
 name = "uniffi-bindgen"
 path = "src/bin/uniffi-bindgen.rs"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = "symbols"

@@ -22,6 +22,9 @@
 //! one bit would put a rewriter in front of the emulator. What is copied is a
 //! list of mode numbers fixed by the spec, and nothing about how they are
 //! handled.
+//!
+//! Without mouse tracking, the alternate screen uses cursor keys for wheel
+//! gestures. The primary screen continues to use the node's history.
 
 /// Where a gesture is, in cells, counted from the top left at zero.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
@@ -40,6 +43,8 @@ pub struct Tracking {
     /// is told about, not whether it is told anything.
     wants: bool,
     encoding: Encoding,
+    alternate: bool,
+    paste: bool,
 }
 
 /// How a report is spelled. Whichever the program last asked for.
@@ -61,6 +66,8 @@ enum State {
     Ground,
     Escape,
     Csi,
+    String,
+    StringEscape,
 }
 
 /// Longest parameter run kept. A real private mode sequence is a few bytes,
@@ -73,11 +80,8 @@ const X10_MAX: u16 = 223;
 impl Tracking {
     /// Bytes the session printed.
     ///
-    /// Only `ESC [` starts a sequence here, so the payload of an OSC cannot
-    /// flip a mode by containing the text of one. A DCS or a tmux passthrough
-    /// carrying a real `ESC [ ? 1000 h` inside it can, and that is left alone:
-    /// a program printing the bytes that switch a mode on switches it on in
-    /// every terminal, and this one is not the place to start disagreeing.
+    /// OSC and other control strings are skipped through their terminator;
+    /// private modes embedded in their payload are not terminal commands.
     pub fn feed(&mut self, bytes: &[u8]) {
         for &byte in bytes {
             match self.state {
@@ -92,6 +96,11 @@ impl Tracking {
                     // a second escape starts again rather than being eaten.
                     self.state = match byte {
                         b'[' => State::Csi,
+                        b']' | b'P' | b'X' | b'^' | b'_' => State::String,
+                        b'c' => {
+                            *self = Self::default();
+                            State::Ground
+                        }
                         0x1b => State::Escape,
                         _ => State::Ground,
                     };
@@ -109,6 +118,18 @@ impl Tracking {
                     // Not a sequence at all: an escape someone printed.
                     _ => self.state = State::Ground,
                 },
+                State::String => match byte {
+                    0x07 => self.state = State::Ground,
+                    0x1b => self.state = State::StringEscape,
+                    _ => {}
+                },
+                State::StringEscape => {
+                    self.state = match byte {
+                        b'\\' => State::Ground,
+                        0x1b => State::StringEscape,
+                        _ => State::String,
+                    };
+                }
             }
         }
     }
@@ -133,6 +154,8 @@ impl Tracking {
                 // starts in rather than to whatever was asked for before it.
                 1006 | 1016 => self.encoding = if on { Encoding::Sgr } else { Encoding::X10 },
                 1015 => self.encoding = if on { Encoding::Urxvt } else { Encoding::X10 },
+                47 | 1047 | 1049 => self.alternate = on,
+                2004 => self.paste = on,
                 _ => {}
             }
         }
@@ -145,6 +168,14 @@ impl Tracking {
     /// its own scrolling from exactly these reports.
     pub fn wanted(&self) -> bool {
         self.wants
+    }
+
+    pub fn alternate_scroll(&self) -> bool {
+        self.alternate
+    }
+
+    pub fn bracketed_paste(&self) -> bool {
+        self.paste
     }
 
     /// One wheel notch at a cell, spelled the way the session asked for.
@@ -183,6 +214,24 @@ mod tests {
         let mut tracking = Tracking::default();
         tracking.feed(output.as_bytes());
         tracking
+    }
+
+    #[test]
+    fn string_payloads_and_reset_cannot_leave_tracking_enabled() {
+        let mut tracking = watching("\x1b]0;title \x1b[?1000h\x07");
+        assert!(!tracking.wanted());
+        tracking.feed(b"\x1b[?1000h\x1b[?1049h\x1bc");
+        assert!(!tracking.wanted());
+        assert!(!tracking.alternate_scroll());
+    }
+
+    #[test]
+    fn alternate_screen_scrolls_without_mouse_tracking() {
+        let mut tracking = watching("\x1b[?1049h");
+        assert!(tracking.alternate_scroll());
+        assert!(!tracking.wanted());
+        tracking.feed(b"\x1b[?1049l");
+        assert!(!tracking.alternate_scroll());
     }
 
     #[test]

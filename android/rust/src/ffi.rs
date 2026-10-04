@@ -420,6 +420,14 @@ impl Attach {
         self.session.send(bytes);
     }
 
+    pub fn cursor_key(&self, direction: Direction) {
+        self.session.cursor_key(direction.final_byte());
+    }
+
+    pub fn paste(&self, text: String) {
+        self.session.paste(&text);
+    }
+
     pub fn resize(&self, grid: Grid) {
         self.session.resize(grid.into());
     }
@@ -431,6 +439,25 @@ impl Attach {
 
     pub fn state(&self) -> State {
         self.session.state()
+    }
+}
+
+#[derive(uniffi::Enum)]
+pub enum Direction {
+    Up,
+    Down,
+    Right,
+    Left,
+}
+
+impl Direction {
+    fn final_byte(&self) -> u8 {
+        match self {
+            Self::Up => b'A',
+            Self::Down => b'B',
+            Self::Right => b'C',
+            Self::Left => b'D',
+        }
     }
 }
 
