@@ -24,13 +24,12 @@
 //! fetched, so a machine reached over ssh is read by the same code, and a
 //! checkpoint of a Linux box can be taken from a Mac.
 //!
-//! Reading is Linux only, and answers a blank rather than a guess anywhere
-//! else. macOS has no `/proc`: the directory would come from `libproc` and the
-//! argv from a `KERN_PROCARGS2` sysctl, which is a separate piece of work. A
-//! blank is a real answer here, and a much better one than a wrong directory:
-//! a session restored in the wrong place resumes somebody else's conversation.
-//! Note that this cuts only one way — a Mac cannot describe its *own*
-//! sessions, but it can describe a Linux machine's over ssh.
+//! Linux reads `/proc`; macOS reads libproc for the foreground group and cwd,
+//! and `KERN_PROCARGS2` for argv. Other platforms answer blank rather than
+//! guessing a directory. Both fields always describe the same process.
+
+#[cfg(target_os = "macos")]
+mod macos;
 
 /// The program holding a session's terminal, and the directory it is in.
 ///
@@ -80,7 +79,10 @@ pub fn of(leader: u32) -> Foreground {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
+pub use macos::of;
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub fn of(_leader: u32) -> Foreground {
     Foreground::default()
 }
