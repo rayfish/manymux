@@ -28,8 +28,14 @@ One machine at a time. Reach it, see what is running, attach to one, type in
 it, resize it, scroll back through what it printed, hop to the session next
 door, leave it, and survive a connection that drops.
 
+An open session runs in a foreground service while you use other apps. Its
+ongoing notification returns to the terminal; allow notifications when asked
+to see it. Reopening the activity keeps the same connection and screen. Back
+to the session list detaches and removes the notification. A failed attach or
+ended session stops the service too.
+
 Long press freezes the visible text for selection; drag to extend it, then Copy.
-Groups and notifications are still pending.
+Groups and session event notifications are still pending.
 
 What is running is a wall of tiles rather than a list of names, each showing
 that session's screen: a name is what somebody called it weeks ago and the

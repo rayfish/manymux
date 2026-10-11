@@ -9,6 +9,8 @@
 //! drawn coalesces in the emulator on its own, which is the backpressure: bytes
 //! pile into a grid of a fixed size rather than into a queue, and one call
 //! collapses however many arrived.
+//! A recreated view asks for every row again, including while disconnected;
+//! this redraw uses the screen already held here and needs no host response.
 //!
 //! Cursor keys follow the emulator's application mode, including wheel
 //! gestures translated into keys on the alternate screen.
@@ -187,6 +189,11 @@ impl Screen {
         let changes = self.vt.resize(size.cols as usize, size.rows as usize);
         self.changed.extend(changes.lines.iter().copied());
         self.changed.extend(0..size.rows as usize);
+    }
+
+    /// Mark the whole screen for a view that has no previous frame.
+    pub fn redraw(&mut self) {
+        self.changed.extend(0..self.size.rows as usize);
     }
 
     /// The rows that have changed since this was last asked, and the cursor.
@@ -415,6 +422,24 @@ mod tests {
         let frame = screen.take_frame();
 
         assert!(frame.changed.is_empty());
+    }
+
+    #[test]
+    fn a_new_view_can_redraw_without_more_output() {
+        let mut screen = screen(20, 4);
+        screen.feed(b"hello");
+        let original = screen.take_frame();
+        assert!(screen.take_frame().changed.is_empty());
+
+        screen.redraw();
+        let redrawn = screen.take_frame();
+        assert_eq!(redrawn.changed.len(), 4);
+        assert_eq!(
+            redrawn.changed[0].runs[0].text,
+            original.changed[0].runs[0].text
+        );
+        assert_eq!(redrawn.cursor.col, original.cursor.col);
+        assert!(screen.take_frame().changed.is_empty());
     }
 
     #[test]

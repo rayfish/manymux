@@ -393,6 +393,11 @@ impl Attach {
         self.session.take_frame()
     }
 
+    /// Paint every row into a new view, even while waiting to reconnect.
+    pub fn redraw(&self) {
+        self.session.redraw();
+    }
+
     /// The view over the host's history, taken the way a frame is.
     ///
     /// Called on the same frame callback and for the same reason: what is

@@ -1,10 +1,12 @@
 package dev.manymux.phone
 
+import android.Manifest
 import android.app.Activity
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.SharedPreferences
+import android.content.pm.PackageManager
 import android.content.res.ColorStateList
 import android.graphics.Color
 import android.graphics.Rect
@@ -69,6 +71,7 @@ import uniffi.manymux_android.Wall
 class MainActivity : Activity() {
 
     private lateinit var phone: Phone
+    private val client get() = application as ManymuxApplication
 
     /** Anything that talks to a machine, off the thread drawing the screen. */
     private val elsewhere = Executors.newSingleThreadExecutor()
@@ -149,26 +152,32 @@ class MainActivity : Activity() {
             window.setDecorFitsSystemWindows(false)
         }
 
-        // App-private storage: the key this device is known by lives here and
-        // nowhere else.
-        phone = Phone.keptIn(filesDir.absolutePath)
+        phone = client.phone
         remembered = getSharedPreferences("manymux", MODE_PRIVATE)
         hosts = HostStore(remembered)
         tiles = remembered.getBoolean("tiles", true)
         takeBack()
 
-        showMachine()
+        val kept = client.session
+        if (kept != null && when (kept.attach.state()) {
+                is State.Reaching, is State.Attached, is State.Waiting -> true
+                else -> false
+            }) {
+            machine = kept.machine
+            showSession(kept.machine, kept.name, kept.attach)
+        } else {
+            client.leave()
+            showMachine()
+        }
 
     }
 
     override fun onDestroy() {
         super.onDestroy()
-        // The session goes on running on the machine. This only stops watching
-        // it, which is the whole point of the thing.
+        // SessionService owns the background lifetime; only release these views.
         gone = true
         wallRefresh?.let { here.removeCallbacks(it) }
-        letGo()
-        phone.close()
+        releaseScreen()
         elsewhere.shutdownNow()
     }
 
@@ -849,10 +858,20 @@ class MainActivity : Activity() {
     // ---- the session ----------------------------------------------------
 
     private fun open(machine: Machine, name: String) {
+        showSession(machine, name, null)
+    }
+
+    private fun showSession(machine: Machine, name: String, kept: Attach?) {
         // Whatever was open before this, if this is a switch rather than an
         // arrival: the tick holds the bar of a screen that is about to be
         // replaced, and a second attach left beside the first is two of them.
-        letGo()
+        if (kept == null) letGo() else releaseScreen()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED &&
+            !remembered.getBoolean("asked-notifications", false)) {
+            remembered.edit().putBoolean("asked-notifications", true).apply()
+            requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
+        }
 
         val bar = TextView(this).apply {
             text = "${machine.address}/$name"
@@ -900,19 +919,22 @@ class MainActivity : Activity() {
             )
             addView(extraKeys(screen), LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
         }
-        show(layout)
-
         // Attaching needs a grid to ask for, and the view only knows its size
         // once it has been laid out. So the attach waits for the first one.
         screen.onGrid = { grid ->
-            if (attach == null) {
-                val attached = phone.attach(machine, name, grid)
+            if (attach == null && !gone && terminal === screen) {
+                val attached = kept ?: client.open(machine, name, grid)
                 attach = attached
+                if (kept != null) {
+                    attached.closeView()
+                    attached.redraw()
+                }
                 screen.attach = attached
                 watch(attached, bar, machine, name)
             }
         }
 
+        show(layout)
         screen.openKeyboard()
 
         // And ask what else is running while nobody is waiting on the answer,
@@ -1026,24 +1048,18 @@ class MainActivity : Activity() {
         here.post(tick)
     }
 
-    /**
-     * Stop watching, and let go of the far end.
-     *
-     * All three parts matter. The tick reposts itself forever and holds the bar,
-     * which holds the activity; the `Attach` is a handle to an object on the
-     * other side of the boundary that nothing else will release; and leaving
-     * either behind means a second session opened later has two of them.
-     *
-     * What this does *not* let go of is the ssh connection, which belongs to
-     * the `Phone` and outlives every attach made over it.
-     */
+    /** Detach deliberately, releasing the views before closing their handle. */
     private fun letGo() {
+        releaseScreen()
+        client.leave()
+    }
+
+    private fun releaseScreen() {
         ticking?.let { here.removeCallbacks(it) }
         ticking = null
+        terminal?.onGrid = null
         terminal?.attach = null
         terminal = null
-        attach?.detach()
-        attach?.close()
         attach = null
     }
 

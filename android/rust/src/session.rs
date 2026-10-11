@@ -231,6 +231,10 @@ impl Session {
         held(&self.screen).take_frame()
     }
 
+    pub fn redraw(&self) {
+        held(&self.screen).redraw();
+    }
+
     /// Keystrokes, or anything else typed at the session.
     pub fn send(&self, bytes: Vec<u8>) {
         let _ = self.say.send(Say::Input(bytes));

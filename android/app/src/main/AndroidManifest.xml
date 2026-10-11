@@ -1,9 +1,10 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
-    <!-- The only permission there is. Everything this app does is one ssh
-         connection to a machine somebody named. -->
     <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
     <!-- `smallestScreenSize` and `density` are the two a foldable turns on.
          Unfolding changes the smallest screen dimension, and an undeclared
@@ -13,12 +14,18 @@
          session list instead. The activity handles the resize itself, which is
          what the terminal wants anyway. -->
     <application
+        android:name=".ManymuxApplication"
         android:allowBackup="false"
         android:icon="@mipmap/ic_launcher"
         android:roundIcon="@mipmap/ic_launcher_round"
         android:label="manymux"
         android:supportsRtl="true"
         android:theme="@style/Theme.Manymux">
+        <service android:name=".SessionService" android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Maintain a user-opened SSH terminal connection and read its output while the user switches apps" />
+        </service>
         <activity
             android:name=".MainActivity"
             android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|density|keyboardHidden"
