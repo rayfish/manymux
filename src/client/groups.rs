@@ -19,6 +19,11 @@
 //! so a watch would have nothing to push to, and the file is small enough to
 //! read once per keystroke that goes anywhere.
 //!
+//! Writers lock a separate file across the read, change and rename. A listing
+//! may arrive long after its host answered, so pruning also carries the groups
+//! read before asking: it can remove only memberships already present then,
+//! in the same group. New sessions and moves made while it was out survive.
+//!
 //! Kept here rather than at the node on purpose. A node runs the build it
 //! started from until `mm restart`, and for a host reached over ssh nothing
 //! says it is stale, so a group defined there would work on some machines and
@@ -37,6 +42,8 @@
 //! number.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs::{File, OpenOptions};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
@@ -116,10 +123,9 @@ impl Groups {
     /// next time any other window listed. Reading first also leaves the caller
     /// holding the file as it is now, which is the copy it goes on to draw.
     ///
-    /// It does not lock. Two writes landing between the same read and write
-    /// still lose one, but that window is the length of a read and a rename
-    /// rather than the length of an attach, and the write that matters is a
-    /// person pressing a key in one window at a time.
+    /// The lock is on a separate file, since writing replaces the group file
+    /// itself. It covers the read as well as the write so concurrent clients
+    /// cannot overwrite each other's changes or share the temporary file.
     pub fn update<T>(&mut self, change: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
         self.update_at(&Self::path(), change)
     }
@@ -134,10 +140,66 @@ impl Groups {
         path: &Path,
         change: impl FnOnce(&mut Self) -> Result<T>,
     ) -> Result<T> {
+        let _lock = Self::lock_at(path)?;
         *self = Self::read(path)?;
         let answer = change(self)?;
         self.write_to(path)?;
         Ok(answer)
+    }
+
+    fn lock_at(path: &Path) -> Result<File> {
+        if let Some(parent) = path.parent() {
+            config::ensure_private_dir(parent)?;
+        }
+        let path = path.with_extension("lock");
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(&path)
+            .with_context(|| format!("opening {}", path.display()))?;
+        file.lock()
+            .with_context(|| format!("locking {}", path.display()))?;
+        Ok(file)
+    }
+
+    /// Merge a listing's removals without dropping memberships added since
+    /// the caller read `before`, which must happen before asking the hosts.
+    pub fn refresh(
+        &mut self,
+        before: &Self,
+        reached: &[String],
+        listing: &[HostedSession],
+    ) -> Result<()> {
+        self.refresh_at(&Self::path(), before, reached, listing)
+    }
+
+    fn refresh_at(
+        &mut self,
+        path: &Path,
+        before: &Self,
+        reached: &[String],
+        listing: &[HostedSession],
+    ) -> Result<()> {
+        let mut survivors = before.clone();
+        survivors.prune(reached, listing);
+        self.update_at(path, |current| {
+            for (name, previous) in &before.groups {
+                if let Some(held) = current.groups.get_mut(name) {
+                    held.members.retain(|member| {
+                        !previous.members.contains(member)
+                            || survivors
+                                .groups
+                                .get(name)
+                                .is_some_and(|group| group.members.contains(member))
+                    });
+                }
+            }
+            current.forget_the_empty();
+            Ok(())
+        })
     }
 
     /// Its own file rather than a section in `settings.toml`, because
@@ -466,6 +528,129 @@ mod tests {
         let back = Groups::read(&path).unwrap();
         assert_eq!(back.group_of("box", &build), Some("pi"));
         assert_eq!(back.group_of("box", &api), Some("manymux"));
+    }
+
+    #[test]
+    fn a_delayed_listing_cannot_prune_a_session_grouped_after_it_started() {
+        let path = temp("delayed-listing");
+        let _ = std::fs::remove_file(&path);
+        let mut older = Groups::read(&path).unwrap();
+        let before = older.clone();
+        let build = session("build", 123, 1000);
+        Groups::default()
+            .update_at(&path, |groups| groups.assign("work", "box", &build))
+            .unwrap();
+
+        older
+            .refresh_at(&path, &before, &["box".into()], &[])
+            .unwrap();
+
+        assert_eq!(
+            Groups::read(&path).unwrap().group_of("box", &build),
+            Some("work")
+        );
+    }
+
+    #[test]
+    fn a_refresh_prunes_known_departures_and_keeps_new_and_unreachable_members() {
+        let path = temp("refresh-departures");
+        let _ = std::fs::remove_file(&path);
+        let gone = session("gone", 123, 1000);
+        let live = session("live", 124, 1001);
+        let new = session("new", 125, 1002);
+        let asleep = session("asleep", 126, 1003);
+        let mut before = Groups::default();
+        before.assign("work", "box", &gone).unwrap();
+        before.assign("work", "box", &live).unwrap();
+        before.assign("work", "gpu-box", &asleep).unwrap();
+        before.write_to(&path).unwrap();
+        Groups::default()
+            .update_at(&path, |groups| groups.assign("work", "box", &new))
+            .unwrap();
+
+        let mut drawn = Groups::default();
+        drawn
+            .refresh_at(
+                &path,
+                &before,
+                &["box".into()],
+                &[hosted("box", live.clone())],
+            )
+            .unwrap();
+
+        for groups in [drawn, Groups::read(&path).unwrap()] {
+            assert_eq!(groups.group_of("box", &gone), None);
+            assert_eq!(groups.group_of("box", &live), Some("work"));
+            assert_eq!(groups.group_of("box", &new), Some("work"));
+            assert_eq!(groups.group_of("gpu-box", &asleep), Some("work"));
+        }
+    }
+
+    #[test]
+    fn a_delayed_listing_keeps_a_membership_moved_to_another_group() {
+        let path = temp("refresh-move");
+        let _ = std::fs::remove_file(&path);
+        let build = session("build", 123, 1000);
+        let mut before = Groups::default();
+        before.assign("work", "box", &build).unwrap();
+        before.write_to(&path).unwrap();
+        Groups::default()
+            .update_at(&path, |groups| groups.assign("other", "box", &build))
+            .unwrap();
+
+        let mut drawn = Groups::default();
+        drawn
+            .refresh_at(&path, &before, &["box".into()], &[])
+            .unwrap();
+
+        assert_eq!(drawn.group_of("box", &build), Some("other"));
+        assert_eq!(
+            Groups::read(&path).unwrap().group_of("box", &build),
+            Some("other")
+        );
+    }
+
+    #[test]
+    fn concurrent_group_updates_keep_both_changes() {
+        use std::sync::mpsc;
+        use std::thread;
+
+        let path = temp("concurrent-updates");
+        let _ = std::fs::remove_file(&path);
+        let build = session("build", 123, 1000);
+        let api = session("api", 124, 1001);
+        let (entered, entering) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        let (finished, finishing) = mpsc::channel();
+
+        thread::scope(|scope| {
+            let first_path = &path;
+            let first_build = &build;
+            let first = scope.spawn(move || {
+                Groups::default().update_at(first_path, |groups| {
+                    groups.assign("work", "box", first_build)?;
+                    entered.send(()).unwrap();
+                    released.recv().unwrap();
+                    Ok(())
+                })
+            });
+            entering.recv().unwrap();
+            let second = scope.spawn(|| {
+                let result =
+                    Groups::default().update_at(&path, |groups| groups.assign("work", "box", &api));
+                finished.send(()).unwrap();
+                result
+            });
+            // An unlocked writer completes here and is overwritten by the first.
+            let _ = finishing.recv_timeout(Duration::from_millis(100));
+            release.send(()).unwrap();
+            first.join().unwrap().unwrap();
+            second.join().unwrap().unwrap();
+        });
+
+        let back = Groups::read(&path).unwrap();
+        assert_eq!(back.group_of("box", &build), Some("work"));
+        assert_eq!(back.group_of("box", &api), Some("work"));
     }
 
     #[test]

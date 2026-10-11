@@ -510,14 +510,12 @@ async fn run(cli: Cli) -> Result<u8> {
         }
 
         Command::Groups => {
+            let before = Groups::load()?;
             let listing = everywhere(&socket).await?;
             let mut groups = Groups::default();
             // The listing is the only thing that says which sessions are still
             // running, so this is where the file gets tidied.
-            groups.update(|groups| {
-                groups.prune(&listing.answering(), &listing.sessions);
-                Ok(())
-            })?;
+            groups.refresh(&before, &listing.answering(), &listing.sessions)?;
             for (name, count) in groups.tally(&listing.sessions) {
                 println!(
                     "{} {}",
@@ -1060,6 +1058,7 @@ async fn open_or_start(socket: &Path, host: &str) -> Result<Stream> {
 
 /// `mm ls`, over every watched machine or just one.
 async fn list(socket: &Path, host: Option<String>) -> Result<u8> {
+    let before = Groups::load().unwrap_or_default();
     let listing = match host {
         // One named machine: ask it directly, so an error names that machine.
         Some(name) => {
@@ -1084,10 +1083,7 @@ async fn list(socket: &Path, host: Option<String>) -> Result<u8> {
     // so this is where the group file gets tidied. Only the machines that
     // answered count: one that is asleep has said nothing about its sessions.
     let mut groups = Groups::default();
-    let _ = groups.update(|groups| {
-        groups.prune(&listing.answering(), &listing.sessions);
-        Ok(())
-    });
+    let _ = groups.refresh(&before, &listing.answering(), &listing.sessions);
 
     let rows: Vec<_> = listing
         .sessions
@@ -1701,7 +1697,7 @@ async fn do_attach(
     let latest: Arc<Mutex<Option<Listed>>> = Arc::new(Mutex::new(None));
     // What the popup's lister last found, for the loop to take back: it hands
     // its own pending listing over, so the answer arrives there and not here.
-    let seen: Arc<Mutex<Option<Snapshot>>> = Arc::new(Mutex::new(None));
+    let seen: Arc<Mutex<Option<Survey>>> = Arc::new(Mutex::new(None));
 
     let mut held = attach::hold(screen)?;
     let mut mode = Mode::Focus;
@@ -1872,18 +1868,16 @@ async fn do_attach(
                             Ok(snapshot) => Ok(snapshot),
                             Err(_) => continue,
                         },
-                        None => everywhere(&socket).await.map(|listing| Snapshot {
-                            answered: listing.answering(),
-                            sessions: listing.sessions,
-                        }),
+                        None => survey(&socket).await,
                     };
-                    let Ok(snapshot) = listing else { continue };
+                    let Ok(surveyed) = listing else { continue };
+                    let snapshot = &surveyed.snapshot;
                     if snapshot.is_empty() {
                         continue;
                     }
                     let held = Groups::load().unwrap_or_else(|_| groups.clone());
                     let machines = Hosts::load().map(|hosts| hosts.names()).unwrap_or_default();
-                    let listed = Listed::of(&snapshot, &held, &machines, focus.as_deref(), &recent);
+                    let listed = Listed::of(snapshot, &held, &machines, focus.as_deref(), &recent);
                     // Kept where the caller can read it once the attach ends:
                     // the ids the popup hands back are this listing's, and
                     // looking them up in the one it opened with would name the
@@ -1892,7 +1886,7 @@ async fn do_attach(
                     // And the snapshot behind them, because the loop's own copy
                     // is now the older of the two: it gave up waiting on the
                     // listing this task went on to collect.
-                    *held_lock(&seen) = Some(snapshot);
+                    *held_lock(&seen) = Some(surveyed);
                     if answered.send(listed.rows).is_err() {
                         return;
                     }
@@ -1923,11 +1917,12 @@ async fn do_attach(
         // hands its pending listing to the popup, so nothing is ever left for
         // `take_listing` to find.
         if let Some(fresher) = held_lock(&seen).take() {
-            let _ = groups.update(|groups| {
-                groups.prune(&fresher.answered, &fresher.sessions);
-                Ok(())
-            });
-            snapshot = fresher;
+            let _ = groups.refresh(
+                &fresher.groups_before,
+                &fresher.snapshot.answered,
+                &fresher.snapshot.sessions,
+            );
+            snapshot = fresher.snapshot;
             cycle.refresh(entries(&snapshot, &groups));
         }
         // Renamed from inside, so the name this run has been using is nobody's
@@ -2477,19 +2472,34 @@ fn entries(snapshot: &Snapshot, groups: &Groups) -> Vec<manymux::client::switch:
         .collect()
 }
 
-/// Ask every machine what it is running, off to one side, so that no keystroke
-/// waits on ssh.
-fn spawn_listing(socket: &Path) -> JoinHandle<Snapshot> {
+/// A listing and the memberships it is old enough to prune.
+#[derive(Default)]
+struct Survey {
+    snapshot: Snapshot,
+    groups_before: Groups,
+}
+
+async fn survey(socket: &Path) -> Result<Survey> {
+    let groups_before = Groups::load().unwrap_or_default();
+    let listing = everywhere(socket).await?;
+    Ok(Survey {
+        snapshot: Snapshot {
+            answered: listing.answering(),
+            sessions: listing.sessions,
+        },
+        groups_before,
+    })
+}
+
+/// Ask every machine off to one side, keeping the groups read before asking.
+fn spawn_listing(socket: &Path) -> JoinHandle<Survey> {
     let socket = socket.to_path_buf();
     tokio::spawn(async move {
-        match everywhere(&socket).await {
-            Ok(listing) => Snapshot {
-                answered: listing.answering(),
-                sessions: listing.sessions,
-            },
+        match survey(&socket).await {
+            Ok(surveyed) => surveyed,
             Err(e) => {
                 debug!("could not list sessions for the switch keys: {e:#}");
-                Snapshot::default()
+                Survey::default()
             }
         }
     })
@@ -2504,12 +2514,12 @@ fn spawn_listing(socket: &Path) -> JoinHandle<Snapshot> {
 /// This is also where the group file gets tidied: the listing is the only thing
 /// that says which sessions are still running, and only the machines that
 /// answered count towards it. The tidying is load-bearing beyond tidiness:
-/// `Groups::update` reads the file before it writes it, so the copy the entries
+/// `Groups::refresh` reads the file before it writes it, so the copy the entries
 /// below are built from is the one on disk rather than the one this run started
 /// with. That is what lets `Cycle::refresh` see a session the window next door
 /// moved out of the group this run is narrowed to.
 async fn take_listing(
-    pending: &mut Option<JoinHandle<Snapshot>>,
+    pending: &mut Option<JoinHandle<Survey>>,
     cycle: &mut Cycle,
     snapshot: &mut Snapshot,
     groups: &mut Groups,
@@ -2519,12 +2529,13 @@ async fn take_listing(
     };
     match tokio::time::timeout(LISTING_WAIT, &mut task).await {
         Ok(Ok(landed)) => {
-            if !landed.is_empty() {
-                let _ = groups.update(|groups| {
-                    groups.prune(&landed.answered, &landed.sessions);
-                    Ok(())
-                });
-                *snapshot = landed;
+            if !landed.snapshot.is_empty() {
+                let _ = groups.refresh(
+                    &landed.groups_before,
+                    &landed.snapshot.answered,
+                    &landed.snapshot.sessions,
+                );
+                *snapshot = landed.snapshot;
                 cycle.refresh(entries(snapshot, groups));
             }
         }

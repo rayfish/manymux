@@ -2906,6 +2906,63 @@ fn a_group_holds_sessions_from_more_than_one_machine() {
     assert!(after.contains("train"), "and the other one stayed: {after}");
 }
 
+#[test]
+fn a_delayed_listing_keeps_a_session_grouped_while_it_was_waiting() {
+    use std::process::Stdio;
+    use std::thread;
+
+    let world = World::new("groups-delayed-listing");
+    world.ok("laptop", &["new", "-d", "-n", "existing", "sleep", "60"]);
+    world.wait_for_node("laptop");
+    world.watches("laptop", &["gpu-box"]);
+
+    let original = std::fs::read_to_string(world.ssh_stub()).unwrap();
+    let gate = world.dir.join("listing-gate");
+    std::fs::write(
+        world.ssh_stub(),
+        format!(
+            r#"#!/bin/sh
+if [ -n "$MM_LISTING_GATE" ]; then
+    touch "$MM_LISTING_GATE.started"
+    while [ ! -f "$MM_LISTING_GATE.release" ]; do sleep 0.01; done
+fi
+{original}"#
+        ),
+    )
+    .unwrap();
+    let listing = Command::new(MM)
+        .arg("--socket")
+        .arg(world.socket("laptop"))
+        .arg("ls")
+        .env("MM_CONFIG_DIR", world.dir.join("laptop"))
+        .env("MM_SSH", world.ssh_stub())
+        .env("MM_LISTING_GATE", &gate)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let started = gate.with_extension("started");
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !started.exists() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        started.exists(),
+        "the listing did not reach the remote host"
+    );
+    // The local answer was collected before the remote SSH process started.
+    world.ok("laptop", &["new", "-d", "-n", "new", "sleep", "60"]);
+    world.ok("laptop", &["group", "new", "work"]);
+    std::fs::write(gate.with_extension("release"), b"").unwrap();
+    assert!(listing.wait_with_output().unwrap().status.success());
+
+    let groups = world.ok("laptop", &["groups"]);
+    assert!(
+        groups.contains("work") && groups.contains("new"),
+        "{groups}"
+    );
+}
+
 /// A group is a set of live sessions and nothing else, so the last one ending
 /// takes the group with it. On this machine as much as on any other: pruning
 /// used to be handed the list of machines worth telling the node about, which
