@@ -8,6 +8,9 @@
 //!
 //! It also means the account question answers itself: `ssh deploy@box` lands in
 //! deploy's node, because the socket lives under deploy's runtime directory.
+//! A parked client keeps only its transport: dropping the attachment precedes
+//! the acknowledgement, so idle connections cannot resize sessions or silence
+//! desktop notifications.
 
 pub mod events;
 mod history;
@@ -291,89 +294,109 @@ impl Node {
         W: AsyncWrite + Unpin + Send,
     {
         let mut read = FrameReader::new(read);
-        let Some(frame) = read.next().await? else {
-            return Ok(());
-        };
-        if frame.tag != tag::REQUEST {
-            bail!("expected a request, got tag {:#x}", frame.tag);
-        }
+        let mut pending = None;
+        loop {
+            let Some(frame) = (match pending.take() {
+                Some(frame) => Some(frame),
+                None => read.next().await?,
+            }) else {
+                return Ok(());
+            };
+            if frame.tag != tag::REQUEST {
+                bail!("expected a request, got tag {:#x}", frame.tag);
+            }
 
-        // A machine that is behind gets requests it has never heard of, which is
-        // normal in a fleet updated one host at a time. Say so, rather than
-        // hanging up and leaving the caller to report a closed connection.
-        let request = match proto::decode::<Request>(&frame.body) {
-            Ok(request) => request,
-            Err(e) => {
-                debug!("undecodable request: {e:#}");
-                let complaint = anyhow::anyhow!(
-                    "this machine runs manymux {}, which does not understand that request: \
+            // A machine that is behind gets requests it has never heard of, which is
+            // normal in a fleet updated one host at a time. Say so, rather than
+            // hanging up and leaving the caller to report a closed connection.
+            let request = match proto::decode::<Request>(&frame.body) {
+                Ok(request) => request,
+                Err(e) => {
+                    debug!("undecodable request: {e:#}");
+                    let complaint = anyhow::anyhow!(
+                        "this machine runs manymux {}, which does not understand that request: \
                      update it",
-                    crate::VERSION
-                );
-                return reply(&mut write, Err(complaint)).await;
-            }
-        };
+                        crate::VERSION
+                    );
+                    return reply(&mut write, Err(complaint)).await;
+                }
+            };
 
-        match request {
-            Request::Attach {
-                name,
-                size,
-                history,
-                read_only,
-            } => {
-                let Some(session) = self.registry.get(&name) else {
-                    return reply(&mut write, Err(anyhow::anyhow!("no session named {name}")))
-                        .await;
-                };
-                let attached = session.attach(size, history, read_only);
-                let response = Response::Attached {
-                    size: attached.size,
-                    paste: true,
-                    scroll: true,
-                    rename: true,
-                    events: true,
-                    read_only: true,
-                };
-                proto::write_msg(&mut write, tag::RESPONSE, &response).await?;
-                pump_attachment(
-                    attached,
-                    &self.registry,
-                    self.events.subscribe(),
-                    read,
-                    write,
-                )
-                .await
-            }
+            match request {
+                Request::Attach {
+                    name,
+                    size,
+                    history,
+                    read_only,
+                } => {
+                    let Some(session) = self.registry.get(&name) else {
+                        return reply(&mut write, Err(anyhow::anyhow!("no session named {name}")))
+                            .await;
+                    };
+                    let attached = session.attach(size, history, read_only);
+                    let response = Response::Attached {
+                        size: attached.size,
+                        paste: true,
+                        scroll: true,
+                        rename: true,
+                        events: true,
+                        read_only: true,
+                        reuse: true,
+                    };
+                    proto::write_msg(&mut write, tag::RESPONSE, &response).await?;
+                    if !pump_attachment(
+                        attached,
+                        &self.registry,
+                        self.events.subscribe(),
+                        &mut read,
+                        &mut write,
+                    )
+                    .await?
+                    {
+                        return Ok(());
+                    }
+                    // The attachment has gone before this fence is written.
+                    send(&mut write, tag::PARK, &[]).await?;
+                    match timeout(proto::PARK_FOR, read.next()).await {
+                        Ok(Ok(Some(frame))) if frame.tag == tag::REQUEST => {
+                            pending = Some(frame);
+                            continue;
+                        }
+                        Ok(Err(e)) => return Err(e),
+                        _ => return Ok(()),
+                    }
+                }
 
-            Request::Events => {
-                proto::write_msg(&mut write, tag::RESPONSE, &Response::Ok).await?;
-                crate::ipc::pump_events(self.events.subscribe(), read, write).await
-            }
+                Request::Events => {
+                    proto::write_msg(&mut write, tag::RESPONSE, &Response::Ok).await?;
+                    return crate::ipc::pump_events(self.events.subscribe(), read, write).await;
+                }
 
-            // Answer before going, so the caller learns it worked rather than
-            // watching the socket vanish and having to guess why.
-            Request::Stop => {
-                proto::write_msg(&mut write, tag::RESPONSE, &Response::Ok).await?;
-                info!(sessions = self.registry.list().len(), "stopping on request");
-                self.shutdown(GRACE).await;
-                // The reply is in the socket buffer, not yet read. A moment for
-                // the caller to take it costs nothing and saves a confusing
-                // "connection reset" on the way out. Still needed after the
-                // shutdown above, which returns at once when there is nothing
-                // to hang up.
-                tokio::time::sleep(Duration::from_millis(50)).await;
-                std::process::exit(0);
-            }
+                // Answer before going, so the caller learns it worked rather than
+                // watching the socket vanish and having to guess why.
+                Request::Stop => {
+                    proto::write_msg(&mut write, tag::RESPONSE, &Response::Ok).await?;
+                    info!(sessions = self.registry.list().len(), "stopping on request");
+                    self.shutdown(GRACE).await;
+                    // The reply is in the socket buffer, not yet read. A moment for
+                    // the caller to take it costs nothing and saves a confusing
+                    // "connection reset" on the way out. Still needed after the
+                    // shutdown above, which returns at once when there is nothing
+                    // to hang up.
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    std::process::exit(0);
+                }
 
-            // Answered rather than acted on and forgotten, so a client can tell
-            // an old node (which refuses the request) from a new one.
-            Request::Reached { hosts } => {
-                let watched = Hosts::load().map(|hosts| hosts.names()).unwrap_or_default();
-                self.rewatch(&hosts, &watched);
-                reply(&mut write, Ok(Response::Ok)).await
-            }
+                // Answered rather than acted on and forgotten, so a client can tell
+                // an old node (which refuses the request) from a new one.
+                Request::Reached { hosts } => {
+                    let watched = Hosts::load().map(|hosts| hosts.names()).unwrap_or_default();
+                    self.rewatch(&hosts, &watched);
+                    return reply(&mut write, Ok(Response::Ok)).await;
+                }
 
-            request => reply(&mut write, self.answer(request)).await,
+                request => return reply(&mut write, self.answer(request)).await,
+            }
         }
     }
 
@@ -448,9 +471,9 @@ async fn pump_attachment<R, W>(
     attached: session::Attached,
     registry: &Registry,
     mut events: broadcast::Receiver<HostedEvent>,
-    mut read: FrameReader<R>,
-    mut write: W,
-) -> Result<()>
+    read: &mut FrameReader<R>,
+    mut write: &mut W,
+) -> Result<bool>
 where
     R: AsyncRead + Unpin + Send,
     W: AsyncWrite + Unpin + Send,
@@ -565,6 +588,7 @@ where
                         }
                     }
                     tag::DETACH => break,
+                    tag::PARK => return Ok(true),
                     other => warn!("ignoring unexpected tag {other:#x} while attached"),
                 }
             }
@@ -617,7 +641,7 @@ where
             }
         }
     }
-    Ok(())
+    Ok(false)
 }
 
 /// A pasted file arriving a frame at a time.

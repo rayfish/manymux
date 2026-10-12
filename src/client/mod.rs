@@ -5,9 +5,13 @@
 //! `ssh <host> mm agent` running on another one. An [`Attached`] session
 //! hands out bytes rather than driving a terminal. The CLI is one consumer; a
 //! mobile app rendering the session with its own terminal widget is another.
+//! Capable nodes can release an attachment without closing its transport. A
+//! parked [`Connection`] drains the old output through an acknowledgement
+//! before accepting another attach; it keeps no session alive on the client.
 
 pub mod attach;
 pub mod checkpoint;
+pub mod connections;
 pub mod groups;
 pub mod listed;
 pub mod pen;
@@ -19,6 +23,7 @@ pub mod switch;
 
 use std::fmt::{self, Display, Formatter};
 use std::io;
+use std::io::{Error, ErrorKind};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -548,35 +553,116 @@ impl Stream {
             history,
             read_only,
         };
-        match self.request(&request).await? {
-            Response::Attached {
+        let response = self.request(&request).await?;
+        Attached::answered(
+            Transport {
+                read: self.read,
+                write: self.write,
+                carrier: self.carrier.map(Arc::new),
+            },
+            response,
+            read_only,
+        )
+    }
+}
+
+/// A transport parked between sessions, with no attachment on the node.
+/// The next attach drains old frames through the node's PARK fence before
+/// accepting its response. The caller supplies the host; this type owns only
+/// the transport, just like an attached session.
+pub struct Connection {
+    ready: JoinHandle<Result<Reader>>,
+    write: Option<Writer>,
+    carrier: Option<Arc<Carrier>>,
+}
+
+struct Transport {
+    read: Reader,
+    write: Writer,
+    carrier: Option<Arc<Carrier>>,
+}
+
+impl Connection {
+    pub async fn attach(
+        mut self,
+        name: &str,
+        size: Size,
+        history: u32,
+        read_only: bool,
+    ) -> Result<Attached> {
+        let write = self
+            .write
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("parked transport has no writer"))?;
+        // Pipeline the attach behind PARK, without waiting for its fence.
+        proto::write_msg(
+            write,
+            tag::REQUEST,
+            &Request::Attach {
+                name: name.to_string(),
                 size,
-                paste,
-                scroll,
-                rename,
-                events,
-                read_only: watching,
-            } => {
-                if read_only && !watching {
-                    bail!(
-                        "that machine runs a manymux too old to watch a session without \
-                         typing into it; `mm update` there, or attach instead"
-                    );
+                history,
+                read_only,
+            },
+        )
+        .await
+        .map_err(Gone::mark)?;
+        let mut read = (&mut self.ready)
+            .await
+            .map_err(|e| anyhow::anyhow!("reading the parked transport: {e}"))??;
+        let frame = next_parked(&mut read).await?;
+        if frame.tag != tag::RESPONSE {
+            bail!("expected an attach response after parking");
+        }
+        let response = proto::decode(&frame.body)?;
+        let write = self
+            .write
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("parked transport has no writer"))?;
+        Attached::answered(
+            Transport {
+                read,
+                write,
+                carrier: self.carrier.take(),
+            },
+            response,
+            read_only,
+        )
+    }
+}
+
+impl Drop for Connection {
+    fn drop(&mut self) {
+        // A reader waiting for PARK must not keep a discarded transport alive.
+        self.ready.abort();
+    }
+}
+
+async fn next_parked(read: &mut Reader) -> Result<proto::Frame> {
+    read.next()
+        .await
+        .map_err(Gone::mark)?
+        .ok_or_else(|| Error::new(ErrorKind::UnexpectedEof, "the parked connection closed"))
+        .map_err(|e| Gone::mark(e.into()))
+}
+
+impl SessionHalves {
+    /// After PARK is sent, drain old output in the background until the node
+    /// acknowledges releasing the attachment. This lets a busy node finish
+    /// a blocked output write and read PARK even while we visit another host.
+    pub fn into_connection(self) -> Connection {
+        let mut read = self.reader.read;
+        let ready = tokio::spawn(async move {
+            loop {
+                if next_parked(&mut read).await?.tag == tag::PARK {
+                    return Ok(read);
                 }
-                Ok(Attached {
-                    read: self.read,
-                    write: self.write,
-                    carrier: self.carrier,
-                    size,
-                    paste,
-                    scroll,
-                    rename,
-                    events,
-                    read_only,
-                })
             }
-            Response::Error(message) => bail!(message),
-            other => bail!("unexpected response to attach: {other:?}"),
+        });
+        Connection {
+            ready,
+            write: Some(self.writer.write),
+            carrier: self.writer._carrier,
         }
     }
 }
@@ -585,7 +671,7 @@ impl Stream {
 pub struct Attached {
     read: Reader,
     write: Writer,
-    carrier: Option<Carrier>,
+    carrier: Option<Arc<Carrier>>,
     /// The size the session settled on, which is the smallest of all attached
     /// clients and so may be smaller than the one requested.
     pub size: Size,
@@ -611,6 +697,8 @@ pub struct Attached {
     /// the client draws and which keys it bothers offering, not what makes it
     /// safe.
     pub read_only: bool,
+    /// Whether this attachment can release its session and reuse the stream.
+    pub reuse: bool,
 }
 
 /// The two halves of an attached session, so output can be read while input is
@@ -621,10 +709,45 @@ pub struct SessionHalves {
 }
 
 impl Attached {
+    fn answered(connection: Transport, response: Response, read_only: bool) -> Result<Self> {
+        match response {
+            Response::Attached {
+                size,
+                paste,
+                scroll,
+                rename,
+                events,
+                read_only: watching,
+                reuse,
+            } => {
+                if read_only && !watching {
+                    bail!(
+                        "that machine runs a manymux too old to watch a session without \
+                         typing into it; `mm update` there, or attach instead"
+                    );
+                }
+                Ok(Self {
+                    read: connection.read,
+                    write: connection.write,
+                    carrier: connection.carrier,
+                    size,
+                    paste,
+                    scroll,
+                    rename,
+                    events,
+                    read_only,
+                    reuse,
+                })
+            }
+            Response::Error(message) => bail!(message),
+            other => bail!("unexpected response to attach: {other:?}"),
+        }
+    }
+
     pub fn split(self) -> SessionHalves {
         // The ssh process outlives both halves: whichever is dropped last takes
         // it with them.
-        let carrier = self.carrier.map(Arc::new);
+        let carrier = self.carrier;
         SessionHalves {
             reader: SessionReader {
                 read: self.read,
@@ -856,6 +979,12 @@ impl SessionWriter {
             Err(e) if Gone::marked(&e) => Ok(()),
             said => said,
         }
+    }
+
+    /// Release this attachment without closing the transport. Only valid
+    /// after the node advertised `Attached::reuse`.
+    pub async fn park(&mut self) -> Result<()> {
+        self.frame(tag::PARK, &[]).await
     }
 
     /// Ask for the screen again, answered with an [`Update::Screen`].

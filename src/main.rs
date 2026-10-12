@@ -15,10 +15,11 @@ use tracing::debug;
 
 use manymux::client::attach::{self, Chose, Mode, Motion, Outcome, Wait};
 use manymux::client::checkpoint::{self, Checkpoint, Kept};
+use manymux::client::connections::Connections;
 use manymux::client::groups::Groups;
 use manymux::client::listed::{Listed, Snapshot};
 use manymux::client::switch::{Cycle, Located};
-use manymux::client::{Attached, Stream};
+use manymux::client::{Attached, Gone, Stream};
 use manymux::hosts::{Hosts, LOCAL, as_listed, is_this_machine, same_machine, this_machine};
 use manymux::lock::held as held_lock;
 use manymux::node::{Config, Node};
@@ -1655,9 +1656,8 @@ fn show_checkpoint() -> Result<u8> {
     Ok(OK)
 }
 
-/// How long a switch key waits on a listing that has not landed yet, before
-/// going with whatever it already knows. A machine that is asleep must not
-/// leave the terminal sitting there.
+/// How long the first attach waits to learn its initial group. Switches
+/// collect only finished listings and do not spend this deadline.
 const LISTING_WAIT: Duration = Duration::from_millis(500);
 
 /// The screen to paint on: what was asked for, else what the settings say.
@@ -1699,6 +1699,7 @@ async fn do_attach(
     // its own pending listing over, so the answer arrives there and not here.
     let seen: Arc<Mutex<Option<Survey>>> = Arc::new(Mutex::new(None));
 
+    let mut connections = Connections::default();
     let mut held = attach::hold(screen)?;
     let mut mode = Mode::Focus;
     let mut hopped = false;
@@ -1729,7 +1730,12 @@ async fn do_attach(
         } else {
             0
         };
-        let session = match reaching(attach_to(socket, &target, history, watching), attached).await
+        let first_attach = !attached;
+        let session = match reaching(
+            attach_using(socket, &target, history, watching, &mut connections),
+            attached,
+        )
+        .await
         {
             Ok(session) => session,
             // The way back out of a session that ended is gone too, and there
@@ -1786,12 +1792,17 @@ async fn do_attach(
         // thing the arm below is written to stop.
         hopped = false;
 
-        // Before the rows are built, because the popup is drawn from them and
-        // it opens on a keystroke inside the attach, where there is no asking
-        // anything. The wait is the same half second the switch keys allow and
-        // for the same reason: what is already known stands rather than being
-        // waited on, since a machine that is asleep must not hold up a screen.
-        take_listing(&mut listing, &mut cycle, &mut snapshot, &mut groups).await;
+        // The first attach may wait briefly for its initial group. Later
+        // landings use cached rows and only collect a finished listing, so
+        // a slow machine never delays a switch.
+        take_listing(
+            &mut listing,
+            &mut cycle,
+            &mut snapshot,
+            &mut groups,
+            first_attach,
+        )
+        .await;
         // Narrowing to the group of the session you arrived in, which is a
         // thing to decide on the way in and never afterwards. It used to wait
         // for a listing that said anything, and on a fleet slower than
@@ -1895,7 +1906,11 @@ async fn do_attach(
                 }
             })
         };
-        let (outcome, renamed) = attach::run(
+        let attach::Run {
+            outcome,
+            renamed,
+            connection,
+        } = attach::run(
             &mut held,
             session,
             &where_,
@@ -1910,6 +1925,9 @@ async fn do_attach(
         )
         .await?;
         lister.abort();
+        if let Some(connection) = connection {
+            connections.insert(target.host.clone(), connection);
+        }
         // The latest answer includes the meaning of every id issued during
         // this attach, even when its rows had not been drawn before a choice.
         let listed = held_lock(&latest).take().unwrap_or(listed);
@@ -2075,23 +2093,14 @@ async fn do_attach(
                 listing = Some(spawn_listing(socket));
             }
             Outcome::Switch(motion) => {
-                take_listing(&mut listing, &mut cycle, &mut snapshot, &mut groups).await;
+                take_listing(&mut listing, &mut cycle, &mut snapshot, &mut groups, false).await;
                 hopped = false;
                 if let Some(next) = cycle.step(motion) {
                     cycle.moved_to(next);
                     hopped = true;
                 }
-                // Whether or not it landed, and this is the whole reason the
-                // key that goes nowhere is worth anything: a press is the only
-                // thing that ever asks, so one that found nowhere to go and did
-                // not ask again was the last one that ever asked. A machine
-                // with one session on it when the run started stayed a machine
-                // with one session on it as far as these keys were concerned,
-                // however many were started beside it afterwards. Asked rather
-                // than waited on, because the press before it has already
-                // waited: `take_listing` gives a listing half a second and no
-                // more, since a keystroke must not sit on a machine that is
-                // asleep.
+                // Ask again without waiting: a machine that added a session
+                // since our last answer must still become reachable by a key.
                 if listing.is_none() {
                     listing = Some(spawn_listing(socket));
                 }
@@ -2327,6 +2336,30 @@ async fn starting(attempt: impl Future<Output = Result<String>>) -> Result<Strin
     }
 }
 
+/// Reuse a recently parked transport, falling back to a fresh one if it died.
+/// A refusal from a live node is still a missing session, never a reconnect.
+async fn attach_using(
+    socket: &Path,
+    target: &Located,
+    history: u32,
+    watching: bool,
+    connections: &mut Connections,
+) -> Result<Attached, Missed> {
+    if let Some(connection) = connections.take(&target.host) {
+        match tokio::time::timeout(
+            Duration::from_secs(2),
+            connection.attach(&target.session, attach::session_size(), history, watching),
+        )
+        .await
+        {
+            Ok(Ok(session)) => return Ok(session),
+            Ok(Err(e)) if !Gone::marked(&e) => return Err(Missed::Gone(e)),
+            _ => debug!("parked connection stopped answering; opening a fresh stream"),
+        }
+    }
+    attach_to(socket, target, history, watching).await
+}
+
 /// Open a stream to wherever a session is, and attach to it.
 async fn attach_to(
     socket: &Path,
@@ -2513,8 +2546,8 @@ fn spawn_listing(socket: &Path) -> JoinHandle<Survey> {
     })
 }
 
-/// Hand the cycle the listing, if one has arrived or arrives shortly, and keep
-/// it for the popup to draw from.
+/// Collect a finished listing without holding up a switch. Only the first
+/// attach waits briefly, to learn its initial group.
 ///
 /// What is already known stands rather than being replaced by nothing, and a
 /// listing still out there asking is left running rather than thrown away.
@@ -2531,7 +2564,11 @@ async fn take_listing(
     cycle: &mut Cycle,
     snapshot: &mut Snapshot,
     groups: &mut Groups,
+    wait: bool,
 ) {
+    if !wait && pending.as_ref().is_none_or(|task| !task.is_finished()) {
+        return;
+    }
     let Some(mut task) = pending.take() else {
         return;
     };
@@ -2577,6 +2614,105 @@ fn current_dir() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use manymux::proto::{self, FrameReader, Size, tag};
+    use std::time::SystemTime;
+    use tokio::io::split;
+    use tokio::net::UnixListener;
+
+    #[tokio::test]
+    async fn a_switch_does_not_wait_for_a_pending_listing() {
+        let task = tokio::spawn(async { std::future::pending::<Survey>().await });
+        let mut pending = Some(task);
+        let mut cycle = Cycle::new(Located::new("gpu-box", "build"));
+        let mut snapshot = Snapshot::default();
+        let mut groups = Groups::default();
+        tokio::time::timeout(
+            Duration::from_millis(20),
+            take_listing(&mut pending, &mut cycle, &mut snapshot, &mut groups, false),
+        )
+        .await
+        .expect("a switch must not wait on a host listing");
+        let task = pending
+            .take()
+            .expect("the listing stays available for the popup");
+        assert!(!task.is_finished());
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn a_broken_cached_transport_opens_a_fresh_connection() {
+        let (client, server) = tokio::io::duplex(4096);
+        let (read, mut write) = split(server);
+        let stale = tokio::spawn(async move {
+            let mut read = FrameReader::new(read);
+            read.next().await.unwrap().unwrap();
+            manymux::proto::write_msg(
+                &mut write,
+                tag::RESPONSE,
+                &Response::Attached {
+                    size: Size::new(80, 24),
+                    paste: true,
+                    scroll: true,
+                    rename: true,
+                    events: true,
+                    read_only: true,
+                    reuse: true,
+                },
+            )
+            .await
+            .unwrap();
+        });
+        let (read, write) = split(client);
+        let attached = Stream::from_halves(Box::new(read), Box::new(write))
+            .attach("build", Size::new(80, 24), 0, false)
+            .await
+            .unwrap();
+        stale.await.unwrap();
+        let mut connections = Connections::default();
+        connections.insert(LOCAL.into(), attached.split().into_connection());
+
+        let suffix = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("mm-reuse-{suffix}.sock"));
+        let listener = UnixListener::bind(&path).unwrap();
+        let fresh = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read, mut write) = split(stream);
+            let mut read = FrameReader::new(read);
+            let frame = read.next().await.unwrap().unwrap();
+            assert!(matches!(proto::decode::<Request>(&frame.body).unwrap(),
+                Request::Attach { name, .. } if name == "test"));
+            manymux::proto::write_msg(
+                &mut write,
+                tag::RESPONSE,
+                &Response::Attached {
+                    size: Size::new(90, 30),
+                    paste: true,
+                    scroll: true,
+                    rename: true,
+                    events: true,
+                    read_only: true,
+                    reuse: true,
+                },
+            )
+            .await
+            .unwrap();
+        });
+        let attached = attach_using(
+            &path,
+            &Located::new(LOCAL, "test"),
+            0,
+            false,
+            &mut connections,
+        )
+        .await
+        .unwrap_or_else(|_| panic!("a failed cached transport should open a fresh stream"));
+        assert_eq!(attached.size, Size::new(90, 30));
+        fresh.await.unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
 
     /// An attempt that never answers, which is what a client multiplexed onto
     /// a dead ssh master is: nothing fails, nothing times out, and the row

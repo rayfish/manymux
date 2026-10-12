@@ -1,8 +1,12 @@
 //! Wire protocol shared by the server, the CLI, and the laptop daemon.
 //!
-//! One exchange happens per stream: a client opens a stream, sends a
+//! One exchange normally happens per stream: a client opens a stream, sends a
 //! [`Request`], and reads a [`Response`]. An `Attach` request turns the rest of
 //! the stream into a bidirectional pipe carrying the session's bytes.
+//! A node advertising `reuse` accepts `PARK` to release that attachment and
+//! return to requests on the same stream. Its `PARK` acknowledgement fences
+//! old output before the next attach. Idle streams hold no session or event
+//! subscription, and expire after `PARK_FOR`. Older nodes use ordinary detach.
 //!
 //! A "stream" is a Unix-socket connection to the node on this machine, or the
 //! pipes of an `ssh <host> mm agent` for one on another, so everything here is
@@ -53,6 +57,9 @@ pub const MAX_FRAME: usize = 1 << 20;
 pub const PING_EVERY: Duration = Duration::from_secs(15);
 pub const SILENT_FOR: Duration = Duration::from_secs(45);
 
+/// How long a node keeps a parked connection without another request.
+pub const PARK_FOR: Duration = Duration::from_secs(300);
+
 pub mod tag {
     pub const REQUEST: u8 = 0x01;
     pub const RESPONSE: u8 = 0x02;
@@ -62,6 +69,10 @@ pub mod tag {
     pub const RESIZE: u8 = 0x11;
     pub const EXIT: u8 = 0x12;
     pub const DETACH: u8 = 0x13;
+    /// Release the attachment and accept another request on this stream.
+    /// The node acknowledges on this tag after dropping the attachment.
+    /// Only sent when `Response::Attached::reuse` was true.
+    pub const PARK: u8 = 0x20;
     /// A session event on a subscription stream: a bell, a title change, an
     /// exit. Server to client only, and unsolicited.
     pub const EVENT: u8 = 0x14;
@@ -403,6 +414,9 @@ pub enum Response {
         /// `mm view` refuses rather than pretending.
         #[serde(default)]
         read_only: bool,
+        /// Whether `PARK` releases the session while keeping this stream open.
+        #[serde(default)]
+        reuse: bool,
     },
     /// What the node is running. `build` is the SHA-256 of the binary it
     /// started from, taken at startup: the version alone cannot answer the
@@ -885,6 +899,7 @@ mod tests {
             rename,
             events,
             read_only,
+            reuse,
         } = decoded
         else {
             panic!("an old answer should still be an attach");
@@ -893,6 +908,7 @@ mod tests {
             !read_only,
             "nor promise to drop the input of a client that only watches"
         );
+        assert!(!reuse, "an old node cannot reuse an attach stream");
         assert_eq!(size, Size::new(80, 24));
         assert!(!paste, "a host that never heard of pasting cannot take one");
         assert!(
@@ -914,6 +930,7 @@ mod tests {
             rename: true,
             events: true,
             read_only: true,
+            reuse: true,
         })
         .unwrap();
         assert!(matches!(decode::<Old>(&new).unwrap(), Old::Attached { .. }));

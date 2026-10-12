@@ -79,6 +79,7 @@ async fn main() -> anyhow::Result<()> {
                         rename: false,
                         events: true,
                         read_only: false,
+                        reuse: false,
                     },
                     other => Response::Error(format!("stub-agent got {other:?}")),
                 };

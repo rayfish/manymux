@@ -35,7 +35,7 @@ pub use keys::{
 use super::picker;
 
 #[cfg(feature = "desktop")]
-pub use terminal::{Held, PopupFeed, Wait, hold, run, session_size, terminal_size, waiting};
+pub use terminal::{Held, PopupFeed, Run, Wait, hold, run, session_size, terminal_size, waiting};
 
 /// How long to wait before trying to reach a lost session again, by how many
 /// tries have failed.

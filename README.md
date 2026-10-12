@@ -161,6 +161,13 @@ the bottom reads `● host/name` with the dot green.
 goes hollow and amber, and the row spells out what the keys do. It stays on, so
 one `Ctrl-]` then `tab tab tab` walks through your sessions.
 
+Switches use the last session list while refreshing it in the background.
+Recent hosts reuse idle transports for up to two minutes, up to four hosts, so
+returning to one skips launching another `mm agent` over SSH. Idle transports have no
+session attached. Older nodes use a fresh attach connection; `mm restart`
+after updating a node enables reuse. A broken cached transport is replaced
+with a fresh one, and connection losses keep the usual reconnect behavior.
+
 | | |
 |---|---|
 | `tab` | next session on this machine |

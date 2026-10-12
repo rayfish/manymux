@@ -8,6 +8,8 @@
 //! end in the middle of an escape sequence.
 //! iTerm2 is never asked for key releases because it can deliver a shortcut's
 //! release after the program that requested it has exited.
+//! Switching releases the node attachment but keeps a capable host's transport.
+//! The caller caches that transport; this loop never keeps hidden attachments.
 
 use std::env;
 use std::fmt::Write as _;
@@ -30,7 +32,9 @@ use crate::client::picker::Picker;
 use crate::client::screen::ScreenMode;
 use crate::client::scroll::{self, Chased, Owed, Scrollback, Selected};
 use crate::client::status::{self, Filter, Popped, Status};
-use crate::client::{Attached, Gone, SessionHalves, SessionReader, SessionWriter, Update};
+use crate::client::{
+    Attached, Connection, Gone, SessionHalves, SessionReader, SessionWriter, Update,
+};
 use crate::clipboard;
 use crate::notify;
 use crate::proto::{HostedEvent, Renamed, Size};
@@ -372,6 +376,13 @@ const TICK: Duration = Duration::from_secs(1);
 /// to pass on.
 const INTERRUPT: u8 = 0x03;
 
+/// What the attach returned, including a reusable transport after a switch.
+pub struct Run {
+    pub outcome: Outcome,
+    pub renamed: Option<String>,
+    pub connection: Option<Connection>,
+}
+
 /// Run the attach loop until the client detaches, switches away, or the
 /// session ends.
 ///
@@ -391,7 +402,7 @@ pub async fn run(
     mode: Mode,
     notice: Option<&str>,
     popup: PopupFeed<'_>,
-) -> Result<(Outcome, Option<String>)> {
+) -> Result<Run> {
     let PopupFeed {
         rows,
         group,
@@ -420,6 +431,7 @@ pub async fn run(
         status.setup(terminal_size())
     ));
     let mut called = session_of(target).to_string();
+    let mut connection = None;
     let outcome = pump(
         &mut held.keys,
         &mut held.filter,
@@ -436,6 +448,7 @@ pub async fn run(
             rows,
             asks,
             fresh,
+            connection: &mut connection,
         },
     )
     .await;
@@ -444,7 +457,11 @@ pub async fn run(
         Err(e) => stopped(e)?,
     };
     let renamed = called != session_of(target);
-    Ok((outcome, renamed.then_some(called)))
+    Ok(Run {
+        outcome,
+        renamed: renamed.then_some(called),
+        connection,
+    })
 }
 
 /// What a pump that stopped with an error leaves the run.
@@ -782,7 +799,7 @@ pub struct PopupFeed<'a> {
 
 /// What the pump paints on and what it paints there, which travel together
 /// because the screen mode decides how all three are used.
-struct Painting {
+struct Painting<'a> {
     screen: Screen,
     /// Whether the session has the terminal on a full-screen program's own
     /// screen, shared with the teardown and the panic hook.
@@ -802,6 +819,7 @@ struct Painting {
     /// listing landing under an open popup does not slide it onto a different
     /// session.
     fresh: tokio::sync::watch::Receiver<Rows>,
+    connection: &'a mut Option<Connection>,
 }
 
 /// The popup on the screen, and what the list in it is for.
@@ -935,6 +953,26 @@ fn is_iterm(term_program: Option<&str>, has_iterm_variable: bool) -> bool {
 
 /// The name in `naming` is written back when a rename lands: the mark row
 /// is not the only thing that has to follow it.
+async fn leave_for(
+    mut halves: SessionHalves,
+    reuse: bool,
+    connection: &mut Option<Connection>,
+    outcome: Outcome,
+) -> Result<Outcome> {
+    if reuse && !matches!(outcome, Outcome::Detached) {
+        match halves.writer.park().await {
+            Ok(()) => *connection = Some(halves.into_connection()),
+            // The key still chose the next session, even if the old host
+            // could not hear goodbye. Reconnect to that choice, not this one.
+            Err(e) if Gone::marked(&e) => {}
+            Err(e) => return Err(e),
+        }
+    } else {
+        halves.writer.detach().await?;
+    }
+    Ok(outcome)
+}
+
 async fn pump(
     keyboard: &mut mpsc::Receiver<Vec<u8>>,
     keys: &mut KeyFilter,
@@ -942,7 +980,7 @@ async fn pump(
     mut status: Status,
     mode: Mode,
     naming: Naming<'_>,
-    painting: Painting,
+    painting: Painting<'_>,
 ) -> Result<Outcome> {
     let Painting {
         screen,
@@ -950,7 +988,9 @@ async fn pump(
         mut rows,
         asks,
         mut fresh,
+        connection,
     } = painting;
+    let reuse = session.reuse;
     let watching = session.read_only;
     let takes_pastes = session.paste;
     let scrolls = session.scroll;
@@ -1078,8 +1118,7 @@ async fn pump(
                         return Ok(Outcome::Detached);
                     }
                     Some(Action::Switch(motion)) => {
-                        writer.detach().await?;
-                        return Ok(Outcome::Switch(motion));
+                        return leave_for(SessionHalves { reader, writer }, reuse, connection, Outcome::Switch(motion)).await;
                     }
                     Some(Action::SessionSearch(search)) => {
                         let up = popup.get_or_insert_with(|| Popup::sessions(&rows));
@@ -1118,8 +1157,7 @@ async fn pump(
                             .await?;
                     }
                     Some(Action::New) => {
-                        writer.detach().await?;
-                        return Ok(Outcome::New);
+                        return leave_for(SessionHalves { reader, writer }, reuse, connection, Outcome::New).await;
                     }
                     // The popup, which is what control mode looks like. Moving
                     // the highlight is local: walking three sessions used to be
@@ -1240,8 +1278,7 @@ async fn pump(
                                     continue;
                                 };
                                 status.set_popup(Popped::None);
-                                writer.detach().await?;
-                                return Ok(Outcome::Chose(Chose::Go(row)));
+                                return leave_for(SessionHalves { reader, writer }, reuse, connection, Outcome::Chose(Chose::Go(row))).await;
                             }
                             Pick::Go => {
                                 let chosen = up.picker.chosen().map(|row| row.id);
@@ -1249,8 +1286,7 @@ async fn pump(
                                 let subject = up.subject();
                                 let Some(chosen) = chosen else { continue };
                                 status.set_popup(Popped::None);
-                                writer.detach().await?;
-                                return Ok(match (what, subject) {
+                                return leave_for(SessionHalves { reader, writer }, reuse, connection, match (what, subject) {
                                     (Showing::Sessions, _) => {
                                         Outcome::Chose(Chose::Go(chosen))
                                     }
@@ -1262,7 +1298,7 @@ async fn pump(
                                         Outcome::Chose(Chose::Focus(chosen))
                                     }
                                     (Showing::Hosting, _) => Outcome::Chose(Chose::On(chosen)),
-                                });
+                                }).await;
                             }
                             // Taken off the screen by the teardown below,
                             // which every other way out of the mode goes
@@ -1316,11 +1352,10 @@ async fn pump(
                                     && !name.trim().is_empty()
                                 {
                                     status.set_popup(Popped::None);
-                                    writer.detach().await?;
-                                    return Ok(Outcome::Chose(Chose::NewGroup {
+                                    return leave_for(SessionHalves { reader, writer }, reuse, connection, Outcome::Chose(Chose::NewGroup {
                                         session,
                                         name,
-                                    }));
+                                    })).await;
                                 }
                             }
                         }
@@ -1590,11 +1625,10 @@ async fn pump(
                                     Some(up) => match up.subject() {
                                         Some(session) if !wanted.trim().is_empty() => {
                                             status.set_popup(Popped::None);
-                                            writer.detach().await?;
-                                            return Ok(Outcome::Chose(Chose::Named {
+                                            return leave_for(SessionHalves { reader, writer }, reuse, connection, Outcome::Chose(Chose::Named {
                                                 session,
                                                 to: wanted,
-                                            }));
+                                            })).await;
                                         }
                                         // Typed at a list with nothing under
                                         // the highlight, which is a name typed
@@ -2275,6 +2309,97 @@ async fn paste(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::client::Stream;
+    use crate::client::attach::Motion;
+    use crate::proto::{self, FrameReader, Response, tag};
+    use tokio::io::split;
+
+    #[tokio::test]
+    async fn switching_parks_only_when_the_node_advertised_reuse() {
+        for reuse in [false, true] {
+            let (client, server) = tokio::io::duplex(4096);
+            let (read, mut write) = split(server);
+            let mut read = FrameReader::new(read);
+            proto::write_msg(
+                &mut write,
+                tag::RESPONSE,
+                &Response::Attached {
+                    size: Size::new(80, 24),
+                    paste: false,
+                    scroll: false,
+                    rename: false,
+                    events: false,
+                    read_only: true,
+                    reuse,
+                },
+            )
+            .await
+            .unwrap();
+            let (client_read, client_write) = split(client);
+            let attached = Stream::from_halves(Box::new(client_read), Box::new(client_write))
+                .attach("build", Size::new(80, 24), 0, false)
+                .await
+                .unwrap();
+            assert_eq!(read.next().await.unwrap().unwrap().tag, tag::REQUEST);
+            let capable = attached.reuse;
+            let mut connection = None;
+            let outcome = leave_for(
+                attached.split(),
+                capable,
+                &mut connection,
+                Outcome::Switch(Motion::Next),
+            )
+            .await
+            .unwrap();
+            assert!(matches!(outcome, Outcome::Switch(Motion::Next)));
+            assert_eq!(connection.is_some(), reuse);
+            assert_eq!(
+                read.next().await.unwrap().unwrap().tag,
+                if reuse { tag::PARK } else { tag::DETACH }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_broken_connection_during_parking_still_switches_to_the_chosen_session() {
+        let (client, server) = tokio::io::duplex(4096);
+        let (read, mut write) = split(server);
+        let mut read = FrameReader::new(read);
+        proto::write_msg(
+            &mut write,
+            tag::RESPONSE,
+            &Response::Attached {
+                size: Size::new(80, 24),
+                paste: false,
+                scroll: false,
+                rename: false,
+                events: false,
+                read_only: true,
+                reuse: true,
+            },
+        )
+        .await
+        .unwrap();
+        let (client_read, client_write) = split(client);
+        let attached = Stream::from_halves(Box::new(client_read), Box::new(client_write))
+            .attach("build", Size::new(80, 24), 0, false)
+            .await
+            .unwrap();
+        read.next().await.unwrap().unwrap();
+        drop(read);
+        drop(write);
+        let mut connection = None;
+        let outcome = leave_for(
+            attached.split(),
+            true,
+            &mut connection,
+            Outcome::Chose(Chose::Go(2)),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(outcome, Outcome::Chose(Chose::Go(2))));
+        assert!(connection.is_none());
+    }
     use crate::client::picker::Row;
     use crate::settings::Screen;
 

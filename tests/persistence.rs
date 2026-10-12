@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
+use manymux::client::{Gone, Stream, Update};
 use manymux::node::{Config, Node};
 use manymux::proto::{
     self, EventKind, FindRequest, FrameReader, HostedEvent, Request, Response, Size, SpawnSpec,
@@ -215,6 +216,230 @@ async fn test_node() -> Arc<Node> {
         notifications: false,
     })
     .await
+}
+
+#[tokio::test]
+async fn switching_reuses_one_transport_and_releases_the_old_attachment() {
+    let node = test_node().await;
+    let first = spawn_session(
+        &node,
+        &["/bin/sh", "-c", "printf first-screen; exec sleep 300"],
+    )
+    .await;
+    let second = spawn_session(
+        &node,
+        &["/bin/sh", "-c", "printf second-screen; exec sleep 300"],
+    )
+    .await;
+    let (client, server) = tokio::io::duplex(1 << 20);
+    let (read, write) = split(server);
+    let serving = Arc::clone(&node);
+    let task = tokio::spawn(async move { serving.handle(read, write).await });
+    let (read, write) = split(client);
+    let stream = Stream::from_halves(Box::new(read), Box::new(write));
+    let mut attached = stream
+        .attach(&first.name, Size::new(40, 10), 0, false)
+        .await
+        .unwrap();
+    assert!(attached.reuse);
+    for name in [&second.name, &first.name, &second.name] {
+        let mut halves = attached.split();
+        // Leave the repaint queued: reattach must drain it through the PARK fence.
+        halves.writer.park().await.unwrap();
+        attached = halves
+            .into_connection()
+            .attach(name, Size::new(80, 24), 0, false)
+            .await
+            .unwrap();
+        let old = if *name == second.name {
+            &first.name
+        } else {
+            &second.name
+        };
+        assert_eq!(node.registry.get(old).unwrap().info().attached, 0);
+        assert_eq!(node.registry.get(name).unwrap().info().attached, 1);
+    }
+    let mut halves = attached.split();
+    let screen = halves.reader.next().await.unwrap();
+    assert!(
+        matches!(screen, Update::Output(bytes) if !String::from_utf8_lossy(&bytes).contains("first-screen"))
+    );
+    halves.writer.detach().await.unwrap();
+    drop(halves);
+    assert!(task.await.unwrap().is_ok());
+    assert_eq!(node.registry.get(&second.name).unwrap().info().attached, 0);
+    node.registry.kill(&first.name).unwrap();
+    node.registry.kill(&second.name).unwrap();
+}
+
+#[tokio::test]
+async fn parking_drains_a_full_output_pipe_even_when_the_transport_is_not_reused() {
+    let node = test_node().await;
+    let spawned = spawn_session(
+        &node,
+        &[
+            "/bin/sh",
+            "-c",
+            "printf '%02000d' 0 | sed 's/0/xy/g'; exec sleep 300",
+        ],
+    )
+    .await;
+    let session = node.registry.get(&spawned.name).unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while session.peek().screen.len() < 512 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let (client, server) = tokio::io::duplex(128);
+    let (read, write) = split(server);
+    let serving = Arc::clone(&node);
+    let task = tokio::spawn(async move { serving.handle(read, write).await });
+    let (read, write) = split(client);
+    let attached = Stream::from_halves(Box::new(read), Box::new(write))
+        .attach(&spawned.name, Size::new(80, 24), 0, false)
+        .await
+        .unwrap();
+    let mut halves = attached.split();
+    halves.writer.park().await.unwrap();
+    let parked = halves.into_connection();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while session.info().attached != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("parking must drain the old screen even while another host is active");
+    drop(parked);
+    // Closing during the acknowledgement may end its write with a broken pipe.
+    let _ = task
+        .await
+        .expect("discarding a cached transport must not panic");
+    assert!(alive(spawned.pid));
+    node.registry.kill(&spawned.name).unwrap();
+}
+
+#[tokio::test]
+async fn a_parked_connection_can_break_without_ending_its_session() {
+    let node = test_node().await;
+    let spawned = spawn_session(&node, &["/bin/sh", "-c", "exec sleep 300"]).await;
+    let (client, server) = tokio::io::duplex(1 << 20);
+    let (read, write) = split(server);
+    let serving = Arc::clone(&node);
+    let task = tokio::spawn(async move { serving.handle(read, write).await });
+    let (read, write) = split(client);
+    let stream = Stream::from_halves(Box::new(read), Box::new(write));
+    let attached = stream
+        .attach(&spawned.name, Size::new(80, 24), 0, false)
+        .await
+        .unwrap();
+    let mut halves = attached.split();
+    halves.writer.park().await.unwrap();
+    let parked = halves.into_connection();
+    task.abort();
+    let _ = task.await;
+    let error = parked
+        .attach(&spawned.name, Size::new(80, 24), 0, false)
+        .await
+        .err()
+        .unwrap();
+    assert!(Gone::marked(&error));
+    assert!(alive(spawned.pid));
+    assert_eq!(node.registry.get(&spawned.name).unwrap().info().attached, 0);
+    node.registry.kill(&spawned.name).unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_unused_parked_transport_expires_without_ending_its_session() {
+    let node = test_node().await;
+    let spawned = spawn_session(&node, &["/bin/sh", "-c", "exec sleep 300"]).await;
+    let mut client = Client::connect(&node);
+    client
+        .send(&Request::Attach {
+            name: spawned.name.clone(),
+            size: Size::new(80, 24),
+            history: 0,
+            read_only: false,
+        })
+        .await
+        .unwrap();
+    proto::write_frame(&mut client.write, tag::PARK, &[])
+        .await
+        .unwrap();
+    loop {
+        let frame = client.read.next().await.unwrap().unwrap();
+        if frame.tag == tag::PARK {
+            break;
+        }
+    }
+    let parked = tokio::time::Instant::now();
+    assert!(client.read.next().await.unwrap().is_none());
+    assert!(parked.elapsed() >= proto::PARK_FOR);
+    assert_eq!(node.registry.get(&spawned.name).unwrap().info().attached, 0);
+    assert!(alive(spawned.pid));
+    node.registry.kill(&spawned.name).unwrap();
+}
+
+#[tokio::test]
+async fn parking_acknowledges_after_releasing_size_and_notification_presence() {
+    let node = test_node().await;
+    let spawned = spawn_session(
+        &node,
+        &["/bin/sh", "-c", "read line; printf '\\a'; exec sleep 300"],
+    )
+    .await;
+    let mut keeper = Client::connect(&node);
+    keeper
+        .send(&Request::Attach {
+            name: spawned.name.clone(),
+            size: Size::new(80, 24),
+            history: 0,
+            read_only: false,
+        })
+        .await
+        .unwrap();
+    let mut events = Client::connect(&node);
+    assert!(matches!(
+        events.send(&Request::Events).await.unwrap(),
+        Response::Ok
+    ));
+    let mut client = Client::connect(&node);
+    assert!(matches!(
+        client
+            .send(&Request::Attach {
+                name: spawned.name.clone(),
+                size: Size::new(40, 10),
+                history: 0,
+                read_only: false,
+            })
+            .await
+            .unwrap(),
+        Response::Attached { reuse: true, .. }
+    ));
+    proto::write_frame(&mut client.write, tag::PARK, &[])
+        .await
+        .unwrap();
+    loop {
+        let frame = client.read.next().await.unwrap().unwrap();
+        if frame.tag == tag::PARK {
+            break;
+        }
+    }
+    let session = node.registry.get(&spawned.name).unwrap();
+    assert_eq!(session.info().attached, 1);
+    assert_eq!(session.info().size, Size::new(80, 24));
+    let input = session.attach(Size::new(80, 24), 0, false);
+    input.attachment.send_input(b"\n".to_vec());
+    drop(input);
+    assert_eq!(events.read_until_bell().await.event.host_attached, 1);
+    // A parked transport is not subscribed to session output or events.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(30), client.read.next())
+            .await
+            .is_err()
+    );
+    node.registry.kill(&spawned.name).unwrap();
 }
 
 /// A freshly spawned session: its name and the pid of the process in it.
