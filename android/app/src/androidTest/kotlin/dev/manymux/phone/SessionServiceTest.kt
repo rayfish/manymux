@@ -18,9 +18,47 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
 import uniffi.manymux_android.Machine
+import uniffi.manymux_android.Grid
+import uniffi.manymux_android.State
 
 @RunWith(AndroidJUnit4::class)
 class SessionServiceTest {
+    @Test
+    fun rapidSwitchingAndLeavingBeforeServiceStartupDoNotCrash() {
+        val instrumentation = InstrumentationRegistry.getInstrumentation()
+        val context = instrumentation.targetContext
+        val client = context.applicationContext as ManymuxApplication
+        val notifications = context.getSystemService(NotificationManager::class.java)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            instrumentation.uiAutomation.grantRuntimePermission(context.packageName, Manifest.permission.POST_NOTIFICATIONS)
+        }
+        ServerSocket(0, 8, InetAddress.getByName("127.0.0.1")).use { server ->
+            val machine = Machine("127.0.0.1", server.localPort.toUShort(), "user")
+            val scenario = ActivityScenario.launch(MainActivity::class.java)
+            try {
+                scenario.onActivity {
+                    client.open(machine, "first", Grid(80u, 24u))
+                    client.open(machine, "second", Grid(80u, 24u))
+                }
+                instrumentation.waitForIdleSync()
+                eventually { notifications.activeNotifications.isNotEmpty() }
+                assertTrue(client.session!!.attach.state() is State.Reaching)
+                instrumentation.runOnMainSync {
+                    client.leave()
+                    client.open(machine, "third", Grid(80u, 24u))
+                    client.leave()
+                }
+                eventually { notifications.activeNotifications.isEmpty() }
+                // The foreground-start watchdog fires after the service callbacks.
+                SystemClock.sleep(6000)
+                assertNull(client.session)
+            } finally {
+                scenario.close()
+                instrumentation.runOnMainSync { client.leave() }
+            }
+        }
+    }
+
     @Test
     fun notificationAndSessionSurviveLeavingAndRecreatingTheActivity() {
         val instrumentation = InstrumentationRegistry.getInstrumentation()

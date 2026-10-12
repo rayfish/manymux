@@ -13,6 +13,9 @@
 //! The ids the rows carry are indices into the `Vec`s beside them, which is how
 //! `client::picker` draws a session without ever learning what a machine is.
 //! See [`Listed::of`].
+//! Reloads keep every issued id through [`Listed::following`], including rows
+//! that disappeared. A pending answer and the displayed rows can then name the
+//! same things even when Enter wins the race against drawing the answer.
 
 use crate::client::attach::Rows;
 use crate::client::groups::Groups;
@@ -99,6 +102,16 @@ const CURRENT: usize = 0;
 const DIGITS: u8 = 9;
 
 impl Listed {
+    /// Keep ids from earlier answers for the lifetime of this attach. Removed
+    /// rows leave their ids reserved, since the keyboard may still choose one
+    /// from the picture drawn before this answer arrived.
+    pub fn following(mut self, previous: &Self) -> Self {
+        self.at = preserve_ids(&mut self.rows.sessions, &self.at, &previous.at);
+        self.groups = preserve_ids(&mut self.rows.groups, &self.groups, &previous.groups);
+        self.hosts = preserve_ids(&mut self.rows.hosts, &self.hosts, &previous.hosts);
+        self
+    }
+
     /// A tree two deep: a heading per machine, the groups on that machine under
     /// it with their sessions inside, and whatever is in no group last.
     ///
@@ -398,6 +411,22 @@ impl Listed {
     }
 }
 
+fn preserve_ids<T: Clone + PartialEq>(rows: &mut [Row], values: &[T], previous: &[T]) -> Vec<T> {
+    let mut kept = previous.to_vec();
+    for row in rows.iter_mut().filter(|row| !row.heading) {
+        let value = &values[row.id];
+        row.id = match kept.iter().position(|before| before == value) {
+            Some(id) => id,
+            None => {
+                let id = kept.len();
+                kept.push(value.clone());
+                id
+            }
+        };
+    }
+    kept
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -406,6 +435,115 @@ mod tests {
     use crate::client::picker::Picker;
     use crate::hosts::LOCAL;
     use crate::proto::Size;
+
+    #[test]
+    fn a_pending_reload_keeps_the_group_id_a_displayed_choice_uses() {
+        let mut first = hosted_on("gpu-box", "build");
+        first.session.pid = 1;
+        let mut second = hosted_on("gpu-box", "test");
+        second.session.pid = 2;
+        let mut groups = Groups::default();
+        groups.assign("alpha", &first.host, &first.session).unwrap();
+        groups
+            .assign("work", &second.host, &second.session)
+            .unwrap();
+        let current = Located::new("gpu-box", "test");
+        let before = Snapshot {
+            sessions: vec![first, second.clone()],
+            answered: vec![],
+        };
+        let displayed = Listed::of(&before, &groups, &[], None, from_ref(&current));
+        let chosen = displayed
+            .rows
+            .groups
+            .iter()
+            .find(|row| row.label == "@work")
+            .unwrap()
+            .id;
+        let after = Snapshot {
+            sessions: vec![second],
+            answered: vec![],
+        };
+        let pending =
+            Listed::of(&after, &groups, &[], None, from_ref(&current)).following(&displayed);
+        assert_eq!(pending.groups.get(chosen), Some(&Some("work".into())));
+        let mut popup = Picker::new("groups", "choose", displayed.rows.groups, chosen);
+        popup.replace(pending.rows.groups, 0);
+        assert_eq!(popup.chosen().unwrap().label, "@work");
+        assert_eq!(popup.chosen().unwrap().id, chosen);
+    }
+
+    #[test]
+    fn reloads_reserve_removed_session_and_host_ids() {
+        let current = Located::new("gpu-box", "test");
+        let first = Snapshot {
+            sessions: vec![
+                hosted_on("gpu-box", "test"),
+                hosted_on("build-box", "build"),
+            ],
+            answered: vec![],
+        };
+        let hosts = vec!["gpu-box".into(), "build-box".into()];
+        let displayed = Listed::of(&first, &Groups::default(), &hosts, None, from_ref(&current));
+        let chosen = displayed
+            .rows
+            .sessions
+            .iter()
+            .find(|row| row.label == "build")
+            .unwrap()
+            .id;
+        let chosen_host = displayed
+            .rows
+            .hosts
+            .iter()
+            .find(|row| row.label == "build-box")
+            .unwrap()
+            .id;
+        let second = Snapshot {
+            sessions: vec![hosted_on("gpu-box", "test"), hosted_on("gpu-box", "new")],
+            answered: vec![],
+        };
+        let pending = Listed::of(
+            &second,
+            &Groups::default(),
+            &["gpu-box".into()],
+            None,
+            from_ref(&current),
+        )
+        .following(&displayed);
+        assert_eq!(pending.at[chosen], Located::new("build-box", "build"));
+        assert_eq!(pending.hosts[chosen_host], "build-box");
+        assert_ne!(
+            pending
+                .rows
+                .sessions
+                .iter()
+                .find(|row| row.label == "new")
+                .unwrap()
+                .id,
+            chosen
+        );
+        let next = Listed::of(&first, &Groups::default(), &hosts, None, from_ref(&current))
+            .following(&pending);
+        assert_eq!(
+            next.rows
+                .sessions
+                .iter()
+                .find(|row| row.label == "build")
+                .unwrap()
+                .id,
+            chosen
+        );
+        assert_eq!(
+            next.rows
+                .hosts
+                .iter()
+                .find(|row| row.label == "build-box")
+                .unwrap()
+                .id,
+            chosen_host
+        );
+    }
 
     fn hosted(name: &str) -> HostedSession {
         HostedSession {

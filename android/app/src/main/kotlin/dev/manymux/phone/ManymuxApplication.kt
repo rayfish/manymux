@@ -35,6 +35,6 @@ class ManymuxApplication : Application() {
     fun leave() {
         session?.attach?.let { it.detach(); it.close() }
         session = null
-        stopService(service)
+        // The service stops after promoting any pending foreground start.
     }
 }

@@ -1853,6 +1853,7 @@ async fn do_attach(
             let recent = cycle.recent();
             let latest = Arc::clone(&latest);
             let seen = Arc::clone(&seen);
+            let mut previous = listed.clone();
             // The listing already out there, handed over rather than left to
             // finish into a variable nobody reads again until the attach ends.
             // `take_listing` gives one half a second and no more, so on a fleet
@@ -1877,11 +1878,12 @@ async fn do_attach(
                     }
                     let held = Groups::load().unwrap_or_else(|_| groups.clone());
                     let machines = Hosts::load().map(|hosts| hosts.names()).unwrap_or_default();
-                    let listed = Listed::of(snapshot, &held, &machines, focus.as_deref(), &recent);
-                    // Kept where the caller can read it once the attach ends:
-                    // the ids the popup hands back are this listing's, and
-                    // looking them up in the one it opened with would name the
-                    // wrong session.
+                    let listed = Listed::of(snapshot, &held, &machines, focus.as_deref(), &recent)
+                        .following(&previous);
+                    previous = listed.clone();
+                    // Every answer retains earlier ids, so a choice from
+                    // either the displayed rows or this pending answer has
+                    // the same meaning here after the attach ends.
                     *held_lock(&latest) = Some(listed.clone());
                     // And the snapshot behind them, because the loop's own copy
                     // is now the older of the two: it gave up waiting on the
@@ -1908,8 +1910,8 @@ async fn do_attach(
         )
         .await?;
         lister.abort();
-        // The rows the ids in `outcome` belong to: the last answer if one
-        // landed while the popup was up, else the ones it opened with.
+        // The latest answer includes the meaning of every id issued during
+        // this attach, even when its rows had not been drawn before a choice.
         let listed = held_lock(&latest).take().unwrap_or(listed);
         // And what those rows were built from, which the loop gave up waiting
         // for and the popup went on to collect. Without taking it back, a fleet
@@ -1966,7 +1968,10 @@ async fn do_attach(
                     // choosing the group you are already in should leave you
                     // where you are.
                     Chose::Focus(row) => {
-                        let group = listed.groups.get(row).cloned().flatten();
+                        let Some(group) = listed.groups.get(row).cloned() else {
+                            notice = Some("that group is no longer listed".to_string());
+                            continue;
+                        };
                         cycle.focus(group);
                         if let Some(next) = cycle.step(Motion::Next)
                             && !cycle.holds(&target)
@@ -2014,7 +2019,10 @@ async fn do_attach(
                     // this, which is why `m` acts on the highlighted row rather
                     // than the session you are attached to.
                     Chose::Move { session, group } => {
-                        let group = listed.groups.get(group).cloned().flatten();
+                        let Some(group) = listed.groups.get(group).cloned() else {
+                            notice = Some("that group is no longer listed".to_string());
+                            continue;
+                        };
                         notice = regroup(socket, &listed, session, group, &mut groups)
                             .await
                             .err()
