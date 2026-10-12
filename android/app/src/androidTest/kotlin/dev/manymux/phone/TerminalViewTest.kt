@@ -138,10 +138,10 @@ class TerminalViewTest {
             scenario.onActivity { activity ->
                 assertEquals(2, keys.childCount)
                 val buttons = descendants(keys).filterIsInstance<TextView>()
-                assertEquals(9, buttons.size)
+                assertEquals(10, buttons.size)
                 fun position(name: String): Rect {
                     val button = buttons.single { it.contentDescription == name }
-                    assertEquals((48 * activity.resources.displayMetrics.density).toInt(), button.height)
+                    assertEquals((32 * activity.resources.displayMetrics.density).toInt(), button.height)
                     val rect = Rect()
                     assertTrue(button.getGlobalVisibleRect(rect))
                     return rect
@@ -156,7 +156,7 @@ class TerminalViewTest {
                 assertEquals(right.top, down.top)
                 assertTrue(left.right <= down.left)
                 assertTrue(down.right <= right.left)
-                for (name in listOf("esc", "tab", "ctrl", "paste", "keyboard")) position(name)
+                for (name in listOf("esc", "tab", "ctrl", "shift", "paste", "keyboard")) position(name)
             }
         } finally {
             scenario.close()
@@ -198,6 +198,46 @@ class TerminalViewTest {
                 arm()
                 terminal.attach = null
                 released()
+            }
+        } finally {
+            scenario.close()
+        }
+    }
+
+    @Test
+    fun shiftChangesTextAndTabThenReleases() {
+        val scenario = ActivityScenario.launch(MainActivity::class.java)
+        try {
+            scenario.onActivity { activity ->
+                val terminal = TerminalView(activity)
+                val method = MainActivity::class.java.getDeclaredMethod("extraKeys", TerminalView::class.java)
+                method.isAccessible = true
+                val keys = method.invoke(activity, terminal) as View
+                val shift = descendants(keys).filterIsInstance<TextView>().single { it.text == "shift" }
+                val charOf = TerminalView::class.java.getDeclaredMethod("charOf", Char::class.javaPrimitiveType)
+                charOf.isAccessible = true
+                fun shifted(character: Char): String {
+                    shift.performClick()
+                    assertTrue(terminal.shift)
+                    assertTrue(shift.isSelected)
+                    val bytes = charOf.invoke(terminal, character) as ByteArray
+                    assertTrue(!terminal.shift)
+                    assertTrue(!shift.isSelected)
+                    return bytes.toString(Charsets.UTF_8)
+                }
+                assertEquals("A", shifted('a'))
+                assertEquals("!", shifted('1'))
+                assertEquals("?", shifted('/'))
+                shift.performClick()
+                assertEquals("\u001b[Z", terminal.tabKey().toString(Charsets.UTF_8))
+                assertTrue(!shift.isSelected)
+                shift.performClick()
+                terminal.onCreateInputConnection(android.view.inputmethod.EditorInfo()).commitText("a", 1)
+                assertTrue(!shift.isSelected)
+                shift.performClick()
+                terminal.attach = null
+                assertTrue(!terminal.shift)
+                assertTrue(!shift.isSelected)
             }
         } finally {
             scenario.close()

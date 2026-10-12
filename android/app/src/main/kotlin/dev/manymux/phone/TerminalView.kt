@@ -76,6 +76,7 @@ class TerminalView(context: Context) : View(context), Choreographer.FrameCallbac
             pending = 0f
             said = false
             control = false
+            shift = false
             cursorOn = false
             viewFrom = 0L
             viewTotal = 0L
@@ -372,6 +373,16 @@ class TerminalView(context: Context) : View(context), Choreographer.FrameCallbac
         }
 
     var onControlChanged: ((Boolean) -> Unit)? = null
+
+    /** Whether the next key is shifted, set by the extra-keys row. */
+    var shift = false
+        set(value) {
+            if (field == value) return
+            field = value
+            onShiftChanged?.invoke(value)
+        }
+
+    var onShiftChanged: ((Boolean) -> Unit)? = null
 
     /** A keyboard asked for before this view had a size to be focused at. */
     private var wanted = false
@@ -688,6 +699,7 @@ class TerminalView(context: Context) : View(context), Choreographer.FrameCallbac
     }
 
     override fun onKeyDown(code: Int, event: KeyEvent): Boolean {
+        if (event.isShiftPressed) shift = true
         val bytes = encode(code, event) ?: return super.onKeyDown(code, event)
         send(bytes)
         return true
@@ -695,10 +707,10 @@ class TerminalView(context: Context) : View(context), Choreographer.FrameCallbac
 
     /** What a key press is, on the wire. */
     private fun encode(code: Int, event: KeyEvent): ByteArray? = when (code) {
-        KeyEvent.KEYCODE_ENTER -> byteArrayOf(0x0d)
-        KeyEvent.KEYCODE_DEL -> byteArrayOf(0x7f)
-        KeyEvent.KEYCODE_TAB -> byteArrayOf(0x09)
-        KeyEvent.KEYCODE_ESCAPE -> byteArrayOf(0x1b)
+        KeyEvent.KEYCODE_ENTER -> shiftedKey("\r", "\u001b[13;2u", "\u001b[13;6u")
+        KeyEvent.KEYCODE_DEL -> shiftedKey("\u007f", "\u007f", "\u007f")
+        KeyEvent.KEYCODE_TAB -> tabKey()
+        KeyEvent.KEYCODE_ESCAPE -> shiftedKey("\u001b", "\u001b", "\u001b")
         KeyEvent.KEYCODE_DPAD_UP -> cursorKey(Direction.UP)
         KeyEvent.KEYCODE_DPAD_DOWN -> cursorKey(Direction.DOWN)
         KeyEvent.KEYCODE_DPAD_RIGHT -> cursorKey(Direction.RIGHT)
@@ -718,13 +730,33 @@ class TerminalView(context: Context) : View(context), Choreographer.FrameCallbac
 
     fun cursorKey(direction: Direction): ByteArray {
         leaveHistory()
-        attach?.cursorKey(direction)
+        if (shift) {
+            val suffix = when (direction) {
+                Direction.UP -> "A"
+                Direction.DOWN -> "B"
+                Direction.RIGHT -> "C"
+                Direction.LEFT -> "D"
+            }
+            send(shiftedKey("", "\u001b[1;2$suffix", "\u001b[1;6$suffix"))
+        } else {
+            attach?.cursorKey(direction)
+        }
         return ByteArray(0)
+    }
+
+    fun tabKey(): ByteArray = shiftedKey("\t", "\u001b[Z", "\u001b[1;6Z")
+
+    private fun shiftedKey(plain: String, shifted: String, chord: String): ByteArray {
+        if (!shift) return plain.toByteArray()
+        val bytes = (if (control) chord else shifted).toByteArray()
+        shift = false
+        control = false
+        return bytes
     }
 
     /** Text from a keyboard that composes rather than sending key events. */
     fun type(text: String) {
-        if (control && text.isNotEmpty()) {
+        if ((control || shift) && text.isNotEmpty()) {
             send(charOf(text[0]))
             if (text.length > 1) send(text.substring(1).toByteArray())
         } else {
@@ -734,14 +766,21 @@ class TerminalView(context: Context) : View(context), Choreographer.FrameCallbac
 
     /** One character, under whatever the extra-keys row is holding. */
     private fun charOf(character: Char): ByteArray {
+        val typed = if (shift) {
+            shift = false
+            val plain = "`1234567890-=[]\\;',./"
+            val shifted = "~!@#${'$'}%^&*()_+{}|:\"<>?"
+            val index = plain.indexOf(character)
+            if (index >= 0) shifted[index] else character.uppercaseChar()
+        } else character
         if (control) {
             control = false
             // Ctrl-A is 1 and Ctrl-] is 0x1d: the low five bits of the letter,
             // which is what a terminal has always sent.
-            val chord = character.uppercaseChar().code and 0x1f
+            val chord = typed.uppercaseChar().code and 0x1f
             return byteArrayOf(chord.toByte())
         }
-        return character.toString().toByteArray()
+        return typed.toString().toByteArray()
     }
 
     fun send(bytes: ByteArray) {

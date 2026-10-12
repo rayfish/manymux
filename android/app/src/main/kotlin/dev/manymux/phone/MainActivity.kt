@@ -330,13 +330,13 @@ class MainActivity : Activity() {
                 typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
                 setTextColor(colour(if (back) R.color.accent else R.color.dim))
                 gravity = Gravity.CENTER_VERTICAL
-                minHeight = dp(48)
+                minHeight = dp(40)
                 if (back) {
                     isClickable = true
                     setBackgroundResource(pressable())
                     setOnClickListener { showMachine() }
                 }
-            }, LinearLayout.LayoutParams(0, dp(48), 1f))
+            }, LinearLayout.LayoutParams(0, dp(40), 1f))
             if (!back) addView(TextView(this@MainActivity).apply {
                 text = "SSH key"
                 textSize = 13f
@@ -347,7 +347,7 @@ class MainActivity : Activity() {
                 setPadding(dp(12), 0, 0, 0)
                 setBackgroundResource(pressable())
                 setOnClickListener { showDeviceKey() }
-            }, LinearLayout.LayoutParams(WRAP_CONTENT, dp(48)))
+            }, LinearLayout.LayoutParams(WRAP_CONTENT, dp(40)))
         }
         val headingRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -368,7 +368,7 @@ class MainActivity : Activity() {
                     setPadding(0, dp(6), 0, 0)
                 })
             }, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
-            action?.let { addView(it, LinearLayout.LayoutParams(WRAP_CONTENT, dp(48))) }
+            action?.let { addView(it, LinearLayout.LayoutParams(WRAP_CONTENT, dp(32))) }
         }
         return LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -443,7 +443,7 @@ class MainActivity : Activity() {
                         show()
                     }
                 }
-            }, LinearLayout.LayoutParams(dp(48), dp(64)))
+            }, LinearLayout.LayoutParams(dp(40), dp(48)))
         }
     }
 
@@ -533,11 +533,11 @@ class MainActivity : Activity() {
         }
         val add = TextView(this).apply {
             text = "+"
-            textSize = 22f
+            textSize = 20f
             gravity = Gravity.CENTER
             setTextColor(colour(R.color.ground))
             background = panel(R.color.accent, round = dp(8))
-            setPadding(dp(14), dp(2), dp(14), dp(6))
+            setPadding(dp(10), dp(2), dp(10), dp(4))
             contentDescription = "new session, or another machine"
             isClickable = true
             setOnClickListener { view -> offerToAdd(view, machine) }
@@ -585,7 +585,7 @@ class MainActivity : Activity() {
             gravity = Gravity.CENTER
             setTextColor(colour(R.color.text))
             setBackgroundResource(pressable())
-            setPadding(dp(12), dp(4), dp(16), dp(6))
+            setPadding(dp(10), dp(2), dp(12), dp(4))
             contentDescription = if (tiles) "show them as a list" else "show them as screens"
             isClickable = true
             setOnClickListener { flipLayout(machine) }
@@ -1068,32 +1068,33 @@ class MainActivity : Activity() {
         val keys = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(colour(R.color.panel))
-            setPadding(dp(6), dp(6), dp(6), dp(6))
+            setPadding(dp(2), dp(2), dp(2), dp(2))
         }
         fun row(): LinearLayout = LinearLayout(this).also {
             it.orientation = LinearLayout.HORIZONTAL
+            it.gravity = Gravity.CENTER
             keys.addView(it, wide())
         }
         fun space(row: LinearLayout) {
-            row.addView(View(this), LinearLayout.LayoutParams(0, dp(48), 1f).apply { setMargins(dp(2), dp(2), dp(2), dp(2)) })
+            row.addView(View(this), LinearLayout.LayoutParams(0, dp(32), 1f).apply { setMargins(dp(1), dp(1), dp(1), dp(1)) })
         }
         fun key(row: LinearLayout, label: String, description: String = label, press: (TextView) -> Unit): TextView {
             val button = TextView(this).apply {
                 text = label
                 contentDescription = description
-                textSize = if (description in listOf("up", "down", "left", "right")) 21f else 13f
+                textSize = if (description in listOf("up", "down", "left", "right")) 18f else 12f
                 gravity = Gravity.CENTER
                 setTextColor(colour(R.color.text))
                 isClickable = true
                 background = buttonBackground(R.color.raised, selectable = true)
             }
             button.setOnClickListener { press(button) }
-            row.addView(button, LinearLayout.LayoutParams(0, dp(48), 1f).apply { setMargins(dp(2), dp(2), dp(2), dp(2)) })
+            row.addView(button, LinearLayout.LayoutParams(0, dp(32), 1f).apply { setMargins(dp(1), dp(1), dp(1), dp(1)) })
             return button
         }
         val top = row()
         key(top, "esc") { screen.send(byteArrayOf(0x1b)) }
-        key(top, "tab") { screen.send(byteArrayOf(0x09)) }
+        key(top, "tab") { screen.send(screen.tabKey()) }
         // Held rather than pressed with something: the next character typed is
         // the chord, which is the only way a soft keyboard can spell one. It
         // says so by staying lit, since a modifier you cannot see the state of
@@ -1105,7 +1106,13 @@ class MainActivity : Activity() {
         }
         screen.onControlChanged = ::showControl
         showControl(screen.control)
-        space(top)
+        val shift = key(top, "shift") { screen.shift = !screen.shift }
+        fun showShift(held: Boolean) {
+            shift.isSelected = held
+            shift.setTextColor(if (held) colour(R.color.accent) else colour(R.color.text))
+        }
+        screen.onShiftChanged = ::showShift
+        showShift(screen.shift)
         key(top, "↑", "up") { screen.cursorKey(Direction.UP) }
         space(top)
         val bottom = row()
@@ -1257,12 +1264,12 @@ class MainActivity : Activity() {
     }
 
     private fun buttonBackground(fill: Int, selectable: Boolean = false): RippleDrawable {
-        fun shape(colour: Int) = panel(colour, dp(12)).apply { setStroke(dp(1), this@MainActivity.colour(R.color.line)) }
+        fun shape(colour: Int) = panel(colour, dp(8)).apply { setStroke(dp(1), this@MainActivity.colour(R.color.line)) }
         val states = StateListDrawable().apply {
             if (selectable) addState(intArrayOf(android.R.attr.state_selected), shape(R.color.accentSurface))
             addState(intArrayOf(), shape(fill))
         }
-        return RippleDrawable(ColorStateList.valueOf(colour(R.color.line)), states, panel(R.color.text, dp(12)))
+        return RippleDrawable(ColorStateList.valueOf(colour(R.color.line)), states, panel(R.color.text, dp(8)))
     }
 
     /** The platform's own press feedback, so a row looks like something to tap. */
@@ -1325,28 +1332,28 @@ class MainActivity : Activity() {
     /** The one button on a screen that says what the screen is for. */
     private fun primary(what: String, press: () -> Unit) = TextView(this).apply {
         text = what
-        textSize = 15f
+        textSize = 13f
         gravity = Gravity.CENTER
         setTextColor(colour(R.color.ground))
         background = buttonBackground(R.color.accent)
-        minHeight = dp(48)
-        setPadding(dp(16), dp(15), dp(16), dp(15))
+        minHeight = dp(32)
+        setPadding(dp(10), dp(5), dp(10), dp(5))
         isClickable = true
         setOnClickListener { press() }
-        layoutParams = wide().apply { topMargin = dp(10) }
+        layoutParams = LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT).apply { topMargin = dp(10) }
     }
 
     private fun secondary(what: String, press: () -> Unit) = TextView(this).apply {
         text = what
-        textSize = 14f
+        textSize = 13f
         gravity = Gravity.CENTER
         setTextColor(colour(R.color.text))
         background = buttonBackground(R.color.ground)
-        minHeight = dp(48)
-        setPadding(dp(16), dp(13), dp(16), dp(13))
+        minHeight = dp(32)
+        setPadding(dp(10), dp(5), dp(10), dp(5))
         isClickable = true
         setOnClickListener { press() }
-        layoutParams = wide().apply { topMargin = dp(8) }
+        layoutParams = LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT).apply { topMargin = dp(8) }
     }
 
     private fun hideKeyboard() {
