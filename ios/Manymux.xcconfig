@@ -1,0 +1,9 @@
+// Signing for a device belongs to whoever builds it, so it lives in a file
+// that is not checked in. Put `DEVELOPMENT_TEAM = <your team id>` in
+// ios/Local.xcconfig. The simulator needs none of it.
+CODE_SIGN_STYLE = Automatic
+#include? "Local.xcconfig"
+
+// The Rust core is built for arm64 simulators only (Apple Silicon); an Intel
+// simulator slice would need `x86_64-apple-ios` added to build-rust.sh.
+EXCLUDED_ARCHS[sdk=iphonesimulator*] = x86_64

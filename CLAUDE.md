@@ -507,6 +507,16 @@ up (`src/client/scroll.rs` is the worked example, shared by both surfaces), and
 the shim links the library without the `desktop` feature, which is why the
 `--no-default-features` check above is not optional.
 
+## The iOS app
+
+`ios/` is the same app for iPhone and iPad, linking the same shim: nothing in
+`android/rust` is Android's but the crate name. `ios/build-rust.sh` builds it
+as a static library for the device and the arm64 simulator and generates the
+Swift bindings from that build, as the Android script does for Kotlin, so a
+change to the shim's boundary is a change to both apps. The Xcode project is
+generated from `ios/project.yml` by XcodeGen and is not checked in.
+`ios/README.md` says what differs from Android; `just ios-test` runs its tests.
+
 ## Conventions
 
 - Comments say why, not what, and the interesting reasoning lives in module-level
