@@ -83,7 +83,9 @@ ios_sim := "iPhone 17"
 
 # The Xcode project, from ios/project.yml. Wants xcodegen.
 ios-project:
-    cd ios && ./build-rust.sh build
+    # XcodeGen wants the generated bindings to exist; after that, Xcode's own
+    # build phase keeps them current.
+    cd ios && [ -f build/ManymuxCore.swift ] || ./build-rust.sh build
     cd ios && xcodegen generate --quiet
 
 # The app, for the simulator.
@@ -97,10 +99,15 @@ ios-test: ios-project
         -destination 'platform=iOS Simulator,name={{ios_sim}}' -derivedDataPath build/derived test
 
 # Put it on the simulator and start it.
-ios-run: ios
+ios-sim-run: ios
     xcrun simctl boot '{{ios_sim}}' 2>/dev/null || true
     xcrun simctl install '{{ios_sim}}' ios/build/derived/Build/Products/Debug-iphonesimulator/Manymux.app
     xcrun simctl launch '{{ios_sim}}' dev.manymux.phone
+
+# Build, install, and launch on a connected iPhone. Optional device ID or name.
+[positional-arguments]
+ios-run device="":
+    bash ios/run-device.sh "$1"
 
 # ---- everything ------------------------------------------------------------
 

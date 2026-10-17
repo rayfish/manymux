@@ -10,8 +10,8 @@ import XCTest
 ///     TEST_RUNNER_MM_USER=somebody TEST_RUNNER_MM_SHOTS=/path/to/shots \
 ///     xcodebuild test -only-testing:ManymuxUITests ...
 ///
-/// The machine has to have this simulator's key already, and a session called
-/// `build` with enough history to scroll through.
+/// The machine has to have this simulator's key already, a session called
+/// `build` with enough history to scroll through, and one called `top` to hop to.
 final class ReachTests: XCTestCase {
     private var shots: URL?
     private var taken = 0

@@ -33,15 +33,7 @@ struct HostStore {
         }
     }
 
-    func remember(_ machine: Machine) {
-        write([machine] + all().filter { $0 != machine })
-    }
-
-    func remove(_ machine: Machine) {
-        write(all().filter { $0 != machine })
-    }
-
-    private func write(_ hosts: [Machine]) {
+    func save(_ hosts: [Machine]) {
         let saved = hosts.map { Saved(address: $0.address, port: Int($0.port), user: $0.user) }
         if let data = try? JSONEncoder().encode(saved) {
             defaults.set(data, forKey: key)

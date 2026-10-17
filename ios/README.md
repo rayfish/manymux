@@ -22,12 +22,18 @@ and why; this app follows it.
 ```bash
 brew install xcodegen
 rustup target add aarch64-apple-ios aarch64-apple-ios-sim
-just ios-run        # build, install on the simulator, start it
+just ios-run        # build, install on a connected iPhone, start it
+just ios-sim-run    # build, install on the simulator, start it
 just ios-test       # unit tests
 ```
 
-Or `just ios-project` and open `ios/Manymux.xcodeproj`. For a device, put
-`DEVELOPMENT_TEAM = <team id>` in `ios/Local.xcconfig`.
+Enable Developer Mode on the iPhone and pair it with Xcode first.
+`just ios-run` uses the local Apple Development certificate's team; set
+`IOS_TEAM_ID` to override it. Pass a device ID or name to select one:
+`just ios-run "My iPhone"`.
+
+Or `just ios-project` and open `ios/Manymux.xcodeproj`. For signing in Xcode,
+put `DEVELOPMENT_TEAM = <team id>` in `ios/Local.xcconfig`.
 
 `ManymuxUITests` drives the app against a real machine and skips unless one is
 named; its doc comment says how.

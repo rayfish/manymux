@@ -77,13 +77,13 @@ final class AppModel {
     // ---- hosts -----------------------------------------------------------
 
     func remember(_ machine: Machine) {
-        store.remember(machine)
-        hosts = store.all()
+        hosts = [machine] + hosts.filter { $0 != machine }
+        store.save(hosts)
     }
 
     func remove(_ machine: Machine) {
-        store.remove(machine)
-        hosts = store.all()
+        hosts.removeAll { $0 == machine }
+        store.save(hosts)
     }
 
     func open(_ machine: Machine) {

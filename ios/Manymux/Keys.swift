@@ -52,6 +52,8 @@ final class Held {
 
     var enter: Data { shifted("\r", "\u{1b}[13;2u", "\u{1b}[13;6u") }
     var tab: Data { shifted("\t", "\u{1b}[Z", "\u{1b}[1;6Z") }
+    // One spelling each, put through `shifted` so pressing them lets go of a
+    // held shift the way every other key does.
     var escape: Data { shifted("\u{1b}", "\u{1b}", "\u{1b}") }
     var backspace: Data { shifted("\u{7f}", "\u{7f}", "\u{7f}") }
 

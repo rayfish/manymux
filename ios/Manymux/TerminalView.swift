@@ -30,14 +30,14 @@ final class TerminalView: UIView, UIKeyInput {
             viewing = false
             viewOpen = false
             looking = false
-            speed = 0
-            pending = 0
+            stopFling()
             said = false
             held.control = false
             held.shift = false
             cursorOn = false
             viewFrom = 0
             viewTotal = 0
+            screenRows = Int.max
             // A fresh attach has been told nothing, whatever the last one knew.
             told = nil
             tellGrid()
@@ -75,6 +75,8 @@ final class TerminalView: UIView, UIKeyInput {
 
     /// The last grid the far end was told about.
     private var told: Grid?
+    /// How many rows the last frame said the screen had.
+    private var screenRows = Int.max
 
     private var link: CADisplayLink?
     private var lastFrame: CFTimeInterval = 0
@@ -89,7 +91,7 @@ final class TerminalView: UIView, UIKeyInput {
     private var selection: [Int: [Run]]?
     private var selectionStart = At(col: 0, row: 0)
     private var selectionEnd = At(col: 0, row: 0)
-    private var menu: UIEditMenuInteraction?
+    private lazy var menu = UIEditMenuInteraction(delegate: self)
 
     init(held: Held) {
         self.held = held
@@ -107,9 +109,7 @@ final class TerminalView: UIView, UIKeyInput {
         addGestureRecognizer(pan)
         addGestureRecognizer(press)
 
-        let menu = UIEditMenuInteraction(delegate: self)
         addInteraction(menu)
-        self.menu = menu
 
         isAccessibilityElement = true
         accessibilityLabel = "terminal"
@@ -155,6 +155,8 @@ final class TerminalView: UIView, UIKeyInput {
     /// rows that changed and never mentions the ones a shorter screen lost, so
     /// without this the old bottom line goes on being drawn under the new one.
     private func forget(below down: Int) {
+        defer { screenRows = down }
+        guard down < screenRows else { return }
         rows = rows.filter { $0.key < down }
         history = history.filter { $0.key < down }
     }
@@ -286,12 +288,8 @@ final class TerminalView: UIView, UIKeyInput {
     @objc private func tapped() {
         if selection != nil {
             endSelection()
-            return
-        }
-        if viewOpen {
-            attach?.closeView()
-            speed = 0
-            pending = 0
+        } else if viewOpen {
+            leaveHistory()
         } else {
             openKeyboard()
         }
@@ -300,26 +298,13 @@ final class TerminalView: UIView, UIKeyInput {
     @objc private func panned(_ pan: UIPanGestureRecognizer) {
         let at = cell(under: pan.location(in: self))
         if selection != nil {
-            switch pan.state {
-            case .began:
-                selectionStart = at
-                selectionEnd = at
-            case .changed:
-                selectionEnd = at
-            case .ended:
-                selectionEnd = at
-                showMenu(at: pan.location(in: self))
-            default:
-                break
-            }
-            setNeedsDisplay()
+            select(pan, at: at)
             return
         }
         switch pan.state {
         case .began:
             // A hand on the screen stops a fling.
-            speed = 0
-            pending = 0
+            stopFling()
             pointer = at
         case .changed:
             pointer = at
@@ -341,23 +326,33 @@ final class TerminalView: UIView, UIKeyInput {
 
     /// Long press freezes the picture; dragging selects cells until Copy.
     @objc private func pressed(_ press: UILongPressGestureRecognizer) {
-        let at = cell(under: press.location(in: self))
-        switch press.state {
-        case .began:
-            speed = 0
-            pending = 0
+        if press.state == .began {
+            stopFling()
             selection = viewing ? history : rows
+        }
+        select(press, at: cell(under: press.location(in: self)))
+    }
+
+    /// Either gesture moving the far end of a selection.
+    private func select(_ gesture: UIGestureRecognizer, at: At) {
+        switch gesture.state {
+        case .began:
             selectionStart = at
             selectionEnd = at
         case .changed:
             selectionEnd = at
         case .ended:
             selectionEnd = at
-            showMenu(at: press.location(in: self))
+            showMenu(at: gesture.location(in: self))
         default:
             break
         }
         setNeedsDisplay()
+    }
+
+    private func stopFling() {
+        speed = 0
+        pending = 0
     }
 
     /// Move by however many whole lines this much dragging comes to, keeping
@@ -396,8 +391,7 @@ final class TerminalView: UIView, UIKeyInput {
         let ends = (viewFrom == 0 && speed < 0)
             || (viewTotal > 0 && viewFrom + shown >= viewTotal && speed > 0)
         if abs(speed) < max(painter.line * 2, 1) || ends {
-            speed = 0
-            pending = 0
+            stopFling()
             settle()
         }
     }
@@ -420,13 +414,13 @@ final class TerminalView: UIView, UIKeyInput {
     // ---- selection ------------------------------------------------------
 
     private func showMenu(at point: CGPoint) {
-        menu?.presentEditMenu(with: UIEditMenuConfiguration(identifier: nil, sourcePoint: point))
+        menu.presentEditMenu(with: UIEditMenuConfiguration(identifier: nil, sourcePoint: point))
     }
 
     private func endSelection() {
         guard selection != nil else { return }
         selection = nil
-        menu?.dismissMenu()
+        menu.dismissMenu()
         setNeedsDisplay()
     }
 
@@ -553,8 +547,7 @@ final class TerminalView: UIView, UIKeyInput {
         endSelection()
         if viewOpen {
             attach?.closeView()
-            speed = 0
-            pending = 0
+            stopFling()
         }
     }
 }

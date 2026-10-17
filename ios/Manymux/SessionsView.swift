@@ -14,7 +14,7 @@ struct SessionsView: View {
     @SwiftUI.State private var wall: Wall?
     @SwiftUI.State private var trouble: Error?
     @SwiftUI.State private var starting = false
-    @SwiftUI.State private var said: String?
+    @SwiftUI.State private var toast = Toast()
 
     private let columns = [GridItem(.adaptive(minimum: 150), spacing: 12)]
 
@@ -38,18 +38,7 @@ struct SessionsView: View {
                 try? await Task.sleep(for: .seconds(2))
             }
         }
-        .overlay(alignment: .bottom) {
-            if let said {
-                Text(said)
-                    .font(.footnote)
-                    .foregroundStyle(Color.text)
-                    .padding(.horizontal, 14)
-                    .padding(.vertical, 10)
-                    .background(Color.panel, in: Capsule())
-                    .padding(.bottom, 24)
-                    .transition(.opacity)
-            }
-        }
+        .toast(toast, at: .bottom, on: .panel)
     }
 
     @ViewBuilder
@@ -146,7 +135,9 @@ struct SessionsView: View {
         case let .success(wall):
             self.wall = wall
             trouble = nil
-            model.seen[machine] = wall.running
+            // Written only when it differs: every write is a redraw of every
+            // view reading it, and most refreshes find nothing new.
+            if model.seen[machine] != wall.running { model.seen[machine] = wall.running }
         case let .failure(error):
             // A list already on the screen stays there: one failed refresh is
             // a radio that dozed, and blanking the wall for it is a flicker.
@@ -157,7 +148,7 @@ struct SessionsView: View {
     /// A login shell there, opened as soon as it has a name.
     private func start() {
         starting = true
-        say("starting one")
+        toast.say("starting one")
         // A size to start it at; the real one is sent the moment the screen
         // knows its own, before the session has printed anything.
         model.ask({ try $0.startOn(machine: machine, grid: Grid(cols: 80, rows: 24)) }) { answer in
@@ -166,16 +157,8 @@ struct SessionsView: View {
             case let .success(name):
                 model.attach(machine, name)
             case let .failure(error):
-                say((error as? Trouble)?.why ?? "could not start one")
+                toast.say((error as? Trouble)?.why ?? "could not start one")
             }
-        }
-    }
-
-    private func say(_ what: String) {
-        withAnimation { said = what }
-        Task {
-            try? await Task.sleep(for: .seconds(2))
-            withAnimation { if said == what { said = nil } }
         }
     }
 }

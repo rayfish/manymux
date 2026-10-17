@@ -49,18 +49,33 @@ cargo run --locked --quiet --manifest-path "$crate/Cargo.toml" --bin uniffi-bind
     --language swift \
     --out-dir "$generated"
 
+# Copied only when different, and the framework remade only when something in
+# it is newer: this runs before every build, and a fresh timestamp on either is
+# Xcode recompiling the app and relinking it for nothing.
+same_or_copy() {
+    cmp -s "$1" "$2" || cp "$1" "$2"
+}
 headers="$out/headers"
-rm -rf "$headers"
 mkdir -p "$headers"
-cp "$generated/ManymuxCoreFFI.h" "$headers/"
+same_or_copy "$generated/ManymuxCoreFFI.h" "$headers/ManymuxCoreFFI.h"
 # Named `module.modulemap` because that is the file Xcode looks for in a
 # framework's headers; uniffi names it after the module.
-cp "$generated/ManymuxCoreFFI.modulemap" "$headers/module.modulemap"
-cp "$generated/ManymuxCore.swift" "$out/ManymuxCore.swift"
+same_or_copy "$generated/ManymuxCoreFFI.modulemap" "$headers/module.modulemap"
+same_or_copy "$generated/ManymuxCore.swift" "$out/ManymuxCore.swift"
 
-rm -rf "$out/ManymuxCore.xcframework"
+framework="$out/ManymuxCore.xcframework"
 args=()
+stale=false
+if [ ! -f "$framework/Info.plist" ]; then stale=true; fi
 for target in "${targets[@]}"; do
-    args+=(-library "$crate/target/$target/release/libmanymux_android.a" -headers "$headers")
+    library="$crate/target/$target/release/libmanymux_android.a"
+    args+=(-library "$library" -headers "$headers")
+    if [ "$library" -nt "$framework/Info.plist" ]; then stale=true; fi
 done
-xcodebuild -quiet -create-xcframework "${args[@]}" -output "$out/ManymuxCore.xcframework"
+for header in "$headers"/*; do
+    if [ "$header" -nt "$framework/Info.plist" ]; then stale=true; fi
+done
+if $stale; then
+    rm -rf "$framework"
+    xcodebuild -quiet -create-xcframework "${args[@]}" -output "$framework"
+fi

@@ -13,7 +13,6 @@ final class Attachment {
     private var ticking: Timer?
 
     func open(_ phone: Phone, _ machine: Machine, _ name: String, _ grid: Grid) -> Attach {
-        if let attach { return attach }
         // Returns at once: the connection, the ladder and the attach happen on
         // the shim's own runtime, and `state` says how they are going.
         let attach = phone.attach(machine: machine, name: name, grid: grid)
@@ -43,13 +42,13 @@ struct SessionScreen: View {
     @SwiftUI.State private var attachment = Attachment()
     @SwiftUI.State private var held = Held()
     @SwiftUI.State private var terminal: TerminalView?
-    @SwiftUI.State private var said: String?
+    @SwiftUI.State private var toast = Toast()
 
     var body: some View {
         VStack(spacing: 0) {
             TerminalSurface(held: held, made: { terminal = $0 }) { view, grid in
                 guard attachment.attach == nil, let phone = model.phone else { return }
-                view.onCannotScroll = { say("\(name) is on a machine too old to scroll back") }
+                view.onCannotScroll = { toast.say("\(name) is on a machine too old to scroll back") }
                 view.attach = attachment.open(phone, machine, name, grid)
             }
             ExtraKeys(held: held, terminal: terminal)
@@ -68,18 +67,7 @@ struct SessionScreen: View {
             }
             ToolbarItem(placement: .topBarTrailing) { switcher }
         }
-        .overlay(alignment: .top) {
-            if let said {
-                Text(said)
-                    .font(.footnote)
-                    .foregroundStyle(Color.text)
-                    .padding(.horizontal, 14)
-                    .padding(.vertical, 10)
-                    .background(Color.raised, in: Capsule())
-                    .padding(.top, 12)
-                    .transition(.opacity)
-            }
-        }
+        .toast(toast, at: .top, on: .raised)
         // What else is running, asked while nobody is waiting on the answer,
         // so the switcher opens on the machine as it is rather than as it was
         // when the list was last drawn.
@@ -141,14 +129,6 @@ struct SessionScreen: View {
         }
         .accessibilityLabel("the other sessions on this machine")
     }
-
-    private func say(_ what: String) {
-        withAnimation { said = what }
-        Task {
-            try? await Task.sleep(for: .seconds(2))
-            withAnimation { if said == what { said = nil } }
-        }
-    }
 }
 
 /// The terminal view, inside SwiftUI.
@@ -186,11 +166,11 @@ private struct ExtraKeys: View {
     var body: some View {
         VStack(spacing: 2) {
             HStack(spacing: 2) {
-                key(.text("esc")) { terminal?.send(held.escape) }
-                key(.text("tab")) { terminal?.send(held.tab) }
-                key(.text("ctrl"), lit: held.control) { held.control.toggle() }
-                key(.text("shift"), lit: held.shift) { held.shift.toggle() }
-                key(.symbol("arrow.up", "up")) { terminal?.cursorKey(.up) }
+                key("esc") { terminal?.send(held.escape) }
+                key("tab") { terminal?.send(held.tab) }
+                key("ctrl", lit: held.control) { held.control.toggle() }
+                key("shift", lit: held.shift) { held.shift.toggle() }
+                key("up", symbol: "arrow.up") { terminal?.cursorKey(.up) }
                 Color.clear.frame(maxWidth: .infinity, maxHeight: 32)
             }
             HStack(spacing: 2) {
@@ -204,7 +184,7 @@ private struct ExtraKeys: View {
                 .buttonBorderShape(.roundedRectangle(radius: 8))
                 .tint(.raised)
                 .frame(maxWidth: .infinity, maxHeight: 32)
-                key(.symbol("keyboard", "keyboard")) {
+                key("keyboard", symbol: "keyboard") {
                     if terminal?.isFirstResponder == true {
                         terminal?.closeKeyboard()
                     } else {
@@ -212,27 +192,29 @@ private struct ExtraKeys: View {
                     }
                 }
                 Color.clear.frame(maxWidth: .infinity, maxHeight: 32)
-                key(.symbol("arrow.left", "left")) { terminal?.cursorKey(.left) }
-                key(.symbol("arrow.down", "down")) { terminal?.cursorKey(.down) }
-                key(.symbol("arrow.right", "right")) { terminal?.cursorKey(.right) }
+                key("left", symbol: "arrow.left") { terminal?.cursorKey(.left) }
+                key("down", symbol: "arrow.down") { terminal?.cursorKey(.down) }
+                key("right", symbol: "arrow.right") { terminal?.cursorKey(.right) }
             }
         }
         .padding(2)
         .background(Color.panel)
     }
 
-    private enum Face {
-        case text(String)
-        /// An SF Symbol, and what to call it out loud.
-        case symbol(String, String)
-    }
-
-    private func key(_ face: Face, lit: Bool = false, press: @escaping () -> Void) -> some View {
+    /// A key that says `label`, or shows `symbol` and is called `label` out
+    /// loud.
+    private func key(
+        _ label: String,
+        symbol: String? = nil,
+        lit: Bool = false,
+        press: @escaping () -> Void
+    ) -> some View {
         Button(action: press) {
             Group {
-                switch face {
-                case let .text(label): Text(label).font(.system(size: 12))
-                case let .symbol(name, _): Image(systemName: name).font(.system(size: 14, weight: .medium))
+                if let symbol {
+                    Image(systemName: symbol).font(.system(size: 14, weight: .medium))
+                } else {
+                    Text(label).font(.system(size: 12))
                 }
             }
             .foregroundStyle(lit ? Color.accent : Color.text)
@@ -245,14 +227,7 @@ private struct ExtraKeys: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .accessibilityLabel(spoken(face))
+        .accessibilityLabel(label)
         .accessibilityAddTraits(lit ? .isSelected : [])
-    }
-
-    private func spoken(_ face: Face) -> String {
-        switch face {
-        case let .text(label): return label
-        case let .symbol(_, said): return said
-        }
     }
 }

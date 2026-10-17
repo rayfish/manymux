@@ -18,11 +18,12 @@ struct Painter {
 
     /// A painter whose grid is the font's own.
     init(size: CGFloat) {
-        regular = UIFont.monospacedSystemFont(ofSize: size, weight: .regular)
-        bold = UIFont.monospacedSystemFont(ofSize: size, weight: .bold)
-        cell = ("M" as NSString).size(withAttributes: [.font: regular]).width
-        line = regular.lineHeight.rounded(.up)
-        inset = (line - regular.lineHeight) / 2
+        let font = UIFont.monospacedSystemFont(ofSize: size, weight: .regular)
+        self.init(
+            cell: ("M" as NSString).size(withAttributes: [.font: font]).width,
+            line: font.lineHeight.rounded(.up),
+            size: size
+        )
     }
 
     /// A painter fitted to a grid it was handed, as a thumbnail is.
