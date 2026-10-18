@@ -4,7 +4,7 @@
 //! and no keys anywhere on the grounds that `~/.ssh/config` and sshd already
 //! hold them. A phone has neither, so it carries its own: one key it generated
 //! and a note of the host key each machine presented the first time. The
-//! departure is the app's and stops here — nothing about it reaches the wire
+//! departure is the app's and stops here: nothing about it reaches the wire
 //! or the library.
 
 use std::fs::{self, File, OpenOptions};
@@ -214,7 +214,7 @@ impl KnownHosts {
 /// here are ones a torn write ruins outright: a zero-byte `id_ed25519` cannot
 /// be read and cannot be regenerated either, since a key file that exists and
 /// will not parse is deliberately an error rather than a reason to make a
-/// second key — so the app would fail to start, every time, with nothing to do
+/// second key, so the app would fail to start, every time, with nothing to do
 /// about it but clear its storage. `known_hosts` is rewritten whole on every
 /// first contact with a machine, so the same accident drops every host key
 /// this device has ever recorded and quietly puts every machine back to trust

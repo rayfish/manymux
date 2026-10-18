@@ -14,7 +14,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use manymux::proto::{Size, SpawnSpec};
+use manymux::proto::{SessionInfo, Size, SpawnSpec};
 use tokio::runtime::Runtime;
 
 use crate::keys::{Identity, KnownHosts};
@@ -22,8 +22,8 @@ use crate::machine::{Connection, Connections, Machine, Rebuff};
 use crate::mouse::At;
 use crate::screen::{Frame, Row, Screen};
 use crate::scroll::Window;
-use crate::session::{Dragged, Session, State};
-use crate::ssh::{peek, reach, start};
+use crate::session::{Attaching, Dragged, Session, State};
+use crate::ssh::{Reached, peek, reach, start};
 
 /// Anything that went wrong, in the one sentence worth showing somebody.
 ///
@@ -117,6 +117,18 @@ pub struct Running {
     pub idle: u64,
 }
 
+impl From<SessionInfo> for Running {
+    fn from(session: SessionInfo) -> Self {
+        Self {
+            name: session.name,
+            title: session.title,
+            command: session.command,
+            attached: session.attached as u32,
+            idle: session.idle,
+        }
+    }
+}
+
 /// One session's screen, ready to draw small.
 ///
 /// The rows are the ones [`Frame`] carries, built here rather than on the far
@@ -190,7 +202,7 @@ impl Phone {
             runtime: Arc::new(runtime),
             identity: Identity::kept_at(&dir.join("id_ed25519"))?,
             known: KnownHosts::at(dir.join("known_hosts")),
-            connections: Arc::new(Connections::none()),
+            connections: Arc::new(Connections::default()),
         }))
     }
 
@@ -210,28 +222,8 @@ impl Phone {
     pub fn running_on(&self, machine: Machine) -> Result<Vec<Running>, Trouble> {
         self.runtime.block_on(async {
             let connection = self.reach_for(&machine).await?;
-            let reached = match reach(&*connection).await {
-                Ok(reached) => reached,
-                Err(error) => {
-                    // Held connections go stale silently on a phone, so a
-                    // failure on one is a failure of the pool as much as of
-                    // the request: dropped here, the retry somebody makes by
-                    // pressing the button again opens a fresh one.
-                    self.connections.forget().await;
-                    return Err(error.into());
-                }
-            };
-            Ok(reached
-                .sessions
-                .into_iter()
-                .map(|session| Running {
-                    name: session.name,
-                    title: session.title,
-                    command: session.command,
-                    attached: session.attached as u32,
-                    idle: session.idle,
-                })
-                .collect())
+            let reached = self.listing(&connection).await?;
+            Ok(reached.sessions.into_iter().map(Running::from).collect())
         })
     }
 
@@ -251,24 +243,8 @@ impl Phone {
     pub fn wall(&self, machine: Machine) -> Result<Wall, Trouble> {
         self.runtime.block_on(async {
             let connection = self.reach_for(&machine).await?;
-            let reached = match reach(&*connection).await {
-                Ok(reached) => reached,
-                Err(error) => {
-                    self.connections.forget().await;
-                    return Err(error.into());
-                }
-            };
-            let running: Vec<Running> = reached
-                .sessions
-                .into_iter()
-                .map(|session| Running {
-                    name: session.name,
-                    title: session.title,
-                    command: session.command,
-                    attached: session.attached as u32,
-                    idle: session.idle,
-                })
-                .collect();
+            let reached = self.listing(&connection).await?;
+            let running: Vec<Running> = reached.sessions.into_iter().map(Running::from).collect();
 
             // Named rather than left empty, so a session started between the
             // two requests is not a screen the app has no row to put under.
@@ -337,15 +313,15 @@ impl Phone {
             // The runtime is held here as well as by the phone: an attach that
             // outlived the object that started it would have its tasks stop
             // without a word, or take a thread down with them.
-            runtime: Arc::clone(&self.runtime),
-            session: Session::open(
+            _runtime: Arc::clone(&self.runtime),
+            session: Session::open(Attaching {
                 machine,
-                self.identity.clone(),
-                self.known.clone(),
-                Arc::clone(&self.connections),
+                identity: self.identity.clone(),
+                known: self.known.clone(),
+                connections: Arc::clone(&self.connections),
                 name,
-                grid.into(),
-            ),
+                wanted: grid.into(),
+            }),
         })
     }
 
@@ -373,13 +349,27 @@ impl Phone {
             .to(machine, &self.identity, &self.known)
             .await?)
     }
+
+    /// What is running there, with the ladder climbed to find out.
+    async fn listing(&self, connection: &Connection) -> Result<Reached, Trouble> {
+        match reach(connection).await {
+            Ok(reached) => Ok(reached),
+            Err(error) => {
+                // Held connections go stale silently on a phone, so a failure
+                // on one is a failure of the pool as much as of the request:
+                // dropped here, the retry somebody makes by pressing the
+                // button again opens a fresh one.
+                self.connections.forget().await;
+                Err(error.into())
+            }
+        }
+    }
 }
 
 /// One attached session.
 #[derive(uniffi::Object)]
 pub struct Attach {
-    #[allow(dead_code)]
-    runtime: Arc<Runtime>,
+    _runtime: Arc<Runtime>,
     session: Session,
 }
 

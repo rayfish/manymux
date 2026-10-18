@@ -30,7 +30,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Result, bail};
-use manymux::client::{PROGRAMS, Stream};
+use manymux::client::{NOT_FOUND, PROGRAMS, Stream};
 use manymux::lock::held;
 use manymux::proto::{Peek, Request, Response, SessionInfo, SpawnSpec};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
@@ -252,11 +252,6 @@ pub async fn peek<E: Exec>(exec: &E, program: &str, names: Vec<String>) -> Resul
         other => bail!("expected screens, got {other:?}"),
     }
 }
-
-/// What a shell exits with for a command it could not find. The same constant
-/// the library keeps privately, and for the same reason: it is the only sign
-/// the far end gives that it has no `mm` on it.
-const NOT_FOUND: i32 = 127;
 
 impl Remote {
     /// Take over a command built by the caller and run it as a child process,

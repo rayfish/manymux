@@ -24,7 +24,7 @@ use manymux::proto::Size;
 use manymux_android::agent::Agent;
 use manymux_android::keys::{Identity, KnownHosts};
 use manymux_android::machine::{Connection, Connections, Machine};
-use manymux_android::session::{Session, State};
+use manymux_android::session::{Attaching, Session, State};
 use manymux_android::ssh::reach;
 
 #[tokio::main]
@@ -64,14 +64,14 @@ async fn main() -> Result<()> {
         }
         Some(name) => {
             let size = Size::new(80, 24);
-            let session = Session::open(
+            let session = Session::open(Attaching {
                 machine,
                 identity,
                 known,
-                Arc::new(Connections::none()),
+                connections: Arc::new(Connections::default()),
                 name,
-                size,
-            );
+                wanted: size,
+            });
             print(&session, size).await;
         }
     }

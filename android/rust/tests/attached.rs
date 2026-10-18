@@ -18,7 +18,7 @@ use manymux::proto::Size;
 use manymux_android::keys::{Identity, KnownHosts, generate};
 use manymux_android::machine::{Connections, Machine};
 use manymux_android::mouse::At;
-use manymux_android::session::{Dragged, Session, State};
+use manymux_android::session::{Attaching, Dragged, Session, State};
 use sshd::{Serving, Sshd};
 use world::{Mm, World};
 
@@ -86,14 +86,14 @@ impl Reachable {
     /// Attach to a session on it, the way the app does when somebody taps a
     /// row.
     fn attach(&self, name: &str) -> Session {
-        Session::open(
-            self.machine.clone(),
-            self.identity.clone(),
-            self.known.clone(),
-            Arc::clone(&self.connections),
-            name.to_string(),
-            Size::new(40, 8),
-        )
+        Session::open(Attaching {
+            machine: self.machine.clone(),
+            identity: self.identity.clone(),
+            known: self.known.clone(),
+            connections: Arc::clone(&self.connections),
+            name: name.to_string(),
+            wanted: Size::new(40, 8),
+        })
     }
 }
 
@@ -122,7 +122,7 @@ async fn reaching(name: &str, how: How, serving: Serving) -> Reaching {
         },
         identity: Identity::kept_at(&world.dir.join("id_ed25519")).unwrap(),
         known: KnownHosts::at(world.dir.join("known_hosts")),
-        connections: Arc::new(Connections::none()),
+        connections: Arc::new(Connections::default()),
     };
     let session = at.attach("build");
     Reaching {

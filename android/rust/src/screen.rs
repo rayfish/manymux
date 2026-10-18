@@ -19,6 +19,7 @@ use std::collections::BTreeSet;
 
 use avt::{Cell, Vt};
 use manymux::proto::Size;
+use manymux::utf8::Utf8Decoder;
 
 use crate::mouse::Tracking;
 
@@ -31,13 +32,69 @@ use crate::mouse::Tracking;
 /// app is killed for it.
 const BEHIND: usize = 0;
 
-/// One session's screen.
-pub struct Screen {
+/// An emulator of the app's own, and the rows of it the app has not been
+/// given since they last changed.
+///
+/// Both surfaces are one of these: the session's screen, and the history view
+/// painted into a grid the same shape ([`crate::scroll`]). So both are built
+/// with no scrollback and both hand rows over through [`runs_of`].
+pub(crate) struct Painted {
     vt: Vt,
-    decoding: Utf8Decoder,
-    /// Rows that have changed since the last frame was taken.
     changed: BTreeSet<usize>,
     size: Size,
+}
+
+impl Painted {
+    pub(crate) fn at(size: Size) -> Self {
+        Self {
+            vt: Vt::builder()
+                .size(size.cols as usize, size.rows as usize)
+                .scrollback_limit(BEHIND)
+                .build(),
+            changed: BTreeSet::new(),
+            size,
+        }
+    }
+
+    pub(crate) fn size(&self) -> Size {
+        self.size
+    }
+
+    pub(crate) fn feed(&mut self, text: &str) {
+        let changes = self.vt.feed_str(text);
+        self.changed.extend(changes.lines.iter().copied());
+    }
+
+    /// Reflowed to a new shape, with every row owed: each is somewhere else
+    /// now, whatever the emulator says moved.
+    pub(crate) fn resize(&mut self, size: Size) {
+        self.size = size;
+        self.vt.resize(size.cols as usize, size.rows as usize);
+        self.mark_all();
+    }
+
+    /// Every row is owed, whatever the emulator thinks changed.
+    pub(crate) fn mark_all(&mut self) {
+        self.changed.extend(0..self.size.rows as usize);
+    }
+
+    /// The rows that changed since this was last asked, in order.
+    pub(crate) fn take_rows(&mut self) -> Vec<Row> {
+        std::mem::take(&mut self.changed)
+            .into_iter()
+            .filter(|at| *at < self.size.rows as usize)
+            .map(|at| Row {
+                at: at as u16,
+                runs: runs_of(self.vt.line(at)),
+            })
+            .collect()
+    }
+}
+
+/// One session's screen.
+pub struct Screen {
+    painted: Painted,
+    decoding: Utf8Decoder,
     /// Whether the program in there is reading the mouse itself, which is the
     /// one thing about the session's output that `avt` throws away and a drag
     /// needs. Reset with the rest of it on a repaint, the modes being replayed
@@ -122,13 +179,8 @@ pub enum Colour {
 impl Screen {
     pub fn at(size: Size) -> Self {
         Self {
-            vt: Vt::builder()
-                .size(size.cols as usize, size.rows as usize)
-                .scrollback_limit(BEHIND)
-                .build(),
-            decoding: Utf8Decoder::new(),
-            changed: BTreeSet::new(),
-            size,
+            painted: Painted::at(size),
+            decoding: Utf8Decoder::default(),
             mouse: Tracking::default(),
         }
     }
@@ -139,8 +191,7 @@ impl Screen {
         // and the raw bytes are what a chunk boundary falls in the middle of.
         self.mouse.feed(bytes);
         let text = self.decoding.decode(bytes);
-        let changes = self.vt.feed_str(&text);
-        self.changed.extend(changes.lines.iter().copied());
+        self.painted.feed(&text);
     }
 
     /// A repaint: whatever was on the screen before it is gone.
@@ -153,9 +204,9 @@ impl Screen {
     /// reported changed: the app is holding a picture that has stopped being
     /// true, including the rows the dump says nothing about.
     pub fn repaint(&mut self, bytes: &[u8]) {
-        *self = Self::at(self.size);
+        *self = Self::at(self.painted.size);
         self.feed(bytes);
-        self.changed.extend(0..self.size.rows as usize);
+        self.painted.mark_all();
     }
 
     /// What the session has asked to be told about the mouse.
@@ -166,7 +217,7 @@ impl Screen {
     pub fn cursor_key(&self, final_byte: u8) -> Vec<u8> {
         vec![
             0x1b,
-            if self.vt.cursor_key_app_mode() {
+            if self.painted.vt.cursor_key_app_mode() {
                 b'O'
             } else {
                 b'['
@@ -185,37 +236,28 @@ impl Screen {
 
     /// The session settled on a different size.
     pub fn resize(&mut self, size: Size) {
-        self.size = size;
-        let changes = self.vt.resize(size.cols as usize, size.rows as usize);
-        self.changed.extend(changes.lines.iter().copied());
-        self.changed.extend(0..size.rows as usize);
+        self.painted.resize(size);
     }
 
     /// Mark the whole screen for a view that has no previous frame.
     pub fn redraw(&mut self) {
-        self.changed.extend(0..self.size.rows as usize);
+        self.painted.mark_all();
     }
 
     /// The rows that have changed since this was last asked, and the cursor.
     pub fn take_frame(&mut self) -> Frame {
-        let cursor = self.vt.cursor();
-        let changed = std::mem::take(&mut self.changed)
-            .into_iter()
-            .filter(|at| *at < self.size.rows as usize)
-            .map(|at| Row {
-                at: at as u16,
-                runs: runs_of(self.vt.line(at)),
-            })
-            .collect();
+        let cursor = self.painted.vt.cursor();
+        let changed = self.painted.take_rows();
+        let size = self.painted.size;
 
         Frame {
-            cols: self.size.cols,
-            rows: self.size.rows,
+            cols: size.cols,
+            rows: size.rows,
             cursor: Cursor {
                 // Clamped, because `avt` lets the column sit one past the last
                 // one while a wrap is pending, and the widget would draw the
                 // block in a column the screen has not got.
-                col: (cursor.col as u16).min(self.size.cols.saturating_sub(1)),
+                col: (cursor.col as u16).min(size.cols.saturating_sub(1)),
                 row: cursor.row as u16,
                 visible: cursor.visible,
             },
@@ -226,11 +268,10 @@ impl Screen {
 
 /// Break a line into stretches that look the same.
 ///
-/// Shared with [`crate::scroll`], which paints the history into an emulator of
-/// its own: the two surfaces the app draws are rendered by one function, so a
+/// Both surfaces the app draws come through here by way of [`Painted`], so a
 /// colour or a wide character cannot come out one way on the screen and
 /// another way in the lines above it.
-pub(crate) fn runs_of(line: &avt::Line) -> Vec<Run> {
+fn runs_of(line: &avt::Line) -> Vec<Run> {
     // The predicate says where to *break*, not where to carry on: read the
     // other way round every cell is a run of its own, which draws the same
     // screen one call per character and loses the run boundaries the widget
@@ -270,68 +311,6 @@ fn colour_of(colour: Option<avt::Color>) -> Colour {
             green: rgb.g,
             blue: rgb.b,
         },
-    }
-}
-
-/// Incremental UTF-8 decoder.
-///
-/// `avt` takes `&str`, but session output arrives in arbitrary chunks that
-/// split multi-byte characters. This holds the incomplete tail until the rest
-/// shows up, and substitutes U+FFFD for genuinely invalid bytes so one bad byte
-/// can't desynchronise the screen forever.
-///
-/// A copy of `node::events::Utf8Decoder`, tests included, because that module
-/// is behind the `desktop` feature and this build does not have it. The two are
-/// the same decoder and should stay so.
-#[derive(Debug, Default)]
-pub struct Utf8Decoder {
-    pending: Vec<u8>,
-}
-
-impl Utf8Decoder {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn decode(&mut self, chunk: &[u8]) -> String {
-        let bytes: &[u8] = if self.pending.is_empty() {
-            chunk
-        } else {
-            self.pending.extend_from_slice(chunk);
-            &self.pending
-        };
-
-        let mut out = String::with_capacity(bytes.len());
-        let mut rest = bytes;
-        loop {
-            match std::str::from_utf8(rest) {
-                Ok(s) => {
-                    out.push_str(s);
-                    rest = &[];
-                    break;
-                }
-                Err(e) => {
-                    let valid = e.valid_up_to();
-                    out.push_str(std::str::from_utf8(&rest[..valid]).unwrap());
-                    match e.error_len() {
-                        // Invalid bytes: emit a replacement and skip them.
-                        Some(n) => {
-                            out.push(char::REPLACEMENT_CHARACTER);
-                            rest = &rest[valid + n..];
-                        }
-                        // Truncated at the end of the chunk: keep it for later.
-                        None => {
-                            rest = &rest[valid..];
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-
-        let tail = rest.to_vec();
-        self.pending = tail;
-        out
     }
 }
 
@@ -527,22 +506,5 @@ mod tests {
             "a row off the bottom of a four row screen: {:?}",
             frame.changed.iter().map(|row| row.at).collect::<Vec<_>>()
         );
-    }
-
-    #[test]
-    fn utf8_split_across_chunks() {
-        let mut d = super::Utf8Decoder::new();
-        let s = "héllo ✓";
-        let mut out = String::new();
-        for b in s.as_bytes() {
-            out.push_str(&d.decode(&[*b]));
-        }
-        assert_eq!(out, s);
-    }
-
-    #[test]
-    fn invalid_utf8_becomes_replacement() {
-        let mut d = super::Utf8Decoder::new();
-        assert_eq!(d.decode(b"a\xffb"), "a\u{fffd}b");
     }
 }

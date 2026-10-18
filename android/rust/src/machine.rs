@@ -352,6 +352,7 @@ impl Connection {
 ///
 /// One machine, because that is what this version reaches. A second entry is a
 /// map keyed by [`Machine::at`] and nothing else about this changes.
+#[derive(Default)]
 pub struct Connections {
     /// Async, and the one lock here that is: what it protects is the thing
     /// being waited for, so two callers arriving together share one handshake
@@ -366,20 +367,7 @@ struct Held {
     connection: Arc<Connection>,
 }
 
-impl Default for Connections {
-    fn default() -> Self {
-        Self::none()
-    }
-}
-
 impl Connections {
-    /// Holding nothing yet.
-    pub fn none() -> Self {
-        Self {
-            holding: AsyncMutex::new(None),
-        }
-    }
-
     /// The connection to `machine`, opening one if what is held is to another
     /// machine, has gone, or was never there.
     pub async fn to(
