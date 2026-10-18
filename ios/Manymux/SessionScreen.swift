@@ -164,8 +164,8 @@ private struct ExtraKeys: View {
     let terminal: TerminalView?
 
     var body: some View {
-        VStack(spacing: 2) {
-            HStack(spacing: 2) {
+        VStack(spacing: 6) {
+            HStack(spacing: 6) {
                 key("esc") { terminal?.send(held.escape) }
                 key("tab") { terminal?.send(held.tab) }
                 key("ctrl", lit: held.control) { held.control.toggle() }
@@ -173,7 +173,7 @@ private struct ExtraKeys: View {
                 key("up", symbol: "arrow.up") { terminal?.cursorKey(.up) }
                 Color.clear.frame(maxWidth: .infinity, maxHeight: 32)
             }
-            HStack(spacing: 2) {
+            HStack(spacing: 6) {
                 // The system's own paste button, which reads the clipboard
                 // without the prompt a programmatic read sets off.
                 PasteButton(payloadType: String.self) { strings in
@@ -197,7 +197,8 @@ private struct ExtraKeys: View {
                 key("right", symbol: "arrow.right") { terminal?.cursorKey(.right) }
             }
         }
-        .padding(2)
+        .padding(.horizontal, 8)
+        .padding(.vertical, 8)
         .background(Color.panel)
     }
 
