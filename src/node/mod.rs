@@ -103,7 +103,17 @@ impl Node {
         let own = Arc::clone(&node);
         tokio::spawn(async move {
             let mut events = own.registry.subscribe();
-            while let Ok(event) = events.recv().await {
+            loop {
+                // A burst bigger than the backlog is some bells missed, not
+                // the end of the feed: only a closed registry ends it.
+                let event = match events.recv().await {
+                    Ok(event) => event,
+                    Err(RecvError::Lagged(n)) => {
+                        debug!("node missed {n} of its own events");
+                        continue;
+                    }
+                    Err(RecvError::Closed) => break,
+                };
                 let _ = own.events.send(HostedEvent {
                     host: this_machine().to_string(),
                     event,
@@ -915,6 +925,7 @@ pub async fn note_a_node_left_behind(socket: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::proto::{EventKind, SpawnSpec};
 
     async fn watching_nothing() -> Arc<Node> {
         Node::start(Config {
@@ -970,6 +981,45 @@ mod tests {
 
         assert_eq!(node.peers.names(), first);
         assert_eq!(node.peers.len(), 1, "one watcher, not two");
+    }
+
+    /// A burst of bells bigger than the backlog, all in one chunk of output,
+    /// is a few missed events. It must not be the last event this node ever
+    /// hears from its own sessions.
+    #[tokio::test]
+    async fn a_burst_of_events_does_not_stop_the_ones_after_it() {
+        let node = watching_nothing().await;
+        let session = node
+            .registry
+            .spawn(&SpawnSpec {
+                command: vec!["/bin/sh".into(), "-c".into(), "sleep 300".into()],
+                ..Default::default()
+            })
+            .unwrap();
+        let mut events = node.events.subscribe();
+        tokio::task::yield_now().await;
+
+        // No await in between, so the forwarding task falls behind.
+        for _ in 0..EVENT_BACKLOG * 2 {
+            session.publish(EventKind::Bell);
+        }
+        tokio::task::yield_now().await;
+        while events.try_recv().is_ok() {}
+
+        session.publish(EventKind::TitleChanged("after".into()));
+        let next = async {
+            loop {
+                match events.recv().await {
+                    Ok(hosted) if matches!(hosted.event.kind, EventKind::TitleChanged(_)) => break,
+                    Ok(_) | Err(RecvError::Lagged(_)) => continue,
+                    Err(RecvError::Closed) => panic!("the node's events closed"),
+                }
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(5), next)
+            .await
+            .expect("an event after the burst still reaches the node");
+        session.kill_now();
     }
 
     #[test]
