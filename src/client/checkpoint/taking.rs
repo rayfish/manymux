@@ -259,9 +259,13 @@ pub fn take(taking: Taking<'_>) -> Taken {
     // record went, and the restart it was taken for was refused in the same
     // breath, leaving neither. The entry is older than this moment and is said
     // to be, and the session is still counted against the save, so nothing acts
-    // on it without somebody deciding to.
+    // on it without somebody deciding to. Matched by machine rather than by
+    // string here too, or an entry spelt `local` misses and is dropped.
     before.retain(|kept| {
-        if undescribed.contains(&Located::new(&kept.host, &kept.name)) {
+        let still_running = undescribed
+            .iter()
+            .any(|at| at.session == kept.name && same_machine(&at.host, &kept.host));
+        if still_running {
             taken.kept_from_before += 1;
             return true;
         }
@@ -605,6 +609,26 @@ mod tests {
         });
 
         assert_eq!(taken.carried, 0);
+        assert_eq!(taken.sessions.len(), 1, "{:?}", taken.sessions);
+        assert_eq!(taken.sessions[0].cwd, "/srv/project");
+    }
+
+    /// The other half of the same spelling: a session this save cannot describe
+    /// keeps its earlier entry, and one written down as `local` was looked for
+    /// under the machine's own name, missed, and dropped with the rest.
+    #[test]
+    fn an_entry_spelling_this_machine_local_is_kept_when_the_session_cannot_be_described() {
+        let here = this_machine();
+        let sessions = vec![hosted(here, "build", 1)];
+        let answering = vec![here.to_string()];
+        let doing = answers(vec![(here, doing("build", 1, None, &["cargo", "build"]))]);
+        let groups = Groups::default();
+        let taken = take(Taking {
+            before: vec![kept(LOCAL, "build", "/srv/project")],
+            ..taking(&sessions, &answering, &doing, &groups)
+        });
+
+        assert_eq!(taken.kept_from_before, 1);
         assert_eq!(taken.sessions.len(), 1, "{:?}", taken.sessions);
         assert_eq!(taken.sessions[0].cwd, "/srv/project");
     }
