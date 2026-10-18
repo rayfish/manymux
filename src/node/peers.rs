@@ -7,7 +7,7 @@
 //! reaches the desktop you are sitting at.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use std::time::Duration;
 
 use tokio::task::JoinHandle;
@@ -111,9 +111,6 @@ impl Peers {
         self.len() == 0
     }
 }
-
-/// Shared so the watcher tasks can outlive the call that started them.
-pub type Shared = Arc<Peers>;
 
 #[cfg(test)]
 mod tests {

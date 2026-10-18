@@ -1,8 +1,13 @@
 //! Where things live on disk.
 
-use std::path::PathBuf;
+use std::fs::{self, DirBuilder, OpenOptions};
+use std::io::Write;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
+use serde::Serialize;
+use serde::de::DeserializeOwned;
 
 /// Per-user runtime directory for sockets: `/tmp/manymux-<uid>`, worked out from
 /// the uid alone and from nothing else.
@@ -51,14 +56,10 @@ pub fn ensure_runtime_dir() -> Result<PathBuf> {
 }
 
 /// Whether `dir` is a directory of ours that nobody else can reach into.
-fn check_runtime_dir(dir: &std::path::Path) -> Result<()> {
-    use std::os::unix::fs::MetadataExt;
-    use std::os::unix::fs::PermissionsExt;
-
+fn check_runtime_dir(dir: &Path) -> Result<()> {
     // Not `metadata`: a symlink planted at that path is followed by the create
     // in the caller, which would land the socket wherever it points.
-    let meta =
-        std::fs::symlink_metadata(dir).with_context(|| format!("checking {}", dir.display()))?;
+    let meta = fs::symlink_metadata(dir).with_context(|| format!("checking {}", dir.display()))?;
     if !meta.is_dir() {
         bail!("{} is not a directory", dir.display());
     }
@@ -131,7 +132,7 @@ pub fn config_dir() -> PathBuf {
 /// The config directory belonging to `home`, for a system-wide unit that will
 /// run as someone else. Same answer [`config_dir`] would give in that account,
 /// worked out without their environment to ask.
-pub fn config_dir_for(home: &std::path::Path) -> PathBuf {
+pub fn config_dir_for(home: &Path) -> PathBuf {
     if cfg!(target_os = "macos") {
         home.join("Library/Application Support/manymux")
     } else {
@@ -144,29 +145,40 @@ pub fn config_dir_for(home: &std::path::Path) -> PathBuf {
 ///
 /// The mode applies to directories this creates, never to ones that already
 /// exist: a socket path of `/tmp/x.sock` must not lead us to chmod `/tmp`.
-pub fn ensure_private_dir(path: &std::path::Path) -> Result<()> {
-    use std::os::unix::fs::DirBuilderExt;
-
-    std::fs::DirBuilder::new()
+pub fn ensure_private_dir(path: &Path) -> Result<()> {
+    DirBuilder::new()
         .recursive(true)
         .mode(0o700)
         .create(path)
         .with_context(|| format!("creating {}", path.display()))
 }
 
+/// A TOML file read into `T`, or `T`'s default when there is no file yet.
+pub fn load_toml<T: DeserializeOwned + Default>(path: &Path) -> Result<T> {
+    if !path.exists() {
+        return Ok(T::default());
+    }
+    let text = fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))
+}
+
+/// Write `value` as TOML only its owner can read. `what` names it in the error
+/// when it cannot be encoded, as in "encoding the host list".
+pub fn save_toml<T: Serialize>(path: &Path, value: &T, what: &str) -> Result<()> {
+    let text = toml::to_string_pretty(value).with_context(|| format!("encoding {what}"))?;
+    write_private_file(path, text.as_bytes())
+}
+
 /// Write a file only its owner can read, replacing any existing one.
 ///
 /// The write goes to a temp file and is renamed into place, so a crash or a
 /// concurrent reader never sees a half-written identity or allowlist.
-pub fn write_private_file(path: &std::path::Path, contents: &[u8]) -> Result<()> {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-
+pub fn write_private_file(path: &Path, contents: &[u8]) -> Result<()> {
     if let Some(dir) = path.parent() {
         ensure_private_dir(dir)?;
     }
     let temp = path.with_extension("tmp");
-    let mut file = std::fs::OpenOptions::new()
+    let mut file = OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(true)
@@ -177,7 +189,7 @@ pub fn write_private_file(path: &std::path::Path, contents: &[u8]) -> Result<()>
         .and_then(|()| file.sync_all())
         .with_context(|| format!("writing {}", temp.display()))?;
     drop(file);
-    std::fs::rename(&temp, path).with_context(|| format!("installing {}", path.display()))
+    fs::rename(&temp, path).with_context(|| format!("installing {}", path.display()))
 }
 
 #[cfg(test)]
@@ -213,11 +225,9 @@ mod tests {
 
     #[test]
     fn a_runtime_directory_somebody_else_owns_is_refused() {
-        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
-
         let dir = std::env::temp_dir().join(format!("manymux-perm-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::DirBuilder::new()
+        let _ = fs::remove_dir_all(&dir);
+        DirBuilder::new()
             .recursive(true)
             .mode(0o755)
             .create(&dir)
@@ -226,21 +236,21 @@ mod tests {
         // in is the same class of mistake as it being someone else's.
         assert!(check_runtime_dir(&dir).is_err());
 
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
         assert!(check_runtime_dir(&dir).is_ok());
 
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn a_symlink_where_the_runtime_directory_should_be_is_refused() {
         let dir = std::env::temp_dir().join(format!("manymux-link-{}", std::process::id()));
-        let _ = std::fs::remove_file(&dir);
+        let _ = fs::remove_file(&dir);
         std::os::unix::fs::symlink("/tmp", &dir).unwrap();
         // It is a directory as far as `metadata` is concerned, which is exactly
         // how a socket ends up somewhere it was never meant to be.
         assert!(check_runtime_dir(&dir).is_err());
-        let _ = std::fs::remove_file(&dir);
+        let _ = fs::remove_file(&dir);
     }
 
     /// Otherwise the update that moves the socket tells everyone their own node

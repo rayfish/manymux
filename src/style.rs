@@ -79,17 +79,19 @@ pub fn host(text: &str) -> String {
     paint("38;5;110", text)
 }
 
+/// The glyph for a session somebody is attached to, for a caller measuring
+/// the text before it is styled.
+pub const DOT_ATTACHED: &str = "●";
+
+/// The glyph for a session nobody is attached to.
+pub const DOT_IDLE: &str = "○";
+
 /// Someone is attached and watching.
 pub fn dot_attached() -> String {
-    green("●")
+    green(DOT_ATTACHED)
 }
 
 /// Nobody is watching this one.
 pub fn dot_idle() -> String {
-    faint("○")
-}
-
-/// Whether styling is on, for callers deciding whether to draw anything fancy.
-pub fn is_enabled() -> bool {
-    enabled()
+    faint(DOT_IDLE)
 }

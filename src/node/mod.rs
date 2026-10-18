@@ -79,8 +79,9 @@ pub struct Node {
     pub registry: Arc<Registry>,
     peers: Peers,
     notifier: Arc<Notifier>,
-    /// Ours and every watched machine's events. The notifier reads this, and so
-    /// does anything asking for `Events` over the socket.
+    /// Ours and every watched machine's events. Our own sessions publish here
+    /// directly, stamped with this machine's name. The notifier reads this, and
+    /// so does anything asking for `Events` over the socket.
     events: broadcast::Sender<HostedEvent>,
     /// SHA-256 of the binary this node started from, taken before an update can
     /// replace the file. Asking again later would hash whatever now sits at
@@ -92,23 +93,11 @@ impl Node {
     pub async fn start(config: Config) -> Arc<Self> {
         let (events, _) = broadcast::channel(EVENT_BACKLOG);
         let node = Arc::new(Self {
-            registry: Registry::new(),
+            registry: Registry::new(events.clone()),
             peers: Peers::default(),
             notifier: Arc::new(Notifier::new(config.notifications)),
             events,
             build: own_build().await,
-        });
-
-        // Our own sessions' events, tagged with this machine's name.
-        let own = Arc::clone(&node);
-        tokio::spawn(async move {
-            let mut events = own.registry.subscribe();
-            while let Ok(event) = events.recv().await {
-                let _ = own.events.send(HostedEvent {
-                    host: this_machine().to_string(),
-                    event,
-                });
-            }
         });
 
         node.watch_peers(&config.peers);
@@ -376,7 +365,7 @@ impl Node {
                 // watching the socket vanish and having to guess why.
                 Request::Stop => {
                     proto::write_msg(&mut write, tag::RESPONSE, &Response::Ok).await?;
-                    info!(sessions = self.registry.list().len(), "stopping on request");
+                    info!(sessions = self.registry.count(), "stopping on request");
                     self.shutdown(GRACE).await;
                     // The reply is in the socket buffer, not yet read. A moment for
                     // the caller to take it costs nothing and saves a confusing
@@ -722,6 +711,35 @@ where
 /// How long to wait for a node we just started to come up.
 const START_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How long to wait for a node asked to stop to let go of its socket. It has
+/// to stay longer than [`GRACE`].
+const STOP_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Which way [`wait_until`] is waiting for a socket to go.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Listening {
+    Yes,
+    No,
+}
+
+/// Poll a socket until a node is or is not answering on it, and say whether
+/// that happened before `limit` ran out.
+async fn wait_until(socket: &Path, wanted: Listening, limit: Duration) -> bool {
+    let deadline = Instant::now() + limit;
+    while Instant::now() < deadline {
+        let listening = if tokio::net::UnixStream::connect(socket).await.is_ok() {
+            Listening::Yes
+        } else {
+            Listening::No
+        };
+        if listening == wanted {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    false
+}
+
 /// Bridge this process's stdin and stdout to the node on this machine, starting
 /// one if it is not running.
 ///
@@ -790,11 +808,8 @@ pub async fn stop(socket: &Path) -> Result<()> {
 
     // Waiting matters: whatever starts a node next has to bind the socket
     // rather than lose a race with the one on its way out.
-    for _ in 0..100 {
-        if tokio::net::UnixStream::connect(socket).await.is_err() {
-            return Ok(());
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+    if wait_until(socket, Listening::No, STOP_TIMEOUT).await {
+        return Ok(());
     }
     bail!("the node was asked to stop but is still listening on {socket:?}")
 }
@@ -875,12 +890,8 @@ async fn start_node(socket: &Path) -> Result<()> {
         .spawn()
         .with_context(|| format!("starting {}", binary.display()))?;
 
-    let deadline = tokio::time::Instant::now() + START_TIMEOUT;
-    while tokio::time::Instant::now() < deadline {
-        if tokio::net::UnixStream::connect(socket).await.is_ok() {
-            return Ok(());
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+    if wait_until(socket, Listening::Yes, START_TIMEOUT).await {
+        return Ok(());
     }
     bail!("started a node but it did not come up within {START_TIMEOUT:?}")
 }
@@ -915,6 +926,8 @@ pub async fn note_a_node_left_behind(socket: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::proto::{EventKind, SpawnSpec};
+    use tokio::sync::broadcast::error::TryRecvError;
 
     async fn watching_nothing() -> Arc<Node> {
         Node::start(Config {
@@ -970,6 +983,47 @@ mod tests {
 
         assert_eq!(node.peers.names(), first);
         assert_eq!(node.peers.len(), 1, "one watcher, not two");
+    }
+
+    /// A burst of bells bigger than the backlog, all in one chunk of output,
+    /// is a few missed events for a listener that fell behind. It must not be
+    /// the last event that listener ever hears from this node's sessions.
+    #[tokio::test]
+    async fn a_burst_of_events_does_not_stop_the_ones_after_it() {
+        let node = watching_nothing().await;
+        let session = node
+            .registry
+            .spawn(&SpawnSpec {
+                command: vec!["/bin/sh".into(), "-c".into(), "sleep 300".into()],
+                ..Default::default()
+            })
+            .unwrap();
+        let mut events = node.events.subscribe();
+
+        // Nothing reads in between, so the listener falls behind.
+        for _ in 0..EVENT_BACKLOG * 2 {
+            session.publish(EventKind::Bell);
+        }
+        assert!(
+            matches!(events.try_recv(), Err(TryRecvError::Lagged(_))),
+            "the burst is bigger than the backlog"
+        );
+        while events.try_recv().is_ok() {}
+
+        session.publish(EventKind::TitleChanged("after".into()));
+        let next = async {
+            loop {
+                match events.recv().await {
+                    Ok(hosted) if matches!(hosted.event.kind, EventKind::TitleChanged(_)) => break,
+                    Ok(_) | Err(RecvError::Lagged(_)) => continue,
+                    Err(RecvError::Closed) => panic!("the node's events closed"),
+                }
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(5), next)
+            .await
+            .expect("an event after the burst still reaches the node");
+        session.kill_now();
     }
 
     #[test]

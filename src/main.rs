@@ -20,7 +20,9 @@ use manymux::client::groups::Groups;
 use manymux::client::listed::{Listed, Snapshot};
 use manymux::client::switch::{Cycle, Located};
 use manymux::client::{Attached, Gone, Stream};
-use manymux::hosts::{Hosts, LOCAL, as_listed, is_this_machine, same_machine, this_machine};
+use manymux::hosts::{
+    Hosts, LOCAL, as_listed, is_this_machine, qualified, same_machine, this_machine,
+};
 use manymux::lock::held as held_lock;
 use manymux::node::{Config, Node};
 use manymux::proto::{Doing, HostedSession, Request, Response, SpawnSpec};
@@ -33,7 +35,7 @@ mod completions;
 mod target;
 
 use target::{
-    Bare, Listing, Started, Unreachable, answer_from, everywhere, locate, note_reached, qualified,
+    Bare, Listing, Started, Unreachable, answer_from, everywhere, locate, note_reached,
     sessions_on, where_to_start,
 };
 
@@ -1948,8 +1950,14 @@ async fn do_attach(
         // Renamed from inside, so the name this run has been using is nobody's
         // now: the cycle would hop to a session that is not there, and the line
         // printed on the way out would name it too.
+        // The history it seeded goes with it, or the next reattach puts it in
+        // the scrollback a second time.
         if let Some(name) = renamed {
+            let was = where_;
             where_ = qualified(&target.host, &name);
+            if seeded.remove(&was) {
+                seeded.insert(where_.clone());
+            }
             cycle.renamed(&name);
         }
         match outcome {
@@ -2062,6 +2070,11 @@ async fn do_attach(
                         let pid = at.and_then(|at| snapshot.info(at)).map(|i| i.pid);
                         match rename_at(socket, at, pid.unwrap_or_default(), &to).await {
                             Ok(name) => {
+                                if let Some(at) = at
+                                    && seeded.remove(&qualified(&at.host, &at.session))
+                                {
+                                    seeded.insert(qualified(&at.host, &name));
+                                }
                                 if let Some(at) = at
                                     && *at == target
                                 {

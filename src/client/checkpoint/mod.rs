@@ -46,7 +46,7 @@ pub use taking::{Dropped, Shared, Taken, Taking, Unsaid, take};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 use crate::config;
@@ -196,18 +196,11 @@ pub struct Checkpoint {
 
 impl Checkpoint {
     pub fn load() -> Result<Self> {
-        let path = Self::path();
-        if !path.exists() {
-            return Ok(Self::default());
-        }
-        let text = std::fs::read_to_string(&path)
-            .with_context(|| format!("reading {}", path.display()))?;
-        toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))
+        config::load_toml(&Self::path())
     }
 
     pub fn save(&self) -> Result<()> {
-        let text = toml::to_string_pretty(self).context("encoding the checkpoint")?;
-        config::write_private_file(&Self::path(), text.as_bytes())
+        config::save_toml(&Self::path(), self, "the checkpoint")
     }
 
     /// Its own file rather than a section in `settings.toml`, the reason

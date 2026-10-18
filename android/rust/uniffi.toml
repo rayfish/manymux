@@ -1,2 +1,9 @@
 [defaults.bindings.kotlin]
 android = true
+
+# The iOS app imports the bindings as `ManymuxCore`, and the C half of them as
+# a module the XCFramework carries (`ios/build-rust.sh`).
+[defaults.bindings.swift]
+module_name = "ManymuxCore"
+ffi_module_name = "ManymuxCoreFFI"
+ffi_module_filename = "ManymuxCoreFFI"

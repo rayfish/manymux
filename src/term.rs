@@ -1,6 +1,6 @@
 //! Rendering the session table.
 
-use crate::hosts::is_this_machine;
+use crate::hosts::qualified;
 use crate::proto::SessionInfo;
 use crate::style;
 
@@ -15,14 +15,9 @@ pub struct SessionRow {
 }
 
 impl SessionRow {
-    /// What you would type to reach this session. Bare on this machine, since
-    /// that is what you would type, and `host/name` anywhere else.
+    /// What you would type to reach this session.
     pub fn target(&self) -> String {
-        if is_this_machine(&self.host) {
-            self.session.name.clone()
-        } else {
-            format!("{}/{}", self.host, self.session.name)
-        }
+        qualified(&self.host, &self.session.name)
     }
 }
 
@@ -135,18 +130,15 @@ fn paint_target(host: &str, target: &str) -> String {
 fn attached(clients: usize) -> Cell {
     match clients {
         0 => Cell::new(
-            format!("{} -", DOT_IDLE),
+            format!("{} -", style::DOT_IDLE),
             format!("{} {}", style::dot_idle(), style::faint("-")),
         ),
         n => Cell::new(
-            format!("{DOT_ATTACHED} {n}"),
+            format!("{} {n}", style::DOT_ATTACHED),
             format!("{} {}", style::dot_attached(), style::green(&n.to_string())),
         ),
     }
 }
-
-const DOT_ATTACHED: char = '●';
-const DOT_IDLE: char = '○';
 
 /// Idle time fades as it grows: a session that just did something is worth
 /// noticing, one that has been quiet for a day is background.

@@ -1,0 +1,5 @@
+# Generated: the Rust core, its bindings, and the Xcode project.
+build/
+Manymux.xcodeproj/
+# Signing, which is personal.
+Local.xcconfig

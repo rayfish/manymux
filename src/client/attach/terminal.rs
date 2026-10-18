@@ -26,7 +26,7 @@ use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::mpsc;
 use tracing::debug;
 
-use super::keys::wheel_is_ours;
+use super::keys::{interrupts, wheel_is_ours};
 use super::{Action, Chose, Find, KeyFilter, Mode, Outcome, Pick, Rename, Rows, Scroll, Select};
 use crate::client::picker::Picker;
 use crate::client::screen::ScreenMode;
@@ -356,7 +356,7 @@ pub async fn waiting(held: &mut Held, target: &str, delay: Duration, lost_for: D
                 // Nobody is going to press anything.
                 None => return Wait::GiveUp,
                 Some(chunk) => {
-                    if chunk.contains(&INTERRUPT) {
+                    if interrupts(&chunk) {
                         return Wait::GiveUp;
                     }
                     if matches!(keys.filter(&chunk).action, Some(Action::Detach)) {
@@ -371,10 +371,6 @@ pub async fn waiting(held: &mut Held, target: &str, delay: Duration, lost_for: D
 /// How often the row counts down. A second, because that is the unit it is
 /// counting in.
 const TICK: Duration = Duration::from_secs(1);
-
-/// Ctrl-C, which while nothing is attached is a way out rather than a signal
-/// to pass on.
-const INTERRUPT: u8 = 0x03;
 
 /// What the attach returned, including a reusable transport after a switch.
 pub struct Run {

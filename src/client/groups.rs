@@ -39,7 +39,10 @@
 //! machine would not even be seen. All three fields are stamped once in
 //! `Session::spawn` and never written again. `started` is there for the one
 //! case the pid alone cannot answer: a machine that rebooted and reused the
-//! number.
+//! number. The host is stored the way a listing spells it (`hosts::as_listed`):
+//! `local` and this machine's own name are one machine, and a member written
+//! under the word typed matched no listing row, so it was in no group anyone
+//! could see and was never pruned.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};
@@ -51,6 +54,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::config;
+use crate::hosts::as_listed;
 use crate::proto::{HostedSession, SessionInfo};
 
 /// One session, named the way it will still be named after a rename.
@@ -72,7 +76,7 @@ impl Member {
             .map(|since| since.as_secs())
             .unwrap_or(0);
         Self {
-            host: host.to_string(),
+            host: as_listed(host).to_string(),
             pid: session.pid,
             started,
         }
@@ -99,17 +103,11 @@ impl Groups {
     }
 
     fn read(path: &Path) -> Result<Self> {
-        if !path.exists() {
-            return Ok(Self::default());
-        }
-        let text =
-            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-        toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))
+        config::load_toml(path)
     }
 
     fn write_to(&self, path: &Path) -> Result<()> {
-        let text = toml::to_string_pretty(self).context("encoding the group list")?;
-        config::write_private_file(path, text.as_bytes())
+        config::save_toml(path, self, "the group list")
     }
 
     /// Read the file, change it, and write it back, in that order.
@@ -315,6 +313,7 @@ impl Groups {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hosts::{LOCAL, this_machine};
     use crate::proto::Size;
     use std::time::Duration;
 
@@ -434,6 +433,21 @@ mod tests {
         groups.prune(&["box".into()], &[hosted("box", live.clone())]);
         assert_eq!(groups.group_of("box", &gone), None);
         assert_eq!(groups.group_of("box", &live), Some("pi"));
+    }
+
+    /// `mm group local/build work` is this machine by its other spelling, and
+    /// every listing names it by its own: kept as typed, the member matched no
+    /// row, so it was in no group anybody could see and was never pruned.
+    #[test]
+    fn a_session_grouped_as_local_is_found_and_pruned_under_this_machine() {
+        let mut groups = Groups::default();
+        let build = session("build", 41823, 1000);
+        groups.assign("work", LOCAL, &build).unwrap();
+        assert_eq!(groups.group_of(this_machine(), &build), Some("work"));
+
+        groups.prune(&[this_machine().to_string()], &[]);
+        assert_eq!(groups.group_of(this_machine(), &build), None);
+        assert!(groups.names().is_empty(), "and the group went with it");
     }
 
     /// A machine that is asleep has not said its sessions are gone, and pruning

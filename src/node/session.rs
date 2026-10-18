@@ -7,6 +7,8 @@
 //! project, and it is why the PTY is owned by the server rather than proxied.
 
 use std::collections::HashMap;
+use std::path::Path;
+use std::slice;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime};
@@ -17,14 +19,16 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{broadcast, mpsc, watch};
 use tracing::{debug, warn};
 
-use super::events::{Event, Scanner, Utf8Decoder};
+use super::events::{Event, Scanner};
+use crate::hosts::this_machine;
 use crate::lock::held;
 use crate::proto::{
-    self, Doing, EventKind, Found, Peek, SessionEvent, SessionInfo, Size, SpawnSpec, View,
-    ViewRequest,
+    self, Doing, EventKind, Found, HostedEvent, Peek, SessionEvent, SessionInfo, Size, SpawnSpec,
+    View, ViewRequest,
 };
 use crate::shell;
 use crate::user;
+use crate::utf8::Utf8Decoder;
 
 /// Lines of scrollback kept per session. Enough to scroll back through a long
 /// build; small enough that a hundred sessions don't matter.
@@ -58,9 +62,10 @@ pub struct Session {
     state: Mutex<State>,
     /// Resolves to the child's exit code once it exits.
     exit_rx: watch::Receiver<Option<i32>>,
-    /// The host-wide event bus. Bells and title changes go here so a laptop can
-    /// hear about them with nothing attached.
-    events: broadcast::Sender<SessionEvent>,
+    /// The node's event bus. Bells and title changes go here, stamped with
+    /// this machine's name, so a laptop can hear about them with nothing
+    /// attached.
+    events: broadcast::Sender<HostedEvent>,
     /// Clients attached to any session on this host, shared by all of them.
     /// Stamped onto every event, because it decides whether a bell is shown to
     /// somebody sitting in a terminal here or raised on a desktop elsewhere.
@@ -95,6 +100,25 @@ struct State {
 }
 
 impl State {
+    /// A session's state before anything has been printed.
+    fn new(size: Size) -> Self {
+        Self {
+            vt: Vt::builder()
+                .size(size.cols as usize, size.rows as usize)
+                .scrollback_limit(SCROLLBACK)
+                .build(),
+            scanner: Scanner::default(),
+            decoder: Utf8Decoder::default(),
+            trimmed: 0,
+            counted: 0,
+            printed: 0,
+            bells: 0,
+            last_activity: Instant::now(),
+            clients: HashMap::new(),
+            size,
+        }
+    }
+
     /// What the session calls itself: the last title the program set, else the
     /// command it was started with. It follows the program rather than the
     /// session's name, which is what a rename changes: the name says which
@@ -230,16 +254,14 @@ impl Attachment {
         self.read_only
     }
 
-    /// Update this client's requested size and renegotiate the effective size.
-    ///
-    /// A viewer never joins that negotiation, so its window changing size is
-    /// nothing to do with the session's geometry.
     /// Ask for a size, and answer with the one the session took.
     ///
     /// Not always the one asked for: the smallest across every attached client
     /// wins, so a client that asked for more than somebody else's terminal has
     /// been given less. A client with a screen of its own has to be told, or it
-    /// reflows its copy to a shape the session never had.
+    /// reflows its copy to a shape the session never had. A viewer never joins
+    /// that negotiation, so its window changing size is nothing to do with the
+    /// session's geometry.
     pub fn resize(&self, size: Size) -> Size {
         if self.read_only {
             return held(&self.session.state).size;
@@ -322,7 +344,7 @@ impl Session {
     pub fn spawn(
         spec: &SpawnSpec,
         name: String,
-        events: broadcast::Sender<SessionEvent>,
+        events: broadcast::Sender<HostedEvent>,
         host_clients: Arc<AtomicUsize>,
     ) -> Result<Arc<Self>> {
         let size = spec.size.sane();
@@ -366,21 +388,7 @@ impl Session {
             started: SystemTime::now(),
             input_tx,
             output_tx: output_tx.clone(),
-            state: Mutex::new(State {
-                vt: Vt::builder()
-                    .size(size.cols as usize, size.rows as usize)
-                    .scrollback_limit(SCROLLBACK)
-                    .build(),
-                scanner: Scanner::new(),
-                decoder: Utf8Decoder::new(),
-                trimmed: 0,
-                counted: 0,
-                printed: 0,
-                bells: 0,
-                last_activity: Instant::now(),
-                clients: HashMap::new(),
-                size,
-            }),
+            state: Mutex::new(State::new(size)),
             exit_rx,
             events,
             host_clients,
@@ -472,19 +480,22 @@ impl Session {
         }
     }
 
-    /// Put an event on the host-wide bus, stamped with enough context that a
+    /// Put an event on the node's bus, stamped with enough context that a
     /// listener never has to ask a follow-up question to render a notification.
     pub fn publish(&self, kind: EventKind) {
         let (title, attached) = {
             let state = held(&self.state);
             (state.title(&self.command), state.clients.len())
         };
-        let _ = self.events.send(SessionEvent {
-            session: self.name(),
-            title,
-            kind,
-            attached,
-            host_attached: self.host_clients.load(Ordering::Relaxed),
+        let _ = self.events.send(HostedEvent {
+            host: this_machine().to_string(),
+            event: SessionEvent {
+                session: self.name(),
+                title,
+                kind,
+                attached,
+                host_attached: self.host_clients.load(Ordering::Relaxed),
+            },
         });
     }
 
@@ -681,7 +692,7 @@ fn launch(spec: &SpawnSpec) -> Launch {
     let named = |argv: &[String]| spec.label.clone().unwrap_or_else(|| describe(argv));
     if spec.command.is_empty() {
         return Launch {
-            label: named(std::slice::from_ref(&shell)),
+            label: named(slice::from_ref(&shell)),
             argv: vec![shell, "-l".to_string()],
         };
     }
@@ -697,7 +708,7 @@ fn describe(argv: &[String]) -> String {
     let program = argv
         .first()
         .map(|p| {
-            std::path::Path::new(p)
+            Path::new(p)
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_else(|| p.clone())
@@ -714,7 +725,7 @@ fn describe(argv: &[String]) -> String {
 /// Default session name for a spec: the program's basename.
 pub fn default_name(spec: &SpawnSpec) -> String {
     match spec.command.first() {
-        Some(program) => describe(std::slice::from_ref(program)),
+        Some(program) => describe(slice::from_ref(program)),
         None => describe(&[user::shell()]),
     }
 }
@@ -762,38 +773,9 @@ mod tests {
         let mut clients = HashMap::new();
         clients.insert(1, Size::new(120, 40));
         clients.insert(2, Size::new(80, 50));
-        let state = State {
-            vt: Vt::new(80, 24),
-            scanner: Scanner::new(),
-            decoder: Utf8Decoder::new(),
-            trimmed: 0,
-            counted: 0,
-            printed: 0,
-            bells: 0,
-            last_activity: Instant::now(),
-            clients,
-            size: Size::new(80, 24),
-        };
+        let mut state = State::new(Size::new(80, 24));
+        state.clients = clients;
         assert_eq!(state.effective_size(), Size::new(80, 40));
-    }
-
-    /// A session's state as [`Session::new`] builds one.
-    fn state() -> State {
-        State {
-            vt: Vt::builder()
-                .size(80, 24)
-                .scrollback_limit(SCROLLBACK)
-                .build(),
-            scanner: Scanner::new(),
-            decoder: Utf8Decoder::new(),
-            trimmed: 0,
-            counted: 0,
-            printed: 0,
-            bells: 0,
-            last_activity: Instant::now(),
-            clients: HashMap::new(),
-            size: Size::new(80, 24),
-        }
     }
 
     /// What [`Session::ingest`] does with a chunk of output, without the
@@ -817,7 +799,7 @@ mod tests {
     /// printed and throw their view back by a thousand.
     #[test]
     fn a_reflow_prints_nothing() {
-        let mut state = state();
+        let mut state = State::new(Size::new(80, 24));
         for i in 0..50 {
             feed(
                 &mut state,
@@ -852,7 +834,7 @@ mod tests {
     /// session to the top of it.
     #[test]
     fn a_resize_under_a_full_screen_program_prints_nothing() {
-        let mut state = state();
+        let mut state = State::new(Size::new(80, 24));
         for i in 0..500 {
             feed(&mut state, &format!("line {i}\r\n"));
         }
@@ -879,18 +861,8 @@ mod tests {
     /// printed, and nothing else the buffer does.
     #[test]
     fn what_a_session_has_printed_does_not_go_back() {
-        let mut state = State {
-            vt: Vt::new(80, 24),
-            scanner: Scanner::new(),
-            decoder: Utf8Decoder::new(),
-            trimmed: 40,
-            counted: 0,
-            printed: 0,
-            bells: 0,
-            last_activity: Instant::now(),
-            clients: HashMap::new(),
-            size: Size::new(80, 24),
-        };
+        let mut state = State::new(Size::new(80, 24));
+        state.trimmed = 40;
         assert_eq!(state.printed(1000), 1040, "the forty that scrolled off");
         assert_eq!(state.printed(1010), 1050, "ten lines printed since");
 
@@ -913,18 +885,7 @@ mod tests {
     /// changes what it is called, not what it says it is doing.
     #[test]
     fn the_title_follows_the_program() {
-        let mut state = State {
-            vt: Vt::new(80, 24),
-            scanner: Scanner::new(),
-            decoder: Utf8Decoder::new(),
-            trimmed: 0,
-            counted: 0,
-            printed: 0,
-            bells: 0,
-            last_activity: Instant::now(),
-            clients: HashMap::new(),
-            size: Size::new(80, 24),
-        };
+        let mut state = State::new(Size::new(80, 24));
         assert_eq!(state.title("zsh"), "zsh", "the command is the fallback");
 
         state.scanner.feed(b"\x1b]0;from the program\x07", |_| {});

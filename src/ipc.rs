@@ -1,19 +1,26 @@
-//! The local Unix socket both long-running halves listen on.
+//! The local Unix socket a node listens on.
 //!
 //! Whoever can reach one of these sockets can run commands as this user, so
 //! they are owner-only and there is no further authentication behind them.
 //! Reaching one from another machine means going through sshd first, which is
 //! where access is decided.
 
-use std::path::Path;
+use std::ffi::CString;
+use std::fs::{self, Permissions};
+use std::io;
+use std::os::fd::AsRawFd;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
+use std::ptr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::net::UnixListener;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::broadcast;
 use tokio::sync::broadcast::error::RecvError;
 use tracing::{debug, info, warn};
@@ -53,7 +60,7 @@ const TOUCH_EVERY: Duration = Duration::from_secs(6 * 60 * 60);
 /// timestamps, so a quiet one looks abandoned. Losing it is worse than it
 /// sounds, because the node binds once and never again, so the sessions would
 /// still be running with nothing left able to reach them.
-fn keep_alive(socket: std::path::PathBuf) {
+fn keep_alive(socket: PathBuf) {
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(TOUCH_EVERY).await;
@@ -65,19 +72,16 @@ fn keep_alive(socket: std::path::PathBuf) {
 }
 
 /// Set a path's times to now, without opening it: a socket cannot be opened.
-fn touch(path: &Path) -> std::io::Result<()> {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
-
+fn touch(path: &Path) -> io::Result<()> {
     let path = CString::new(path.as_os_str().as_bytes())
-        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+        .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
     // SAFETY: the pointer is to a NUL-terminated string alive for the call, and
     // a null `times` is utimensat's own way of saying "now".
-    let set = unsafe { libc::utimensat(libc::AT_FDCWD, path.as_ptr(), std::ptr::null(), 0) };
+    let set = unsafe { libc::utimensat(libc::AT_FDCWD, path.as_ptr(), ptr::null(), 0) };
     if set == 0 {
         Ok(())
     } else {
-        Err(std::io::Error::last_os_error())
+        Err(io::Error::last_os_error())
     }
 }
 
@@ -106,10 +110,10 @@ async fn listen(socket: &Path) -> Result<UnixListener> {
             crate::config::ensure_private_dir(dir)?;
         }
     }
-    if socket.exists() && tokio::net::UnixStream::connect(socket).await.is_ok() {
+    if socket.exists() && UnixStream::connect(socket).await.is_ok() {
         bail!("something is already listening on {}", socket.display());
     }
-    std::fs::remove_file(socket).ok();
+    fs::remove_file(socket).ok();
 
     let listener =
         UnixListener::bind(socket).with_context(|| format!("binding {}", socket.display()))?;
@@ -123,9 +127,7 @@ async fn listen(socket: &Path) -> Result<UnixListener> {
 /// The way to reach a node that will not answer: it is whatever process is
 /// holding this socket, and the kernel already knows which one that is. Only
 /// Linux and macOS are covered, which is what manymux publishes builds for.
-pub fn peer_pid(stream: &tokio::net::UnixStream) -> Option<u32> {
-    use std::os::fd::AsRawFd;
-
+pub fn peer_pid(stream: &UnixStream) -> Option<u32> {
     let fd = stream.as_raw_fd();
     #[cfg(target_os = "linux")]
     {
@@ -172,8 +174,7 @@ pub fn peer_pid(stream: &tokio::net::UnixStream) -> Option<u32> {
 }
 
 fn set_mode(socket: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o600))
+    fs::set_permissions(socket, Permissions::from_mode(0o600))
         .with_context(|| format!("restricting {}", socket.display()))
 }
 
@@ -217,18 +218,18 @@ mod tests {
     #[tokio::test]
     async fn a_connection_names_the_process_on_the_other_end() {
         let dir = std::env::temp_dir().join(format!("manymux-peer-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        fs::create_dir_all(&dir).unwrap();
         let socket = dir.join("t.sock");
         let listener = UnixListener::bind(&socket).unwrap();
 
-        let client = tokio::net::UnixStream::connect(&socket).await.unwrap();
+        let client = UnixStream::connect(&socket).await.unwrap();
         let (server, _) = listener.accept().await.unwrap();
 
         // Both ends are this test process, so both readings have to name it.
         assert_eq!(peer_pid(&client), Some(std::process::id()));
         assert_eq!(peer_pid(&server), Some(std::process::id()));
 
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// The socket is the thing a `/tmp` cleaner would take, and it is also the
@@ -236,19 +237,19 @@ mod tests {
     #[tokio::test]
     async fn a_bound_socket_can_be_kept_looking_used() {
         let dir = std::env::temp_dir().join(format!("manymux-touch-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        fs::create_dir_all(&dir).unwrap();
         let socket = dir.join("t.sock");
         let _listener = UnixListener::bind(&socket).unwrap();
 
-        let before = std::fs::metadata(&socket).unwrap().modified().unwrap();
+        let before = fs::metadata(&socket).unwrap().modified().unwrap();
         touch(&socket).unwrap();
-        let after = std::fs::metadata(&socket).unwrap().modified().unwrap();
+        let after = fs::metadata(&socket).unwrap().modified().unwrap();
         assert!(after >= before);
         assert!(
-            after.elapsed().unwrap() < std::time::Duration::from_secs(5),
+            after.elapsed().unwrap() < Duration::from_secs(5),
             "the socket should look touched just now"
         );
 
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&dir);
     }
 }

@@ -25,7 +25,7 @@
 //! way to tell the two apart before it could be done at all.
 
 use anyhow::{Result, bail};
-use bytes::BytesMut;
+use bytes::{Buf, BytesMut};
 use std::time::{Duration, SystemTime};
 
 use serde::de::DeserializeOwned;
@@ -795,7 +795,7 @@ impl Decoder for FrameCodec {
         if src.len() < HEAD {
             return Ok(None);
         }
-        let len = u32::from_be_bytes(src[1..HEAD].try_into().unwrap()) as usize;
+        let len = u32::from_be_bytes([src[1], src[2], src[3], src[4]]) as usize;
         if len > MAX_FRAME {
             bail!("peer sent a {len} byte frame, over the {MAX_FRAME} limit");
         }
@@ -806,7 +806,8 @@ impl Decoder for FrameCodec {
             return Ok(None);
         }
         let tag = src[0];
-        let body = src.split_to(HEAD + len).split_off(HEAD).to_vec();
+        src.advance(HEAD);
+        let body = src.split_to(len).to_vec();
         Ok(Some(Frame { tag, body }))
     }
 }

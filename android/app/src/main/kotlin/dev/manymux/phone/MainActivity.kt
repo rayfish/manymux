@@ -459,30 +459,41 @@ class MainActivity : Activity() {
     }
 
     private fun loadWall(machine: Machine, expected: Long) {
-        elsewhere.execute {
-            val answer = runCatching { phone.wall(machine) }
-            here.post {
-                if (isFinishing || gone || surface != expected) return@post
-                val previous = (findViewById<android.view.ViewGroup>(android.R.id.content)
-                    .getChildAt(0) as? LinearLayout)?.getChildAt(1) as? ScrollView
-                val position = previous?.scrollY ?: 0
-                val body = answer.fold(
-                    onSuccess = { wall ->
-                        seen = wall.running
-                        answered = wall
-                        sessions(machine, wall)
-                    },
-                    onFailure = { why ->
-                        answered?.let { sessions(machine, it) } ?: trouble(machine, why)
-                    },
-                )
-                val overview = overview(machine, body)
-                show(overview)
-                (overview as LinearLayout).getChildAt(1).let { scroll ->
-                    scroll.post { scroll.scrollTo(0, position) }
-                }
-                scheduleWallRefresh(machine)
+        ask({ phone.wall(machine) }) { answer ->
+            if (isFinishing || gone || surface != expected) return@ask
+            val previous = (findViewById<android.view.ViewGroup>(android.R.id.content)
+                .getChildAt(0) as? LinearLayout)?.getChildAt(1) as? ScrollView
+            val position = previous?.scrollY ?: 0
+            val body = answer.fold(
+                onSuccess = { wall ->
+                    seen = wall.running
+                    answered = wall
+                    sessions(machine, wall)
+                },
+                onFailure = { why ->
+                    answered?.let { sessions(machine, it) } ?: trouble(machine, why)
+                },
+            )
+            val overview = overview(machine, body)
+            show(overview)
+            (overview as LinearLayout).getChildAt(1).let { scroll ->
+                scroll.post { scroll.scrollTo(0, position) }
             }
+            scheduleWallRefresh(machine)
+        }
+    }
+
+    /**
+     * Run [work] off the main thread and hand what came of it to [then] on it.
+     *
+     * The calls that wait on a machine block, so they go to [elsewhere]; what
+     * they answered goes back to the main thread, where whoever asked checks
+     * the screen is still the one that asked before touching it.
+     */
+    private fun <T> ask(work: () -> T, then: (Result<T>) -> Unit) {
+        elsewhere.execute {
+            val answer = runCatching { work() }
+            here.post { then(answer) }
         }
     }
 
@@ -838,20 +849,17 @@ class MainActivity : Activity() {
         wallRefresh?.let { here.removeCallbacks(it) }
         wallRefresh = null
         val expected = surface
-        elsewhere.execute {
-            // A size to start it at. The real one is sent the moment the view
-            // knows its own, which is a resize the session has not printed
-            // anything into yet.
-            val answer = runCatching { phone.startOn(machine, Grid(80u, 24u)) }
-            here.post {
-                if (isFinishing || gone || surface != expected) return@post
-                answer
-                    .onSuccess { name -> open(machine, name) }
-                    .onFailure { why ->
-                        say(why.message ?: "could not start one")
-                        scheduleWallRefresh(machine)
-                    }
-            }
+        // A size to start it at. The real one is sent the moment the view
+        // knows its own, which is a resize the session has not printed
+        // anything into yet.
+        ask({ phone.startOn(machine, Grid(80u, 24u)) }) { answer ->
+            if (isFinishing || gone || surface != expected) return@ask
+            answer
+                .onSuccess { name -> open(machine, name) }
+                .onFailure { why ->
+                    say(why.message ?: "could not start one")
+                    scheduleWallRefresh(machine)
+                }
         }
     }
 
@@ -1002,17 +1010,14 @@ class MainActivity : Activity() {
         if (asking) return
         asking = true
         val expected = surface
-        elsewhere.execute {
-            val answer = runCatching { phone.runningOn(machine) }
-            here.post {
-                asking = false
-                if (surface != expected) return@post
-                if (isFinishing || gone) return@post
-                // A failure says nothing: nobody asked for this, and the
-                // session on the screen is the thing being used. The copy that
-                // is already held stays, since a stale list beats no list.
-                answer.onSuccess { seen = it }
-            }
+        ask({ phone.runningOn(machine) }) { answer ->
+            asking = false
+            if (surface != expected) return@ask
+            if (isFinishing || gone) return@ask
+            // A failure says nothing: nobody asked for this, and the
+            // session on the screen is the thing being used. The copy that
+            // is already held stays, since a stale list beats no list.
+            answer.onSuccess { seen = it }
         }
     }
 
@@ -1021,7 +1026,8 @@ class MainActivity : Activity() {
         val where = "${machine.address}/$name"
         val tick = object : Runnable {
             override fun run() {
-                bar.text = when (val state = attached.state()) {
+                val state = attached.state()
+                bar.text = when (state) {
                     is State.Reaching -> "$where  ·  reaching"
                     is State.Attached -> where
                     // The screen above stays exactly as the session last
@@ -1034,7 +1040,7 @@ class MainActivity : Activity() {
                     is State.Failed -> state.why
                 }
                 bar.setTextColor(
-                    when (attached.state()) {
+                    when (state) {
                         is State.Attached -> colour(R.color.text)
                         is State.Failed -> colour(R.color.warn)
                         is State.Waiting -> colour(R.color.warn)
@@ -1291,14 +1297,6 @@ class MainActivity : Activity() {
     }
 
     private fun wide() = LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT)
-
-    private fun title(what: String) = TextView(this).apply {
-        text = what
-        textSize = 32f
-        typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
-        setTextColor(colour(R.color.text))
-        setPadding(0, dp(8), 0, dp(4))
-    }
 
     /** A small uppercase heading, which is what separates the sections. */
     private fun label(what: String) = TextView(this).apply {

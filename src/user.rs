@@ -8,7 +8,7 @@
 //! `login` and `sshd` find them, rather than from whatever the service manager
 //! happened to pass down.
 
-use std::ffi::CStr;
+use std::ffi::{CStr, CString};
 use std::sync::OnceLock;
 
 /// The account this process runs as.
@@ -45,22 +45,11 @@ pub fn shell() -> String {
 /// account: the sessions belong to whoever ran `sudo`, not to root, so the unit
 /// needs that user's home rather than `/root`.
 pub fn named(name: &str) -> Option<User> {
-    let name = std::ffi::CString::new(name).ok()?;
-    // SAFETY: getpwnam returns a pointer into static storage, valid until the
-    // next getpw* call. Every field is copied out before returning, and nothing
-    // else here calls getpw*.
-    unsafe {
-        let entry = libc::getpwnam(name.as_ptr());
-        if entry.is_null() {
-            return None;
-        }
-        let entry = &*entry;
-        Some(User {
-            name: string(entry.pw_name),
-            home: string(entry.pw_dir),
-            shell: string(entry.pw_shell),
-        })
-    }
+    let name = CString::new(name).ok()?;
+    // SAFETY: getpwnam returns null or a pointer into static storage, valid
+    // until the next getpw* call. It is copied out at once, and nothing else
+    // here calls getpw*.
+    unsafe { copied(libc::getpwnam(name.as_ptr())) }
 }
 
 fn lookup() -> Option<User> {
@@ -97,15 +86,21 @@ fn var(name: &str) -> Option<String> {
 }
 
 fn from_passwd() -> Option<User> {
-    // SAFETY: getpwuid returns a pointer into static storage, valid until the
-    // next getpw* call. This runs once, behind a OnceLock, and every field is
-    // copied out before returning.
+    // SAFETY: getpwuid returns null or a pointer into static storage, valid
+    // until the next getpw* call. This runs once, behind a OnceLock, and it is
+    // copied out at once.
+    unsafe { copied(libc::getpwuid(libc::getuid())) }
+}
+
+/// A passwd entry copied out of the static storage the getpw* calls answer in.
+///
+/// SAFETY: `entry` must be null or point to a valid passwd entry that no other
+/// getpw* call overwrites while this runs.
+unsafe fn copied(entry: *const libc::passwd) -> Option<User> {
+    // SAFETY: the caller's promise, checked for null first.
+    let entry = unsafe { entry.as_ref() }?;
+    // SAFETY: the fields of a valid entry are null or NUL-terminated strings.
     unsafe {
-        let entry = libc::getpwuid(libc::getuid());
-        if entry.is_null() {
-            return None;
-        }
-        let entry = &*entry;
         Some(User {
             name: string(entry.pw_name),
             home: string(entry.pw_dir),
