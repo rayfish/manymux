@@ -351,6 +351,35 @@ fn key_code(byte: u8) -> u32 {
     }
 }
 
+/// Ctrl-C, which while nothing is attached is a way out rather than a signal
+/// to pass on.
+#[cfg(feature = "desktop")]
+const INTERRUPT: u8 = 0x03;
+
+/// Whether somebody pressed Ctrl-C anywhere in this chunk.
+///
+/// For the wait after a dropped connection, where it is a way out. The keyboard
+/// mode the session asked for is still on then, nobody having been there to
+/// switch it off, so the key arrives in whichever of the three spellings that
+/// program left the terminal in.
+#[cfg(feature = "desktop")]
+pub(super) fn interrupts(chunk: &[u8]) -> bool {
+    let mut i = 0;
+    while i < chunk.len() {
+        if let Some(key) = Encoded::parse(&chunk[i..]) {
+            if key.down() && key.is(INTERRUPT) {
+                return true;
+            }
+            i += key.len;
+        } else if chunk[i] == INTERRUPT {
+            return true;
+        } else {
+            i += 1;
+        }
+    }
+    false
+}
+
 /// Which way a switch key moves, through the sessions on a machine or through
 /// the machines themselves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1446,8 +1475,9 @@ impl KeyFilter {
             // holding is left only by something the user typed; in focus mode
             // these are the session's and go straight through, which is why
             // that mode is not here.
+            // Shift-Tab is skipped here too: where it means something it was
+            // read above through `PICK_KEYS`, and in the view it means nothing.
             if self.mode != Mode::Focus
-                && !input[i..].starts_with(SHIFT_TAB)
                 && let Some(len) = sequence(&input[i..])
             {
                 i += len;
@@ -1525,15 +1555,6 @@ impl KeyFilter {
                     }
                     self.mode = Mode::Focus;
                     None
-                }
-                // Shift-Tab, which starts with the same byte as the Esc that
-                // closes the popup. An Esc with `[Z` behind it in the same
-                // read is the key; one at the end of a read is a real Esc.
-                // Split across two reads it reads as an Esc, which costs a trip
-                // back to focus and nothing else.
-                0x1b if input[i..].starts_with(&SHIFT_TAB[1..]) => {
-                    i += 2;
-                    Some(Action::Pick(Pick::Up))
                 }
                 0x1b | b'\n' => {
                     self.mode = Mode::Focus;
@@ -2200,6 +2221,40 @@ mod tests {
                 rest: Vec::new(),
             }
         );
+    }
+
+    /// Shift-Tab is bound to nothing in the view, and read a byte at a time its
+    /// Esc is the Esc that leaves: reaching for it closed the view and lost
+    /// your place.
+    #[test]
+    fn shift_tab_does_not_close_the_view() {
+        let mut f = KeyFilter::new(KEY);
+        f.set_scroll(true);
+        f.filter(&[KEY, SCROLL_KEY]);
+        assert_eq!(
+            f.filter(SHIFT_TAB),
+            Keystrokes {
+                forward: Vec::new(),
+                action: None,
+                mode: Mode::Scroll,
+                rest: Vec::new(),
+            }
+        );
+    }
+
+    /// A session running `pi` leaves the terminal spelling Ctrl-C the long
+    /// way, and a dropped connection leaves it there: read as the byte alone,
+    /// the one key a hand reaches for during the wait did nothing.
+    #[cfg(feature = "desktop")]
+    #[test]
+    fn ctrl_c_is_an_interrupt_in_every_spelling() {
+        for keys in [&b"\x03"[..], b"ab\x03", b"\x1b[99;5u", b"\x1b[27;5;99~"] {
+            assert!(interrupts(keys), "{keys:?}");
+        }
+        // Letting go of it, and a plain `c`, are not.
+        for keys in [&b"\x1b[99;5:3u"[..], b"c", b"\x1b[99u"] {
+            assert!(!interrupts(keys), "{keys:?}");
+        }
     }
 
     /// Inline the terminal has the history in its own buffer, so the client's
