@@ -21,7 +21,7 @@ use tracing::debug;
 use manymux::client::Stream;
 use manymux::client::groups::Groups;
 use manymux::client::switch::Located;
-use manymux::hosts::{Hosts, LOCAL, Named, Target, is_this_machine, this_machine};
+use manymux::hosts::{Hosts, LOCAL, Named, Target, is_this_machine, same_machine, this_machine};
 use manymux::proto::{HostedSession, Request, Response, SessionInfo};
 
 use crate::open_hushed;
@@ -455,7 +455,7 @@ fn in_group(
 ) -> Result<Located> {
     let found = listing.iter().find(|hosted| {
         groups.group_of(&hosted.host, &hosted.session) == Some(group)
-            && host.is_none_or(|want| hosted.host == want)
+            && host.is_none_or(|want| same_machine(want, &hosted.host))
             && name.is_none_or(|want| hosted.session.name == want)
     });
     if let Some(hosted) = found {
@@ -769,6 +769,21 @@ mod tests {
         let (groups, listing) = world();
         let found = in_group(&groups, &listing, "pi", None, None).unwrap();
         assert_eq!(found, Located::new("box", "build"));
+    }
+
+    /// `mm a local/@pi` is this machine by its other spelling, and the listing
+    /// names it by its own.
+    #[test]
+    fn a_group_narrowed_to_local_finds_this_machine() {
+        let build = at("build", 1, 1000);
+        let mut groups = Groups::default();
+        groups.assign("pi", this_machine(), &build).unwrap();
+        let listing = vec![HostedSession {
+            host: this_machine().into(),
+            session: build,
+        }];
+        let found = in_group(&groups, &listing, "pi", Some(LOCAL), None).unwrap();
+        assert_eq!(found, Located::new(this_machine(), "build"));
     }
 
     #[test]
