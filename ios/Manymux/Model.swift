@@ -20,6 +20,7 @@ enum TextSize {
 enum Route: Hashable {
     case addHost
     case deviceKey
+    case settings
     case sessions(Machine)
     case session(Machine, String)
 }

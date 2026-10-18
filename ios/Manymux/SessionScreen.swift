@@ -43,7 +43,6 @@ struct SessionScreen: View {
     @SwiftUI.State private var held = Held()
     @SwiftUI.State private var terminal: TerminalView?
     @SwiftUI.State private var toast = Toast()
-    @SwiftUI.State private var sizing = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -71,12 +70,7 @@ struct SessionScreen: View {
                     .lineLimit(1)
                     .truncationMode(.middle)
             }
-            ToolbarItem(placement: .topBarTrailing) {
-                HStack {
-                    sizer
-                    switcher
-                }
-            }
+            ToolbarItem(placement: .topBarTrailing) { switcher }
         }
         .toast(toast, at: .top, on: .raised)
         // What else is running, asked while nobody is waiting on the answer,
@@ -114,35 +108,6 @@ struct SessionScreen: View {
         case .attached: return .text
         case .failed, .waiting: return .warn
         default: return .dim
-        }
-    }
-
-    /// The text size, with the session resizing behind it as it moves. A
-    /// pinch on the terminal does the same, but nothing on the screen says so.
-    private var sizer: some View {
-        @Bindable var model = model
-        return Button {
-            sizing = true
-        } label: {
-            Image(systemName: "textformat.size")
-        }
-        .accessibilityLabel("text size")
-        .popover(isPresented: $sizing) {
-            HStack(spacing: 12) {
-                Image(systemName: "textformat.size.smaller")
-                Slider(
-                    value: $model.textSize,
-                    in: TextSize.smallest...TextSize.largest,
-                    step: 0.5
-                )
-                .frame(width: 200)
-                Image(systemName: "textformat.size.larger")
-                Text(String(format: "%.1f", model.textSize))
-                    .font(.system(size: 12, design: .monospaced))
-                    .frame(width: 36, alignment: .trailing)
-            }
-            .padding()
-            .presentationCompactAdaptation(.popover)
         }
     }
 

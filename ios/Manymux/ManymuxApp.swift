@@ -18,6 +18,8 @@ struct ManymuxApp: App {
                             AddHostView()
                         case .deviceKey:
                             DeviceKeyView()
+                        case .settings:
+                            SettingsView()
                         case let .sessions(machine):
                             SessionsView(machine: machine)
                         case let .session(machine, name):

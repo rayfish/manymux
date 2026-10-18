@@ -1,7 +1,7 @@
 import SwiftUI
 
-/// Saved hosts are the home screen; adding one and the device's key have pages
-/// of their own.
+/// Saved hosts are the home screen; adding one and the settings, the device's
+/// key among them, have pages of their own.
 struct HostsView: View {
     @Environment(AppModel.self) private var model
 
@@ -39,8 +39,10 @@ struct HostsView: View {
         .navigationTitle("Hosts")
         .toolbar {
             ToolbarItem(placement: .topBarLeading) {
-                NavigationLink("SSH key", value: Route.deviceKey)
-                    .foregroundStyle(Color.dim)
+                NavigationLink(value: Route.settings) {
+                    Label("Settings", systemImage: "gearshape")
+                }
+                .tint(.dim)
             }
             ToolbarItem(placement: .topBarTrailing) {
                 NavigationLink(value: Route.addHost) {
