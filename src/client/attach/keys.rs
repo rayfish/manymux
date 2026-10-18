@@ -302,7 +302,7 @@ fn alternate(field: &str) -> Option<u32> {
 /// A sequence that the chunk ends in the middle of is not one, the same way a
 /// Shift-Tab split down the middle is not one: what is there is an Esc, which
 /// is what it would have been read as before any of this.
-fn sequence(input: &[u8]) -> Option<usize> {
+pub(super) fn sequence(input: &[u8]) -> Option<usize> {
     let rest = input.strip_prefix(b"\x1b")?;
     match rest.first()? {
         // A control sequence, which runs to its final byte.
@@ -644,7 +644,7 @@ impl Report {
 /// view was already up, on the reasoning that a wheel is worth less than a drag,
 /// which left the wheel doing nothing at all for the rest of the attach: the
 /// client's screen is the terminal's alternate one, where the terminal has no
-/// scrollback to offer, and [`crate::client::screen::Alternate`] switches
+/// scrollback to offer, and [`Screen::Alternate`](crate::settings::Screen::Alternate) switches
 /// alternate scroll off besides, so a notch reached nobody. A key that only
 /// works after you have pressed another key is not the gesture anybody reaches
 /// for.
@@ -1343,6 +1343,11 @@ impl KeyFilter {
         self.wheel = ours && self.scroll;
     }
 
+    /// Whether the wheel is the client's, as last set.
+    pub fn wheel(&self) -> bool {
+        self.wheel
+    }
+
     /// Start in a mode. Attaching after a switch starts in control mode, which
     /// is what makes `tab tab tab` walk the list across the hops.
     pub fn set_mode(&mut self, mode: Mode) {
@@ -1384,13 +1389,7 @@ impl KeyFilter {
             // each of them.
             if self.prompt.is_some() {
                 let action = self.typing(&input[i..]);
-                self.mode = Self::after(action, self.mode);
-                return Keystrokes {
-                    forward,
-                    action: Some(action),
-                    mode: self.mode,
-                    rest: Vec::new(),
-                };
+                return self.finish(forward, action, Vec::new());
             }
             // The wheel, while it is the client's. Every report is swallowed,
             // not only the ones that move the view: the client asked the
@@ -1401,19 +1400,13 @@ impl KeyFilter {
                 let Some(action) = self.mousing(input, &mut i, now) else {
                     continue;
                 };
-                self.mode = Self::after(action, self.mode);
-                return Keystrokes {
-                    forward,
-                    action: Some(action),
-                    mode: self.mode,
-                    // Whatever is left of the chunk, always: a hand does one
-                    // thing at a time and the reports of it arrive together, so
-                    // `mousing` stops at the first report that means something
-                    // else and this is what hands that one on. A spin and the
-                    // click that follows it, or a drag and the release that
-                    // ends it, are one read more often than not.
-                    rest: input[i..].to_vec(),
-                };
+                // Whatever is left of the chunk, always: a hand does one thing
+                // at a time and the reports of it arrive together, so
+                // `mousing` stops at the first report that means something
+                // else and this is what hands that one on. A spin and the click
+                // that follows it, or a drag and the release that ends it, are
+                // one read more often than not.
+                return self.finish(forward, action, input[i..].to_vec());
             }
             // The keys that drive the view, which are escape sequences of their
             // own and have to be read whole before the escape starting them is
@@ -1422,14 +1415,7 @@ impl KeyFilter {
                 && let Some(key) = Special::parse(&input[i..])
                 && let Some((_, scroll)) = VIEW_KEYS.iter().find(|(plain, _)| key.is(plain))
             {
-                let action = Action::Scroll(*scroll);
-                self.mode = Self::after(action, self.mode);
-                return Keystrokes {
-                    forward,
-                    action: Some(action),
-                    mode: self.mode,
-                    rest: Vec::new(),
-                };
+                return self.finish(forward, Action::Scroll(*scroll), Vec::new());
             }
             // The same, for the arrows that move a popup's highlight.
             if matches!(self.mode, Mode::Control | Mode::Picking)
@@ -1440,13 +1426,7 @@ impl KeyFilter {
                 self.pressed = None;
                 i += key.len;
                 let action = Action::Pick(*pick);
-                self.mode = Self::after(action, self.mode);
-                return Keystrokes {
-                    forward,
-                    action: Some(action),
-                    mode: self.mode,
-                    rest: rest_after(action, &input[i..]),
-                };
+                return self.finish(forward, action, rest_after(action, &input[i..]));
             }
             // A terminal that a program has put into an extended-keys mode
             // spells the client's own keys as escape sequences, so they have to
@@ -1456,13 +1436,7 @@ impl KeyFilter {
                 let spelling = &input[i..i + key.len];
                 i += key.len;
                 if let Some(action) = self.encoded(&key, spelling, now, &mut forward) {
-                    self.mode = Self::after(action, self.mode);
-                    return Keystrokes {
-                        forward,
-                        action: Some(action),
-                        mode: self.mode,
-                        rest: rest_after(action, &input[i..]),
-                    };
+                    return self.finish(forward, action, rest_after(action, &input[i..]));
                 }
                 continue;
             }
@@ -1492,13 +1466,7 @@ impl KeyFilter {
                     continue;
                 };
                 self.opening(action);
-                self.mode = Self::after(action, self.mode);
-                return Keystrokes {
-                    forward,
-                    action: Some(action),
-                    mode: self.mode,
-                    rest: rest_after(action, &input[i..]),
-                };
+                return self.finish(forward, action, rest_after(action, &input[i..]));
             }
             if self.mode == Mode::Scroll {
                 // Nothing typed here reaches the session: the screen is showing
@@ -1510,13 +1478,7 @@ impl KeyFilter {
                     continue;
                 };
                 self.opening(action);
-                self.mode = Self::after(action, self.mode);
-                return Keystrokes {
-                    forward,
-                    action: Some(action),
-                    mode: self.mode,
-                    rest: Vec::new(),
-                };
+                return self.finish(forward, action, Vec::new());
             }
             if self.mode == Mode::Focus {
                 if b == self.prefix {
@@ -1529,12 +1491,7 @@ impl KeyFilter {
                     // key on when the clipboard turns out to hold nothing to
                     // paste, so the session keeps the key on every press that
                     // was not one.
-                    return Keystrokes {
-                        forward,
-                        action: Some(Action::Paste),
-                        mode: self.mode,
-                        rest: Vec::new(),
-                    };
+                    return self.finish(forward, Action::Paste, Vec::new());
                 } else {
                     forward.push(b);
                 }
@@ -1577,13 +1534,7 @@ impl KeyFilter {
             // detach or a switch. Popup moves and opening its search are the
             // exceptions, and hand the rest back; see `rest_after`.
             if let Some(action) = action {
-                self.mode = Self::after(action, self.mode);
-                return Keystrokes {
-                    forward,
-                    action: Some(action),
-                    mode: self.mode,
-                    rest: rest_after(action, &input[i..]),
-                };
+                return self.finish(forward, action, rest_after(action, &input[i..]));
             }
         }
         Keystrokes {
@@ -1591,6 +1542,18 @@ impl KeyFilter {
             action: None,
             mode: self.mode,
             rest: Vec::new(),
+        }
+    }
+
+    /// Hand an action up: the mode it leaves the keys in, what was forwarded
+    /// on the way to it, and what of the chunk is still to be read.
+    fn finish(&mut self, forward: Vec<u8>, action: Action, rest: Vec<u8>) -> Keystrokes {
+        self.mode = Self::after(action, self.mode);
+        Keystrokes {
+            forward,
+            action: Some(action),
+            mode: self.mode,
+            rest,
         }
     }
 

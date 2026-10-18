@@ -659,12 +659,7 @@ impl Session {
     /// as long as a clone.
     pub fn doing(&self) -> Doing {
         let front = crate::foreground::of(self.pid);
-        Doing {
-            name: self.name(),
-            pid: self.pid,
-            cwd: front.cwd,
-            foreground: front.argv,
-        }
+        Doing::new(self.name(), self.pid, front)
     }
 }
 

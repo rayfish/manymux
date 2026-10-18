@@ -34,6 +34,8 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio_stream::StreamExt;
 use tokio_util::codec::{Decoder, FramedRead};
 
+use crate::foreground::Foreground;
+
 /// Frames larger than this are a protocol error, not an allocation.
 pub const MAX_FRAME: usize = 1 << 20;
 
@@ -495,6 +497,19 @@ pub struct Doing {
     /// been restarted.
     #[serde(default)]
     pub foreground: Vec<String>,
+}
+
+impl Doing {
+    /// One session's answer, however what is in front of it was come by: read
+    /// by the node, by a client on the same machine, or over ssh.
+    pub fn new(name: String, pid: u32, front: Foreground) -> Self {
+        Self {
+            name,
+            pid,
+            cwd: front.cwd,
+            foreground: front.argv,
+        }
+    }
 }
 
 /// A window of a session's history, as a scrolling client asks for it.

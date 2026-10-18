@@ -16,9 +16,10 @@
 //! region, because the mark's row is fenced off with one, and that a hop leaves
 //! the session you left in the scrollback rather than wiping it.
 //!
-//! Only what differs between them is here, and all of it is string building
-//! with no terminal involved, so both can be read side by side and tested
-//! without one. What they have in common (the title, and undoing whatever the
+//! Only what differs between them is here, as methods on
+//! [`Screen`] that match on the mode, and all of it is string building with no
+//! terminal involved, so both can be read side by side and tested without
+//! one. What they have in common (the title, and undoing whatever the
 //! last full-screen program switched on) is written by the caller in
 //! [`super::attach`].
 
@@ -33,164 +34,123 @@ use crate::settings::Screen;
 /// what is not asked for is not lost, it is just not in this terminal.
 pub const SEEDED_HISTORY: u32 = 1000;
 
-/// What one way of putting a session on a terminal has to say for itself.
-///
-/// Six moments, and the caller writes what both modes have in common around
-/// them.
-pub trait ScreenMode {
+/// Leaving the alternate screen in both of its spellings, `?1047` and `?1049`,
+/// for whichever one the session or this client used to get there.
+const LEAVE_ALTERNATE: &str = "\x1b[?1047l\x1b[?1049l";
+
+/// What each way of putting a session on a terminal has to say for itself, at
+/// the six moments the caller writes what both have in common around.
+impl Screen {
     /// Sent once, when the terminal changes hands.
-    fn setup(&self) -> String;
+    pub fn setup(self) -> String {
+        match self {
+            // A session's repaint places everything by absolute coordinates,
+            // because that is what a screen dump is, so painting it onto your
+            // shell's screen would write the session over your scrollback and
+            // leave the cursor at the session's row 1 rather than where its
+            // prompt appears to be. On a surface of its own the coordinates
+            // mean what they say.
+            //
+            // Alternate scroll goes with it. The client reports the mouse here
+            // for the whole attach, so most of the time nothing is left for a
+            // notch to be turned into; but while a session has asked for the
+            // mouse itself the client's tracking is off, and a terminal on its
+            // alternate screen with nobody reporting turns a notch into arrow
+            // keys, which land in whatever is reading the session's input.
+            // Scrolling up at a shell would walk its history. Saved first, so
+            // what the terminal had is what it gets back: one that does not
+            // know how to save it keeps the setting off afterwards, which costs
+            // `less` its wheel and is the cheaper half of the trade.
+            Screen::Alternate => "\x1b[?1007s\x1b[?1007l\x1b[?1049h".to_string(),
+            Screen::Inline => String::new(),
+        }
+    }
 
     /// Sent before every attach, hops included, after the caller's `undone()`.
     ///
     /// `on_alternate` is whether the session being left has the terminal on a
     /// full-screen program's own screen, which is the hop's to undo for the
     /// same reason a detach undoes it.
-    fn takeover(&self, on_alternate: bool) -> String;
+    pub fn takeover(self, on_alternate: bool) -> String {
+        match self {
+            // The erase is what the screen dump cannot do for itself: it paints
+            // from the cursor down to its last line with anything on it and
+            // stops, so without this the session before it shows through
+            // underneath, below that line and beside a narrower screen. Homing
+            // is the other half, since the dump starts printing wherever it
+            // finds the cursor. The erase comes last because it clears to the
+            // current background, and a program that left a pen set would
+            // otherwise paint the whole screen its colour.
+            Screen::Alternate => "\x1b[H\x1b[2J".to_string(),
+            // Nothing is erased: what is on the screen is the terminal's to
+            // keep, and rolling it away before the repaint is what moves it
+            // into the scrollback instead of throwing it out.
+            //
+            // The screen a full-screen program in the session you are leaving
+            // put the terminal on is another matter, and hopping has to leave
+            // it the way detaching does. Without this, hopping out of Claude
+            // Code lands the next session on the terminal's alternate screen,
+            // where there is no scrollback to roll into and the wheel goes back
+            // to being arrow keys, which is inline not working at all.
+            Screen::Inline if on_alternate => LEAVE_ALTERNATE.to_string(),
+            Screen::Inline => String::new(),
+        }
+    }
 
     /// Sent before the screen dump, which paints by absolute coordinates from
     /// the top and so needs the screen underneath it blank.
-    fn before_repaint(&self, size: Size) -> String;
+    pub fn before_repaint(self, size: Size) -> String {
+        match self {
+            Screen::Alternate => String::new(),
+            // A newline on the last row of the scrolling region scrolls the
+            // region, and what scrolls off the top of it is what the terminal
+            // keeps. So this leaves the same blank screen an erase would, with
+            // every line still reachable by the wheel. It runs here rather than
+            // in the takeover because the history the node sends goes out first
+            // and has to be scrolled away with everything else.
+            Screen::Inline => {
+                let rows = session_size(size).rows;
+                format!("\x1b[{rows};1H{}\x1b[H", "\n".repeat(usize::from(rows)))
+            }
+        }
+    }
 
     /// Sent when the terminal is given back, after the caller's `undone()` and
     /// the title pop. `on_alternate` is whether the session has the terminal on
     /// a full-screen program's own screen.
-    fn reset(&self, size: Size, on_alternate: bool) -> String;
+    pub fn reset(self, size: Size, on_alternate: bool) -> String {
+        match self {
+            // Column zero, but no newline: leaving the alternate screen already
+            // put the cursor back where the shell left it, on the line after
+            // the command you typed. A newline here would print the detach
+            // message one blank line further down for no reason.
+            Screen::Alternate => format!("{LEAVE_ALTERNATE}\x1b[?1007r\r"),
+            Screen::Inline => {
+                // The session is in a full-screen program and the terminal is
+                // on its screen, so without this the shell would come back to
+                // vim's leftovers.
+                let leave = if on_alternate { LEAVE_ALTERNATE } else { "" };
+                // What the session last painted stays where a finished
+                // program's output stays. The shell carries on from the row the
+                // mark was on, under it rather than over it.
+                format!("{leave}\x1b[{};1H\x1b[2K\r", size.rows)
+            }
+        }
+    }
 
-    /// Lines of the session's history to ask the node for.
-    fn history(&self) -> u32;
+    /// Lines of the session's history to ask the node for: none where there
+    /// is nowhere to put them.
+    pub fn history(self) -> u32 {
+        match self {
+            Screen::Alternate => 0,
+            Screen::Inline => SEEDED_HISTORY,
+        }
+    }
 
     /// Whether the session's own switches between the primary and alternate
     /// screens are the client's to swallow.
-    fn owns_the_screen(&self) -> bool;
-}
-
-/// The session gets a screen of its own, and the shell's is given back
-/// untouched.
-pub struct Alternate;
-
-/// The session paints on the terminal's screen, and its history goes into the
-/// terminal's scrollback.
-pub struct Inline;
-
-impl Screen {
-    pub fn mode(self) -> &'static dyn ScreenMode {
-        match self {
-            Screen::Alternate => &Alternate,
-            Screen::Inline => &Inline,
-        }
-    }
-}
-
-impl ScreenMode for Alternate {
-    fn setup(&self) -> String {
-        // A session's repaint places everything by absolute coordinates,
-        // because that is what a screen dump is, so painting it onto your
-        // shell's screen would write the session over your scrollback and leave
-        // the cursor at the session's row 1 rather than where its prompt
-        // appears to be. On a surface of its own the coordinates mean what they
-        // say.
-        //
-        // Alternate scroll goes with it. The client reports the mouse here for
-        // the whole attach, so most of the time nothing is left for a notch to
-        // be turned into; but while a session has asked for the mouse itself
-        // the client's tracking is off, and a terminal on its alternate screen
-        // with nobody reporting turns a notch into arrow keys, which land in
-        // whatever is reading the session's input. Scrolling up at a shell
-        // would walk its history. Saved first, so what the terminal had is what
-        // it gets back: one that does not know how to save it keeps the setting
-        // off afterwards, which costs `less` its wheel and is the cheaper half
-        // of the trade.
-        "\x1b[?1007s\x1b[?1007l\x1b[?1049h".to_string()
-    }
-
-    fn takeover(&self, _on_alternate: bool) -> String {
-        // The erase is what the screen dump cannot do for itself: it paints
-        // from the cursor down to its last line with anything on it and stops,
-        // so without this the session before it shows through underneath, below
-        // that line and beside a narrower screen. Homing is the other half,
-        // since the dump starts printing wherever it finds the cursor. The
-        // erase comes last because it clears to the current background, and a
-        // program that left a pen set would otherwise paint the whole screen
-        // its colour.
-        "\x1b[H\x1b[2J".to_string()
-    }
-
-    fn before_repaint(&self, _size: Size) -> String {
-        String::new()
-    }
-
-    fn reset(&self, _size: Size, _on_alternate: bool) -> String {
-        // Column zero, but no newline: leaving the alternate screen already put
-        // the cursor back where the shell left it, on the line after the
-        // command you typed. A newline here would print the detach message one
-        // blank line further down for no reason.
-        "\x1b[?1047l\x1b[?1049l\x1b[?1007r\r".to_string()
-    }
-
-    fn history(&self) -> u32 {
-        0
-    }
-
-    fn owns_the_screen(&self) -> bool {
-        true
-    }
-}
-
-impl ScreenMode for Inline {
-    fn setup(&self) -> String {
-        String::new()
-    }
-
-    fn takeover(&self, on_alternate: bool) -> String {
-        // Nothing is erased: what is on the screen is the terminal's to keep,
-        // and rolling it away before the repaint is what moves it into the
-        // scrollback instead of throwing it out.
-        //
-        // The screen a full-screen program in the session you are leaving put
-        // the terminal on is another matter, and hopping has to leave it the
-        // way detaching does. Without this, hopping out of Claude Code lands
-        // the next session on the terminal's alternate screen, where there is
-        // no scrollback to roll into and the wheel goes back to being arrow
-        // keys, which is inline not working at all.
-        if on_alternate {
-            "\x1b[?1047l\x1b[?1049l".to_string()
-        } else {
-            String::new()
-        }
-    }
-
-    fn before_repaint(&self, size: Size) -> String {
-        // A newline on the last row of the scrolling region scrolls the region,
-        // and what scrolls off the top of it is what the terminal keeps. So
-        // this leaves the same blank screen an erase would, with every line
-        // still reachable by the wheel. It runs here rather than in the
-        // takeover because the history the node sends goes out first and has to
-        // be scrolled away with everything else.
-        let rows = session_size(size).rows;
-        format!("\x1b[{rows};1H{}\x1b[H", "\n".repeat(usize::from(rows)))
-    }
-
-    fn reset(&self, size: Size, on_alternate: bool) -> String {
-        let mut reset = String::new();
-        if on_alternate {
-            // The session is in a full-screen program and the terminal is on
-            // its screen, so without this the shell would come back to vim's
-            // leftovers.
-            reset.push_str("\x1b[?1047l\x1b[?1049l");
-        }
-        // What the session last painted stays where a finished program's output
-        // stays. The shell carries on from the row the mark was on, under it
-        // rather than over it.
-        format!("{reset}\x1b[{};1H\x1b[2K\r", size.rows)
-    }
-
-    fn history(&self) -> u32 {
-        SEEDED_HISTORY
-    }
-
-    fn owns_the_screen(&self) -> bool {
-        false
+    pub fn owns_the_screen(self) -> bool {
+        matches!(self, Screen::Alternate)
     }
 }
 
@@ -202,7 +162,7 @@ mod tests {
 
     #[test]
     fn the_alternate_screen_takes_a_surface_of_its_own_and_erases_it() {
-        let mode = Screen::Alternate.mode();
+        let mode = Screen::Alternate;
         assert!(mode.setup().ends_with("\x1b[?1049h"), "{:?}", mode.setup());
         assert_eq!(mode.takeover(false), "\x1b[H\x1b[2J");
         // The session's own switches never reached the terminal, so there is
@@ -224,7 +184,7 @@ mod tests {
     /// terminal back the setting it arrived with.
     #[test]
     fn the_alternate_screen_makes_the_wheel_inert_rather_than_arrow_keys() {
-        let mode = Screen::Alternate.mode();
+        let mode = Screen::Alternate;
         let setup = mode.setup();
         assert!(setup.contains("\x1b[?1007s"), "{setup:?}");
         assert!(setup.contains("\x1b[?1007l"), "{setup:?}");
@@ -241,7 +201,7 @@ mod tests {
     /// having it.
     #[test]
     fn inline_leaves_alternate_scroll_alone() {
-        let mode = Screen::Inline.mode();
+        let mode = Screen::Inline;
         assert!(!mode.setup().contains("1007"));
         assert!(!mode.reset(SIZE, false).contains("1007"));
         assert!(!mode.reset(SIZE, true).contains("1007"));
@@ -249,7 +209,7 @@ mod tests {
 
     #[test]
     fn leaving_the_alternate_screen_hands_back_the_one_underneath() {
-        let reset = Screen::Alternate.mode().reset(SIZE, false);
+        let reset = Screen::Alternate.reset(SIZE, false);
         assert!(reset.contains("\x1b[?1047l"), "{reset:?}");
         assert!(reset.contains("\x1b[?1049l"), "{reset:?}");
         assert!(reset.ends_with('\r'), "{reset:?}");
@@ -257,7 +217,7 @@ mod tests {
 
     #[test]
     fn inline_takes_no_screen_and_erases_nothing() {
-        let mode = Screen::Inline.mode();
+        let mode = Screen::Inline;
         assert_eq!(mode.setup(), "");
         assert_eq!(mode.takeover(false), "");
         assert!(!mode.owns_the_screen());
@@ -271,7 +231,7 @@ mod tests {
     /// until the whole run of attaches ended.
     #[test]
     fn hopping_leaves_the_screen_the_session_being_left_put_the_terminal_on() {
-        let left = Screen::Inline.mode().takeover(true);
+        let left = Screen::Inline.takeover(true);
         assert!(left.contains("\x1b[?1049l"), "{left:?}");
         assert!(left.contains("\x1b[?1047l"), "{left:?}");
     }
@@ -282,7 +242,7 @@ mod tests {
     /// away, which is what the alternate screen does to them.
     #[test]
     fn inline_rolls_the_region_away_and_comes_back_to_the_top() {
-        let rolled = Screen::Inline.mode().before_repaint(SIZE);
+        let rolled = Screen::Inline.before_repaint(SIZE);
         // 24 rows for the session, one for the mark.
         assert!(rolled.starts_with("\x1b[24;1H"), "{rolled:?}");
         assert_eq!(rolled.matches('\n').count(), 24);
@@ -294,9 +254,7 @@ mod tests {
     /// region is the whole screen and the roll has to be too.
     #[test]
     fn an_unmarked_terminal_rolls_every_row() {
-        let rolled = Screen::Inline
-            .mode()
-            .before_repaint(Size { cols: 80, rows: 4 });
+        let rolled = Screen::Inline.before_repaint(Size { cols: 80, rows: 4 });
         assert!(rolled.starts_with("\x1b[4;1H"), "{rolled:?}");
         assert_eq!(rolled.matches('\n').count(), 4);
     }
@@ -307,10 +265,10 @@ mod tests {
     /// program's output stays.
     #[test]
     fn inline_pops_a_screen_only_when_the_session_is_in_one() {
-        let popped = Screen::Inline.mode().reset(SIZE, true);
+        let popped = Screen::Inline.reset(SIZE, true);
         assert!(popped.contains("\x1b[?1049l"), "{popped:?}");
 
-        let plain = Screen::Inline.mode().reset(SIZE, false);
+        let plain = Screen::Inline.reset(SIZE, false);
         assert!(!plain.contains("1049"), "{plain:?}");
         // The row the mark was on, cleared, for the shell to carry on from.
         assert!(plain.ends_with("\x1b[25;1H\x1b[2K\r"), "{plain:?}");

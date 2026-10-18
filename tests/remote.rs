@@ -3785,7 +3785,7 @@ fn a_checkpoint_records_what_a_machine_over_ssh_is_running_and_where() {
 #[test]
 #[cfg(target_os = "linux")]
 fn reading_proc_over_a_shell_agrees_with_reading_it_here() {
-    use manymux::client::checkpoint::{Want, read_back, read_proc};
+    use manymux::client::checkpoint::{Want, in_front_of, read_back, read_proc};
     use manymux::foreground;
 
     // A process with a command and a directory of its own, so both halves of
@@ -3811,17 +3811,18 @@ fn reading_proc_over_a_shell_agrees_with_reading_it_here() {
     // front of the terminal.
     let stats = read_back(&run(read_proc(&[pid], Want::Stat)));
     assert_eq!(stats.len(), 1, "one record per pid asked about");
-    assert_eq!(stats[0].0, pid, "and it names the pid it answered for");
-    let stat = String::from_utf8_lossy(&stats[0].1).into_owned();
-    let front = foreground::in_front(pid, foreground::tpgid(&stat));
+    assert!(
+        stats.contains_key(&pid),
+        "and it names the pid it answered for"
+    );
+    let front = in_front_of(pid, &stats);
 
     // Pass two: that process's directory and argv.
     let cwd = read_back(&run(read_proc(&[front], Want::Cwd)));
     let argv = read_back(&run(read_proc(&[front], Want::Cmdline)));
     let raw = foreground::Raw {
-        stat,
-        cwd: String::from_utf8_lossy(&cwd[0].1).into_owned(),
-        cmdline: argv[0].1.clone(),
+        cwd: cwd[&front].clone(),
+        cmdline: argv[&front].clone(),
     };
 
     let over_shell = raw.read();
@@ -3869,7 +3870,7 @@ fn what_comes_back_over_a_shell_survives_nuls_and_spaces() {
         .output()
         .unwrap();
     let back = read_back(&out.stdout);
-    let argv = manymux::foreground::argv_from(&back[0].1);
+    let argv = manymux::foreground::argv_from(&back[&pid]);
 
     let out = Command::new("/bin/sh")
         .arg("-c")
@@ -3877,7 +3878,7 @@ fn what_comes_back_over_a_shell_survives_nuls_and_spaces() {
         .output()
         .unwrap();
     let cwd = read_back(&out.stdout);
-    let cwd = String::from_utf8_lossy(&cwd[0].1).into_owned();
+    let cwd = String::from_utf8_lossy(&cwd[&pid]).into_owned();
 
     let _ = child.kill();
     let _ = child.wait();

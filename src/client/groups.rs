@@ -48,7 +48,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-use std::time::UNIX_EPOCH;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -70,17 +70,23 @@ pub struct Member {
 
 impl Member {
     pub fn of(host: &str, session: &SessionInfo) -> Self {
-        let started = session
-            .started
-            .duration_since(UNIX_EPOCH)
-            .map(|since| since.as_secs())
-            .unwrap_or(0);
         Self {
             host: as_listed(host).to_string(),
             pid: session.pid,
-            started,
+            started: seconds(session.started),
         }
     }
+}
+
+/// Whole seconds since the epoch, and the epoch itself for a time before it.
+///
+/// What this file and the checkpoint both write a time down as. A clock set
+/// before 1970 is no reason to fail a write, and the epoch is already what a
+/// host too old to say sends.
+pub fn seconds(at: SystemTime) -> u64 {
+    at.duration_since(UNIX_EPOCH)
+        .map(|since| since.as_secs())
+        .unwrap_or(0)
 }
 
 #[derive(Serialize, Deserialize, Default, Debug, Clone)]
@@ -250,6 +256,21 @@ impl Groups {
         Ok(name)
     }
 
+    /// Put a session in a group, or take it out of every group for `None`.
+    ///
+    /// The one shape both ways of choosing a group from somewhere else take:
+    /// `mm group host/name [group]` and the popup's move list each hand over
+    /// a group or nothing.
+    pub fn set(&mut self, group: Option<&str>, host: &str, session: &SessionInfo) -> Result<()> {
+        match group {
+            Some(group) => {
+                self.assign(group, host, session)?;
+            }
+            None => self.clear(host, session),
+        }
+        Ok(())
+    }
+
     pub fn clear(&mut self, host: &str, session: &SessionInfo) {
         let member = Member::of(host, session);
         for held in self.groups.values_mut() {
@@ -266,7 +287,7 @@ impl Groups {
     /// sessions for exactly this, and it is that one rather than
     /// `Listing::reached()`, which leaves this machine out because this machine
     /// is never watched: fed that, every local member was kept forever.
-    pub fn prune(&mut self, reached: &[String], listing: &[HostedSession]) {
+    fn prune(&mut self, reached: &[String], listing: &[HostedSession]) {
         let live: BTreeSet<Member> = listing
             .iter()
             .map(|hosted| Member::of(&hosted.host, &hosted.session))
@@ -297,10 +318,6 @@ impl Groups {
 
     pub fn names(&self) -> Vec<String> {
         self.groups.keys().cloned().collect()
-    }
-
-    pub fn has(&self, group: &str) -> bool {
-        self.groups.contains_key(group)
     }
 
     /// A group is a set of live sessions and nothing else, so one that has lost
@@ -396,6 +413,25 @@ mod tests {
         groups.assign("pi", "box", &s).unwrap();
         groups.clear("box", &s);
         assert_eq!(groups.group_of("box", &s), None);
+    }
+
+    /// What both ways of choosing a group hand over: a name puts the session
+    /// in it, with the same rules `assign` keeps, and nothing takes it out.
+    #[test]
+    fn setting_a_group_assigns_and_setting_none_clears() {
+        let mut groups = Groups::default();
+        let s = session("build", 41823, 1000);
+        groups.set(Some("@pi"), "box", &s).unwrap();
+        assert_eq!(groups.group_of("box", &s), Some("pi"));
+        assert!(groups.set(Some("a/b"), "box", &s).is_err());
+        assert_eq!(
+            groups.group_of("box", &s),
+            Some("pi"),
+            "a refused name moves nothing"
+        );
+        groups.set(None, "box", &s).unwrap();
+        assert_eq!(groups.group_of("box", &s), None);
+        assert!(groups.names().is_empty());
     }
 
     /// A reused pid on a machine that rebooted is a different session, which is

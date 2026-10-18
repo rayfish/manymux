@@ -467,8 +467,7 @@ impl Scrollback {
         };
         search.at = Some(at);
         let middle = self.page() / 2;
-        let furthest = self.total.saturating_sub(self.page());
-        self.offset = line.saturating_sub(middle).min(furthest);
+        self.offset = line.saturating_sub(middle).min(self.furthest());
     }
 
     /// What the row says about the search: the needle, and which match of how
@@ -509,6 +508,12 @@ impl Scrollback {
         self.offset == 0
     }
 
+    /// The offset of the oldest window there is: the top of the history, as
+    /// far as the host has said.
+    fn furthest(&self) -> u64 {
+        self.total.saturating_sub(self.page())
+    }
+
     fn page(&self) -> u64 {
         u64::from(self.rows).max(1)
     }
@@ -547,8 +552,7 @@ impl Scrollback {
             self.offset = self.offset.saturating_add(lines);
             return;
         }
-        let furthest = self.total.saturating_sub(self.page());
-        self.offset = self.offset.saturating_add(lines).min(furthest);
+        self.offset = self.offset.saturating_add(lines).min(self.furthest());
     }
 
     pub fn down(&mut self, lines: u64) {
@@ -572,7 +576,7 @@ impl Scrollback {
             self.offset = u64::MAX;
             return;
         }
-        self.offset = self.total.saturating_sub(self.page());
+        self.offset = self.furthest();
     }
 
     /// Back to the live screen.
@@ -641,8 +645,7 @@ impl Scrollback {
         self.answered = true;
         // A buffer that trimmed under the request, or one shorter than a
         // screen: keep the window inside what exists.
-        let furthest = self.total.saturating_sub(self.page());
-        self.offset = self.offset.min(furthest);
+        self.offset = self.offset.min(self.furthest());
         self.block = Some(Block {
             from: window.from,
             lines: window.lines,
@@ -728,7 +731,7 @@ impl Scrollback {
     /// nothing is asked for until something moves, and what is asked for then
     /// is the end as it is by then.
     fn pinned(&self) -> bool {
-        self.offset == 0 || (self.trimming && self.offset >= self.total.saturating_sub(self.page()))
+        self.offset == 0 || (self.trimming && self.offset >= self.furthest())
     }
 
     /// Where a cell of the screen sits in the buffer.
@@ -757,12 +760,20 @@ impl Scrollback {
     /// selected before.
     pub fn select_from(&mut self, spot: Spot) {
         let at = self.cell(spot);
+        self.begin(at, at, Grain::Cell);
+    }
+
+    /// A new gesture's selection, in place of whatever was there.
+    ///
+    /// Every press starts one, and every press is a hand that has stopped
+    /// asking for the view and owes no copy any more, whichever click it is.
+    fn begin(&mut self, anchor: Cell, head: Cell, grain: Grain) {
         self.stop_chasing();
         self.forget_the_copy();
         self.selection = Some(Selection {
-            anchor: at,
-            head: at,
-            grain: Grain::Cell,
+            anchor,
+            head,
+            grain,
         });
     }
 
@@ -886,13 +897,7 @@ impl Scrollback {
     /// here however far away the machine is.
     pub fn select_word(&mut self, spot: Spot) {
         let at = self.cell(spot);
-        self.chasing = None;
-        self.forget_the_copy();
-        self.selection = Some(Selection {
-            anchor: at,
-            head: at,
-            grain: Grain::Word,
-        });
+        self.begin(at, at, Grain::Word);
     }
 
     /// And the whole line under a third, to the end of what is on it: the
@@ -900,19 +905,15 @@ impl Scrollback {
     /// takes whole lines for the same reason a double click's takes words.
     pub fn select_line(&mut self, spot: Spot) {
         let at = self.cell(spot);
-        self.chasing = None;
-        self.forget_the_copy();
-        self.selection = Some(Selection {
-            anchor: Cell {
-                line: at.line,
-                col: 0,
-            },
-            head: Cell {
-                line: at.line,
-                col: self.line_ends(at.line),
-            },
-            grain: Grain::Line,
-        });
+        let anchor = Cell {
+            line: at.line,
+            col: 0,
+        };
+        let head = Cell {
+            line: at.line,
+            col: self.line_ends(at.line),
+        };
+        self.begin(anchor, head, Grain::Line);
     }
 
     /// Drop the copy a gesture owed, its release having landed before the
@@ -1321,7 +1322,7 @@ fn in_a_word(c: char) -> bool {
 /// A wide glyph occupies its two cells as one piece: a pointer on either half
 /// selects the glyph rather than cutting it in two, which keeps the highlight
 /// and copied text under the cursor together for CJK and emoji.
-fn plain(line: &str, from: u16, to: u16) -> String {
+pub fn plain(line: &str, from: u16, to: u16) -> String {
     let mut out = String::new();
     walk(line, |piece| {
         if let Piece::Char(cell) = piece

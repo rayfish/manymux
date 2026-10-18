@@ -207,7 +207,7 @@ impl Status {
     /// same sequence [`Self::setup`] opens with, and it lasts exactly as long:
     /// until the session sets a title of its own.
     pub fn retitle(&self) -> String {
-        self.title(&self.target)
+        title(&self.target)
     }
 
     /// Say how far back the view is, or that it has gone. The caller repaints.
@@ -299,7 +299,7 @@ impl Status {
     /// Sent once, after the alternate screen is up: name the window, fence the
     /// session into the rows above the mark, and draw it.
     pub fn setup(&self, size: Size) -> String {
-        format!("{}{}", self.title(&self.target), self.repaint(size))
+        format!("{}{}", title(&self.target), self.repaint(size))
     }
 
     /// Re-fence the scrolling region and redraw, after something that may have
@@ -468,12 +468,12 @@ impl Status {
         }
         format!("{showing}{HINT_GAP}{keys}")
     }
+}
 
-    /// `mm ` in front of a title, or in front of the target when the session has
-    /// not set one.
-    fn title(&self, text: &str) -> String {
-        format!("\x1b]0;{}\x07", prefixed(text))
-    }
+/// `mm ` in front of a title, or in front of the target when the session has
+/// not set one.
+fn title(text: &str) -> String {
+    format!("\x1b]0;{}\x07", prefixed(text))
 }
 
 /// As many of the hints as fit in `room` columns, in their own order and with
@@ -682,7 +682,7 @@ const MAX_OSC: usize = 4096;
 impl Filter {
     pub fn new(screen: Screen) -> Self {
         Self {
-            owns_the_screen: screen.mode().owns_the_screen(),
+            owns_the_screen: screen.owns_the_screen(),
             state: State::default(),
             held: Vec::new(),
             dirty: false,
@@ -704,7 +704,8 @@ impl Filter {
     }
 
     /// Whether the program currently asks the terminal to report key releases.
-    pub fn reports_key_releases(&self) -> bool {
+    #[cfg(test)]
+    fn reports_key_releases(&self) -> bool {
         self.keyboard.reports_releases()
     }
 

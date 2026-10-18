@@ -109,8 +109,9 @@ Three consequences run through the whole codebase and are worth keeping intact:
 - `src/client/groups.rs` is `groups.toml`, beside the host list: which sessions
   you are treating as one piece of work, spanning machines. `src/client/picker.rs`
   is the list control mode draws, filled with sessions or with groups, and
-  `src/client/listed.rs` is what fills it: one fan-out's answers, and the tree of
-  rows built from them.
+  `src/client/listed.rs` is what fills it: one fan-out's answers (with the
+  memberships read before asking, which bound what it may prune), the tree of
+  rows built from them, and the entries the switch keys walk.
 - `src/main.rs` is the CLI, and the only place that decides local versus remote:
   `open()` picks socket or ssh, `open_or_start()` is for commands that ask a
   machine to hold something new. Beside it and belonging to the binary rather
@@ -122,8 +123,9 @@ Three consequences run through the whole codebase and are worth keeping intact:
   saying so. The middle one belongs in the library, where it can be tested
   without a fleet and where a mobile client can reach it. `mm checkpoint save` is
   the worked example: `src/main.rs` lists the machines and asks each what its
-  sessions are doing, `client::checkpoint::taking` decides what to write down and
-  what was lost, and `main` turns each reason it answers with into the line
+  sessions are doing (over ssh, `client::checkpoint::described` reads what
+  `/proc` sent back), `client::checkpoint::taking` decides what to write down
+  and what was lost, and `main` turns each reason it answers with into the line
   somebody reads. A rule that lives in a `println!` is a rule no test can see.
 
 ### Rules that are easy to break

@@ -50,7 +50,7 @@ impl Located {
 /// Not being in the list is not the same as being at its start: a session that
 /// has since exited, or a machine that has dropped out of the listing, leaves us
 /// outside it, so the step starts from whichever end it is heading towards.
-fn wrapped(forwards: bool, at: Option<usize>, len: usize) -> Option<usize> {
+pub(crate) fn wrapped(forwards: bool, at: Option<usize>, len: usize) -> Option<usize> {
     if len == 0 {
         return None;
     }

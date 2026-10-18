@@ -500,15 +500,7 @@ async fn run(cli: Cli) -> Result<u8> {
                 .iter()
                 .find(|s| s.name == at.session)
                 .ok_or_else(|| anyhow!("no session named {} on {}", at.session, at.host))?;
-            Groups::change(|groups| {
-                match &name {
-                    Some(name) => {
-                        groups.assign(name, &at.host, session)?;
-                    }
-                    None => groups.clear(&at.host, session),
-                }
-                Ok(())
-            })?;
+            Groups::change(|groups| groups.set(name.as_deref(), &at.host, session))?;
             Ok(OK)
         }
 
@@ -1322,7 +1314,14 @@ async fn what_is_doing(socket: &Path, host: &str, listing: &Listing) -> Result<V
     if is_this_machine(host) {
         return Ok(here
             .iter()
-            .map(|hosted| doing(&hosted.session, manymux::foreground::of(hosted.session.pid)))
+            .map(|hosted| {
+                let session = &hosted.session;
+                Doing::new(
+                    session.name.clone(),
+                    session.pid,
+                    manymux::foreground::of(session.pid),
+                )
+            })
             .collect());
     }
 
@@ -1342,16 +1341,6 @@ async fn what_is_doing(socket: &Path, host: &str, listing: &Listing) -> Result<V
     }
 }
 
-/// One session's answer, however the three files were come by.
-fn doing(session: &manymux::proto::SessionInfo, front: manymux::foreground::Foreground) -> Doing {
-    Doing {
-        name: session.name.clone(),
-        pid: session.pid,
-        cwd: front.cwd,
-        foreground: front.argv,
-    }
-}
-
 /// Read what a machine is doing out of its `/proc`, over ssh.
 ///
 /// Two passes, because which process to describe is decided *here*: the first
@@ -1365,78 +1354,35 @@ fn doing(session: &manymux::proto::SessionInfo, front: manymux::foreground::Fore
 /// directory, which is reported and counted against the save the way any other
 /// undescribable session is.
 async fn over_ssh(host: &str, here: &[&HostedSession]) -> Result<Vec<Doing>> {
-    use manymux::foreground::{Foreground, Raw};
-
     let leaders: Vec<u32> = here.iter().map(|hosted| hosted.session.pid).collect();
     if leaders.is_empty() {
         return Ok(Vec::new());
     }
-
-    let stats = checkpoint::read_back(
-        &manymux::ssh::ask(
-            host,
-            &checkpoint::read_proc(&leaders, checkpoint::Want::Stat),
-        )
-        .await?,
-    );
-    let stat_of = |pid: u32| -> String {
-        stats
-            .iter()
-            .find(|(answered, _)| *answered == pid)
-            .map(|(_, bytes)| String::from_utf8_lossy(bytes).into_owned())
-            .unwrap_or_default()
-    };
-
+    let stats = read_over_ssh(host, &leaders, checkpoint::Want::Stat).await?;
     // Whose directory and argv to ask for, decided by the same rule the local
     // path uses, on the same bytes.
     let fronts: Vec<u32> = leaders
         .iter()
-        .map(|&leader| {
-            manymux::foreground::in_front(leader, manymux::foreground::tpgid(&stat_of(leader)))
-        })
+        .map(|&leader| checkpoint::in_front_of(leader, &stats))
         .collect();
-
-    let cwds = checkpoint::read_back(
-        &manymux::ssh::ask(host, &checkpoint::read_proc(&fronts, checkpoint::Want::Cwd)).await?,
-    );
-    let argvs = checkpoint::read_back(
-        &manymux::ssh::ask(
-            host,
-            &checkpoint::read_proc(&fronts, checkpoint::Want::Cmdline),
-        )
-        .await?,
-    );
-    let bytes_of = |answers: &[(u32, Vec<u8>)], pid: u32| -> Vec<u8> {
-        answers
-            .iter()
-            .find(|(answered, _)| *answered == pid)
-            .map(|(_, bytes)| bytes.clone())
-            .unwrap_or_default()
-    };
+    let cwds = read_over_ssh(host, &fronts, checkpoint::Want::Cwd).await?;
+    let argvs = read_over_ssh(host, &fronts, checkpoint::Want::Cmdline).await?;
 
     Ok(here
         .iter()
         .zip(&fronts)
-        .map(|(hosted, &front)| {
-            let raw = Raw {
-                stat: stat_of(hosted.session.pid),
-                cwd: String::from_utf8_lossy(&bytes_of(&cwds, front)).into_owned(),
-                cmdline: bytes_of(&argvs, front),
-            };
-            // Non-UTF-8 is nothing rather than something close to it, here as
-            // in the local path: `from_utf8_lossy` on a path would name a
-            // directory that does not exist.
-            let front = if raw.cwd.contains('\u{fffd}') {
-                Foreground {
-                    cwd: None,
-                    argv: raw.read().argv,
-                }
-            } else {
-                raw.read()
-            };
-            doing(&hosted.session, front)
-        })
+        .map(|(hosted, &front)| checkpoint::described(&hosted.session, front, &cwds, &argvs))
         .collect())
+}
+
+/// One pass of [`over_ssh`]: the same `/proc` file for each of these pids.
+async fn read_over_ssh(
+    host: &str,
+    pids: &[u32],
+    want: checkpoint::Want,
+) -> Result<checkpoint::ReadBack> {
+    let out = manymux::ssh::ask(host, &checkpoint::read_proc(pids, want)).await?;
+    Ok(checkpoint::read_back(&out))
 }
 
 /// `mm checkpoint restore`: start the saved sessions again.
@@ -1699,7 +1645,7 @@ async fn do_attach(
     let latest: Arc<Mutex<Option<Listed>>> = Arc::new(Mutex::new(None));
     // What the popup's lister last found, for the loop to take back: it hands
     // its own pending listing over, so the answer arrives there and not here.
-    let seen: Arc<Mutex<Option<Survey>>> = Arc::new(Mutex::new(None));
+    let seen: Arc<Mutex<Option<Snapshot>>> = Arc::new(Mutex::new(None));
 
     let mut connections = Connections::default();
     let mut held = attach::hold(screen)?;
@@ -1728,7 +1674,7 @@ async fn do_attach(
         let target = cycle.current().clone();
         let mut where_ = qualified(&target.host, &target.session);
         let history = if seeded.insert(where_.clone()) {
-            screen.mode().history()
+            screen.history()
         } else {
             0
         };
@@ -1832,7 +1778,7 @@ async fn do_attach(
         // Only against a snapshot that says something: an empty one is a run
         // whose listing has never landed, and every group is missing from it.
         if !snapshot.is_empty() {
-            cycle.refresh(entries(&snapshot, &groups));
+            cycle.refresh(snapshot.entries(&groups));
         }
         if !settled {
             settled = true;
@@ -1884,14 +1830,13 @@ async fn do_attach(
                         },
                         None => survey(&socket).await,
                     };
-                    let Ok(surveyed) = listing else { continue };
-                    let snapshot = &surveyed.snapshot;
+                    let Ok(snapshot) = listing else { continue };
                     if snapshot.is_empty() {
                         continue;
                     }
                     let held = Groups::load().unwrap_or_else(|_| groups.clone());
                     let machines = Hosts::load().map(|hosts| hosts.names()).unwrap_or_default();
-                    let listed = Listed::of(snapshot, &held, &machines, focus.as_deref(), &recent)
+                    let listed = Listed::of(&snapshot, &held, &machines, focus.as_deref(), &recent)
                         .following(&previous);
                     previous = listed.clone();
                     // Every answer retains earlier ids, so a choice from
@@ -1901,7 +1846,7 @@ async fn do_attach(
                     // And the snapshot behind them, because the loop's own copy
                     // is now the older of the two: it gave up waiting on the
                     // listing this task went on to collect.
-                    *held_lock(&seen) = Some(surveyed);
+                    *held_lock(&seen) = Some(snapshot);
                     if answered.send(listed.rows).is_err() {
                         return;
                     }
@@ -1939,13 +1884,9 @@ async fn do_attach(
         // hands its pending listing to the popup, so nothing is ever left for
         // `take_listing` to find.
         if let Some(fresher) = held_lock(&seen).take() {
-            let _ = groups.refresh(
-                &fresher.groups_before,
-                &fresher.snapshot.answered,
-                &fresher.snapshot.sessions,
-            );
-            snapshot = fresher.snapshot;
-            cycle.refresh(entries(&snapshot, &groups));
+            let _ = fresher.refresh(&mut groups);
+            snapshot = fresher;
+            cycle.refresh(snapshot.entries(&groups));
         }
         // Renamed from inside, so the name this run has been using is nobody's
         // now: the cycle would hop to a session that is not there, and the line
@@ -2053,14 +1994,14 @@ async fn do_attach(
                             .await
                             .err()
                             .map(|e| format!("{e:#}"));
-                        cycle.refresh(entries(&snapshot, &groups));
+                        cycle.refresh(snapshot.entries(&groups));
                     }
                     Chose::NewGroup { session, name } => {
                         notice = regroup(socket, &listed, session, Some(name), &mut groups)
                             .await
                             .err()
                             .map(|e| format!("{e:#}"));
-                        cycle.refresh(entries(&snapshot, &groups));
+                        cycle.refresh(snapshot.entries(&groups));
                     }
                     // The row may not be the session at the other end of the
                     // attach stream, and `tag::RENAME` renames that one by
@@ -2473,15 +2414,7 @@ async fn regroup(
         .iter()
         .find(|s| s.name == at.session)
         .ok_or_else(|| anyhow!("{} is no longer running", at.session))?;
-    groups.update(|groups| {
-        match &group {
-            Some(name) => {
-                groups.assign(name, &at.host, session)?;
-            }
-            None => groups.clear(&at.host, session),
-        }
-        Ok(())
-    })
+    groups.update(|groups| groups.set(group.as_deref(), &at.host, session))
 }
 
 /// Rename the session on a popup row, wherever it is running, and answer with
@@ -2510,50 +2443,27 @@ async fn rename_at(socket: &Path, at: Option<&Located>, pid: u32, to: &str) -> R
         .unwrap_or_else(|| to.to_string()))
 }
 
-/// The listing as the cycle wants it: an address, and the group it is in.
-fn entries(snapshot: &Snapshot, groups: &Groups) -> Vec<manymux::client::switch::Entry> {
-    snapshot
-        .sessions
-        .iter()
-        .map(|hosted| {
-            manymux::client::switch::Entry::new(
-                Located::new(&hosted.host, &hosted.session.name),
-                groups
-                    .group_of(&hosted.host, &hosted.session)
-                    .map(str::to_string),
-            )
-        })
-        .collect()
-}
-
-/// A listing and the memberships it is old enough to prune.
-#[derive(Default)]
-struct Survey {
-    snapshot: Snapshot,
-    groups_before: Groups,
-}
-
-async fn survey(socket: &Path) -> Result<Survey> {
-    let groups_before = Groups::load().unwrap_or_default();
+/// Every machine's sessions, with the memberships read before asking, which
+/// are all a listing that lands late is old enough to prune.
+async fn survey(socket: &Path) -> Result<Snapshot> {
+    let before = Groups::load().unwrap_or_default();
     let listing = everywhere(socket).await?;
-    Ok(Survey {
-        snapshot: Snapshot {
-            answered: listing.answering(),
-            sessions: listing.sessions,
-        },
-        groups_before,
+    Ok(Snapshot {
+        answered: listing.answering(),
+        sessions: listing.sessions,
+        before,
     })
 }
 
 /// Ask every machine off to one side, keeping the groups read before asking.
-fn spawn_listing(socket: &Path) -> JoinHandle<Survey> {
+fn spawn_listing(socket: &Path) -> JoinHandle<Snapshot> {
     let socket = socket.to_path_buf();
     tokio::spawn(async move {
         match survey(&socket).await {
             Ok(surveyed) => surveyed,
             Err(e) => {
                 debug!("could not list sessions for the switch keys: {e:#}");
-                Survey::default()
+                Snapshot::default()
             }
         }
     })
@@ -2573,7 +2483,7 @@ fn spawn_listing(socket: &Path) -> JoinHandle<Survey> {
 /// with. That is what lets `Cycle::refresh` see a session the window next door
 /// moved out of the group this run is narrowed to.
 async fn take_listing(
-    pending: &mut Option<JoinHandle<Survey>>,
+    pending: &mut Option<JoinHandle<Snapshot>>,
     cycle: &mut Cycle,
     snapshot: &mut Snapshot,
     groups: &mut Groups,
@@ -2587,14 +2497,10 @@ async fn take_listing(
     };
     match tokio::time::timeout(LISTING_WAIT, &mut task).await {
         Ok(Ok(landed)) => {
-            if !landed.snapshot.is_empty() {
-                let _ = groups.refresh(
-                    &landed.groups_before,
-                    &landed.snapshot.answered,
-                    &landed.snapshot.sessions,
-                );
-                *snapshot = landed.snapshot;
-                cycle.refresh(entries(snapshot, groups));
+            if !landed.is_empty() {
+                let _ = landed.refresh(groups);
+                *snapshot = landed;
+                cycle.refresh(snapshot.entries(groups));
             }
         }
         Ok(Err(e)) => debug!("the listing task did not finish: {e}"),
@@ -2634,7 +2540,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_switch_does_not_wait_for_a_pending_listing() {
-        let task = tokio::spawn(async { std::future::pending::<Survey>().await });
+        let task = tokio::spawn(async { std::future::pending::<Snapshot>().await });
         let mut pending = Some(task);
         let mut cycle = Cycle::new(Located::new("gpu-box", "build"));
         let mut snapshot = Snapshot::default();
