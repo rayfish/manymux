@@ -6,7 +6,6 @@ import android.content.Context
 import android.content.res.Configuration
 import android.graphics.Canvas
 import android.graphics.Paint
-import android.graphics.Typeface
 import android.view.ActionMode
 import android.view.Menu
 import android.view.MenuItem
@@ -100,9 +99,7 @@ class TerminalView(context: Context) : View(context), Choreographer.FrameCallbac
      */
     var onCannotScroll: (() -> Unit)? = null
 
-    private val ink = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        typeface = Typeface.MONOSPACE
-    }
+    private val painter = Painter()
     private val block = Paint()
 
     /** Every row the screen has, by index. Replaced as frames arrive. */
@@ -128,9 +125,8 @@ class TerminalView(context: Context) : View(context), Choreographer.FrameCallbac
     private var viewFrom = 0L
     private var viewTotal = 0L
 
-    private var cellWidth = 0f
-    private var lineHeight = 0f
-    private var baseline = 0f
+    private val cellWidth get() = painter.cell
+    private val lineHeight get() = painter.line
 
     /** The last grid the far end was told about, so it is told only on a change. */
     private var told: Grid? = null
@@ -157,11 +153,7 @@ class TerminalView(context: Context) : View(context), Choreographer.FrameCallbac
      * behind their back.
      */
     private fun measureCell() {
-        ink.textSize = CELL_DP * resources.displayMetrics.density
-        cellWidth = ink.measureText("M")
-        val metrics = ink.fontMetrics
-        lineHeight = metrics.descent - metrics.ascent
-        baseline = -metrics.ascent
+        painter.fitFont(CELL_DP * resources.displayMetrics.density)
     }
 
     /**
@@ -291,32 +283,7 @@ class TerminalView(context: Context) : View(context), Choreographer.FrameCallbac
 
     override fun onDraw(canvas: Canvas) {
         canvas.drawColor(Palette.GROUND)
-        for ((at, runs) in selectionRows ?: if (viewing) history else rows) {
-            var x = 0f
-            val top = at * lineHeight
-            for (run in runs) {
-                // The run's own cell count, never the font's idea of how wide
-                // the text is: a wide character is two cells and one glyph, and
-                // measuring the glyph puts the rest of the row out of step.
-                val across = run.cells.toInt() * cellWidth
-                val background = Palette.of(run.look.background, Palette.GROUND)
-                val foreground = Palette.of(run.look.foreground, Palette.TEXT)
-                val paper = if (run.look.inverse) foreground else background
-                val text = if (run.look.inverse) background else foreground
-                if (paper != Palette.GROUND) {
-                    block.color = paper
-                    canvas.drawRect(x, top, x + across, top + lineHeight, block)
-                }
-                ink.color = text
-                ink.isFakeBoldText = run.look.bold
-                ink.isUnderlineText = run.look.underline
-                ink.isStrikeThruText = run.look.strikethrough
-                ink.textSkewX = if (run.look.italic) -0.25f else 0f
-                ink.alpha = if (run.look.faint) 0x99 else 0xFF
-                canvas.drawText(run.text, x, top + baseline, ink)
-                x += across
-            }
-        }
+        painter.paint(canvas, selectionRows ?: if (viewing) history else rows, width, height)
         if (selectionRows != null) {
             drawSelection(canvas)
             return
@@ -699,10 +666,18 @@ class TerminalView(context: Context) : View(context), Choreographer.FrameCallbac
     }
 
     override fun onKeyDown(code: Int, event: KeyEvent): Boolean {
-        if (event.isShiftPressed) shift = true
-        val bytes = encode(code, event) ?: return super.onKeyDown(code, event)
-        send(bytes)
-        return true
+        // Held for this key only, and only if the row was not already holding
+        // it: a key this does not handle (Shift on its own, F1) must not leave
+        // shift lit behind it for whatever is typed next.
+        val shifted = event.isShiftPressed && !shift
+        if (shifted) shift = true
+        try {
+            val bytes = encode(code, event) ?: return super.onKeyDown(code, event)
+            send(bytes)
+            return true
+        } finally {
+            if (shifted) shift = false
+        }
     }
 
     /** What a key press is, on the wire. */

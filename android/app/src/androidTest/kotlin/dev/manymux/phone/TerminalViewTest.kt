@@ -15,6 +15,7 @@ import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
+import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.View
 import android.view.ActionMode
@@ -53,8 +54,9 @@ class TerminalViewTest {
                 terminal.invalidate()
             }
             instrumentation.waitForIdleSync()
-            val cell = field(terminal, "cellWidth") as Float
-            val line = field(terminal, "lineHeight") as Float
+            val painter = field(terminal, "painter") as Painter
+            val cell = painter.cell
+            val line = painter.line
             val down = SystemClock.uptimeMillis()
             touch(terminal, down, MotionEvent.ACTION_DOWN, cell * 2.5f, line / 2)
             SystemClock.sleep(800)
@@ -238,6 +240,42 @@ class TerminalViewTest {
                 terminal.attach = null
                 assertTrue(!terminal.shift)
                 assertTrue(!shift.isSelected)
+            }
+        } finally {
+            scenario.close()
+        }
+    }
+
+    @Test
+    fun aHardwareShiftOnAKeyNotHandledLeavesNoShiftBehind() {
+        val scenario = ActivityScenario.launch(MainActivity::class.java)
+        try {
+            scenario.onActivity { activity ->
+                val terminal = TerminalView(activity)
+                val method = MainActivity::class.java.getDeclaredMethod("extraKeys", TerminalView::class.java)
+                method.isAccessible = true
+                val keys = method.invoke(activity, terminal) as View
+                val shift = descendants(keys).filterIsInstance<TextView>().single { it.text == "shift" }
+                fun press(code: Int) {
+                    val now = SystemClock.uptimeMillis()
+                    val event = KeyEvent(
+                        now, now, KeyEvent.ACTION_DOWN, code, 0,
+                        KeyEvent.META_SHIFT_ON or KeyEvent.META_SHIFT_LEFT_ON,
+                    )
+                    terminal.onKeyDown(code, event)
+                }
+                press(KeyEvent.KEYCODE_SHIFT_LEFT)
+                assertTrue("A bare Shift should not latch the row's shift", !terminal.shift)
+                assertTrue(!shift.isSelected)
+                press(KeyEvent.KEYCODE_F1)
+                assertTrue("Shift-F1 should not latch the row's shift", !terminal.shift)
+                assertTrue(!shift.isSelected)
+                // A shift the row was already holding is the row's, and a key
+                // this does not handle leaves it where it was.
+                shift.performClick()
+                press(KeyEvent.KEYCODE_F1)
+                assertTrue(terminal.shift)
+                assertTrue(shift.isSelected)
             }
         } finally {
             scenario.close()
