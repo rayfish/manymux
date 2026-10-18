@@ -2065,6 +2065,125 @@ fn an_attach_whose_connection_drops_comes_back_by_itself() {
     let _ = client.wait();
 }
 
+/// A session renamed from inside keeps the history it already put in the
+/// terminal's scrollback.
+///
+/// Which sessions have been seeded was kept by name, so after a rename the
+/// next reattach, a dropped connection coming back, asked for the history
+/// again and an inline screen got a second copy of it.
+#[test]
+fn a_session_renamed_from_inside_is_not_seeded_twice() {
+    use std::io::{Read, Write};
+    use std::os::fd::AsFd;
+    use std::sync::mpsc;
+
+    let world = World::new("rename-seeded");
+    world.ok("laptop", &["add", "gpu-box"]);
+    world.ok(
+        "gpu-box",
+        &[
+            "new",
+            "-d",
+            "-n",
+            "long",
+            "sh",
+            "-c",
+            "seq 1 200 | sed s/^/line-/; sleep 300",
+        ],
+    );
+    world.wait_for_node("gpu-box");
+
+    let (pty, pts) = pty_process::blocking::open().unwrap();
+    pty.resize(pty_process::Size::new(24, 80)).unwrap();
+    let mut client = pty_process::blocking::Command::new(MM)
+        .arg("--socket")
+        .arg(world.socket("laptop"))
+        .args(["attach", "--screen", "inline", "gpu-box/long"])
+        .env("MM_CONFIG_DIR", world.dir.join("laptop"))
+        .env("MM_SSH", world.ssh_stub())
+        .env("MM_LOG", "manymux=warn")
+        .env("TERM", "xterm-256color")
+        .spawn(pts)
+        .expect("attaching on a terminal");
+
+    let (seen_tx, seen_rx) = mpsc::channel();
+    let mut reading =
+        unsafe { pty_process::blocking::Pty::from_fd(pty.as_fd().try_clone_to_owned().unwrap()) };
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 1024];
+        while let Ok(read @ 1..) = reading.read(&mut buf) {
+            if seen_tx.send(buf[..read].to_vec()).is_err() {
+                return;
+            }
+        }
+    });
+
+    let mut seen = String::new();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut opened = false;
+    let mut typed = false;
+    let mut cut = false;
+    let mut noticed = false;
+    let mut back: Option<Instant> = None;
+    loop {
+        if let Ok(chunk) = seen_rx.recv_timeout(Duration::from_millis(100)) {
+            seen.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        // The history went in once, on the way in.
+        if !opened && seen.contains("gpu-box/long") && seen.contains("line-100") {
+            opened = true;
+            (&pty).write_all(b"\x1dr").unwrap();
+            seen.clear();
+        }
+        if opened && !typed && seen.contains("long") {
+            typed = true;
+            std::thread::sleep(Duration::from_millis(200));
+            (&pty).write_all(b"\x15renamed").unwrap();
+            std::thread::sleep(Duration::from_millis(200));
+            (&pty).write_all(b"\r").unwrap();
+        }
+        if typed && !cut && watched_name(&world, "renamed") {
+            cut = true;
+            let pattern = format!("{}/gpu-box.sock agent", world.dir.display());
+            Command::new("pkill")
+                .args(["-f", &pattern])
+                .status()
+                .expect("running pkill");
+        }
+        if cut && !noticed && seen.contains("retrying in") {
+            noticed = true;
+            seen.clear();
+        }
+        // The screen repainted, which only a reattach does.
+        if noticed && back.is_none() && seen.contains("line-200") {
+            back = Some(Instant::now());
+        }
+        // Long enough after the reattach for a history to have arrived.
+        if back.is_some_and(|at| at.elapsed() > Duration::from_secs(1)) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "opened={opened} typed={typed} cut={cut} noticed={noticed}; the terminal saw: {seen:?}"
+        );
+    }
+
+    assert!(
+        !seen.contains("line-100"),
+        "the history was put in the scrollback a second time: {seen:?}"
+    );
+
+    let _ = client.kill();
+    let _ = client.wait();
+}
+
+fn watched_name(world: &World, name: &str) -> bool {
+    world
+        .ok("gpu-box", &["ls", "local"])
+        .lines()
+        .any(|line| line.split_whitespace().any(|word| word == name))
+}
+
 /// A switch key that finds nowhere to go has to ask where to go next time.
 ///
 /// The listing behind the keys is only ever asked for by a press, so a press
