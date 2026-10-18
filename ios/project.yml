@@ -60,6 +60,8 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: dev.manymux.phone
         TARGETED_DEVICE_FAMILY: "1,2"
+        # The Android launcher mark, drawn on the session's ground.
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         # The pre-build script writes into build/, outside what a sandboxed
         # script phase may touch.
         ENABLE_USER_SCRIPT_SANDBOXING: NO
