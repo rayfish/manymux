@@ -42,6 +42,7 @@
 //! the name and the title even when the title is clipped in the box, and keeps
 //! the headings above matches so the machine and group remain visible.
 
+use crate::client::switch::wrapped;
 use crate::proto::Size;
 use crate::style;
 
@@ -269,11 +270,7 @@ impl Picker {
         self.rows = filtered(&self.source, &self.query);
         let preferred = at.and_then(|index| self.source.get(index).map(|row| row.id));
         self.at = was
-            .and_then(|id| {
-                self.rows
-                    .iter()
-                    .position(|row| row.id == id && !row.heading)
-            })
+            .and_then(|id| self.index_of(id))
             // Nothing was highlighted, which is a box that opened on an empty
             // listing: the fan-out takes longer than the half second the switch
             // keys give it, so on a slow fleet the *first* popup of a run always
@@ -282,13 +279,7 @@ impl Picker {
             // the session you are in is the one you are looking out from, and
             // Enter is the next key. Falling back to the first row hopped you
             // into somebody else's session.
-            .or_else(|| {
-                preferred.and_then(|id| {
-                    self.rows
-                        .iter()
-                        .position(|row| row.id == id && !row.heading)
-                })
-            })
+            .or_else(|| preferred.and_then(|id| self.index_of(id)))
             .or_else(|| self.first())
             .unwrap_or(0);
         self.top = 0;
@@ -300,13 +291,16 @@ impl Picker {
     /// the picker that was showing it, while an index does not survive a
     /// listing landing in between.
     pub fn point_at(&mut self, id: usize) {
-        if let Some(at) = self
-            .rows
-            .iter()
-            .position(|row| row.id == id && !row.heading)
-        {
+        if let Some(at) = self.index_of(id) {
             self.at = at;
         }
+    }
+
+    /// Where the row with this id is, among the rows that can be landed on.
+    fn index_of(&self, id: usize) -> Option<usize> {
+        self.rows
+            .iter()
+            .position(|row| row.id == id && !row.heading)
     }
 
     /// The row this digit reaches, if a row wears it.
@@ -336,17 +330,13 @@ impl Picker {
     /// sessions, whatever gathered it.
     pub fn next_heading(&mut self, forwards: bool) {
         let len = self.rows.len();
-        if len == 0 {
-            return;
-        }
         let mut seen_heading = false;
         let mut next = self.at;
         for _ in 0..len {
-            next = if forwards {
-                (next + 1) % len
-            } else {
-                (next + len - 1) % len
+            let Some(stepped) = wrapped(forwards, Some(next), len) else {
+                return;
             };
+            next = stepped;
             if self.rows[next].heading {
                 seen_heading = true;
                 continue;
@@ -371,16 +361,12 @@ impl Picker {
     /// of nothing but headings has nowhere to go and must not spin.
     fn step(&mut self, forwards: bool) {
         let len = self.rows.len();
-        if len == 0 {
-            return;
-        }
         let mut next = self.at;
         for _ in 0..len {
-            next = if forwards {
-                (next + 1) % len
-            } else {
-                (next + len - 1) % len
+            let Some(stepped) = wrapped(forwards, Some(next), len) else {
+                return;
             };
+            next = stepped;
             if self.landable(next).is_some() {
                 self.at = next;
                 return;

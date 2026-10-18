@@ -230,7 +230,7 @@ pub const PROGRAMS: [&str; 2] = ["mm", "~/.local/bin/mm"];
 
 /// What a shell exits with for a command it could not find, and the only sign
 /// the far end gives that it has no `mm` on it.
-const NOT_FOUND: i32 = 127;
+pub const NOT_FOUND: i32 = 127;
 
 /// Whether to put `mm` on a machine that turns out not to have it, asked of
 /// whoever is running this. Returning false leaves the machine alone.

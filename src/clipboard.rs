@@ -18,6 +18,8 @@ use std::process::Stdio;
 use anyhow::{Result, anyhow, bail};
 use tokio::process::Command;
 
+use crate::settings;
+
 /// An image on the clipboard, ready to go over the wire.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Image {
@@ -43,11 +45,9 @@ pub fn enabled() -> bool {
     }
 }
 
+/// Anything but a way of saying off leaves it on, as `MM_NOTIFY` does.
 fn is_on(value: &str) -> bool {
-    !matches!(
-        value.trim().to_ascii_lowercase().as_str(),
-        "0" | "off" | "no" | "false"
-    )
+    settings::flag("MM_PASTE", value).unwrap_or(true)
 }
 
 /// The image on the clipboard, if there is one.
@@ -304,7 +304,7 @@ fn unhex(text: &str) -> Option<Vec<u8>> {
     // The class code sits between the marker and the hex, and is four
     // characters however the four are spelled.
     let start = text.find("«data ")? + "«data ".len() + 4;
-    let end = text[start..].find('»')? + start;
+    let end = text.get(start..)?.find('»')? + start;
     let digits = &text.as_bytes()[start..end];
     if digits.is_empty() || !digits.len().is_multiple_of(2) {
         return None;

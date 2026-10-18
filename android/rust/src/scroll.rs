@@ -10,17 +10,14 @@
 //! makes: the desktop has a terminal in front of somebody to paint those into,
 //! and a phone has none, so they are painted into an `avt::Vt` of the widget's
 //! own size and read back out as rows of runs. Both surfaces of this client are
-//! therefore rendered by the same emulator through the same `runs_of`, and a
+//! therefore a `screen::Painted`, rendered through the same `runs_of`, and a
 //! colour or a wide character cannot come out one way on the screen and another
 //! way two lines above it.
 
-use std::collections::BTreeSet;
-
-use avt::Vt;
 use manymux::client::scroll::Scrollback;
 use manymux::proto::{Size, View, ViewRequest};
 
-use crate::screen::{Row, runs_of};
+use crate::screen::{Painted, Row};
 
 /// The view, as the app sees it.
 #[derive(uniffi::Record)]
@@ -45,9 +42,7 @@ pub struct Window {
 pub struct Scrolling {
     open: bool,
     back: Scrollback,
-    vt: Vt,
-    changed: BTreeSet<usize>,
-    size: Size,
+    painted: Painted,
     /// Whether anything has been painted since the view opened.
     showing: bool,
 }
@@ -57,9 +52,7 @@ impl Scrolling {
         Self {
             open: false,
             back: Scrollback::new(size),
-            vt: emulator(size),
-            changed: BTreeSet::new(),
-            size,
+            painted: Painted::at(size),
             showing: false,
         }
     }
@@ -102,15 +95,14 @@ impl Scrolling {
     /// it. It also means the emulator and the rows the app holds start
     /// together, which is what makes an empty frame safe to skip drawing.
     pub fn close(&mut self) {
-        *self = Self::at(self.size);
+        *self = Self::at(self.painted.size());
     }
 
     /// The screen is a different shape, so every row is somewhere else.
     pub fn resize(&mut self, size: Size) {
-        self.size = size;
         self.back.resize(size);
-        self.vt = emulator(size);
-        self.changed.extend(0..size.rows as usize);
+        self.painted = Painted::at(size);
+        self.painted.mark_all();
         self.paint();
     }
 
@@ -130,14 +122,7 @@ impl Scrolling {
 
     /// The view as it should now look, and only the rows that changed.
     pub fn take_window(&mut self) -> Window {
-        let changed = std::mem::take(&mut self.changed)
-            .into_iter()
-            .filter(|at| *at < self.size.rows as usize)
-            .map(|at| Row {
-                at: at as u16,
-                runs: runs_of(self.vt.line(at)),
-            })
-            .collect();
+        let changed = self.painted.take_rows();
         Window {
             open: self.open,
             showing: self.showing,
@@ -159,18 +144,8 @@ impl Scrolling {
             return;
         }
         self.showing = true;
-        let changes = self.vt.feed_str(&painted);
-        self.changed.extend(changes.lines.iter().copied());
+        self.painted.feed(&painted);
     }
-}
-
-fn emulator(size: Size) -> Vt {
-    Vt::builder()
-        .size(size.cols as usize, size.rows as usize)
-        // The view is a window over the host's history and keeps none of its
-        // own, the same as the screen beside it.
-        .scrollback_limit(0)
-        .build()
 }
 
 #[cfg(test)]

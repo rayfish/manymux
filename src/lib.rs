@@ -30,6 +30,7 @@ pub mod ssh;
 pub mod style;
 pub mod term;
 pub mod user;
+pub mod utf8;
 
 #[cfg(feature = "desktop")]
 pub mod clipboard;

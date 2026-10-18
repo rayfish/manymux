@@ -17,10 +17,12 @@
 //! that disappeared. A pending answer and the displayed rows can then name the
 //! same things even when Enter wins the race against drawing the answer.
 
+use anyhow::Result;
+
 use crate::client::attach::Rows;
 use crate::client::groups::Groups;
 use crate::client::picker::Row;
-use crate::client::switch::{Cycle, Located};
+use crate::client::switch::{Cycle, Entry, Located};
 use crate::hosts::{as_listed, is_this_machine, same_machine, this_machine};
 use crate::proto::{HostedSession, SessionInfo};
 use crate::term;
@@ -41,9 +43,36 @@ pub struct Snapshot {
     /// `Listing::reached`, which leaves this machine out for a different
     /// question entirely.
     pub answered: Vec<String>,
+    /// The group file as it was read before the machines were asked, which is
+    /// what bounds what this listing may prune ([`Groups::refresh`]): an
+    /// answer can arrive long after it was asked for, and a session moved into
+    /// a group while it was out must not be taken out again by it.
+    pub before: Groups,
 }
 
 impl Snapshot {
+    /// The listing as the switch keys want it: an address, and the group it is
+    /// in.
+    pub fn entries(&self, groups: &Groups) -> Vec<Entry> {
+        self.sessions
+            .iter()
+            .map(|hosted| {
+                Entry::new(
+                    Located::new(&hosted.host, &hosted.session.name),
+                    groups
+                        .group_of(&hosted.host, &hosted.session)
+                        .map(str::to_string),
+                )
+            })
+            .collect()
+    }
+
+    /// Tidy the group file by what this listing says has ended, and leave
+    /// `groups` holding the file as it now is.
+    pub fn refresh(&self, groups: &mut Groups) -> Result<()> {
+        groups.refresh(&self.before, &self.answered, &self.sessions)
+    }
+
     /// What a machine said about one session, for the pid a group is keyed on.
     pub fn info(&self, at: &Located) -> Option<&SessionInfo> {
         self.sessions
@@ -451,6 +480,7 @@ mod tests {
         let before = Snapshot {
             sessions: vec![first, second.clone()],
             answered: vec![],
+            ..Snapshot::default()
         };
         let displayed = Listed::of(&before, &groups, &[], None, from_ref(&current));
         let chosen = displayed
@@ -463,6 +493,7 @@ mod tests {
         let after = Snapshot {
             sessions: vec![second],
             answered: vec![],
+            ..Snapshot::default()
         };
         let pending =
             Listed::of(&after, &groups, &[], None, from_ref(&current)).following(&displayed);
@@ -482,6 +513,7 @@ mod tests {
                 hosted_on("build-box", "build"),
             ],
             answered: vec![],
+            ..Snapshot::default()
         };
         let hosts = vec!["gpu-box".into(), "build-box".into()];
         let displayed = Listed::of(&first, &Groups::default(), &hosts, None, from_ref(&current));
@@ -502,6 +534,7 @@ mod tests {
         let second = Snapshot {
             sessions: vec![hosted_on("gpu-box", "test"), hosted_on("gpu-box", "new")],
             answered: vec![],
+            ..Snapshot::default()
         };
         let pending = Listed::of(
             &second,
@@ -572,6 +605,7 @@ mod tests {
         let snapshot = Snapshot {
             sessions: vec![hosted("build"), hosted("test")],
             answered: vec![this_machine().to_string()],
+            ..Snapshot::default()
         };
         let current = Located::new(as_listed(LOCAL), "test");
         let listed = Listed::of(&snapshot, &Groups::default(), &[], None, from_ref(&current));
@@ -601,6 +635,31 @@ mod tests {
         }
     }
 
+    /// What the switch keys walk: every session in the listing, in its order,
+    /// each with the group it is in by the membership handed in rather than by
+    /// any read before asking.
+    #[test]
+    fn the_entries_are_the_listing_with_each_session_s_group() {
+        let mut build = hosted_on("gpu-box", "build");
+        build.session.pid = 1;
+        let mut test = hosted_on("gpu-box", "test");
+        test.session.pid = 2;
+        let mut groups = Groups::default();
+        groups.assign("work", &test.host, &test.session).unwrap();
+        let snapshot = Snapshot {
+            sessions: vec![build, test],
+            answered: vec!["gpu-box".to_string()],
+            ..Snapshot::default()
+        };
+        assert_eq!(
+            snapshot.entries(&groups),
+            vec![
+                Entry::new(Located::new("gpu-box", "build"), None),
+                Entry::new(Located::new("gpu-box", "test"), Some("work".to_string())),
+            ]
+        );
+    }
+
     /// A fan-out gets half a second and no more, so on a fleet slower than that
     /// the box opens on whatever landed first, which is not necessarily the
     /// machine you are sitting on. The cursor still opens on the session you
@@ -611,6 +670,7 @@ mod tests {
         let snapshot = Snapshot {
             sessions: vec![hosted_on("gpu-box", "build")],
             answered: vec!["gpu-box".to_string()],
+            ..Snapshot::default()
         };
         let current = Located::new(as_listed(LOCAL), "test");
         let listed = Listed::of(&snapshot, &Groups::default(), &[], None, from_ref(&current));
@@ -632,6 +692,7 @@ mod tests {
         let partial = Snapshot {
             sessions: vec![hosted_on("gpu-box", "build")],
             answered: vec!["gpu-box".to_string()],
+            ..Snapshot::default()
         };
         let first = Listed::of(&partial, &Groups::default(), &[], None, from_ref(&current));
         let mut popup = Picker::new(
@@ -643,6 +704,7 @@ mod tests {
         let full = Snapshot {
             sessions: vec![hosted_on("gpu-box", "build"), hosted("api"), hosted("test")],
             answered: vec!["gpu-box".to_string(), this_machine().to_string()],
+            ..Snapshot::default()
         };
         let then = Listed::of(&full, &Groups::default(), &[], None, from_ref(&current));
         popup.replace(then.rows.sessions.clone(), then.rows.at);
@@ -663,6 +725,7 @@ mod tests {
         let snapshot = Snapshot {
             sessions: vec![hosted("build")],
             answered: vec![this_machine().to_string()],
+            ..Snapshot::default()
         };
         let current = Located::new(as_listed(LOCAL), "build");
         let hosts = ["gpu-box".to_string()];
@@ -715,6 +778,7 @@ mod tests {
         let snapshot = Snapshot {
             sessions: vec![hosted_on("deploy@box", "build")],
             answered: vec!["deploy@box".to_string()],
+            ..Snapshot::default()
         };
         let current = Located::new("deploy@box", "build");
         let hosts = ["gpu-box".to_string()];
@@ -741,6 +805,7 @@ mod tests {
         let snapshot = Snapshot {
             sessions: vec![hosted("build")],
             answered: vec![this_machine().to_string()],
+            ..Snapshot::default()
         };
         let current = Located::new(as_listed(LOCAL), "gone");
         let listed = Listed::of(&snapshot, &Groups::default(), &[], None, from_ref(&current));
@@ -761,6 +826,7 @@ mod tests {
         let snapshot = Snapshot {
             sessions: vec![hosted("build"), hosted("test"), hosted("web")],
             answered: vec![this_machine().to_string()],
+            ..Snapshot::default()
         };
         let recent = [
             Located::new(as_listed(LOCAL), "test"),
@@ -778,6 +844,7 @@ mod tests {
         let snapshot = Snapshot {
             sessions: vec![hosted("build"), hosted("test")],
             answered: vec![this_machine().to_string()],
+            ..Snapshot::default()
         };
         let recent = [
             Located::new(as_listed(LOCAL), "test"),
@@ -797,6 +864,7 @@ mod tests {
         let snapshot = Snapshot {
             sessions: names.iter().map(|n| hosted(n)).collect(),
             answered: vec![this_machine().to_string()],
+            ..Snapshot::default()
         };
         let recent: Vec<Located> = names
             .iter()

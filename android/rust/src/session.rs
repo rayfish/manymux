@@ -109,7 +109,7 @@ const STEADY: Duration = Duration::from_secs(30);
 /// that ended, and reconnecting to it every ten seconds forever is the bug
 /// this exists to stop.
 ///
-/// `main.rs` draws the same line and then waits out both, on the grounds that
+/// `src/attaching.rs` draws the same line and then waits out both, on the grounds that
 /// a node restarting is a session that can come back under the same name. This
 /// end diverges deliberately: there is no cycle to fall back to and no hop to
 /// undo, so waiting means a phone showing a dead screen and a bar that says
@@ -161,17 +161,7 @@ enum Paint {
 /// screen's lock for as long as it takes to copy some rows, or drops a message
 /// into a queue.
 pub struct Session {
-    screen: Arc<Mutex<Screen>>,
-    /// The view over the host's history, which is a second surface and not a
-    /// state of the first: the session goes on printing into the screen while
-    /// somebody reads what it printed a minute ago, and coming back costs
-    /// nothing because nothing was thrown away.
-    scrolling: Arc<Mutex<Scrolling>>,
-    /// Whether the host can be scrolled back through at all, as it said when
-    /// it answered the attach. A build too old to know the request would skip
-    /// it in silence, so a gesture that quietly did nothing is the thing this
-    /// exists to stop.
-    scrolls: Arc<AtomicBool>,
+    surfaces: Surfaces,
     say: mpsc::UnboundedSender<Say>,
     state: watch::Receiver<State>,
 }
@@ -181,42 +171,20 @@ impl Session {
     ///
     /// Returns at once: everything happens on tasks, and [`Session::state`]
     /// says how far it has got.
-    pub fn open(
-        machine: Machine,
-        identity: Identity,
-        known: KnownHosts,
-        connections: Arc<Connections>,
-        name: String,
-        size: Size,
-    ) -> Self {
-        let screen = Arc::new(Mutex::new(Screen::at(size)));
-        let scrolling = Arc::new(Mutex::new(Scrolling::at(size)));
-        let scrolls = Arc::new(AtomicBool::new(false));
+    pub fn open(attaching: Attaching) -> Self {
+        let size = attaching.wanted;
+        let surfaces = Surfaces {
+            screen: Arc::new(Mutex::new(Screen::at(size))),
+            scrolling: Arc::new(Mutex::new(Scrolling::at(size))),
+            scrolls: Arc::new(AtomicBool::new(false)),
+        };
         let (say, said) = mpsc::unbounded_channel();
         let (state, watching) = watch::channel(State::Reaching);
 
-        tokio::spawn(keep_attached(
-            Attaching {
-                machine,
-                identity,
-                known,
-                connections,
-                name,
-                wanted: size,
-            },
-            Surfaces {
-                screen: Arc::clone(&screen),
-                scrolling: Arc::clone(&scrolling),
-                scrolls: Arc::clone(&scrolls),
-            },
-            said,
-            state,
-        ));
+        tokio::spawn(keep_attached(attaching, surfaces.clone(), said, state));
 
         Self {
-            screen,
-            scrolling,
-            scrolls,
+            surfaces,
             say,
             state: watching,
         }
@@ -228,11 +196,11 @@ impl Session {
     /// nobody is drawing stays attached, which is what an app in the background
     /// is.
     pub fn take_frame(&self) -> Frame {
-        held(&self.screen).take_frame()
+        held(&self.surfaces.screen).take_frame()
     }
 
     pub fn redraw(&self) {
-        held(&self.screen).redraw();
+        held(&self.surfaces.screen).redraw();
     }
 
     /// Keystrokes, or anything else typed at the session.
@@ -241,11 +209,11 @@ impl Session {
     }
 
     pub fn cursor_key(&self, final_byte: u8) {
-        self.send(held(&self.screen).cursor_key(final_byte));
+        self.send(held(&self.surfaces.screen).cursor_key(final_byte));
     }
 
     pub fn paste(&self, text: &str) {
-        self.send(held(&self.screen).paste(text));
+        self.send(held(&self.surfaces.screen).paste(text));
     }
 
     /// The phone's screen is a different shape now.
@@ -279,12 +247,12 @@ impl Session {
             // The host cannot answer for a window, and the session is not
             // reading the mouse either, so there is nothing this can do but
             // say so where the gesture was made.
-            if !self.scrolls.load(Ordering::Relaxed) {
+            if !self.surfaces.scrolls.load(Ordering::Relaxed) {
                 return Dragged::Nowhere;
             }
-            held(&self.scrolling).up(lines as u64);
+            held(&self.surfaces.scrolling).up(lines as u64);
         } else {
-            held(&self.scrolling).down(lines.unsigned_abs());
+            held(&self.surfaces.scrolling).down(lines.unsigned_abs());
         }
         let _ = self.say.send(Say::Look);
         Dragged::Looked
@@ -295,7 +263,7 @@ impl Session {
     /// The screen's lock is taken and given back before the view's, which is
     /// the only order these two are ever taken in.
     fn wheel(&self, lines: i64, at: At) -> Option<Vec<u8>> {
-        let screen = held(&self.screen);
+        let screen = held(&self.surfaces.screen);
         let up = lines > 0;
         let notch = if screen.mouse().wanted() {
             screen.mouse().wheel(up, at.col, at.row)
@@ -310,12 +278,12 @@ impl Session {
 
     /// Back to the live screen.
     pub fn close_view(&self) {
-        held(&self.scrolling).close();
+        held(&self.surfaces.scrolling).close();
     }
 
     /// The view as it should now look, taken the way a frame is.
     pub fn take_window(&self) -> Window {
-        held(&self.scrolling).take_window()
+        held(&self.surfaces.scrolling).take_window()
     }
 
     /// Leave, without ending anything.
@@ -334,25 +302,34 @@ impl Session {
 /// Cloned per attempt so that the attempt can be waited on and given up while
 /// the size it was asked for goes on changing under it.
 #[derive(Clone)]
-struct Attaching {
-    machine: Machine,
-    identity: Identity,
-    known: KnownHosts,
+pub struct Attaching {
+    pub machine: Machine,
+    pub identity: Identity,
+    pub known: KnownHosts,
     /// Shared with the app, so a session opened after somebody went back to
     /// the list rides the connection the list was drawn over.
-    connections: Arc<Connections>,
-    name: String,
+    pub connections: Arc<Connections>,
+    pub name: String,
     /// The size the phone is asking for, which is not the size the session
     /// settles on: the node takes the smallest of every attached client's.
-    wanted: Size,
+    pub wanted: Size,
 }
 
 /// What the app draws, and what says whether the second of them is worth
 /// drawing at all. Held by the task for as long as the session is, and by the
 /// app through [`Session`].
+#[derive(Clone)]
 struct Surfaces {
     screen: Arc<Mutex<Screen>>,
+    /// The view over the host's history, which is a second surface and not a
+    /// state of the first: the session goes on printing into the screen while
+    /// somebody reads what it printed a minute ago, and coming back costs
+    /// nothing because nothing was thrown away.
     scrolling: Arc<Mutex<Scrolling>>,
+    /// Whether the host can be scrolled back through at all, as it said when
+    /// it answered the attach. A build too old to know the request would skip
+    /// it in silence, so a gesture that quietly did nothing is the thing this
+    /// exists to stop.
     scrolls: Arc<AtomicBool>,
 }
 
@@ -657,9 +634,6 @@ async fn pump(
                         break Ending::Lost;
                     }
                 }
-                // Answered here and nowhere else. A client that waited for the
-                // app to draw before saying it was alive would be detached by
-                // the host for being in somebody's pocket.
                 // What the session actually became, which is not always what
                 // was asked for: the node takes the smallest across every
                 // attached client. Reflowing this end's copy to the size that
@@ -675,6 +649,9 @@ async fn pump(
                         break Ending::Lost;
                     }
                 }
+                // Answered here and nowhere else. A client that waited for the
+                // app to draw before saying it was alive would be detached by
+                // the host for being in somebody's pocket.
                 Ok(Update::Ping) => {
                     if writer.pong().await.is_err() {
                         break Ending::Lost;

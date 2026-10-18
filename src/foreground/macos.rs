@@ -6,17 +6,7 @@ use std::{ptr, str};
 
 use libc::{proc_bsdinfo, proc_vnodepathinfo};
 
-use super::{Foreground, in_front};
-
-pub fn of(leader: u32) -> Foreground {
-    let front = in_front(leader, foreground_group(leader));
-    Foreground {
-        cwd: cwd_of(front),
-        argv: argv_of(front),
-    }
-}
-
-fn foreground_group(pid: u32) -> Option<i32> {
+pub(super) fn foreground_group(pid: u32) -> Option<i32> {
     let pid = i32::try_from(pid).ok()?;
     let mut info = MaybeUninit::<proc_bsdinfo>::uninit();
     // Safe: libproc receives a writable buffer of exactly the requested size.
@@ -36,7 +26,7 @@ fn foreground_group(pid: u32) -> Option<i32> {
     Some(unsafe { info.assume_init() }.e_tpgid as i32)
 }
 
-fn cwd_of(pid: u32) -> Option<String> {
+pub(super) fn cwd_of(pid: u32) -> Option<String> {
     let pid = i32::try_from(pid).ok()?;
     let mut info = MaybeUninit::<proc_vnodepathinfo>::uninit();
     // Safe: the buffer matches the flavor's C struct and is writable in full.
@@ -71,7 +61,7 @@ fn cwd_of(pid: u32) -> Option<String> {
         .flatten()
 }
 
-fn argv_of(pid: u32) -> Vec<String> {
+pub(super) fn argv_of(pid: u32) -> Vec<String> {
     let Ok(pid) = i32::try_from(pid) else {
         return Vec::new();
     };
@@ -153,6 +143,7 @@ mod tests {
     use std::{env, process};
 
     use super::*;
+    use crate::foreground::{Foreground, of};
 
     #[test]
     fn reads_own_directory_and_arguments() {

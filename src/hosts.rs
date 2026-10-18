@@ -33,7 +33,7 @@ pub const LOCAL: &str = "local";
 /// one magic word among real ones. Falls back to [`LOCAL`] on a machine that
 /// will not tell us.
 pub fn this_machine() -> &'static str {
-    static NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    static NAME: OnceLock<String> = OnceLock::new();
     NAME.get_or_init(|| {
         let mut buf = [0u8; 256];
         // SAFETY: gethostname writes at most `len` bytes into a buffer we own,
@@ -45,7 +45,7 @@ pub fn this_machine() -> &'static str {
         } else {
             String::new()
         };
-        // `dario-mbp.local` and `box.example.com` both read better short.
+        // `laptop.local` and `box.example.com` both read better short.
         let short = name.split('.').next().unwrap_or("").trim();
         if short.is_empty() {
             LOCAL.to_string()
@@ -58,6 +58,16 @@ pub fn this_machine() -> &'static str {
 /// Whether `name` means this machine rather than one reached over ssh.
 pub fn is_this_machine(name: &str) -> bool {
     name == LOCAL || name == this_machine()
+}
+
+/// What you would type to reach a session: bare on this machine, since that is
+/// what you would type, and `host/name` anywhere else.
+pub fn qualified(host: &str, name: &str) -> String {
+    if is_this_machine(host) {
+        name.to_string()
+    } else {
+        format!("{host}/{name}")
+    }
 }
 
 /// Whether two names on hand are the same machine.
@@ -164,18 +174,11 @@ pub struct Hosts {
 
 impl Hosts {
     pub fn load() -> Result<Self> {
-        let path = Self::path();
-        if !path.exists() {
-            return Ok(Self::default());
-        }
-        let text = std::fs::read_to_string(&path)
-            .with_context(|| format!("reading {}", path.display()))?;
-        toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))
+        config::load_toml(&Self::path())
     }
 
     pub fn save(&self) -> Result<()> {
-        let text = toml::to_string_pretty(self).context("encoding the host list")?;
-        config::write_private_file(&Self::path(), text.as_bytes())
+        config::save_toml(&Self::path(), self, "the host list")
     }
 
     pub fn path() -> PathBuf {
@@ -345,8 +348,8 @@ mod tests {
         let mut hosts = Hosts::default();
         hosts.add("gpu-box").unwrap();
         // ssh understands this, so manymux does too, with no parsing of its own.
-        hosts.add("dario@gpu-box").unwrap();
-        assert!(hosts.has("dario@gpu-box"));
+        hosts.add("user@gpu-box").unwrap();
+        assert!(hosts.has("user@gpu-box"));
 
         assert!(hosts.add("local").is_err(), "`local` is reserved");
         assert!(hosts.add(this_machine()).is_err());

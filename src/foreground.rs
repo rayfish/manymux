@@ -60,7 +60,7 @@ pub struct Foreground {
 /// *is* claude, with the same pid the node recorded. Nothing here may read
 /// that equality as "no command is running": it is the ordinary case, and the
 /// argv is what tells a prompt from a program.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub fn of(leader: u32) -> Foreground {
     // Both halves come from one process, or neither does. The foreground
     // process is where the work is and is free to have moved: a `cd` in a
@@ -72,7 +72,7 @@ pub fn of(leader: u32) -> Foreground {
     // back a line later. A session whose build had `cd`ed into a directory
     // since removed came out recorded in the leader's, which for a program
     // that resumes by directory is somebody else's conversation.
-    let front = in_front_of(leader);
+    let front = in_front(leader, foreground_group(leader));
     Foreground {
         cwd: cwd_of(front),
         argv: argv_of(front),
@@ -80,7 +80,7 @@ pub fn of(leader: u32) -> Foreground {
 }
 
 #[cfg(target_os = "macos")]
-pub use macos::of;
+use macos::{argv_of, cwd_of, foreground_group};
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub fn of(_leader: u32) -> Foreground {
@@ -193,9 +193,8 @@ fn argv_of(pid: u32) -> Vec<String> {
 }
 
 #[cfg(target_os = "linux")]
-fn in_front_of(leader: u32) -> u32 {
-    let stat = std::fs::read_to_string(format!("/proc/{leader}/stat")).ok();
-    in_front(leader, stat.as_deref().and_then(tpgid))
+fn foreground_group(leader: u32) -> Option<i32> {
+    tpgid(&std::fs::read_to_string(format!("/proc/{leader}/stat")).ok()?)
 }
 
 /// The parsers above, over bytes somebody else read.
@@ -205,12 +204,13 @@ fn in_front_of(leader: u32) -> u32 {
 /// three files this reads locally, and every rule about what they mean is
 /// applied here, once. A shell script that decided any of it would be a second
 /// implementation of rules that took three review rounds to get right.
+///
+/// The leader's `stat` is not in here: it decides which process these two
+/// describe ([`tpgid`], [`in_front`]), and is spent before they are asked for.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Raw {
-    /// The leader's `/proc/<pid>/stat`, for the foreground process group.
-    pub stat: String,
-    /// What `/proc/<front>/cwd` points at.
-    pub cwd: String,
+    /// What `/proc/<front>/cwd` points at, as the bytes the link holds.
+    pub cwd: Vec<u8>,
     /// `/proc/<front>/cmdline`, NULs and all.
     pub cmdline: Vec<u8>,
 }
@@ -218,10 +218,25 @@ pub struct Raw {
 impl Raw {
     pub fn read(&self) -> Foreground {
         Foreground {
-            cwd: cwd_from(&self.cwd),
+            cwd: cwd_in(&self.cwd),
             argv: argv_from(&self.cmdline),
         }
     }
+}
+
+/// A directory, from the bytes of a link read on some other machine.
+///
+/// Not UTF-8 is no directory, for the reason [`cwd_of`] gives. A path that
+/// is UTF-8 and holds U+FFFD is refused as well: these bytes used to be
+/// decoded lossily before anything looked at them, so the two could not be
+/// told apart, and keeping them refused costs nothing but a directory nobody
+/// names that way.
+fn cwd_in(link: &[u8]) -> Option<String> {
+    let link = std::str::from_utf8(link).ok()?;
+    if link.contains('\u{fffd}') {
+        return None;
+    }
+    cwd_from(link)
 }
 
 #[cfg(test)]
@@ -279,12 +294,11 @@ mod tests {
     /// is a checkpoint that means one thing here and another there.
     #[test]
     fn the_rules_apply_to_bytes_from_anywhere() {
+        assert_eq!(tpgid("1234 (zsh) S 1 1234 1234 34816 5678 0"), Some(5678));
         let raw = Raw {
-            stat: "1234 (zsh) S 1 1234 1234 34816 5678 0".to_string(),
-            cwd: "/srv/project".to_string(),
+            cwd: b"/srv/project".to_vec(),
             cmdline: b"claude\0--continue\0".to_vec(),
         };
-        assert_eq!(tpgid(&raw.stat), Some(5678));
         assert_eq!(
             raw.read(),
             Foreground {
@@ -297,6 +311,13 @@ mod tests {
         // that is not UTF-8, the padding a rewritten process title leaves.
         assert_eq!(cwd_from("/gone (deleted)"), None);
         assert_eq!(cwd_from(""), None);
+        assert_eq!(cwd_in(b"/srv/caf\xe9"), None, "not UTF-8, so nowhere");
+        assert_eq!(
+            cwd_in("/srv/caf\u{fffd}".as_bytes()),
+            None,
+            "and what a lossy read would have made of it is refused the same"
+        );
+        assert_eq!(cwd_in(b"/gone (deleted)"), None);
         assert!(argv_from(b"caf\xe9\0").is_empty(), "not UTF-8, so nothing");
         assert_eq!(argv_from(b"pi\0\0\0\0"), vec!["pi".to_string()]);
         assert_eq!(
@@ -322,7 +343,7 @@ mod tests {
         // The test binary is its own process group leader in the usual case;
         // whatever the answer, asking about ourselves gives our own argv back
         // rather than an empty one.
-        let front = in_front_of(me);
+        let front = in_front(me, foreground_group(me));
         assert!(
             !argv_of(front).is_empty(),
             "a live process has an argv, whether or not it leads its group"
@@ -351,11 +372,7 @@ mod tests {
     fn a_process_that_is_gone_is_a_blank_rather_than_a_failure() {
         assert_eq!(cwd_of(u32::MAX), None);
         assert!(argv_of(u32::MAX).is_empty());
-        assert_eq!(
-            in_front_of(u32::MAX),
-            u32::MAX,
-            "nothing to read, so itself"
-        );
+        assert_eq!(foreground_group(u32::MAX), None, "nothing to read");
         assert_eq!(of(u32::MAX), Foreground::default());
     }
 }

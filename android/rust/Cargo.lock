@@ -1100,7 +1100,6 @@ dependencies = [
  "russh",
  "tokio",
  "tokio-stream",
- "unicode-width",
  "uniffi",
 ]
 

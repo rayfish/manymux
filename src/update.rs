@@ -8,6 +8,11 @@
 //! stack and a hash: an update path is not worth doubling the dependency tree
 //! over, and this is a tool that already delegates its transport to `ssh`.
 
+use std::env::current_exe;
+use std::ffi::CString;
+use std::fs::{self, Permissions};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -100,7 +105,7 @@ impl Channel {
 /// What is published for this machine, and how it compares to what is running.
 pub async fn check(channel: Channel) -> Result<Available> {
     let asset = asset_name()?;
-    let running = sha256_of(&std::env::current_exe().context("finding the running binary")?)
+    let running = sha256_of(&current_exe().context("finding the running binary")?)
         .await
         .context("checksumming the running binary")?;
 
@@ -130,7 +135,7 @@ pub async fn check(channel: Channel) -> Result<Available> {
 
 /// Download the published asset, verify it, and swap it in.
 pub async fn apply(available: &Available) -> Result<PathBuf> {
-    let binary = std::env::current_exe().context("finding the running binary")?;
+    let binary = current_exe().context("finding the running binary")?;
     let dir = binary.parent().unwrap_or(Path::new("."));
 
     // Before spending a download on it. The installer puts mm in
@@ -176,23 +181,22 @@ pub async fn apply(available: &Available) -> Result<PathBuf> {
 
     let downloaded = curl(&url, &staged).await;
     if let Err(e) = downloaded {
-        let _ = std::fs::remove_file(&staged);
+        let _ = fs::remove_file(&staged);
         return Err(e.context(format!("downloading {url}")));
     }
 
     let actual = sha256_of(&staged).await?;
     if actual != available.checksum {
-        let _ = std::fs::remove_file(&staged);
+        let _ = fs::remove_file(&staged);
         bail!(
             "checksum mismatch, refusing to install\n  expected: {}\n  got:      {actual}",
             available.checksum
         );
     }
 
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755))
+    fs::set_permissions(&staged, Permissions::from_mode(0o755))
         .context("making the new binary executable")?;
-    std::fs::rename(&staged, &binary).with_context(|| format!("replacing {}", binary.display()))?;
+    fs::rename(&staged, &binary).with_context(|| format!("replacing {}", binary.display()))?;
     Ok(binary)
 }
 
@@ -202,9 +206,7 @@ pub async fn apply(available: &Available) -> Result<PathBuf> {
 /// whole answer: macOS ACLs can grant or deny past it, and root ignores it
 /// entirely. Asking the kernel gets all three right.
 pub fn writable(dir: &Path) -> bool {
-    use std::os::unix::ffi::OsStrExt;
-
-    let Ok(path) = std::ffi::CString::new(dir.as_os_str().as_bytes()) else {
+    let Ok(path) = CString::new(dir.as_os_str().as_bytes()) else {
         return false;
     };
     // SAFETY: access reads the path and returns; the CString outlives the call.
@@ -338,6 +340,7 @@ fn file_name(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn the_asset_matches_what_ci_publishes() {
@@ -395,8 +398,8 @@ mod tests {
     #[tokio::test]
     async fn a_node_is_stale_when_it_started_from_another_binary() {
         let dir = std::env::temp_dir().join(format!("mm-stale-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
         let socket = dir.join("s.sock");
 
         let node = crate::node::Node::start(crate::node::Config {
@@ -413,12 +416,12 @@ mod tests {
             if tokio::net::UnixStream::connect(&socket).await.is_ok() {
                 break;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
 
         // The node hashed this test binary at startup, which is the binary
         // "on disk" as far as it is concerned.
-        let ours = sha256_of(&std::env::current_exe().unwrap()).await.unwrap();
+        let ours = sha256_of(&current_exe().unwrap()).await.unwrap();
         assert!(!is_stale(&socket, &ours).await, "it is running this binary");
         assert!(
             is_stale(&socket, "a build it did not start from").await,
@@ -426,7 +429,7 @@ mod tests {
         );
 
         serving.abort();
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

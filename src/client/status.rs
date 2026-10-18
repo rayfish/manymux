@@ -11,6 +11,8 @@
 
 use std::time::Duration;
 
+use unicode_width::UnicodeWidthStr;
+
 use crate::client::attach::Mode;
 use crate::client::scroll::Selected;
 use crate::keyboard::Keyboard;
@@ -205,7 +207,7 @@ impl Status {
     /// same sequence [`Self::setup`] opens with, and it lasts exactly as long:
     /// until the session sets a title of its own.
     pub fn retitle(&self) -> String {
-        self.title(&self.target)
+        title(&self.target)
     }
 
     /// Say how far back the view is, or that it has gone. The caller repaints.
@@ -297,7 +299,7 @@ impl Status {
     /// Sent once, after the alternate screen is up: name the window, fence the
     /// session into the rows above the mark, and draw it.
     pub fn setup(&self, size: Size) -> String {
-        format!("{}{}", self.title(&self.target), self.repaint(size))
+        format!("{}{}", title(&self.target), self.repaint(size))
     }
 
     /// Re-fence the scrolling region and redraw, after something that may have
@@ -466,12 +468,12 @@ impl Status {
         }
         format!("{showing}{HINT_GAP}{keys}")
     }
+}
 
-    /// `mm ` in front of a title, or in front of the target when the session has
-    /// not set one.
-    fn title(&self, text: &str) -> String {
-        format!("\x1b]0;{}\x07", prefixed(text))
-    }
+/// `mm ` in front of a title, or in front of the target when the session has
+/// not set one.
+fn title(text: &str) -> String {
+    format!("\x1b]0;{}\x07", prefixed(text))
 }
 
 /// As many of the hints as fit in `room` columns, in their own order and with
@@ -497,9 +499,10 @@ fn hints(room: u16) -> String {
     text
 }
 
-/// How many columns a piece of unstyled text takes.
+/// How many columns a piece of unstyled text takes: a session name can hold
+/// wide characters, and counting them as one put the mark off the row's end.
 fn columns(text: &str) -> u16 {
-    u16::try_from(text.chars().count()).unwrap_or(u16::MAX)
+    u16::try_from(text.width()).unwrap_or(u16::MAX)
 }
 
 /// What the row says while a lost connection is being waited out.
@@ -679,7 +682,7 @@ const MAX_OSC: usize = 4096;
 impl Filter {
     pub fn new(screen: Screen) -> Self {
         Self {
-            owns_the_screen: screen.mode().owns_the_screen(),
+            owns_the_screen: screen.owns_the_screen(),
             state: State::default(),
             held: Vec::new(),
             dirty: false,
@@ -701,7 +704,8 @@ impl Filter {
     }
 
     /// Whether the program currently asks the terminal to report key releases.
-    pub fn reports_key_releases(&self) -> bool {
+    #[cfg(test)]
+    fn reports_key_releases(&self) -> bool {
         self.keyboard.reports_releases()
     }
 
@@ -752,9 +756,15 @@ impl Filter {
                     match b {
                         b'[' => self.state = State::Csi,
                         b']' => self.state = State::Osc,
-                        // RIS resets everything, margins included.
+                        // RIS resets everything, margins included, and with
+                        // them the modes the session had asked for: tracking,
+                        // the alternate screen and the keyboard flags.
                         b'c' => {
                             self.dirty = true;
+                            self.mouse = false;
+                            self.alternate = false;
+                            self.releases_ended |= self.keyboard.reports_releases();
+                            self.keyboard = Keyboard::default();
                             self.release(&mut out);
                         }
                         b'P' | b'X' | b'^' | b'_' => {
@@ -1248,6 +1258,24 @@ mod tests {
         assert!(!filter.take_dirty());
     }
 
+    /// A terminal reset turns off mouse tracking, leaves the alternate screen
+    /// and forgets the keyboard flags, so the filter has to as well: kept, the
+    /// wheel stayed the session's after a program that asked for it was gone.
+    #[test]
+    fn a_terminal_reset_forgets_what_the_session_had_asked_for() {
+        let mut filter = Filter::new(Screen::Inline);
+        through(&mut filter, "\x1b[?1000h\x1b[?1049h\x1b[>7u");
+        assert!(filter.session_mouse());
+        assert!(filter.on_alternate());
+        assert!(filter.reports_key_releases());
+
+        through(&mut filter, "\x1bc");
+        assert!(!filter.session_mouse(), "the wheel is the client's again");
+        assert!(!filter.on_alternate());
+        assert!(!filter.reports_key_releases());
+        assert!(filter.take_releases_ended());
+    }
+
     #[test]
     fn ending_key_release_reports_is_carried_to_the_input_filter() {
         let mut filter = Filter::default();
@@ -1454,6 +1482,15 @@ mod tests {
         // at column 70 of row 24.
         assert!(painted.contains("\x1b[24;70H"), "{painted:?}");
         assert!(painted.contains("● "), "{painted:?}");
+    }
+
+    /// A wide character takes two columns, and counted as one the mark ran off
+    /// the right end of the row by one column per character.
+    #[test]
+    fn the_mark_counts_wide_characters_as_two_columns() {
+        let painted = Status::new("srv/构建").repaint(Size::new(80, 24));
+        // `● srv/构建` is 10 columns, so it starts at column 69.
+        assert!(painted.contains("\x1b[24;69H"), "{painted:?}");
     }
 
     /// The row names no mode: what mode it is is said by what sits beside the

@@ -30,8 +30,9 @@ pub enum Event {
     Notify { title: String, body: String },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum State {
+    #[default]
     Ground,
     /// Saw ESC, waiting on the introducer.
     Escape,
@@ -47,16 +48,6 @@ enum State {
     IgnoredEscape,
 }
 
-/// Private modes worth turning back on when a client reattaches.
-///
-/// Deliberately excludes the ones `avt`'s screen dump already restores (1, 6,
-/// 7, 25, 1047, 1048, 1049): re-emitting those would fight the repaint.
-/// Everything here is about *input* and how the terminal talks back, which is
-/// exactly what the screen model has no opinion on.
-///
-/// Detaching undoes this list, in `client::attach`. The two have to stay
-/// together: a mode switched on for a session and not switched off again is a
-/// mode left on in the shell you get back.
 /// Bracketed paste: the program has asked to be told when text arrives as a
 /// paste rather than as typing. Named because a pasted file's path is wrapped
 /// in it when the program is expecting that.
@@ -69,6 +60,16 @@ pub const BRACKETED_PASTE: u16 = 2004;
 /// counting a buffer that is not there.
 const ALTERNATE_SCREEN: &[u16] = &[47, 1047, 1049];
 
+/// Private modes worth turning back on when a client reattaches.
+///
+/// Deliberately excludes the ones `avt`'s screen dump already restores (1, 6,
+/// 7, 25, 1047, 1048, 1049): re-emitting those would fight the repaint.
+/// Everything here is about *input* and how the terminal talks back, which is
+/// exactly what the screen model has no opinion on.
+///
+/// Detaching undoes this list, in `client::attach`. The two have to stay
+/// together: a mode switched on for a session and not switched off again is a
+/// mode left on in the shell you get back.
 pub const REPLAYED_MODES: &[u16] = &[
     9,    // X10 mouse reporting
     66,   // application keypad
@@ -90,7 +91,7 @@ const MAX_CSI: usize = 64;
 /// an image transfer or a paste, and we drop it rather than grow unboundedly.
 const MAX_OSC: usize = 4096;
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct Scanner {
     state: State,
     osc: Vec<u8>,
@@ -104,8 +105,8 @@ pub struct Scanner {
     modes: Vec<u16>,
     /// Last cursor style set with DECSCUSR (`CSI Ps SP q`).
     cursor_style: Option<u16>,
-    /// Last title the program set. Kept here as well as on the session because
-    /// a reattach has to restore it on the client's terminal.
+    /// Last title the program set. The session reads its title from here, and
+    /// a reattach restores it on the client's terminal.
     title: Option<String>,
     /// What the program asked the keyboard to do.
     keyboard: Keyboard,
@@ -120,27 +121,7 @@ pub struct Scanner {
     on_alternate: bool,
 }
 
-impl Default for Scanner {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl Scanner {
-    pub fn new() -> Self {
-        Self {
-            state: State::Ground,
-            osc: Vec::new(),
-            overflowed: false,
-            csi: Vec::new(),
-            modes: Vec::new(),
-            cursor_style: None,
-            title: None,
-            keyboard: Keyboard::default(),
-            on_alternate: false,
-        }
-    }
-
     /// The escape sequences that put a freshly attached terminal back into the
     /// state the program expects, for everything the screen dump does not
     /// cover: the title, mouse reporting, bracketed paste, cursor style.
@@ -378,71 +359,12 @@ fn clean(s: &str) -> String {
         .to_string()
 }
 
-/// Incremental UTF-8 decoder.
-///
-/// `avt` takes `&str`, but PTY output arrives in arbitrary chunks that split
-/// multi-byte characters. This holds the incomplete tail until the rest shows
-/// up, and substitutes U+FFFD for genuinely invalid bytes so one bad byte can't
-/// desynchronise the screen forever.
-#[derive(Debug, Default)]
-pub struct Utf8Decoder {
-    pending: Vec<u8>,
-}
-
-impl Utf8Decoder {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn decode(&mut self, chunk: &[u8]) -> String {
-        let bytes: &[u8] = if self.pending.is_empty() {
-            chunk
-        } else {
-            self.pending.extend_from_slice(chunk);
-            &self.pending
-        };
-
-        let mut out = String::with_capacity(bytes.len());
-        let mut rest = bytes;
-        loop {
-            match std::str::from_utf8(rest) {
-                Ok(s) => {
-                    out.push_str(s);
-                    rest = &[];
-                    break;
-                }
-                Err(e) => {
-                    let valid = e.valid_up_to();
-                    // SAFETY-free: from_utf8 already validated this prefix.
-                    out.push_str(std::str::from_utf8(&rest[..valid]).unwrap());
-                    match e.error_len() {
-                        // Invalid bytes: emit a replacement and skip them.
-                        Some(n) => {
-                            out.push(char::REPLACEMENT_CHARACTER);
-                            rest = &rest[valid + n..];
-                        }
-                        // Truncated at the end of the chunk: keep it for later.
-                        None => {
-                            rest = &rest[valid..];
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-
-        let tail = rest.to_vec();
-        self.pending = tail;
-        out
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn scan(input: &[u8]) -> Vec<Event> {
-        let mut s = Scanner::new();
+        let mut s = Scanner::default();
         let mut events = Vec::new();
         s.feed(input, |e| events.push(e));
         events
@@ -471,7 +393,7 @@ mod tests {
 
     #[test]
     fn sequences_split_across_chunks() {
-        let mut s = Scanner::new();
+        let mut s = Scanner::default();
         let mut events = Vec::new();
         s.feed(b"\x1b]0;split ti", |e| events.push(e));
         assert!(events.is_empty());
@@ -508,7 +430,7 @@ mod tests {
     }
 
     fn scanner_after(input: &[u8]) -> Scanner {
-        let mut s = Scanner::new();
+        let mut s = Scanner::default();
         s.feed(input, |_| {});
         s
     }
@@ -533,7 +455,7 @@ mod tests {
     /// goes back to drifting.
     #[test]
     fn a_reset_gives_back_the_screen_a_program_took() {
-        let mut scanner = Scanner::new();
+        let mut scanner = Scanner::default();
         scanner.feed(b"\x1b[?1049h", |_| {});
         assert!(scanner.on_alternate(), "a program took the screen");
         scanner.feed(b"\x1bc", |_| {});
@@ -545,7 +467,7 @@ mod tests {
             (b"\x1b[?1047h", b"\x1b[?1047l"),
             (b"\x1b[?6;47h", b"\x1b[?47l"),
         ] {
-            let mut scanner = Scanner::new();
+            let mut scanner = Scanner::default();
             scanner.feed(on, |_| {});
             assert!(scanner.on_alternate(), "{on:?}");
             scanner.feed(off, |_| {});
@@ -639,24 +561,5 @@ mod tests {
     fn a_mode_is_replayed_once_however_often_it_is_set() {
         let s = scanner_after(b"\x1b[?1006h\x1b[?1006h\x1b[?1006h");
         assert_eq!(s.replay(), "\x1b[?1006h");
-    }
-
-    #[test]
-    fn utf8_split_across_chunks() {
-        let mut d = Utf8Decoder::new();
-        let s = "héllo ✓";
-        let bytes = s.as_bytes();
-        let mut out = String::new();
-        // Feed one byte at a time, the worst case for multi-byte characters.
-        for b in bytes {
-            out.push_str(&d.decode(&[*b]));
-        }
-        assert_eq!(out, s);
-    }
-
-    #[test]
-    fn invalid_utf8_becomes_replacement() {
-        let mut d = Utf8Decoder::new();
-        assert_eq!(d.decode(b"a\xffb"), "a\u{fffd}b");
     }
 }

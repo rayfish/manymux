@@ -32,25 +32,28 @@
 //! listing it has always given.
 //!
 //! A machine reached over ssh is read the same way, over the connection that
-//! is already open ([`read_proc`], [`read_back`]). The far end `cat`s and
-//! `readlink`s and decides nothing; every rule about what that means is
-//! applied here, on the same functions the local path uses. That is not
-//! tidiness: a shell script that worked out which process was in front, or
-//! what a ` (deleted)` suffix meant, would be a second implementation of rules
-//! that took three review rounds to get right, and it would drift.
+//! is already open ([`read_proc`], [`read_back`], [`described`]). The far end
+//! `cat`s and `readlink`s and decides nothing; every rule about what that
+//! means is applied here, on the same functions the local path uses. That is
+//! not tidiness: a shell script that worked out which process was in front,
+//! or what a ` (deleted)` suffix meant, would be a second implementation of
+//! rules that took three review rounds to get right, and it would drift.
 
 pub mod taking;
 
 pub use taking::{Dropped, Shared, Taken, Taking, Unsaid, take};
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::SystemTime;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
+use crate::client::groups::seconds;
 use crate::config;
-use crate::proto::{Size, SpawnSpec};
+use crate::foreground::{self, Raw};
+use crate::proto::{Doing, SessionInfo, Size, SpawnSpec};
 
 /// A program that can be asked to pick up where it left off.
 pub struct Resumable {
@@ -196,18 +199,11 @@ pub struct Checkpoint {
 
 impl Checkpoint {
     pub fn load() -> Result<Self> {
-        let path = Self::path();
-        if !path.exists() {
-            return Ok(Self::default());
-        }
-        let text = std::fs::read_to_string(&path)
-            .with_context(|| format!("reading {}", path.display()))?;
-        toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))
+        config::load_toml(&Self::path())
     }
 
     pub fn save(&self) -> Result<()> {
-        let text = toml::to_string_pretty(self).context("encoding the checkpoint")?;
-        config::write_private_file(&Self::path(), text.as_bytes())
+        config::save_toml(&Self::path(), self, "the checkpoint")
     }
 
     /// Its own file rather than a section in `settings.toml`, the reason
@@ -223,10 +219,7 @@ impl Checkpoint {
 
     /// Now, for stamping a checkpoint as it is written.
     pub fn now() -> u64 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|since| since.as_secs())
-            .unwrap_or(0)
+        seconds(SystemTime::now())
     }
 }
 
@@ -599,15 +592,19 @@ impl Want {
     }
 }
 
-/// The bytes each pid answered with, in the order the records arrived.
+/// What one pass of [`read_proc`] brought back: the bytes each pid answered
+/// with.
+pub type ReadBack = BTreeMap<u32, Vec<u8>>;
+
+/// The bytes each pid answered with, looked up by pid.
 ///
 /// Anything that is not a record this wrote is skipped rather than guessed at:
 /// a login shell on the far side is free to print a banner before the command
 /// runs, and a checkpoint is not the place to find out that somebody's
 /// `.profile` says hello.
-pub fn read_back(out: &[u8]) -> Vec<(u32, Vec<u8>)> {
+pub fn read_back(out: &[u8]) -> ReadBack {
     let text = String::from_utf8_lossy(out);
-    let mut found = Vec::new();
+    let mut found = ReadBack::new();
     let mut pid = None;
     for line in text.lines() {
         if let Some(rest) = line.strip_prefix("P ") {
@@ -615,10 +612,36 @@ pub fn read_back(out: &[u8]) -> Vec<(u32, Vec<u8>)> {
         } else if let Some(rest) = line.strip_prefix("X ")
             && let Some(p) = pid.take()
         {
-            found.push((p, unhex(rest.trim())));
+            found.insert(p, unhex(rest.trim()));
         }
     }
     found
+}
+
+/// Which process the second pass asks about for a session, from what the first
+/// said about its leader: the one in front of its terminal, by the rule the
+/// local reading uses ([`foreground::in_front`]), or the leader itself where
+/// the stat said nothing usable.
+pub fn in_front_of(leader: u32, stats: &ReadBack) -> u32 {
+    let stat = stats
+        .get(&leader)
+        .map(|bytes| String::from_utf8_lossy(bytes))
+        .unwrap_or_default();
+    foreground::in_front(leader, foreground::tpgid(&stat))
+}
+
+/// One session's answer, from what the second pass said about `front`, the
+/// process [`in_front_of`] picked for it.
+///
+/// A pid that answered nothing is a process that went between the two passes,
+/// and comes out the way any undescribable session does: no directory and no
+/// argv, reported and counted against the save rather than guessed at.
+pub fn described(session: &SessionInfo, front: u32, cwds: &ReadBack, argvs: &ReadBack) -> Doing {
+    let raw = Raw {
+        cwd: cwds.get(&front).cloned().unwrap_or_default(),
+        cmdline: argvs.get(&front).cloned().unwrap_or_default(),
+    };
+    Doing::new(session.name.clone(), session.pid, raw.read())
 }
 
 fn unhex(text: &str) -> Vec<u8> {
@@ -658,6 +681,60 @@ pub fn still_wrapped(argv: &[String]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What the far end prints for one pass, as `read_proc`'s script prints it.
+    fn printed(records: &[(u32, &[u8])]) -> Vec<u8> {
+        let mut out = String::from("a banner a login shell printed first\n");
+        for (pid, bytes) in records {
+            let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+            out.push_str(&format!("P {pid}\nX {hex}\n"));
+        }
+        out.into_bytes()
+    }
+
+    /// The ssh path end to end, minus the ssh: which process to ask about is
+    /// decided from the leader's stat here, and what comes back about it is
+    /// read by the same rules the local path uses, refusals included.
+    #[test]
+    fn a_machine_read_over_ssh_is_described_by_the_local_rules() {
+        let stats = read_back(&printed(&[
+            (100, b"100 (zsh) S 1 100 100 34816 300 0"),
+            (200, b""),
+        ]));
+        assert_eq!(in_front_of(100, &stats), 300, "something is in front");
+        assert_eq!(in_front_of(200, &stats), 200, "an empty stat is the leader");
+        assert_eq!(in_front_of(999, &stats), 999, "and so is no answer at all");
+
+        let cwds = read_back(&printed(&[(300, b"/srv/project"), (200, b"/srv/caf\xe9")]));
+        let argvs = read_back(&printed(&[(300, b"claude\0--continue\0"), (200, b"zsh\0")]));
+        let session = |name: &str, pid| SessionInfo {
+            name: name.to_string(),
+            title: String::new(),
+            command: "zsh".into(),
+            pid,
+            size: Size::new(80, 24),
+            attached: 0,
+            idle: 0,
+            bells: 0,
+            started: SystemTime::UNIX_EPOCH,
+            node: String::new(),
+        };
+
+        assert_eq!(
+            described(&session("build", 100), 300, &cwds, &argvs),
+            Doing {
+                name: "build".into(),
+                pid: 100,
+                cwd: Some("/srv/project".into()),
+                foreground: argv(&["claude", "--continue"]),
+            }
+        );
+        let undecodable = described(&session("api", 200), 200, &cwds, &argvs);
+        assert_eq!(undecodable.cwd, None, "a path that is not UTF-8 is nowhere");
+        assert_eq!(undecodable.foreground, argv(&["zsh"]));
+        let gone = described(&session("gone", 400), 400, &cwds, &argvs);
+        assert_eq!((gone.cwd, gone.foreground), (None, Vec::new()));
+    }
 
     fn argv(words: &[&str]) -> Vec<String> {
         words.iter().map(|w| w.to_string()).collect()

@@ -1,6 +1,10 @@
 //! Text from a frozen set of rendered rows, addressed in terminal cells.
+//!
+//! The cells are counted by `manymux::client::scroll::plain`, the desktop's
+//! own, which counts them the way `avt` laid them out: a wide character is two
+//! and everything else one, a combining mark included.
 
-use unicode_width::UnicodeWidthChar;
+use manymux::client::scroll::plain;
 
 use crate::mouse::At;
 use crate::screen::Row;
@@ -16,29 +20,14 @@ pub fn selection_text(mut rows: Vec<Row>, start: At, end: At) -> String {
     rows.into_iter()
         .filter(|row| row.at >= start.row && row.at <= end.row)
         .map(|row| {
-            let left = if row.at == start.row {
-                usize::from(start.col)
-            } else {
-                0
-            };
+            let left = if row.at == start.row { start.col } else { 0 };
             let right = if row.at == end.row {
-                usize::from(end.col) + 1
+                end.col.saturating_add(1)
             } else {
-                usize::MAX
+                u16::MAX
             };
-            let mut col = 0;
-            let mut text = String::new();
-            for ch in row
-                .runs
-                .into_iter()
-                .flat_map(|run| run.text.chars().collect::<Vec<_>>())
-            {
-                let width = ch.width().unwrap_or(0);
-                if col < right && col + width > left || width == 0 && !text.is_empty() {
-                    text.push(ch);
-                }
-                col += width;
-            }
+            let line: String = row.runs.into_iter().map(|run| run.text).collect();
+            let text = plain(&line, left, right);
             text.trim_end().to_owned()
         })
         .collect::<Vec<_>>()
@@ -59,6 +48,19 @@ mod tests {
         assert_eq!(
             selection_text(rows, At { col: 2, row: 1 }, At { col: 3, row: 0 }),
             "界cd\nsec"
+        );
+    }
+
+    /// `avt` gives a combining mark a cell of its own, so the columns the app
+    /// selected by are counted the same way here or the copy lands one short.
+    #[test]
+    fn a_combining_mark_takes_the_cell_avt_gave_it() {
+        let mut screen = Screen::at(Size::new(12, 1));
+        screen.repaint("e\u{301}xyz".as_bytes());
+        let rows = screen.take_frame().changed;
+        assert_eq!(
+            selection_text(rows, At { col: 2, row: 0 }, At { col: 3, row: 0 }),
+            "xy"
         );
     }
 }

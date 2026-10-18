@@ -26,10 +26,9 @@ use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::mpsc;
 use tracing::debug;
 
-use super::keys::wheel_is_ours;
+use super::keys::{interrupts, sequence, wheel_is_ours};
 use super::{Action, Chose, Find, KeyFilter, Mode, Outcome, Pick, Rename, Rows, Scroll, Select};
 use crate::client::picker::Picker;
-use crate::client::screen::ScreenMode;
 use crate::client::scroll::{self, Chased, Owed, Scrollback, Selected};
 use crate::client::status::{self, Filter, Popped, Status};
 use crate::client::{
@@ -46,8 +45,8 @@ use crate::settings::{Mouse, Screen, Settings};
 /// you had, not leave it named after a session you left. What the mode adds
 /// is the screen, and why it adds what it adds is in
 /// [`crate::client::screen`].
-fn setup(mode: &dyn ScreenMode) -> String {
-    format!("\x1b[22;2t{}", mode.setup()) // push the window title
+fn setup(screen: Screen) -> String {
+    format!("\x1b[22;2t{}", screen.setup()) // push the window title
 }
 
 /// Terminal state a full-screen program may have left behind, undone
@@ -113,8 +112,8 @@ fn given_back() -> String {
 /// What to do about that screen is the mode's, since only one of the two
 /// owns it. `on_alternate` is whether the session being left has the
 /// terminal on a full-screen program's own screen.
-pub(super) fn takeover(mode: &dyn ScreenMode, on_alternate: bool) -> String {
-    format!("{}{}", undone(), mode.takeover(on_alternate))
+pub(super) fn takeover(screen: Screen, on_alternate: bool) -> String {
+    format!("{}{}", undone(), screen.takeover(on_alternate))
 }
 
 /// Written before a screen the node sent in answer to a resize.
@@ -164,10 +163,10 @@ const SHOWN: &str = "\x1b[?25h";
 /// `on_alternate` is whether the session has the terminal on a full-screen
 /// program's own screen, which only the attach loop can see and which only
 /// the inline mode has to do anything about.
-pub(super) fn reset(mode: &dyn ScreenMode, on_alternate: bool) -> String {
+pub(super) fn reset(screen: Screen, on_alternate: bool) -> String {
     let mut reset = undone();
     reset.push_str("\x1b[23;2t"); // pop the title pushed on attach
-    let _ = write!(reset, "{}", mode.reset(terminal_size(), on_alternate));
+    let _ = write!(reset, "{}", screen.reset(terminal_size(), on_alternate));
     reset
 }
 
@@ -221,7 +220,7 @@ pub fn hold(screen: Screen) -> Result<Held> {
         previous(panic);
     }));
     terminal::enable_raw_mode()?;
-    write_now(&setup(screen.mode()));
+    write_now(&setup(screen));
     Ok(Held {
         keys: keyboard(),
         filter: KeyFilter::default(),
@@ -235,10 +234,7 @@ impl Held {
     /// Restore the terminal and wait until it has processed the keyboard-mode
     /// reset before the shell can read stdin again.
     pub async fn release(&mut self) {
-        let reset = reset(
-            self.screen.mode(),
-            self.on_alternate.load(Ordering::Relaxed),
-        );
+        let reset = reset(self.screen, self.on_alternate.load(Ordering::Relaxed));
         while self.keys.try_recv().is_ok() {}
         // The device-attributes reply is an in-band fence. A release already
         // in flight reaches stdin before this reply because the terminal
@@ -277,7 +273,7 @@ impl Drop for Held {
 fn give_back(screen: Screen, on_alternate: bool) {
     // Turn off keyboard event reporting before restoring the shell's input
     // mode. A release already queued while it was on must not reach the shell.
-    write_now(&reset(screen.mode(), on_alternate));
+    write_now(&reset(screen, on_alternate));
     unsafe {
         libc::tcflush(libc::STDIN_FILENO, libc::TCIFLUSH);
     }
@@ -356,7 +352,7 @@ pub async fn waiting(held: &mut Held, target: &str, delay: Duration, lost_for: D
                 // Nobody is going to press anything.
                 None => return Wait::GiveUp,
                 Some(chunk) => {
-                    if chunk.contains(&INTERRUPT) {
+                    if interrupts(&chunk) {
                         return Wait::GiveUp;
                     }
                     if matches!(keys.filter(&chunk).action, Some(Action::Detach)) {
@@ -371,10 +367,6 @@ pub async fn waiting(held: &mut Held, target: &str, delay: Duration, lost_for: D
 /// How often the row counts down. A second, because that is the unit it is
 /// counting in.
 const TICK: Duration = Duration::from_secs(1);
-
-/// Ctrl-C, which while nothing is attached is a way out rather than a signal
-/// to pass on.
-const INTERRUPT: u8 = 0x03;
 
 /// What the attach returned, including a reusable transport after a switch.
 pub struct Run {
@@ -427,7 +419,7 @@ pub async fn run(
     // session's own repaint puts the terminal.
     write_now(&format!(
         "{}{}",
-        takeover(screen.mode(), on_alternate.swap(false, Ordering::Relaxed)),
+        takeover(screen, on_alternate.swap(false, Ordering::Relaxed)),
         status.setup(terminal_size())
     ));
     let mut called = session_of(target).to_string();
@@ -588,21 +580,19 @@ const COPY_LOST: &str = "those lines are no longer here to copy";
 /// the terminal, and only one of them is ours to read. [`given_back`] switches
 /// off every mode a session can ask for, and the mouse is one of those, so a
 /// screen painted while the client held the wheel took the wheel with it and
-/// this function had nothing to say about it: `wheel` still said ours, the
-/// terminal had stopped reporting, and the first notch after a popup went back
-/// to doing whatever the terminal does with one. So that path re-asserts
+/// this function had nothing to say about it: the key filter still said ours,
+/// the terminal had stopped reporting, and the first notch after a popup went
+/// back to doing whatever the terminal does with one. So that path re-asserts
 /// [`WHEEL_OURS`] by hand rather than clearing the flag and waiting for the
 /// next frame, which would leave a window with the same silence in it.
-async fn own_the_wheel(
-    stdout: &mut Stdout,
-    keys: &mut KeyFilter,
-    wheel: &mut bool,
-    ours: bool,
-) -> Result<()> {
-    if *wheel == ours {
+///
+/// The key filter's flag is the one record of whether the wheel is ours: it
+/// reads the reports by it, and `ours` is only ever true where the screen is
+/// the client's, which is the only place the filter lets the wheel be ours.
+async fn own_the_wheel(stdout: &mut Stdout, keys: &mut KeyFilter, ours: bool) -> Result<()> {
+    if keys.wheel() == ours {
         return Ok(());
     }
-    *wheel = ours;
     keys.set_wheel(ours);
     stdout
         .write_all(if ours { WHEEL_OURS } else { WHEEL_THEIRS }.as_bytes())
@@ -692,6 +682,10 @@ impl InputFrames {
     }
 }
 
+/// How much of a chunk is whole: everything up to an escape sequence the
+/// terminal has not finished sending. A CSI or SS3 is measured the way the key
+/// filter reads one ([`sequence`]), so the two cannot disagree about where a
+/// key ends; an Esc before anything else is a key of its own.
 fn complete_input_len(input: &[u8]) -> usize {
     let mut at = 0;
     while at < input.len() {
@@ -699,26 +693,13 @@ fn complete_input_len(input: &[u8]) -> usize {
             at += 1;
             continue;
         }
-        let Some(next) = input.get(at + 1) else {
-            break;
-        };
-        match next {
-            b'[' => {
-                let Some(end) = input[at + 2..]
-                    .iter()
-                    .position(|b| (0x40..=0x7e).contains(b))
-                else {
-                    break;
-                };
-                at += end + 3;
-            }
-            b'O' => {
-                if input.get(at + 2).is_none() {
-                    break;
-                }
-                at += 3;
-            }
-            _ => at += 1,
+        match input.get(at + 1) {
+            None => break,
+            Some(b'[' | b'O') => match sequence(&input[at..]) {
+                Some(len) => at += len,
+                None => break,
+            },
+            Some(_) => at += 1,
         }
     }
     at
@@ -1001,7 +982,7 @@ async fn pump(
     } = session.split();
     let mut stdout = tokio::io::stdout();
     let mut winch = signal(SignalKind::window_change())?;
-    keys.begin_attach(mode, screen.mode().owns_the_screen());
+    keys.begin_attach(mode, screen.owns_the_screen());
     // The key is the client's on a screen the client owns, whether or not
     // the host can answer for a window: a host that cannot is worth saying
     // out loud, and a key that quietly does nothing is the one thing worse
@@ -1015,7 +996,7 @@ async fn pump(
     // they have. A host that cannot answer for a window gets a sentence on the
     // row when the key is pressed, and keeps its wheel either way.
     let history =
-        scrolls && screen.mode().owns_the_screen() && Settings::or_default().mouse == Mouse::Client;
+        scrolls && screen.owns_the_screen() && Settings::or_default().mouse == Mouse::Client;
     let mut output = Filter::new(screen);
     if running_in_iterm() {
         output = output.without_key_releases();
@@ -1025,10 +1006,6 @@ async fn pump(
     // The popup control mode puts on the screen, while it is up, and which of
     // the three lists it is showing.
     let mut popup: Option<Popup> = None;
-    // Whether the client has mouse tracking on for itself, which it does
-    // only while there is a history to look at and the session has asked
-    // for no reports of its own.
-    let mut wheel = false;
     // The row no longer says what the keys are doing. Held until there is a
     // safe moment to draw, the same as a mark the session cleared.
     let mut restate = false;
@@ -1148,10 +1125,12 @@ async fn pump(
                     // throws away the picking.
                     Some(Action::Pick(Pick::Hosts) | Action::New) if watching => {
                         let back = popup.as_ref().map_or(Mode::Focus, Popup::mode);
-                        keys.set_mode(back);
-                        status.set_mode(back);
-                        status.set_notice("watching, so nothing here can start a session");
-                        notice_until = Some(tokio::time::Instant::now() + NOTICE_FOR);
+                        set_mode(keys, &mut status, back);
+                        notice(
+                            &mut status,
+                            &mut notice_until,
+                            "watching, so nothing here can start a session",
+                        );
                         restate = true;
                         settle(&mut stdout, &output, &status, &mut pending, &mut restate)
                             .await?;
@@ -1218,8 +1197,7 @@ async fn pump(
                                     ),
                                     what: Showing::Hosting,
                                 };
-                                keys.set_mode(Mode::Picking);
-                                status.set_mode(Mode::Picking);
+                                set_mode(keys, &mut status, Mode::Picking);
                             }
                             // Off to the group list, over the session list
                             // rather than instead of it: Esc there comes back
@@ -1234,8 +1212,7 @@ async fn pump(
                                     // session list. Same shape as the bug
                                     // `Popup::mode` was added for.
                                     let back = up.mode();
-                                    keys.set_mode(back);
-                                    status.set_mode(back);
+                                    set_mode(keys, &mut status, back);
                                     restate = true;
                                     continue;
                                 };
@@ -1257,8 +1234,7 @@ async fn pump(
                                     picker: Picker::new(title, hints, rows.groups.clone(), 0),
                                     what,
                                 };
-                                keys.set_mode(Mode::Picking);
-                                status.set_mode(Mode::Picking);
+                                set_mode(keys, &mut status, Mode::Picking);
                             }
                             // Enter on the row wearing that digit, without the
                             // walk to it. Nothing at all where no row wears it,
@@ -1272,8 +1248,7 @@ async fn pump(
                             Pick::Number(digit) => {
                                 let Some(row) = up.picker.at_number(digit).map(|row| row.id) else {
                                     let back = up.mode();
-                                    keys.set_mode(back);
-                                    status.set_mode(back);
+                                    set_mode(keys, &mut status, back);
                                     restate = true;
                                     continue;
                                 };
@@ -1281,24 +1256,20 @@ async fn pump(
                                 return leave_for(SessionHalves { reader, writer }, reuse, connection, Outcome::Chose(Chose::Go(row))).await;
                             }
                             Pick::Go => {
-                                let chosen = up.picker.chosen().map(|row| row.id);
-                                let what = up.what;
-                                let subject = up.subject();
-                                let Some(chosen) = chosen else { continue };
+                                let Some(chosen) = up.picker.chosen().map(|row| row.id) else {
+                                    continue;
+                                };
+                                let chose = match up.what {
+                                    Showing::Sessions => Chose::Go(chosen),
+                                    Showing::Moving { row } => Chose::Move {
+                                        session: row,
+                                        group: chosen,
+                                    },
+                                    Showing::Narrowing => Chose::Focus(chosen),
+                                    Showing::Hosting => Chose::On(chosen),
+                                };
                                 status.set_popup(Popped::None);
-                                return leave_for(SessionHalves { reader, writer }, reuse, connection, match (what, subject) {
-                                    (Showing::Sessions, _) => {
-                                        Outcome::Chose(Chose::Go(chosen))
-                                    }
-                                    (Showing::Moving { .. }, Some(session)) => {
-                                        Outcome::Chose(Chose::Move { session, group: chosen })
-                                    }
-                                    (Showing::Moving { .. }, None) => Outcome::Detached,
-                                    (Showing::Narrowing, _) => {
-                                        Outcome::Chose(Chose::Focus(chosen))
-                                    }
-                                    (Showing::Hosting, _) => Outcome::Chose(Chose::On(chosen)),
-                                }).await;
+                                return leave_for(SessionHalves { reader, writer }, reuse, connection, Outcome::Chose(chose)).await;
                             }
                             // Taken off the screen by the teardown below,
                             // which every other way out of the mode goes
@@ -1329,11 +1300,9 @@ async fn pump(
                         // group row as a session, which is the thing refusing
                         // this key exists to stop.
                         let back = popup.as_ref().map_or(Mode::Focus, Popup::mode);
-                        keys.set_mode(back);
-                        status.set_mode(back);
+                        set_mode(keys, &mut status, back);
                         status.set_grouping(None);
-                        status.set_notice("no session here to put in a group");
-                        notice_until = Some(tokio::time::Instant::now() + NOTICE_FOR);
+                        notice(&mut status, &mut notice_until, "no session here to put in a group");
                         restate = true;
                         draw_popup(&mut stdout, &mut popup, &mut status, &mut restate).await?;
                     }
@@ -1370,12 +1339,12 @@ async fn pump(
                     // view behind it would say `scroll` on the row and
                     // take every key you typed.
                     Some(Action::Scroll(_)) if !scrolls => {
-                        keys.set_mode(Mode::Focus);
-                        status.set_mode(Mode::Focus);
-                        status.set_notice(
+                        set_mode(keys, &mut status, Mode::Focus);
+                        notice(
+                            &mut status,
+                            &mut notice_until,
                             "this host is too old to scroll back; `mm restart` there",
                         );
-                        notice_until = Some(tokio::time::Instant::now() + NOTICE_FOR);
                         restate = true;
                         settle(&mut stdout, &output, &status, &mut pending, &mut restate)
                             .await?;
@@ -1393,15 +1362,14 @@ async fn pump(
                     // Typing, and what typing turns into. The needle lives
                     // in the key filter until Enter, so all of this does is
                     // keep the row saying what is in it.
-                    Some(Action::Find(found)) if !scrolls => {
+                    Some(Action::Find(_)) if !scrolls => {
                         keys.stop_typing();
-                        keys.set_mode(Mode::Focus);
-                        status.set_mode(Mode::Focus);
-                        let _ = found;
-                        status.set_notice(
+                        set_mode(keys, &mut status, Mode::Focus);
+                        notice(
+                            &mut status,
+                            &mut notice_until,
                             "this host is too old to search; `mm restart` there",
                         );
-                        notice_until = Some(tokio::time::Instant::now() + NOTICE_FOR);
                         restate = true;
                         settle(&mut stdout, &output, &status, &mut pending, &mut restate)
                             .await?;
@@ -1426,11 +1394,7 @@ async fn pump(
                                 view.step(found == Find::Next);
                                 status.set_scrolled(Some(view.offset()));
                                 status.set_searching(view.searching());
-                                let wanted = view.wanted();
-                                let painted = view.paint();
-                                if let Some(request) = wanted {
-                                    writer.view(&request).await?;
-                                }
+                                let painted = paint_view(view, &mut writer).await?;
                                 stdout.write_all(painted.as_bytes()).await?;
                             }
                         }
@@ -1470,26 +1434,15 @@ async fn pump(
                                 Scroll::Down(_) | Scroll::PageDown | Scroll::Bottom
                             );
                         if landed {
-                            scrolling = None;
-                            status.set_scrolled(None);
-                            keys.set_mode(Mode::Focus);
-                            status.set_mode(Mode::Focus);
+                            close_view(&mut scrolling, &mut status, keys);
                             ask_for_the_screen(&mut writer, &mut owed).await?;
                             restate = true;
                             settle(&mut stdout, &output, &status, &mut pending, &mut restate)
                                 .await?;
                         } else {
-                            let wanted = view.wanted();
-                            let painted = view.paint();
+                            let painted = paint_view(view, &mut writer).await?;
                             status.set_scrolled(Some(view.offset()));
-                            if let Some(request) = wanted {
-                                writer.view(&request).await?;
-                            }
-                            stdout.write_all(painted.as_bytes()).await?;
-                            stdout
-                                .write_all(status.repaint(terminal_size()).as_bytes())
-                                .await?;
-                            stdout.flush().await?;
+                            put_up(&mut stdout, &painted, &status, terminal_size()).await?;
                         }
                     }
                     // A drag, which only means anything where there is a view
@@ -1499,8 +1452,7 @@ async fn pump(
                     // switched on by the same flag and nothing should depend on
                     // remembering that.
                     Some(Action::Select(_)) if !scrolls => {
-                        keys.set_mode(Mode::Focus);
-                        status.set_mode(Mode::Focus);
+                        set_mode(keys, &mut status, Mode::Focus);
                     }
                     Some(Action::Select(what)) => {
                         let view = scrolling
@@ -1558,14 +1510,10 @@ async fn pump(
                             stdout
                                 .write_all(clipboard::to_terminal(text).as_bytes())
                                 .await?;
-                            status.set_notice(&copied_says(text));
-                            notice_until = Some(tokio::time::Instant::now() + NOTICE_FOR);
+                            notice(&mut status, &mut notice_until, &copied_says(text));
                         }
                         if done {
-                            scrolling = None;
-                            status.set_scrolled(None);
-                            keys.set_mode(Mode::Focus);
-                            status.set_mode(Mode::Focus);
+                            close_view(&mut scrolling, &mut status, keys);
                             ask_for_the_screen(&mut writer, &mut owed).await?;
                             restate = true;
                             settle(&mut stdout, &output, &status, &mut pending, &mut restate)
@@ -1573,11 +1521,7 @@ async fn pump(
                         } else {
                             status.set_scrolled(Some(offset));
                             status.set_selected(selected);
-                            stdout.write_all(painted.as_bytes()).await?;
-                            stdout
-                                .write_all(status.repaint(terminal_size()).as_bytes())
-                                .await?;
-                            stdout.flush().await?;
+                            put_up(&mut stdout, &painted, &status, terminal_size()).await?;
                         }
                     }
                     // The same shape as a search, and the same reason for
@@ -1586,15 +1530,13 @@ async fn pump(
                     // what is in it.
                     Some(Action::Rename(_)) if watching || !renames => {
                         keys.stop_typing();
-                        keys.set_mode(Mode::Focus);
-                        status.set_mode(Mode::Focus);
+                        set_mode(keys, &mut status, Mode::Focus);
                         status.set_renaming(None);
-                        status.set_notice(if watching {
+                        notice(&mut status, &mut notice_until, if watching {
                             "watching, so nothing here can be renamed"
                         } else {
                             "this host is too old to rename from here; `mm rename` instead"
                         });
-                        notice_until = Some(tokio::time::Instant::now() + NOTICE_FOR);
                         restate = true;
                         settle(&mut stdout, &output, &status, &mut pending, &mut restate)
                             .await?;
@@ -1637,9 +1579,11 @@ async fn pump(
                                         // that went nowhere in silence reads as
                                         // a rename that worked.
                                         None => {
-                                            status.set_notice("no session here to rename");
-                                            notice_until =
-                                                Some(tokio::time::Instant::now() + NOTICE_FOR);
+                                            notice(
+                                                &mut status,
+                                                &mut notice_until,
+                                                "no session here to rename",
+                                            );
                                         }
                                         Some(_) => {}
                                     },
@@ -1664,8 +1608,11 @@ async fn pump(
                     // Nothing to hand a session this client cannot type into,
                     // and the clipboard is not worth reading to find that out.
                     Some(Action::Paste) if watching => {
-                        status.set_notice("watching, so there is nothing to paste into");
-                        notice_until = Some(tokio::time::Instant::now() + NOTICE_FOR);
+                        notice(
+                            &mut status,
+                            &mut notice_until,
+                            "watching, so there is nothing to paste into",
+                        );
                         restate = true;
                     }
                     Some(Action::Paste) => {
@@ -1733,7 +1680,7 @@ async fn pump(
                 // and the wheel goes with that: a program that wants reports
                 // gets every one of them, the wheel included.
                 let ours = wheel_is_ours(history, output.session_mouse());
-                own_the_wheel(&mut stdout, keys, &mut wheel, ours).await?;
+                own_the_wheel(&mut stdout, keys, ours).await?;
                 if chunk.is_empty() {
                     break 'chunk;
                 }
@@ -1761,7 +1708,7 @@ async fn pump(
                     // scrollback instead, after any history, which is
                     // written as it arrives.
                     if !painted {
-                        let before = screen.mode().before_repaint(terminal_size());
+                        let before = screen.before_repaint(terminal_size());
                         stdout.write_all(before.as_bytes()).await?;
                     }
                     let bytes = output.feed(&bytes);
@@ -1787,7 +1734,7 @@ async fn pump(
                     // given it back. Only between sequences, like the mark.
                     if output.at_boundary() {
                         let ours = wheel_is_ours(history, output.session_mouse());
-                        own_the_wheel(&mut stdout, keys, &mut wheel, ours).await?;
+                        own_the_wheel(&mut stdout, keys, ours).await?;
                     }
                     // A screen switch went no further than this client, so
                     // the terminal is still showing the screen the session
@@ -1842,7 +1789,7 @@ async fn pump(
                             stdout.write_all(given_back().as_bytes()).await?;
                             // Which includes the mouse, and the client's hold
                             // on it is not the session's to lose.
-                            if wheel {
+                            if keys.wheel() {
                                 stdout.write_all(WHEEL_OURS.as_bytes()).await?;
                             }
                             stdout.write_all(REGROWN.as_bytes()).await?;
@@ -1876,16 +1823,8 @@ async fn pump(
                         view.found(found);
                         status.set_scrolled(Some(view.offset()));
                         status.set_searching(view.searching());
-                        let wanted = view.wanted();
-                        let painted = view.paint();
-                        if let Some(request) = wanted {
-                            writer.view(&request).await?;
-                        }
-                        stdout.write_all(painted.as_bytes()).await?;
-                        stdout
-                            .write_all(status.repaint(terminal_size()).as_bytes())
-                            .await?;
-                        stdout.flush().await?;
+                        let painted = paint_view(view, &mut writer).await?;
+                        put_up(&mut stdout, &painted, &status, terminal_size()).await?;
                     }
                 }
                 // A block of the history. Dropped if the view has been
@@ -1935,32 +1874,23 @@ async fn pump(
                                 stdout
                                     .write_all(clipboard::to_terminal(text).as_bytes())
                                     .await?;
-                                status.set_notice(&copied_says(text));
-                                notice_until = Some(tokio::time::Instant::now() + NOTICE_FOR);
+                                notice(&mut status, &mut notice_until, &copied_says(text));
                             }
                             Owed::Lost => {
-                                status.set_notice(COPY_LOST);
-                                notice_until = Some(tokio::time::Instant::now() + NOTICE_FOR);
+                                notice(&mut status, &mut notice_until, COPY_LOST);
                             }
                         }
                         if !done {
                             status.set_scrolled(Some(view.offset()));
                             status.set_selected(view.selected_size());
-                            stdout.write_all(view.paint().as_bytes()).await?;
-                            stdout
-                                .write_all(status.repaint(terminal_size()).as_bytes())
-                                .await?;
-                            stdout.flush().await?;
+                            put_up(&mut stdout, &view.paint(), &status, terminal_size()).await?;
                         }
                     }
                     // The drag was over before its lines arrived, so this is
                     // where it ends: the same handing back of the screen the
                     // release would have done had it been able to answer.
                     if done {
-                        scrolling = None;
-                        status.set_scrolled(None);
-                        keys.set_mode(Mode::Focus);
-                        status.set_mode(Mode::Focus);
+                        close_view(&mut scrolling, &mut status, keys);
                         ask_for_the_screen(&mut writer, &mut owed).await?;
                         restate = true;
                         settle(&mut stdout, &output, &status, &mut pending, &mut restate)
@@ -1972,16 +1902,16 @@ async fn pump(
                 // goes with it, for a session that has set no title of its
                 // own and so is showing the target there.
                 Update::Renamed(answer) => {
-                    match answer {
+                    let said = match answer {
                         Renamed::Name(name) => {
                             *naming.called = name;
                             status.set_target(&naming.target());
                             pending.push_str(&status.retitle());
-                            status.set_notice(&format!("renamed to {}", naming.called));
+                            format!("renamed to {}", naming.called)
                         }
-                        Renamed::Refused(why) => status.set_notice(&why),
-                    }
-                    notice_until = Some(tokio::time::Instant::now() + NOTICE_FOR);
+                        Renamed::Refused(why) => why,
+                    };
+                    notice(&mut status, &mut notice_until, &said);
                     restate = true;
                     settle(&mut stdout, &output, &status, &mut pending, &mut restate)
                         .await?;
@@ -1992,8 +1922,7 @@ async fn pump(
                 Update::Event(hosted) => {
                     if let Some(rung) = bells.ring(&hosted) {
                         pending.push_str(&rung.escape);
-                        status.set_notice(&rung.notice);
-                        notice_until = Some(tokio::time::Instant::now() + NOTICE_FOR);
+                        notice(&mut status, &mut notice_until, &rung.notice);
                         restate = true;
                         settle(&mut stdout, &output, &status, &mut pending, &mut restate)
                             .await?;
@@ -2025,14 +1954,8 @@ async fn pump(
                 // closes onto an erased screen anyway.
                 if let Some(view) = scrolling.as_mut() {
                     view.resize(status::session_size(size));
-                    let wanted = view.wanted();
-                    let painted = view.paint();
-                    if let Some(request) = wanted {
-                        writer.view(&request).await?;
-                    }
-                    stdout.write_all(painted.as_bytes()).await?;
-                    stdout.write_all(status.repaint(size).as_bytes()).await?;
-                    stdout.flush().await?;
+                    let painted = paint_view(view, &mut writer).await?;
+                    put_up(&mut stdout, &painted, &status, size).await?;
                     continue;
                 }
                 // And a popup is a surface of ours too, so it is drawn again at
@@ -2067,18 +1990,10 @@ async fn pump(
                 let Some(view) = scrolling.as_mut() else { continue };
                 match view.chase() {
                     Chased::Moved => {
-                        let wanted = view.wanted();
-                        let painted = view.paint();
-                        let offset = view.offset();
-                        let selected = view.selected_size();
-                        if let Some(request) = wanted {
-                            writer.view(&request).await?;
-                        }
-                        status.set_scrolled(Some(offset));
-                        status.set_selected(selected);
-                        stdout.write_all(painted.as_bytes()).await?;
-                        stdout.write_all(status.repaint(terminal_size()).as_bytes()).await?;
-                        stdout.flush().await?;
+                        let painted = paint_view(view, &mut writer).await?;
+                        status.set_scrolled(Some(view.offset()));
+                        status.set_selected(view.selected_size());
+                        put_up(&mut stdout, &painted, &status, terminal_size()).await?;
                         chase_at = Some(tokio::time::Instant::now() + CHASE_EVERY);
                     }
                     // The oldest line there is, or the live screen. Nothing to
@@ -2097,11 +2012,10 @@ async fn pump(
                         status.set_scrolled(Some(view.offset()));
                         status.set_selected(view.selected_size());
                         stdout.write_all(painted.as_bytes()).await?;
-                        status.set_notice(&format!(
+                        notice(&mut status, &mut notice_until, &format!(
                             "{} lines is as much as one copy takes",
                             scroll::COPY_LINES
                         ));
-                        notice_until = Some(tokio::time::Instant::now() + NOTICE_FOR);
                         restate = true;
                         settle(&mut stdout, &output, &status, &mut pending, &mut restate)
                             .await?;
@@ -2117,6 +2031,57 @@ async fn pump(
             }
         }
     }
+}
+
+/// Ask for the block the view now wants, if there is one, and answer with the
+/// view painted from what it holds meanwhile.
+///
+/// Asked before the paint goes out, the same order every move of the view
+/// keeps, so the block is on its way while the picture is being written.
+async fn paint_view(view: &mut Scrollback, writer: &mut SessionWriter) -> Result<String> {
+    let wanted = view.wanted();
+    let painted = view.paint();
+    if let Some(request) = wanted {
+        writer.view(&request).await?;
+    }
+    Ok(painted)
+}
+
+/// Write a picture of the client's own and the row under it, and flush.
+///
+/// Written on the spot rather than through `settle`: while the view is up the
+/// session is not being painted, so there is no sequence of its to land in the
+/// middle of.
+async fn put_up(stdout: &mut Stdout, painted: &str, status: &Status, size: Size) -> Result<()> {
+    stdout.write_all(painted.as_bytes()).await?;
+    stdout.write_all(status.repaint(size).as_bytes()).await?;
+    stdout.flush().await?;
+    Ok(())
+}
+
+/// Take the view down and give the keys back to the session. What the view
+/// was drawn over is the caller's to ask for again ([`ask_for_the_screen`]).
+fn close_view(scrolling: &mut Option<Scrollback>, status: &mut Status, keys: &mut KeyFilter) {
+    *scrolling = None;
+    status.set_scrolled(None);
+    set_mode(keys, status, Mode::Focus);
+}
+
+/// Put the keys and the row in one mode together.
+///
+/// Never one without the other: the row says what the keys will do, and every
+/// way out of a list that moved only one of them left a table on the screen
+/// that the keys were no longer reading, or keys reading a table nobody could
+/// see.
+fn set_mode(keys: &mut KeyFilter, status: &mut Status, mode: Mode) {
+    keys.set_mode(mode);
+    status.set_mode(mode);
+}
+
+/// Put something on the row, and give it the few seconds it is up for.
+fn notice(status: &mut Status, until: &mut Option<tokio::time::Instant>, text: &str) {
+    status.set_notice(text);
+    *until = Some(tokio::time::Instant::now() + NOTICE_FOR);
 }
 
 fn drop_finished_releases(output: &mut Filter, keys: &mut KeyFilter) {
@@ -2633,7 +2598,7 @@ mod tests {
     #[cfg(feature = "desktop")]
     #[test]
     fn detaching_undoes_every_mode_a_reattach_replays() {
-        let reset = reset(Screen::Alternate.mode(), false);
+        let reset = reset(Screen::Alternate, false);
         for mode in crate::node::events::REPLAYED_MODES {
             assert!(
                 reset.contains(&format!("\x1b[?{mode}l")),
@@ -2664,7 +2629,7 @@ mod tests {
     #[cfg(feature = "desktop")]
     #[test]
     fn detaching_undoes_the_keyboard_protocols_too() {
-        let reset = reset(Screen::Alternate.mode(), false);
+        let reset = reset(Screen::Alternate, false);
         for sequence in [
             "\x1b[<16u",  // pop kitty's stack, however deep the program went
             "\x1b[=0;1u", // and clear flags it set without pushing
@@ -2683,7 +2648,7 @@ mod tests {
     #[cfg(feature = "desktop")]
     #[test]
     fn a_hop_erases_the_session_before_it() {
-        let takeover = takeover(Screen::Alternate.mode(), false);
+        let takeover = takeover(Screen::Alternate, false);
         let erase = takeover.find("\x1b[2J").expect("a hop erases nothing");
         assert!(
             takeover[..erase].contains("\x1b[H"),
@@ -2700,7 +2665,7 @@ mod tests {
     #[cfg(feature = "desktop")]
     #[test]
     fn a_hop_undoes_every_mode_the_session_before_it_switched_on() {
-        let takeover = takeover(Screen::Alternate.mode(), false);
+        let takeover = takeover(Screen::Alternate, false);
         for mode in crate::node::events::REPLAYED_MODES {
             assert!(
                 takeover.contains(&format!("\x1b[?{mode}l")),
@@ -2762,7 +2727,7 @@ mod tests {
     #[cfg(feature = "desktop")]
     #[test]
     fn a_hop_stays_on_the_alternate_screen() {
-        let takeover = takeover(Screen::Alternate.mode(), false);
+        let takeover = takeover(Screen::Alternate, false);
         for sequence in ["\x1b[?1049l", "\x1b[?1047l", "\x1b[23;2t"] {
             assert!(
                 !takeover.contains(sequence),
