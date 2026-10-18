@@ -1,6 +1,21 @@
 import Foundation
 import Observation
 
+/// The range the terminal's text size moves in.
+enum TextSize {
+    /// The Android app's 12.5dp, about fifty columns on an ordinary phone.
+    static let normal = 12.5
+    /// About as small as a phone's screen still reads, for the wide program
+    /// that wants every column it can get.
+    static let smallest = 7.0
+    static let largest = 24.0
+
+    /// In half-point steps, so a slider and a pinch land on the same sizes.
+    static func clamped(_ size: Double) -> Double {
+        (min(max(size, smallest), largest) * 2).rounded() / 2
+    }
+}
+
 /// Where the app is.
 enum Route: Hashable {
     case addHost
@@ -36,6 +51,12 @@ final class AppModel {
         didSet { UserDefaults.standard.set(tiles, forKey: "tiles") }
     }
 
+    /// The terminal's text size, in points. Like `tiles`, about the person
+    /// reading rather than the machine, so one setting for every session.
+    var textSize: Double {
+        didSet { UserDefaults.standard.set(textSize, forKey: "textSize") }
+    }
+
     private let store = HostStore()
 
     /// Anything that talks to a machine, off the main thread and one at a
@@ -48,6 +69,8 @@ final class AppModel {
     init() {
         hosts = store.all()
         tiles = UserDefaults.standard.object(forKey: "tiles") as? Bool ?? true
+        let stored = UserDefaults.standard.double(forKey: "textSize")
+        textSize = stored > 0 ? TextSize.clamped(stored) : TextSize.normal
         do {
             phone = try Phone.keptIn(dir: try AppModel.keptIn().path)
             trouble = nil

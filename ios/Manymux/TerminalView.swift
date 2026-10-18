@@ -1,16 +1,5 @@
 import UIKit
 
-/// How tall one cell's text is, in points, until somebody pinches. The Android
-/// app's 12.5dp, which is about fifty columns on an ordinary phone.
-private let cellPoints: CGFloat = 12.5
-
-/// How far a pinch may take it. The bottom is about as small as a phone's
-/// screen still reads, for the wide program that wants every column it can get.
-private let smallest: CGFloat = 7
-private let largest: CGFloat = 24
-
-/// Where the size somebody pinched to is kept, so the next session opens at it.
-private let sizeKey = "textSize"
 
 /// What is left of a fling's speed after a sixtieth of a second, spent against
 /// the frame's own length so a 120Hz screen coasts as far as a 60Hz one.
@@ -64,10 +53,24 @@ final class TerminalView: UIView, UIKeyInput {
     /// does, there being nothing on the screen saying it was ever a gesture.
     var onCannotScroll: (() -> Void)?
 
-    private var textSize = TerminalView.storedSize()
+    /// How tall one cell's text is, in points. A smaller size is more
+    /// columns, which the far end is told about the way it is told about a
+    /// rotation.
+    var textSize = CGFloat(TextSize.normal) {
+        didSet {
+            guard textSize != oldValue else { return }
+            painter = Painter(size: textSize)
+            tellGrid()
+            setNeedsDisplay()
+        }
+    }
+
+    /// Told when a pinch changes the size, so the setting follows the fingers.
+    var onTextSize: ((CGFloat) -> Void)?
+
     private lazy var painter = Painter(size: textSize)
     /// The size a pinch started from, its scale being relative to that.
-    private var pinchedFrom: CGFloat = cellPoints
+    private var pinchedFrom = CGFloat(TextSize.normal)
     private var rows: [Int: [Run]] = [:]
     private var cursorCol = 0
     private var cursorRow = 0
@@ -427,31 +430,19 @@ final class TerminalView: UIView, UIKeyInput {
 
     // ---- selection ------------------------------------------------------
 
-    /// Text size follows the fingers in half-point steps, and the grid with
-    /// it: a smaller size is more columns, which the far end is told about the
-    /// way it is told about a rotation.
+    /// Text size follows the fingers, in the same steps as the slider.
     @objc private func pinched(_ pinch: UIPinchGestureRecognizer) {
         switch pinch.state {
         case .began:
             pinchedFrom = textSize
         case .changed:
-            let wanted = min(max(pinchedFrom * pinch.scale, smallest), largest)
-            let stepped = (wanted * 2).rounded() / 2
+            let stepped = CGFloat(TextSize.clamped(Double(pinchedFrom * pinch.scale)))
             guard stepped != textSize else { return }
             textSize = stepped
-            painter = Painter(size: stepped)
-            tellGrid()
-            setNeedsDisplay()
-        case .ended:
-            UserDefaults.standard.set(Double(textSize), forKey: sizeKey)
+            onTextSize?(stepped)
         default:
             break
         }
-    }
-
-    private static func storedSize() -> CGFloat {
-        let stored = UserDefaults.standard.double(forKey: sizeKey)
-        return stored > 0 ? min(max(CGFloat(stored), smallest), largest) : cellPoints
     }
 
     private func showMenu(at point: CGPoint) {

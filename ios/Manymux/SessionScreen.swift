@@ -43,10 +43,16 @@ struct SessionScreen: View {
     @SwiftUI.State private var held = Held()
     @SwiftUI.State private var terminal: TerminalView?
     @SwiftUI.State private var toast = Toast()
+    @SwiftUI.State private var sizing = false
 
     var body: some View {
         VStack(spacing: 0) {
-            TerminalSurface(held: held, made: { terminal = $0 }) { view, grid in
+            TerminalSurface(
+                held: held,
+                textSize: model.textSize,
+                resized: { model.textSize = Double($0) },
+                made: { terminal = $0 }
+            ) { view, grid in
                 guard attachment.attach == nil, let phone = model.phone else { return }
                 view.onCannotScroll = { toast.say("\(name) is on a machine too old to scroll back") }
                 view.attach = attachment.open(phone, machine, name, grid)
@@ -65,7 +71,12 @@ struct SessionScreen: View {
                     .lineLimit(1)
                     .truncationMode(.middle)
             }
-            ToolbarItem(placement: .topBarTrailing) { switcher }
+            ToolbarItem(placement: .topBarTrailing) {
+                HStack {
+                    sizer
+                    switcher
+                }
+            }
         }
         .toast(toast, at: .top, on: .raised)
         // What else is running, asked while nobody is waiting on the answer,
@@ -106,6 +117,35 @@ struct SessionScreen: View {
         }
     }
 
+    /// The text size, with the session resizing behind it as it moves. A
+    /// pinch on the terminal does the same, but nothing on the screen says so.
+    private var sizer: some View {
+        @Bindable var model = model
+        return Button {
+            sizing = true
+        } label: {
+            Image(systemName: "textformat.size")
+        }
+        .accessibilityLabel("text size")
+        .popover(isPresented: $sizing) {
+            HStack(spacing: 12) {
+                Image(systemName: "textformat.size.smaller")
+                Slider(
+                    value: $model.textSize,
+                    in: TextSize.smallest...TextSize.largest,
+                    step: 0.5
+                )
+                .frame(width: 200)
+                Image(systemName: "textformat.size.larger")
+                Text(String(format: "%.1f", model.textSize))
+                    .font(.system(size: 12, design: .monospaced))
+                    .frame(width: 36, alignment: .trailing)
+            }
+            .padding()
+            .presentationCompactAdaptation(.popover)
+        }
+    }
+
     /// The way to the session next door, where a desktop has `Ctrl-] tab`.
     ///
     /// Opened on the listing already in hand rather than on a round trip, so
@@ -134,11 +174,15 @@ struct SessionScreen: View {
 /// The terminal view, inside SwiftUI.
 private struct TerminalSurface: UIViewRepresentable {
     let held: Held
+    let textSize: Double
+    let resized: (CGFloat) -> Void
     let made: (TerminalView) -> Void
     let grid: (TerminalView, Grid) -> Void
 
     func makeUIView(context: Context) -> TerminalView {
         let view = TerminalView(held: held)
+        view.textSize = CGFloat(textSize)
+        view.onTextSize = resized
         view.onGrid = { [weak view] grid in
             guard let view else { return }
             self.grid(view, grid)
@@ -150,10 +194,13 @@ private struct TerminalSurface: UIViewRepresentable {
         return view
     }
 
-    func updateUIView(_ view: TerminalView, context: Context) {}
+    func updateUIView(_ view: TerminalView, context: Context) {
+        view.textSize = CGFloat(textSize)
+    }
 
     static func dismantleUIView(_ view: TerminalView, coordinator: ()) {
         view.onGrid = nil
+        view.onTextSize = nil
         view.attach = nil
     }
 }
