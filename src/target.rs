@@ -189,11 +189,7 @@ impl Listing {
             .iter()
             .map(|host| host.host.as_str())
             .collect();
-        match hosts.len() {
-            0 => None,
-            1 => Some(format!("{} did not answer", hosts[0])),
-            _ => Some(format!("{} did not answer", hosts.join(", "))),
-        }
+        (!hosts.is_empty()).then(|| format!("{} did not answer", hosts.join(", ")))
     }
 }
 
@@ -384,7 +380,6 @@ pub(crate) async fn locate(socket: &Path, target: &str, bare: Bare) -> Result<Lo
         // The listing has to be fetched whatever else is known: a group spans
         // machines, so there is no telling which ones it is on without asking.
         let listing = everywhere(socket).await?;
-        note_reached(socket, listing.reached()).await;
         let groups = Groups::load()?;
         let (host, name) = match (&target.host, &target.session) {
             (Some(Named::Session(host)), Named::Group(_)) => (Some(host.as_str()), None),

@@ -115,18 +115,21 @@ Three consequences run through the whole codebase and are worth keeping intact:
 - `src/main.rs` is the CLI, and the only place that decides local versus remote:
   `open()` picks socket or ssh, `open_or_start()` is for commands that ask a
   machine to hold something new. Beside it and belonging to the binary rather
-  than the library: `src/target.rs` turns a typed word into a machine and a
-  session, `src/complete.rs` answers a tab, `src/completions.rs` works out
-  where a shell reads its completion script from.
+  than the library: `src/attaching.rs` is the attach loop (`do_attach`, the
+  hops, reconnecting), `src/checkpointing.rs` the `mm checkpoint` commands,
+  `src/target.rs` turns a typed word into a machine and a session,
+  `src/complete.rs` answers a tab, `src/completions.rs` works out where a shell
+  reads its completion script from.
 - **What the binary keeps is the asking and the words.** A command here is three
   things: putting questions to machines, deciding what the answers come to, and
   saying so. The middle one belongs in the library, where it can be tested
   without a fleet and where a mobile client can reach it. `mm checkpoint save` is
-  the worked example: `src/main.rs` lists the machines and asks each what its
-  sessions are doing (over ssh, `client::checkpoint::described` reads what
-  `/proc` sent back), `client::checkpoint::taking` decides what to write down
-  and what was lost, and `main` turns each reason it answers with into the line
-  somebody reads. A rule that lives in a `println!` is a rule no test can see.
+  the worked example: `src/checkpointing.rs` lists the machines and asks each
+  what its sessions are doing (over ssh, `client::checkpoint::described` reads
+  what `/proc` sent back), `client::checkpoint::taking` decides what to write
+  down and what was lost, and `checkpointing` turns each reason it answers with
+  into the line somebody reads. A rule that lives in a `println!` is a rule no
+  test can see.
 
 ### Rules that are easy to break
 
@@ -340,7 +343,7 @@ things that must simply never be done.
   back to, while that one is somebody pressing the key that means leave, and
   they have left whether or not the frame went.
 - **An attempt to get back has a deadline, because the waiting does not**
-  (`main::REACH_FOR`, ten seconds, applied by `reaching` and only once
+  (`attaching::REACH_FOR`, ten seconds, applied by `reaching` and only once
   `attached`). The wait reads the keyboard throughout; the *attempt* reads
   nothing, so one that never returns is a terminal frozen on `reconnecting` with
   a row that has stopped counting and a Ctrl-C nobody is reading. ssh gets there
@@ -362,7 +365,7 @@ things that must simply never be done.
   `cycle.current()`, which a hop has already moved. `open()` failing is a
   machine that never answered and is waited for; an error out of
   `Stream::attach` is a node that answered and has no such session
-  (`main::Missed`), which is a listing gone stale under the switch keys and the
+  (`attaching::Missed`), which is a listing gone stale under the switch keys and the
   one case that forgets the entry and undoes the hop. Reading every failure the
   second way meant a closed lid mid-hop dropped a live session from the cycle
   and ended the attach. `hopped` is cleared on a landing as well as by the
@@ -423,7 +426,7 @@ things that must simply never be done.
   back and a fresh attach, none of which this half may know. Which is why the
   key opens a list of machines rather than starting one where you stand: the
   machine is chosen from rows handed in, the way every other row in that popup
-  is, and what comes back is an id. `main::start_on` does the work.
+  is, and what comes back is an id. `attaching::start_on` does the work.
 - **Every key the client reads has three spellings, not one.** A program that
   asks for the kitty keyboard protocol (`CSI > 7 u`, which `pi` sends on
   startup) or for xterm's `modifyOtherKeys` changes how the *terminal* encodes
