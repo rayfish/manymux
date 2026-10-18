@@ -60,7 +60,7 @@ pub struct Agent {
 
 /// Start `program agent` on `host` and hand back its pipes.
 ///
-/// `host` is an ssh destination, so `gpu-box`, `dario@gpu-box` and any `Host`
+/// `host` is an ssh destination, so `gpu-box`, `user@gpu-box` and any `Host`
 /// alias from your ssh config all work, along with whatever `ProxyCommand` or
 /// `ProxyJump` that alias carries. `program` is how `mm` is named over there;
 /// see [`crate::client::PROGRAMS`] for why there is more than one answer.

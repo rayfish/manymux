@@ -45,7 +45,7 @@ pub fn this_machine() -> &'static str {
         } else {
             String::new()
         };
-        // `dario-mbp.local` and `box.example.com` both read better short.
+        // `laptop.local` and `box.example.com` both read better short.
         let short = name.split('.').next().unwrap_or("").trim();
         if short.is_empty() {
             LOCAL.to_string()
@@ -345,8 +345,8 @@ mod tests {
         let mut hosts = Hosts::default();
         hosts.add("gpu-box").unwrap();
         // ssh understands this, so manymux does too, with no parsing of its own.
-        hosts.add("dario@gpu-box").unwrap();
-        assert!(hosts.has("dario@gpu-box"));
+        hosts.add("user@gpu-box").unwrap();
+        assert!(hosts.has("user@gpu-box"));
 
         assert!(hosts.add("local").is_err(), "`local` is reserved");
         assert!(hosts.add(this_machine()).is_err());
