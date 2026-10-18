@@ -509,6 +509,11 @@ the shim links the library without the `desktop` feature, which is why the
 
 ## Conventions
 
+- **The apps ship only with a version, the desktop ships every push.** The
+  Android and iOS apps are released only when a new version is tagged
+  (`release.yml`, on `v*`), never from the nightly. `nightly.yml` builds the
+  `mm` binaries alone and keeps doing so on every push to master. Do not add
+  an app job to the nightly.
 - Comments say why, not what, and the interesting reasoning lives in module-level
   `//!` docs. When changing behaviour these docs are usually the thing that needs
   updating with it.
