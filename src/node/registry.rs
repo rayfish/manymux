@@ -1,4 +1,9 @@
 //! The set of live sessions on this host.
+//!
+//! It holds no event bus of its own. Each session publishes straight onto the
+//! node's, stamped with this machine's name, so one session's events reach
+//! every listener in the order it published them and there is no forwarding
+//! task between the two to fall behind.
 
 use std::collections::HashMap;
 use std::sync::atomic::AtomicUsize;
@@ -10,16 +15,12 @@ use tracing::info;
 
 use super::session::{Session, default_name};
 use crate::lock::held;
-use crate::proto::{Doing, EventKind, Peek, SessionEvent, SessionInfo, SpawnSpec};
-
-/// Events buffered per subscriber. A subscriber that falls this far behind is
-/// missing bells anyway, so it is dropped rather than allowed to hold memory.
-const EVENT_BACKLOG: usize = 256;
+use crate::proto::{Doing, EventKind, HostedEvent, Peek, SessionInfo, SpawnSpec};
 
 pub struct Registry {
     sessions: Mutex<HashMap<String, Arc<Session>>>,
-    /// Everything happening in every session on this host, in one stream.
-    events: broadcast::Sender<SessionEvent>,
+    /// The node's bus, handed to every session spawned here.
+    events: broadcast::Sender<HostedEvent>,
     /// Clients attached anywhere on this host, counted once for the machine
     /// rather than per session: a bell reaches whoever is sitting here, whichever
     /// session they happen to be looking at.
@@ -27,18 +28,12 @@ pub struct Registry {
 }
 
 impl Registry {
-    pub fn new() -> Arc<Self> {
-        let (events, _) = broadcast::channel(EVENT_BACKLOG);
+    pub fn new(events: broadcast::Sender<HostedEvent>) -> Arc<Self> {
         Arc::new(Self {
             sessions: Mutex::new(HashMap::new()),
             events,
             clients: Arc::new(AtomicUsize::new(0)),
         })
-    }
-
-    /// Listen to everything happening on this host.
-    pub fn subscribe(&self) -> broadcast::Receiver<SessionEvent> {
-        self.events.subscribe()
     }
 
     pub fn spawn(self: &Arc<Self>, spec: &SpawnSpec) -> Result<Arc<Session>> {
@@ -89,6 +84,13 @@ impl Registry {
         let mut sessions = held(&self.sessions);
         prune(&mut sessions);
         sessions.values().map(Arc::clone).collect()
+    }
+
+    /// How many sessions are live, without building a row for each.
+    pub fn count(&self) -> usize {
+        let mut sessions = held(&self.sessions);
+        prune(&mut sessions);
+        sessions.len()
     }
 
     pub fn list(&self) -> Vec<SessionInfo> {

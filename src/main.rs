@@ -20,7 +20,9 @@ use manymux::client::groups::Groups;
 use manymux::client::listed::{Listed, Snapshot};
 use manymux::client::switch::{Cycle, Located};
 use manymux::client::{Attached, Gone, Stream};
-use manymux::hosts::{Hosts, LOCAL, as_listed, is_this_machine, same_machine, this_machine};
+use manymux::hosts::{
+    Hosts, LOCAL, as_listed, is_this_machine, qualified, same_machine, this_machine,
+};
 use manymux::lock::held as held_lock;
 use manymux::node::{Config, Node};
 use manymux::proto::{Doing, HostedSession, Request, Response, SpawnSpec};
@@ -33,7 +35,7 @@ mod completions;
 mod target;
 
 use target::{
-    Bare, Listing, Started, Unreachable, answer_from, everywhere, locate, note_reached, qualified,
+    Bare, Listing, Started, Unreachable, answer_from, everywhere, locate, note_reached,
     sessions_on, where_to_start,
 };
 

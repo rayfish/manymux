@@ -103,17 +103,11 @@ impl Groups {
     }
 
     fn read(path: &Path) -> Result<Self> {
-        if !path.exists() {
-            return Ok(Self::default());
-        }
-        let text =
-            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-        toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))
+        config::load_toml(path)
     }
 
     fn write_to(&self, path: &Path) -> Result<()> {
-        let text = toml::to_string_pretty(self).context("encoding the group list")?;
-        config::write_private_file(path, text.as_bytes())
+        config::save_toml(path, self, "the group list")
     }
 
     /// Read the file, change it, and write it back, in that order.

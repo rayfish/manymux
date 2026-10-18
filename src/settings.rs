@@ -10,7 +10,7 @@
 
 use std::path::PathBuf;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::config;
@@ -116,13 +116,7 @@ impl Default for Settings {
 impl Settings {
     /// What is on disk, or the defaults if there is nothing there yet.
     pub fn load() -> Result<Self> {
-        let path = Self::path();
-        if !path.exists() {
-            return Ok(Self::default());
-        }
-        let text = std::fs::read_to_string(&path)
-            .with_context(|| format!("reading {}", path.display()))?;
-        toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))
+        config::load_toml(&Self::path())
     }
 
     /// What is on disk, or the defaults if it cannot be read at all.
@@ -135,8 +129,7 @@ impl Settings {
     }
 
     pub fn save(&self) -> Result<()> {
-        let text = toml::to_string_pretty(self).context("encoding the settings")?;
-        config::write_private_file(&Self::path(), text.as_bytes())
+        config::save_toml(&Self::path(), self, "the settings")
     }
 
     pub fn path() -> PathBuf {
@@ -180,7 +173,7 @@ pub fn notify_wanted() -> bool {
 }
 
 /// Read a setting written the way a person writes one.
-fn flag(key: &str, value: &str) -> Result<bool> {
+pub(crate) fn flag(key: &str, value: &str) -> Result<bool> {
     match value.trim().to_ascii_lowercase().as_str() {
         "on" | "true" | "yes" | "1" => Ok(true),
         "off" | "false" | "no" | "0" => Ok(false),

@@ -514,14 +514,6 @@ fn on_that_machine(listing: &Listing, machine: &str) -> Result<Located> {
     bail!("nothing is running on {machine}; `mm n {machine} <command>` starts something there")
 }
 
-pub(crate) fn qualified(host: &str, name: &str) -> String {
-    if is_this_machine(host) {
-        name.to_string()
-    } else {
-        format!("{host}/{name}")
-    }
-}
-
 /// Where a `mm new` should run, and what it should run there.
 pub(crate) struct Started {
     pub(crate) host: String,

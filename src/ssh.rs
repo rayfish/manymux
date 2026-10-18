@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use std::process::Stdio;
 
 use anyhow::{Context, Result, bail};
-use tokio::process::{Child, Command};
+use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 
 /// How long a shared connection lingers after the last command using it.
 ///
@@ -51,11 +51,11 @@ const ALIVE_TRIES: &str = "3";
 /// A running `ssh <host> mm agent`, and its pipes.
 pub struct Agent {
     pub child: Child,
-    pub stdin: tokio::process::ChildStdin,
-    pub stdout: tokio::process::ChildStdout,
+    pub stdin: ChildStdin,
+    pub stdout: ChildStdout,
     /// Piped by [`agent`] and left for the caller to deal with, `None` from
     /// [`agent_quietly`], which throws it away at the source.
-    pub stderr: Option<tokio::process::ChildStderr>,
+    pub stderr: Option<ChildStderr>,
 }
 
 /// Start `program agent` on `host` and hand back its pipes.
