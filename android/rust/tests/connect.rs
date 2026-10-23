@@ -16,12 +16,13 @@ mod sshd;
 mod world;
 
 use std::slice::from_ref;
+use std::sync::Arc;
 
 use agent::Agency;
 use manymux::proto::{Size, SpawnSpec};
 use manymux_android::agent::Agent;
 use manymux_android::keys::{Identity, KnownHosts, Verdict, generate};
-use manymux_android::machine::{Connection, Machine, Rebuff};
+use manymux_android::machine::{Connection, Connections, Machine, Rebuff};
 use manymux_android::ssh::{reach, start};
 use russh::keys::{PrivateKey, PublicKey};
 use sshd::Sshd;
@@ -130,6 +131,35 @@ impl Reachable {
     async fn connect(&self) -> anyhow::Result<Connection> {
         Connection::open(&self.machine, &self.identity, &self.known).await
     }
+}
+
+#[tokio::test]
+async fn pooled_connections_keep_accounts_separate() {
+    let reachable = Reachable::with("connect-accounts", Mm::OnPath).await;
+    let pool = Connections::default();
+    let first = pool
+        .to(&reachable.machine, &reachable.identity, &reachable.known)
+        .await
+        .unwrap();
+    let again = pool
+        .to(&reachable.machine, &reachable.identity, &reachable.known)
+        .await
+        .unwrap();
+    assert!(Arc::ptr_eq(&first, &again));
+
+    let other_account = Machine {
+        user: "another-account".to_string(),
+        ..reachable.machine.clone()
+    };
+    let other = pool
+        .to(&other_account, &reachable.identity, &reachable.known)
+        .await
+        .unwrap();
+
+    assert!(!Arc::ptr_eq(&first, &other));
+    assert_eq!(reachable.sshd.connections(), 2);
+    assert_eq!(reach(&*first).await.unwrap().sessions.len(), 1);
+    assert_eq!(reach(&*other).await.unwrap().sessions.len(), 1);
 }
 
 #[tokio::test]

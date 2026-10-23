@@ -634,7 +634,9 @@ async fn a_client_can_scroll_back_through_what_a_session_printed() {
         })
         .await
         .unwrap();
-    client.read_until("line 60\r\n").await;
+    // Attaching can catch the final line in the screen dump, whose padding
+    // comes between the text and its newline.
+    client.read_until("line 60").await;
 
     let view = client
         .ask_for_view(&ViewRequest {

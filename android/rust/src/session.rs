@@ -17,6 +17,8 @@
 //!
 //! A drag goes to mouse tracking first, then to cursor keys on the alternate
 //! screen, and otherwise to the node's history.
+//! A grid changed during an attach attempt is sent once that attempt lands;
+//! the request in flight still carries the grid it started with.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -342,6 +344,7 @@ struct Surfaces {
 struct Riding {
     _connection: Arc<Connection>,
     attached: Attached,
+    wanted: Size,
 }
 
 /// Reach the session, attach, and keep doing so.
@@ -560,6 +563,7 @@ async fn attach(attaching: Attaching) -> Result<Riding, Missed> {
     Ok(Riding {
         _connection: connection,
         attached,
+        wanted: attaching.wanted,
     })
 }
 
@@ -587,6 +591,7 @@ async fn pump(
 ) -> Ending {
     let screen = &surfaces.screen;
     let settled = riding.attached.size;
+    let mut pending_resize = (*wanted != riding.wanted).then_some(*wanted);
     let SessionHalves {
         mut reader,
         mut writer,
@@ -676,13 +681,19 @@ async fn pump(
                 Ok(_) => {}
                 Err(_) => break Ending::Lost,
             },
-            asked = said.recv() => match asked {
+            asked = async {
+                match pending_resize {
+                    Some(size) => Some(Say::Resize(size)),
+                    None => said.recv().await,
+                }
+            } => match asked {
                 Some(Say::Input(bytes)) => {
                     if writer.send_input(&bytes).await.is_err() {
                         break Ending::Lost;
                     }
                 }
                 Some(Say::Resize(size)) => {
+                    pending_resize = None;
                     *wanted = size;
                     // A window of a different height is one the block in hand
                     // may no longer cover, and the view is showing lines

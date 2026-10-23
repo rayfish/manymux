@@ -8,6 +8,8 @@
 //!
 //! What comes out the other end is the same pair of byte halves, so everything
 //! above it is the library's unchanged.
+//! Pooled connections belong to an account as well as an address: a second
+//! user on the same server must authenticate separately.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -39,7 +41,7 @@ const HOLD: usize = 64 * 1024;
 /// Only the app knows this. It is the phone's stand-in for `~/.ssh/config`, and
 /// the reason `src/hosts.rs`'s rule that nothing stores an address survives:
 /// the library still stores none.
-#[derive(Clone, Debug, uniffi::Record)]
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
 pub struct Machine {
     /// A free-form string rather than a parsed host, which is the one place
     /// this crate takes the loose type on purpose: it crosses the boundary as
@@ -351,7 +353,7 @@ impl Connection {
 /// pays it twice.
 ///
 /// One machine, because that is what this version reaches. A second entry is a
-/// map keyed by [`Machine::at`] and nothing else about this changes.
+/// map keyed by [`Machine`] and nothing else about this changes.
 #[derive(Default)]
 pub struct Connections {
     /// Async, and the one lock here that is: what it protects is the thing
@@ -363,7 +365,7 @@ pub struct Connections {
 
 /// One machine's connection, and which machine it is to.
 struct Held {
-    at: String,
+    machine: Machine,
     connection: Arc<Connection>,
 }
 
@@ -376,17 +378,16 @@ impl Connections {
         identity: &Identity,
         known: &KnownHosts,
     ) -> Result<Arc<Connection>> {
-        let at = machine.at();
         let mut holding = self.holding.lock().await;
         if let Some(held) = holding.as_ref()
-            && held.at == at
+            && held.machine == *machine
             && !held.connection.is_closed()
         {
             return Ok(Arc::clone(&held.connection));
         }
         let connection = Arc::new(Connection::open(machine, identity, known).await?);
         *holding = Some(Held {
-            at,
+            machine: machine.clone(),
             connection: Arc::clone(&connection),
         });
         Ok(connection)

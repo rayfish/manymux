@@ -6,6 +6,9 @@
 //! the session: the node keeps the title the program set, so `mm ls` still shows
 //! it unprefixed.
 //!
+//! A screen snapshot starts a new parser stream, since lost output can leave
+//! the previous stream inside an unfinished escape sequence.
+//!
 //! Everything here is string building and parsing, kept out of
 //! [`super::attach`] so it can be tested without a terminal.
 
@@ -833,6 +836,22 @@ impl Filter {
         out
     }
 
+    /// Replace the output stream with a complete screen and its mode replay.
+    pub fn snapshot(&mut self, bytes: &[u8]) -> Vec<u8> {
+        let releases = self.keyboard.reports_releases();
+        self.state = State::Ground;
+        self.held.clear();
+        self.owed = false;
+        self.alternate = false;
+        self.mouse = false;
+        self.keyboard = Keyboard::default();
+        let painted = self.feed(bytes);
+        self.releases_ended |= releases && !self.keyboard.reports_releases();
+        self.take_switched();
+        self.take_dirty();
+        painted
+    }
+
     /// Whether the mark and its scrolling region may have been undone since this
     /// was last asked. Clears the flag.
     pub fn take_dirty(&mut self) -> bool {
@@ -1019,6 +1038,26 @@ mod tests {
 
     fn through(filter: &mut Filter, input: &str) -> String {
         String::from_utf8(filter.feed(input.as_bytes())).unwrap()
+    }
+
+    #[test]
+    fn a_snapshot_replaces_an_unfinished_sequence_and_stale_modes() {
+        for prefix in [
+            b"\x1b]0;unfinished".as_slice(),
+            b"\x1bPunfinished",
+            b"\x1b[31;",
+        ] {
+            let mut filter = Filter::default();
+            filter.feed(b"\x1b[?1049h\x1b[?1000h\x1b[>3u");
+            filter.feed(prefix);
+            assert_eq!(filter.snapshot(b"new screen"), b"new screen");
+            assert!(filter.at_boundary());
+            assert!(!filter.on_alternate());
+            assert!(!filter.session_mouse());
+            assert!(!filter.reports_key_releases());
+            assert!(filter.take_releases_ended());
+            assert!(!filter.take_switched());
+        }
     }
 
     /// The terminal's own cursor is the session's for as long as the session is

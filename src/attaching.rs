@@ -4,6 +4,8 @@
 //! switch keys and the popup ask for, the listing they are drawn from, and the
 //! wait for a connection that dropped. The terminal itself is
 //! `client::attach`'s; this is the half that knows hosts, groups and pids.
+//! A transport lost during the attach handshake is unreachable, rather than
+//! evidence that the session disappeared from a switch listing.
 
 use std::collections::HashSet;
 use std::fmt::{self, Display, Formatter};
@@ -757,7 +759,13 @@ async fn attach_to(
     stream
         .attach(&target.session, attach::session_size(), history, watching)
         .await
-        .map_err(Missed::Gone)
+        .map_err(|error| {
+            if Gone::marked(&error) {
+                Missed::Unreachable(error)
+            } else {
+                Missed::Gone(error)
+            }
+        })
 }
 
 /// Start a session on the machine picked from the list, for the control key
@@ -978,6 +986,29 @@ mod tests {
             .expect("the listing stays available for the popup");
         assert!(!task.is_finished());
         task.abort();
+    }
+
+    #[tokio::test]
+    async fn a_connection_lost_during_attach_does_not_forget_the_session() {
+        let suffix = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("mm-handshake-{suffix}.sock"));
+        let listener = UnixListener::bind(&path).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut read = FrameReader::new(stream);
+            let frame = read.next().await.unwrap().unwrap();
+            assert!(matches!(
+                proto::decode::<Request>(&frame.body).unwrap(),
+                Request::Attach { .. }
+            ));
+        });
+        let result = attach_to(&path, &Located::new(LOCAL, "build"), 0, false).await;
+        server.await.unwrap();
+        std::fs::remove_file(path).unwrap();
+        assert!(matches!(result, Err(Missed::Unreachable(_))));
     }
 
     #[tokio::test]

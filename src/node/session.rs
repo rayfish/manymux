@@ -5,6 +5,8 @@
 //! the session's whole life, so a client going away is invisible to the child:
 //! no SIGHUP, no EOF on stdin, nothing. That is the entire point of the
 //! project, and it is why the PTY is owned by the server rather than proxied.
+//! A replacement screen and its output subscription are taken under the same
+//! lock as an attach, so bytes already in the screen are never replayed over it.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -279,10 +281,12 @@ impl Attachment {
         held(&self.session.state).scanner.bracketed_paste()
     }
 
-    /// Re-read the screen after a lag, so the client can repaint instead of
-    /// rendering a hole.
-    pub fn resync(&self) -> String {
-        held(&self.session.state).repaint()
+    /// Replace the screen and resume output from the same instant. Queued
+    /// bytes are already represented in the dump and must not be replayed.
+    pub(super) fn resync(&self, output: &mut broadcast::Receiver<Arc<[u8]>>) -> String {
+        let state = held(&self.session.state);
+        *output = self.session.output_tx.subscribe();
+        state.repaint()
     }
 
     /// A window of the session's history, for a client scrolling back through
@@ -728,6 +732,84 @@ pub fn default_name(spec: &SpawnSpec) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::duplex;
+
+    use crate::node::registry::Registry;
+    use crate::proto::{FrameReader, tag};
+
+    fn quiet_session(exit_rx: watch::Receiver<Option<i32>>) -> Arc<Session> {
+        let (input_tx, _input_rx) = mpsc::unbounded_channel();
+        let (output_tx, _) = broadcast::channel(OUTPUT_BACKLOG);
+        let (events, _) = broadcast::channel(16);
+        Arc::new(Session {
+            name: Mutex::new("build".into()),
+            command: "shell".into(),
+            pid: 0,
+            started: SystemTime::now(),
+            input_tx,
+            output_tx,
+            state: Mutex::new(State::new(Size::new(80, 24))),
+            exit_rx,
+            events,
+            host_clients: Arc::new(AtomicUsize::new(0)),
+            next_client: AtomicU64::new(0),
+        })
+    }
+
+    #[test]
+    fn a_requested_snapshot_replaces_queued_output() {
+        let (_exit_tx, exit_rx) = watch::channel(None);
+        let session = quiet_session(exit_rx);
+        let mut attached = session.attach(Size::new(80, 24), 0, false);
+        session.ingest(b"before");
+        let screen = attached.attachment.resync(&mut attached.output);
+        assert!(screen.contains("before"));
+        assert!(matches!(
+            attached.output.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+        session.ingest(b"after");
+        assert_eq!(&*attached.output.try_recv().unwrap(), b"after");
+    }
+
+    #[tokio::test]
+    async fn a_lagged_client_gets_one_snapshot_then_only_new_output() {
+        let (_exit_tx, exit_rx) = watch::channel(None);
+        let session = quiet_session(exit_rx);
+        let attached = session.attach(Size::new(80, 24), 0, false);
+        for _ in 0..OUTPUT_BACKLOG * 2 {
+            session.ingest(b"old\r\n");
+        }
+        let (client, server) = duplex(64 * 1024);
+        let (read, mut write) = tokio::io::split(server);
+        let events = session.events.clone();
+        let registry = Registry::new(events.clone());
+        let task = tokio::spawn(async move {
+            super::super::pump_attachment(
+                attached,
+                &registry,
+                events.subscribe(),
+                &mut FrameReader::new(read),
+                &mut write,
+            )
+            .await
+        });
+        let (read, mut write) = tokio::io::split(client);
+        let mut frames = FrameReader::new(read);
+        assert_eq!(frames.next().await.unwrap().unwrap().tag, tag::DATA);
+        let recovered = frames.next().await.unwrap().unwrap();
+        assert_eq!(recovered.tag, tag::RESYNC, "a dump is not live output");
+        assert!(String::from_utf8_lossy(&recovered.body).contains("old"));
+
+        session.ingest(b"new");
+        let next = frames.next().await.unwrap().unwrap();
+        assert_eq!(next.tag, tag::DATA);
+        assert_eq!(next.body, b"new", "queued output predates the snapshot");
+        proto::write_frame(&mut write, tag::DETACH, &[])
+            .await
+            .unwrap();
+        assert!(!task.await.unwrap().unwrap());
+    }
 
     #[test]
     fn a_bare_session_is_an_interactive_login_shell() {

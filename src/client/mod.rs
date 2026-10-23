@@ -379,15 +379,20 @@ impl Stream {
                 // On a stream that keeps what ssh said, this is where it is
                 // worth having: ssh's own line about the machine says what a
                 // broken pipe and an exit status can only be read as.
+                let closed = Error::new(
+                    ErrorKind::UnexpectedEof,
+                    "the host closed the connection without responding",
+                );
                 if let Some(said) = self.said() {
-                    bail!(said);
+                    return Err(anyhow::Error::new(closed).context(said));
                 }
                 if let Some(carrier) = &mut self.carrier
                     && let Ok(Some(status)) = carrier.child.try_wait()
                 {
-                    bail!("ssh exited with {status} before answering");
+                    return Err(anyhow::Error::new(closed)
+                        .context(format!("ssh exited with {status} before answering")));
                 }
-                bail!("the host closed the connection without responding");
+                return Err(closed.into());
             };
             // A frame came back, so this is a machine with an `mm` on it and
             // the probing is over. Anything ssh has to say from here is worth
@@ -553,7 +558,7 @@ impl Stream {
             history,
             read_only,
         };
-        let response = self.request(&request).await?;
+        let response = self.request(&request).await.map_err(Gone::mark)?;
         Attached::answered(
             Transport {
                 read: self.read,
@@ -1058,6 +1063,43 @@ mod tests {
             write: Box::new(stream),
             _carrier: None,
         }
+    }
+
+    #[tokio::test]
+    async fn a_connection_lost_before_the_attach_answer_is_marked() {
+        let stream = Stream::from_halves(Box::new(tokio::io::empty()), Box::new(tokio::io::sink()));
+        let error = stream
+            .attach("build", Size::new(80, 24), 0, false)
+            .await
+            .err()
+            .unwrap();
+        assert!(Gone::marked(&error), "{error:#}");
+        assert_eq!(
+            error.downcast_ref::<Error>().unwrap().kind(),
+            ErrorKind::UnexpectedEof
+        );
+    }
+
+    #[tokio::test]
+    async fn an_attach_refusal_is_not_a_connection_failure() {
+        let mut answer = Vec::new();
+        proto::write_msg(
+            &mut answer,
+            tag::RESPONSE,
+            &Response::Error("no such session".into()),
+        )
+        .await
+        .unwrap();
+        let stream = Stream::from_halves(
+            Box::new(io::Cursor::new(answer)),
+            Box::new(tokio::io::sink()),
+        );
+        let error = stream
+            .attach("build", Size::new(80, 24), 0, false)
+            .await
+            .err()
+            .unwrap();
+        assert!(!Gone::marked(&error), "{error:#}");
     }
 
     /// The case the mark exists for. A keystroke typed at an ssh whose network

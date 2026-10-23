@@ -11,6 +11,8 @@
 //! A parked client keeps only its transport: dropping the attachment precedes
 //! the acknowledgement, so idle connections cannot resize sessions or silence
 //! desktop notifications.
+//! A screen replacing missed output uses `RESYNC`, and starts a fresh output
+//! subscription at that screen, so its switches and old bytes cannot replay.
 
 pub mod events;
 mod history;
@@ -518,7 +520,7 @@ where
                     // is showing. This model is the only place the right
                     // picture still exists.
                     tag::RESYNC => {
-                        send(&mut write, tag::RESYNC, attachment.resync().as_bytes()).await?
+                        send(&mut write, tag::RESYNC, attachment.resync(&mut output).as_bytes()).await?
                     }
                     // A client scrolling back through what the session printed.
                     // Answered from the model, which is the only place those
@@ -587,7 +589,7 @@ where
                 // instead of showing it a gap.
                 Err(RecvError::Lagged(n)) => {
                     debug!("client lagged {n} chunks, resyncing");
-                    send(&mut write, tag::DATA, attachment.resync().as_bytes()).await?;
+                    send(&mut write, tag::RESYNC, attachment.resync(&mut output).as_bytes()).await?;
                 }
                 Err(RecvError::Closed) => break,
             },

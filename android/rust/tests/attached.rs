@@ -239,6 +239,27 @@ async fn alternate_screen_drags_reach_the_program_as_cursor_keys() {
 }
 
 #[tokio::test]
+async fn a_resize_during_the_first_connection_reaches_the_node() {
+    // This test uses the current-thread runtime. The session task cannot run
+    // until this function yields, so the resize precedes its first handshake.
+    let session = attached("attach-initial-resize", How::Steady).await;
+    session.resize(Size::new(30, 6));
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let frame = session.take_frame();
+            if frame.cols == 20 && frame.rows == 6 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the node must receive the grid chosen while connecting");
+    session.detach();
+}
+
+#[tokio::test]
 async fn a_resize_is_told_to_the_far_end() {
     let session = attached("attach-resize", How::Steady).await;
     until_it_says(&session, "ready").await;

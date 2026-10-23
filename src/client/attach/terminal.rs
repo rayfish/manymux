@@ -8,6 +8,8 @@
 //! end in the middle of an escape sequence.
 //! iTerm2 is never asked for key releases because it can deliver a shortcut's
 //! release after the program that requested it has exited.
+//! Screen snapshots replace parser state and stay behind open client surfaces.
+//! A closed popup feed stays dormant until the attachment ends.
 //! Switching releases the node attachment but keeps a capable host's transport.
 //! The caller caches that transport; this loop never keeps hidden attachments.
 
@@ -523,22 +525,6 @@ const NOTICE_FOR: Duration = Duration::from_secs(5);
 /// step instead, where it costs a bigger jump and not another screenful.
 const CHASE_EVERY: Duration = Duration::from_millis(50);
 
-/// Ask the node for the session's screen, and note that it owes an erased,
-/// homed one to paint it onto.
-///
-/// One call because they are one act. A dump starts painting wherever the
-/// cursor is and never erases, so a screen asked for and painted where it fell
-/// walks its own first rows off the top of the terminal, one `\r\n` at a time:
-/// a full-screen program leaves the cursor at the bottom on its way out, and
-/// what came back was the last lines of the session sitting under a blank half.
-/// These were two statements once, at four call sites, and the one place the
-/// second was missing showed nothing until somebody quit a pager.
-async fn ask_for_the_screen(writer: &mut SessionWriter, owed: &mut usize) -> Result<()> {
-    writer.resync().await?;
-    *owed += 1;
-    Ok(())
-}
-
 /// What the client says to take the mouse: report buttons and the moves made
 /// with one held, in the SGR spelling.
 ///
@@ -1021,10 +1007,6 @@ async fn pump(
     // that frame is a screen dump and paints by absolute coordinates from the
     // top, straight over anything already there.
     let mut greet = mode == Mode::Control;
-    // Screens still owed for a resize, and so still to be painted onto one
-    // wiped first. Counted rather than flagged because a drag across the
-    // desktop asks more than once before the first answer arrives.
-    let mut owed = 0usize;
     // When the notice on the row stops being worth showing. Already set if the
     // caller arrived with something to say, which needs the same few seconds
     // as one a key here put there.
@@ -1356,7 +1338,7 @@ async fn pump(
                     Some(Action::Scroll(Scroll::Leave)) => {
                         scrolling = None;
                         status.set_scrolled(None);
-                        ask_for_the_screen(&mut writer, &mut owed).await?;
+                        writer.resync().await?;
                         restate = true;
                     }
                     // Typing, and what typing turns into. The needle lives
@@ -1435,7 +1417,7 @@ async fn pump(
                             );
                         if landed {
                             close_view(&mut scrolling, &mut status, keys);
-                            ask_for_the_screen(&mut writer, &mut owed).await?;
+                            writer.resync().await?;
                             restate = true;
                             settle(&mut stdout, &output, &status, &mut pending, &mut restate)
                                 .await?;
@@ -1514,7 +1496,7 @@ async fn pump(
                         }
                         if done {
                             close_view(&mut scrolling, &mut status, keys);
-                            ask_for_the_screen(&mut writer, &mut owed).await?;
+                            writer.resync().await?;
                             restate = true;
                             settle(&mut stdout, &output, &status, &mut pending, &mut restate)
                                 .await?;
@@ -1635,7 +1617,7 @@ async fn pump(
                         // switch swallowed while it ran is only now
                         // answerable.
                         if output.take_switched() {
-                            ask_for_the_screen(&mut writer, &mut owed).await?;
+                            writer.resync().await?;
                         }
                         // The same discipline as everywhere else: never
                         // into the middle of a sequence the session is
@@ -1646,6 +1628,11 @@ async fn pump(
                             stdout.flush().await?;
                             restate = false;
                         }
+                        // A snapshot during the paste reset the terminal modes.
+                        // Reassert ownership even when the key flag did not change.
+                        keys.set_wheel(false);
+                        let ours = wheel_is_ours(history, output.session_mouse());
+                        own_the_wheel(&mut stdout, keys, ours).await?;
                         if let Pasted::Ended(outcome) = pasted {
                             return Ok(outcome);
                         }
@@ -1672,7 +1659,7 @@ async fn pump(
                 {
                     popup = None;
                     status.set_popup(Popped::None);
-                    ask_for_the_screen(&mut writer, &mut owed).await?;
+                    writer.resync().await?;
                     restate = true;
                     settle(&mut stdout, &output, &status, &mut pending, &mut restate).await?;
                 }
@@ -1689,11 +1676,8 @@ async fn pump(
             // A listing has landed. Swapped in under the highlight rather than
             // reopening the popup, so a session ending three rows up does not
             // move what Enter would take.
-            landed = fresh.changed() => {
-                if landed.is_err() {
-                    continue;
-                }
-                rows = fresh.borrow_and_update().clone();
+            landed = changed_rows(&mut fresh) => {
+                rows = landed;
                 if let Some(up) = popup.as_mut() {
                     up.refreshed(&rows);
                     draw_popup(&mut stdout, &mut popup, &mut status, &mut restate).await?;
@@ -1746,7 +1730,7 @@ async fn pump(
                     // never fires: the terminal made the switch itself and
                     // kept both screens.
                     if output.take_switched() && painted {
-                        ask_for_the_screen(&mut writer, &mut owed).await?;
+                        writer.resync().await?;
                     }
                     painted = true;
                     // Only between sequences: a repaint written into the
@@ -1779,30 +1763,18 @@ async fn pump(
                     // Not onto an open box: this is a whole screen and would
                     // take it with it. Closing the box asks for another, so
                     // what is dropped here is painted a moment later anyway.
-                    let ours = popup.is_none();
-                    if owed > 0 {
-                        owed -= 1;
-                        if ours {
-                            // What the dump replays is what the program has
-                            // on, so what it turned off since goes off here:
-                            // see `given_back`.
-                            stdout.write_all(given_back().as_bytes()).await?;
-                            // Which includes the mouse, and the client's hold
-                            // on it is not the session's to lose.
-                            if keys.wheel() {
-                                stdout.write_all(WHEEL_OURS.as_bytes()).await?;
-                            }
-                            stdout.write_all(REGROWN.as_bytes()).await?;
-                        }
+                    let bytes = screen_repaint(
+                        &mut output,
+                        &bytes,
+                        popup.is_some() || scrolling.is_some(),
+                        history,
+                    );
+                    if popup.is_none() && scrolling.is_none() {
+                        keys.set_wheel(wheel_is_ours(history, output.session_mouse()));
                     }
-                    let bytes = output.feed(&bytes);
                     drop_finished_releases(&mut output, keys);
-                    if ours {
-                        stdout.write_all(&bytes).await?;
-                    }
+                    stdout.write_all(&bytes).await?;
                     on_alternate.store(output.on_alternate(), Ordering::Relaxed);
-                    output.take_switched();
-                    output.take_dirty();
                     // The dump put the session's own screen back, mark and
                     // region included, so both are ours to draw again.
                     restate = true;
@@ -1891,7 +1863,7 @@ async fn pump(
                     // release would have done had it been able to answer.
                     if done {
                         close_view(&mut scrolling, &mut status, keys);
-                        ask_for_the_screen(&mut writer, &mut owed).await?;
+                        writer.resync().await?;
                         restate = true;
                         settle(&mut stdout, &output, &status, &mut pending, &mut restate)
                             .await?;
@@ -1979,7 +1951,7 @@ async fn pump(
                     stdout.flush().await?;
                     continue;
                 }
-                ask_for_the_screen(&mut writer, &mut owed).await?;
+                writer.resync().await?;
             }
             // A drag is being held against the top or bottom of the window,
             // which is a hand asking for the lines past it. The pointer is
@@ -2033,6 +2005,33 @@ async fn pump(
     }
 }
 
+/// A missing feed has no more updates, so keep its select arm dormant.
+async fn changed_rows(fresh: &mut tokio::sync::watch::Receiver<Rows>) -> Rows {
+    if fresh.changed().await.is_err() {
+        std::future::pending().await
+    } else {
+        fresh.borrow_and_update().clone()
+    }
+}
+
+/// A snapshot replaces the session picture, including after lost output.
+fn screen_repaint(output: &mut Filter, bytes: &[u8], covered: bool, history: bool) -> Vec<u8> {
+    let bytes = output.snapshot(bytes);
+    if covered {
+        return Vec::new();
+    }
+    // Cancel an escape or string whose remaining output was lost.
+    let mut repaint = String::from("\x18\x1b\\");
+    repaint.push_str(&undone());
+    repaint.push_str(REGROWN);
+    let mut repaint = repaint.into_bytes();
+    repaint.extend(bytes);
+    if wheel_is_ours(history, output.session_mouse()) {
+        repaint.extend_from_slice(WHEEL_OURS.as_bytes());
+    }
+    repaint
+}
+
 /// Ask for the block the view now wants, if there is one, and answer with the
 /// view painted from what it holds meanwhile.
 ///
@@ -2060,7 +2059,7 @@ async fn put_up(stdout: &mut Stdout, painted: &str, status: &Status, size: Size)
 }
 
 /// Take the view down and give the keys back to the session. What the view
-/// was drawn over is the caller's to ask for again ([`ask_for_the_screen`]).
+/// was drawn over is the caller's to ask for again with [`SessionWriter::resync`].
 fn close_view(scrolling: &mut Option<Scrollback>, status: &mut Status, keys: &mut KeyFilter) {
     *scrolling = None;
     status.set_scrolled(None);
@@ -2243,8 +2242,13 @@ async fn paste(
                 return Ok(Pasted::Done);
             }
             update = reader.next() => match update? {
-                Update::Output(bytes) | Update::Screen(bytes) => {
+                Update::Output(bytes) => {
                     stdout.write_all(&output.feed(&bytes)).await?;
+                    stdout.flush().await?;
+                }
+                Update::Screen(bytes) => {
+                    stdout.write_all(&screen_repaint(output, &bytes, false, false)).await?;
+                    stdout.write_all(status.repaint(terminal_size()).as_bytes()).await?;
                     stdout.flush().await?;
                 }
                 // Left unanswered: the writing half is busy with the paste,
@@ -2278,6 +2282,68 @@ mod tests {
     use crate::client::attach::Motion;
     use crate::proto::{self, FrameReader, Response, tag};
     use tokio::io::split;
+
+    #[tokio::test]
+    async fn a_closed_popup_feed_waits_instead_of_repeatedly_waking() {
+        let (send, mut receive) = tokio::sync::watch::channel(Rows::default());
+        drop(send);
+        tokio::select! {
+            biased;
+            _ = changed_rows(&mut receive) => panic!("a closed feed has no rows to deliver"),
+            _ = std::future::ready(()) => {}
+        }
+    }
+
+    #[test]
+    fn a_recovery_snapshot_replaces_the_screen_and_cancels_an_unfinished_string() {
+        use avt::Vt;
+
+        for interrupted in ["", "\x1bPunfinished", "\x1b]0;unfinished", "\x1b[31;"] {
+            let mut terminal = Vt::builder().size(20, 4).build();
+            let mut output = Filter::default();
+            let before = format!("old content\r\nleftovers\r\nmore{interrupted}");
+            terminal.feed_str(&String::from_utf8(output.feed(before.as_bytes())).unwrap());
+            let painted = screen_repaint(&mut output, b"new", false, false);
+            terminal.feed_str(&String::from_utf8(painted).unwrap());
+            let lines: Vec<_> = terminal.lines().map(|line| line.text()).collect();
+            assert_eq!(lines[0].trim_end(), "new", "{interrupted:?}");
+            assert!(
+                lines[1..].iter().all(|line| line.trim().is_empty()),
+                "{lines:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_recovery_snapshot_restores_default_wrapping_after_lost_mode_changes() {
+        use avt::Vt;
+
+        let mut terminal = Vt::builder().size(4, 3).build();
+        let mut output = Filter::default();
+        terminal.feed_str("\x1b[?7l");
+        let painted = screen_repaint(&mut output, b"abcde", false, false);
+        terminal.feed_str(&String::from_utf8(painted).unwrap());
+        let lines: Vec<_> = terminal.lines().map(|line| line.text()).collect();
+        assert_eq!(lines[0].trim_end(), "abcd");
+        assert_eq!(lines[1].trim_end(), "e");
+    }
+
+    #[test]
+    fn a_snapshot_reassigns_the_wheel_from_the_replayed_session_modes() {
+        let mut output = Filter::default();
+        let painted = screen_repaint(&mut output, b"new", false, true);
+        assert!(painted.ends_with(WHEEL_OURS.as_bytes()));
+        let painted = screen_repaint(&mut output, b"\x1b[?1000hnew", false, true);
+        assert!(!painted.ends_with(WHEEL_OURS.as_bytes()));
+        assert!(output.session_mouse());
+    }
+
+    #[test]
+    fn a_recovery_snapshot_does_not_paint_over_a_client_surface() {
+        let mut output = Filter::default();
+        assert!(screen_repaint(&mut output, b"session", true, false).is_empty());
+        assert!(output.at_boundary());
+    }
 
     #[tokio::test]
     async fn switching_parks_only_when_the_node_advertised_reuse() {
