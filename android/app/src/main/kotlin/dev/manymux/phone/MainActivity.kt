@@ -8,6 +8,7 @@ import android.content.Context
 import android.content.SharedPreferences
 import android.content.pm.PackageManager
 import android.content.res.ColorStateList
+import android.content.res.Configuration
 import android.graphics.Color
 import android.graphics.Rect
 import android.graphics.Typeface
@@ -28,6 +29,7 @@ import android.view.WindowInsets
 import android.view.WindowInsetsAnimation
 import android.view.inputmethod.InputMethodManager
 import android.widget.EditText
+import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.PopupMenu
 import android.widget.ScrollView
@@ -86,6 +88,9 @@ class MainActivity : Activity() {
 
     /** The bar's own clock, kept so it can be stopped. */
     private var ticking: Runnable? = null
+
+    /** Lays the open session out again for the screen's new shape. */
+    private var reshape: (() -> Unit)? = null
 
     /**
      * What was running the last time a machine answered.
@@ -179,6 +184,11 @@ class MainActivity : Activity() {
         wallRefresh?.let { here.removeCallbacks(it) }
         releaseScreen()
         elsewhere.shutdownNow()
+    }
+
+    override fun onConfigurationChanged(config: Configuration) {
+        super.onConfigurationChanged(config)
+        reshape?.invoke()
     }
 
     override fun onWindowFocusChanged(focused: Boolean) {
@@ -915,18 +925,46 @@ class MainActivity : Activity() {
         terminal = screen
         screen.onCannotScroll = { say("$name is on a machine too old to scroll back") }
 
+        // What the bar says, for when there is no bar: only news, since a
+        // session that is attached is the one whose screen is under it.
+        val notice = TextView(this).apply {
+            typeface = Typeface.MONOSPACE
+            textSize = 12f
+            maxLines = 1
+            ellipsize = TextUtils.TruncateAt.MIDDLE
+            background = panel(R.color.raised, dp(14))
+            setPadding(dp(12), dp(6), dp(12), dp(6))
+            visibility = View.GONE
+        }
+        val stage = FrameLayout(this).apply {
+            addView(screen, FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT))
+            addView(
+                notice,
+                FrameLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT, Gravity.TOP or Gravity.CENTER_HORIZONTAL)
+                    .apply { topMargin = dp(6) },
+            )
+        }
+
         val layout = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             // The bar above and the keys below are both this colour, so the
             // strips the system bars leave at the top and bottom continue them.
             setBackgroundColor(colour(R.color.panel))
             addView(top, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
-            addView(
-                screen,
-                LinearLayout.LayoutParams(MATCH_PARENT, 0).apply { weight = 1f },
-            )
-            addView(extraKeys(screen), LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
+            addView(stage, LinearLayout.LayoutParams(MATCH_PARENT, 0).apply { weight = 1f })
         }
+        // A phone on its side, where the bar and two rows of keys would leave
+        // the terminal a strip: the bar goes and its button joins one row of
+        // keys. Back needs no key, being the system's gesture.
+        fun lay() {
+            val flat = short()
+            top.visibility = if (flat) View.GONE else View.VISIBLE
+            if (layout.childCount > 2) layout.removeViewAt(2)
+            val keys = extraKeys(screen, flat) { under -> offerToSwitch(under, machine, name) }
+            layout.addView(keys, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
+        }
+        lay()
+        reshape = ::lay
         // Attaching needs a grid to ask for, and the view only knows its size
         // once it has been laid out. So the attach waits for the first one.
         screen.onGrid = { grid ->
@@ -938,7 +976,7 @@ class MainActivity : Activity() {
                     attached.redraw()
                 }
                 screen.attach = attached
-                watch(attached, bar, machine, name)
+                watch(attached, bar, notice, machine, name)
             }
         }
 
@@ -1021,8 +1059,11 @@ class MainActivity : Activity() {
         }
     }
 
-    /** The bar says what the mark row says: where you are, and how it is going. */
-    private fun watch(attached: Attach, bar: TextView, machine: Machine, name: String) {
+    /**
+     * The bar says what the mark row says: where you are, and how it is going.
+     * [notice] says it over the screen when the bar is put away.
+     */
+    private fun watch(attached: Attach, bar: TextView, notice: TextView, machine: Machine, name: String) {
         val where = "${machine.address}/$name"
         val tick = object : Runnable {
             override fun run() {
@@ -1047,6 +1088,9 @@ class MainActivity : Activity() {
                         else -> colour(R.color.dim)
                     },
                 )
+                notice.text = bar.text
+                notice.setTextColor(bar.currentTextColor)
+                notice.visibility = if (short() && state !is State.Attached) View.VISIBLE else View.GONE
                 here.postDelayed(this, 500)
             }
         }
@@ -1063,14 +1107,21 @@ class MainActivity : Activity() {
     private fun releaseScreen() {
         ticking?.let { here.removeCallbacks(it) }
         ticking = null
+        reshape = null
         terminal?.onGrid = null
         terminal?.attach = null
         terminal = null
         attach = null
     }
 
-    /** The keys a phone keyboard has not got. */
-    private fun extraKeys(screen: TerminalView): View {
+    /** Whether the screen is too short for the bar and two rows of keys. */
+    private fun short(): Boolean = resources.configuration.screenHeightDp < 480
+
+    /**
+     * The keys a phone keyboard has not got: two rows, or one when [flat], which
+     * then ends with [others], the switcher the bar would have held.
+     */
+    private fun extraKeys(screen: TerminalView, flat: Boolean, others: (View) -> Unit): View {
         val keys = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(colour(R.color.panel))
@@ -1098,6 +1149,17 @@ class MainActivity : Activity() {
             row.addView(button, LinearLayout.LayoutParams(0, dp(32), 1f).apply { setMargins(dp(1), dp(1), dp(1), dp(1)) })
             return button
         }
+        fun paste(row: LinearLayout) = key(row, "paste") {
+            val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+            val text = clipboard.primaryClip?.getItemAt(0)?.coerceToText(this)?.toString()
+            if (!text.isNullOrEmpty()) screen.paste(text)
+        }
+        fun keyboard(row: LinearLayout) = key(row, "⌨", "keyboard") { screen.openKeyboard() }
+        fun left(row: LinearLayout) = key(row, "←", "left") { screen.cursorKey(Direction.LEFT) }
+        fun up(row: LinearLayout) = key(row, "↑", "up") { screen.cursorKey(Direction.UP) }
+        fun down(row: LinearLayout) = key(row, "↓", "down") { screen.cursorKey(Direction.DOWN) }
+        fun right(row: LinearLayout) = key(row, "→", "right") { screen.cursorKey(Direction.RIGHT) }
+
         val top = row()
         key(top, "esc") { screen.send(byteArrayOf(0x1b)) }
         key(top, "tab") { screen.send(screen.tabKey()) }
@@ -1119,19 +1181,25 @@ class MainActivity : Activity() {
         }
         screen.onShiftChanged = ::showShift
         showShift(screen.shift)
-        key(top, "↑", "up") { screen.cursorKey(Direction.UP) }
+        if (flat) {
+            paste(top)
+            keyboard(top)
+            left(top)
+            up(top)
+            down(top)
+            right(top)
+            key(top, "☰", "the other sessions on this machine", others)
+            return keys
+        }
+        up(top)
         space(top)
         val bottom = row()
-        key(bottom, "paste") {
-            val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-            val text = clipboard.primaryClip?.getItemAt(0)?.coerceToText(this)?.toString()
-            if (!text.isNullOrEmpty()) screen.paste(text)
-        }
-        key(bottom, "⌨", "keyboard") { screen.openKeyboard() }
+        paste(bottom)
+        keyboard(bottom)
         space(bottom)
-        key(bottom, "←", "left") { screen.cursorKey(Direction.LEFT) }
-        key(bottom, "↓", "down") { screen.cursorKey(Direction.DOWN) }
-        key(bottom, "→", "right") { screen.cursorKey(Direction.RIGHT) }
+        left(bottom)
+        down(bottom)
+        right(bottom)
         return keys
     }
 

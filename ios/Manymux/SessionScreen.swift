@@ -36,6 +36,8 @@ final class Attachment {
 
 struct SessionScreen: View {
     @Environment(AppModel.self) private var model
+    @Environment(\.dismiss) private var dismiss
+    @Environment(\.verticalSizeClass) private var verticalSize
     let machine: Machine
     let name: String
 
@@ -56,9 +58,27 @@ struct SessionScreen: View {
                 view.onCannotScroll = { toast.say("\(name) is on a machine too old to scroll back") }
                 view.attach = attachment.open(phone, machine, name, grid)
             }
-            ExtraKeys(held: held, terminal: terminal)
+            .overlay(alignment: .top) {
+                // With no bar to say it in, only news is shown: a session
+                // that is attached is the one whose screen is under it.
+                if flat && attachment.state != .attached {
+                    Text(status)
+                        .font(.system(size: 12, design: .monospaced))
+                        .foregroundStyle(statusColour)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 6)
+                        .background(Color.raised, in: Capsule())
+                        .padding(.top, 6)
+                }
+            }
+            ExtraKeys(held: held, terminal: terminal, flat: flat, leave: { dismiss() }) {
+                switcher { keyFace("the other sessions", symbol: "rectangle.stack") }
+            }
         }
         .background(Color.panel)
+        .toolbar(flat ? .hidden : .visible, for: .navigationBar)
         .navigationBarTitleDisplayMode(.inline)
         .toolbarBackground(Color.panel, for: .navigationBar)
         .toolbarBackground(.visible, for: .navigationBar)
@@ -70,7 +90,9 @@ struct SessionScreen: View {
                     .lineLimit(1)
                     .truncationMode(.middle)
             }
-            ToolbarItem(placement: .topBarTrailing) { switcher }
+            ToolbarItem(placement: .topBarTrailing) {
+                switcher { Image(systemName: "rectangle.stack") }
+            }
         }
         .toast(toast, at: .top, on: .raised)
         // What else is running, asked while nobody is waiting on the answer,
@@ -87,6 +109,10 @@ struct SessionScreen: View {
             attachment.leave()
         }
     }
+
+    /// A phone on its side, where the bar and two rows of keys would leave the
+    /// terminal a strip: the bar goes and its two buttons join one row of keys.
+    private var flat: Bool { verticalSize == .compact }
 
     /// The bar says where you are, and how it is going. The screen under it
     /// stays as the session last painted it whatever happens to the
@@ -116,7 +142,7 @@ struct SessionScreen: View {
     /// Opened on the listing already in hand rather than on a round trip, so
     /// it costs nothing to press. The session you are in is shown and not
     /// offered, so the rows do not move under a hand that has learnt them.
-    private var switcher: some View {
+    private func switcher(@ViewBuilder label: () -> some View) -> some View {
         Menu {
             let seen = model.seen[machine] ?? []
             if seen.isEmpty {
@@ -130,7 +156,7 @@ struct SessionScreen: View {
                 }
             }
         } label: {
-            Image(systemName: "rectangle.stack")
+            label()
         }
         .accessibilityLabel("the other sessions on this machine")
     }
@@ -171,51 +197,91 @@ private struct TerminalSurface: UIViewRepresentable {
 }
 
 /// The keys a phone keyboard has not got.
-private struct ExtraKeys: View {
+///
+/// Two rows upright, one on its side, where the row also carries the way back
+/// and `ends`, the switcher, since the bar that held them is gone.
+private struct ExtraKeys<Ends: View>: View {
     let held: Held
     let terminal: TerminalView?
+    let flat: Bool
+    let leave: () -> Void
+    @ViewBuilder let ends: () -> Ends
 
     var body: some View {
-        VStack(spacing: 6) {
-            HStack(spacing: 6) {
-                key("esc") { terminal?.send(held.escape) }
-                key("tab") { terminal?.send(held.tab) }
-                key("ctrl", lit: held.control) { held.control.toggle() }
-                key("shift", lit: held.shift) { held.shift.toggle() }
-                key("up", symbol: "arrow.up") { terminal?.cursorKey(.up) }
-                Color.clear.frame(maxWidth: .infinity, maxHeight: 32)
-            }
-            HStack(spacing: 6) {
-                // The system's own paste button, which reads the clipboard
-                // without the prompt a programmatic read sets off.
-                PasteButton(payloadType: String.self) { strings in
-                    guard let text = strings.first, !text.isEmpty else { return }
-                    DispatchQueue.main.async { terminal?.paste(text) }
+        Group {
+            if flat {
+                HStack(spacing: 6) {
+                    key("back", symbol: "chevron.left", press: leave)
+                    esc
+                    tab
+                    control
+                    shift
+                    paste
+                    keyboard
+                    key("left", symbol: "arrow.left") { terminal?.cursorKey(.left) }
+                    key("up", symbol: "arrow.up") { terminal?.cursorKey(.up) }
+                    key("down", symbol: "arrow.down") { terminal?.cursorKey(.down) }
+                    key("right", symbol: "arrow.right") { terminal?.cursorKey(.right) }
+                    ends()
                 }
-                .labelStyle(.iconOnly)
-                .buttonBorderShape(.roundedRectangle(radius: 8))
-                .tint(.raised)
-                .frame(maxWidth: .infinity, maxHeight: 32)
-                key("keyboard", symbol: "keyboard") {
-                    if terminal?.isFirstResponder == true {
-                        terminal?.closeKeyboard()
-                    } else {
-                        terminal?.openKeyboard()
+            } else {
+                VStack(spacing: 6) {
+                    HStack(spacing: 6) {
+                        esc
+                        tab
+                        control
+                        shift
+                        key("up", symbol: "arrow.up") { terminal?.cursorKey(.up) }
+                        Color.clear.frame(maxWidth: .infinity, maxHeight: 32)
+                    }
+                    HStack(spacing: 6) {
+                        paste
+                        keyboard
+                        Color.clear.frame(maxWidth: .infinity, maxHeight: 32)
+                        key("left", symbol: "arrow.left") { terminal?.cursorKey(.left) }
+                        key("down", symbol: "arrow.down") { terminal?.cursorKey(.down) }
+                        key("right", symbol: "arrow.right") { terminal?.cursorKey(.right) }
                     }
                 }
-                Color.clear.frame(maxWidth: .infinity, maxHeight: 32)
-                key("left", symbol: "arrow.left") { terminal?.cursorKey(.left) }
-                key("down", symbol: "arrow.down") { terminal?.cursorKey(.down) }
-                key("right", symbol: "arrow.right") { terminal?.cursorKey(.right) }
             }
         }
         .padding(.horizontal, 8)
-        .padding(.vertical, 8)
+        .padding(.vertical, flat ? 4 : 8)
         .background(Color.panel)
     }
 
-    /// A key that says `label`, or shows `symbol` and is called `label` out
-    /// loud.
+    private var esc: some View { key("esc") { terminal?.send(held.escape) } }
+    private var tab: some View { key("tab") { terminal?.send(held.tab) } }
+    private var control: some View {
+        key("ctrl", lit: held.control) { held.control.toggle() }
+    }
+    private var shift: some View {
+        key("shift", lit: held.shift) { held.shift.toggle() }
+    }
+
+    /// The system's own paste button, which reads the clipboard without the
+    /// prompt a programmatic read sets off.
+    private var paste: some View {
+        PasteButton(payloadType: String.self) { strings in
+            guard let text = strings.first, !text.isEmpty else { return }
+            DispatchQueue.main.async { terminal?.paste(text) }
+        }
+        .labelStyle(.iconOnly)
+        .buttonBorderShape(.roundedRectangle(radius: 8))
+        .tint(.raised)
+        .frame(maxWidth: .infinity, maxHeight: 32)
+    }
+
+    private var keyboard: some View {
+        key("keyboard", symbol: "keyboard") {
+            if terminal?.isFirstResponder == true {
+                terminal?.closeKeyboard()
+            } else {
+                terminal?.openKeyboard()
+            }
+        }
+    }
+
     private func key(
         _ label: String,
         symbol: String? = nil,
@@ -223,24 +289,30 @@ private struct ExtraKeys: View {
         press: @escaping () -> Void
     ) -> some View {
         Button(action: press) {
-            Group {
-                if let symbol {
-                    Image(systemName: symbol).font(.system(size: 14, weight: .medium))
-                } else {
-                    Text(label).font(.system(size: 12))
-                }
-            }
-            .foregroundStyle(lit ? Color.accent : Color.text)
-            .frame(maxWidth: .infinity, minHeight: 32, maxHeight: 32)
-            .background(
-                RoundedRectangle(cornerRadius: 8)
-                    .fill(lit ? Color.accentSurface : Color.raised)
-                    .stroke(Color.line, lineWidth: 1)
-            )
-            .contentShape(Rectangle())
+            keyFace(label, symbol: symbol, lit: lit)
         }
         .buttonStyle(.plain)
         .accessibilityLabel(label)
         .accessibilityAddTraits(lit ? .isSelected : [])
     }
+}
+
+/// What a key looks like: `label`, or `symbol` and called `label` out loud.
+/// Apart from the button so the switcher's menu can wear it too.
+private func keyFace(_ label: String, symbol: String? = nil, lit: Bool = false) -> some View {
+    Group {
+        if let symbol {
+            Image(systemName: symbol).font(.system(size: 14, weight: .medium))
+        } else {
+            Text(label).font(.system(size: 12))
+        }
+    }
+    .foregroundStyle(lit ? Color.accent : Color.text)
+    .frame(maxWidth: .infinity, minHeight: 32, maxHeight: 32)
+    .background(
+        RoundedRectangle(cornerRadius: 8)
+            .fill(lit ? Color.accentSurface : Color.raised)
+            .stroke(Color.line, lineWidth: 1)
+    )
+    .contentShape(Rectangle())
 }
