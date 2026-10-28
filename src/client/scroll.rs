@@ -41,8 +41,11 @@
 //! and a word worked out then is one character long.
 //!
 //! The window moves locally inside a block that has already arrived, and a
-//! block is a few screenfuls. A request per wheel notch would be a round trip
-//! over ssh per wheel notch, on machines that are usually two hops away.
+//! block is a few screenfuls. The next block is fetched before the window
+//! reaches an edge. Only one request may be in flight: wheel input keeps
+//! moving the window locally, and the reply is followed by a request for
+//! wherever it has landed. Otherwise a fast wheel queues a round trip per
+//! notch and the replies keep replacing the cache with blocks already passed.
 //!
 //! Everything in here is a count back from the newest line, which is the only
 //! end of a buffer that trims from the top can be counted from, and the newest
@@ -125,6 +128,9 @@ pub struct Scrollback {
     /// is not asked for again and again. Its answer arriving does not clear
     /// this: the answer is the best there is.
     asked: Option<ViewRequest>,
+    /// Whether the last request is still waiting for its reply. Moves made
+    /// meanwhile are folded into the request built after that reply arrives.
+    in_flight: bool,
     /// Rows the session's part of the screen has, which is what a page is.
     rows: u16,
     /// Columns it has, which is where a highlight has to stop.
@@ -393,6 +399,7 @@ impl Scrollback {
             answered: false,
             block: None,
             asked: None,
+            in_flight: false,
             rows: size.rows,
             cols: size.cols,
             search: None,
@@ -584,14 +591,24 @@ impl Scrollback {
         self.offset = 0;
     }
 
-    /// What to ask the host for, if what we hold does not cover the window.
+    /// What to ask the host for, if the window is nearing or past a block edge.
     ///
     /// A block is centred on the window rather than starting at it, so moving
     /// either way stays inside it for a while. The first call always asks,
     /// because nothing has arrived yet and the total is not even known.
     pub fn wanted(&mut self) -> Option<ViewRequest> {
-        if self.covered() {
+        if self.in_flight {
             return None;
+        }
+        if self.covered() {
+            let block = self.block.as_ref()?;
+            let margin = self.page() / 2;
+            let near_bottom = block.from > 0 && self.offset - block.from < margin;
+            let near_top = block.top() < self.total
+                && block.top().saturating_sub(self.offset + self.page()) < margin;
+            if !near_bottom && !near_top {
+                return None;
+            }
         }
         let span = self.page() * BLOCK;
         // Half a block below the window, so scrolling back down is local too,
@@ -605,7 +622,7 @@ impl Scrollback {
         // edge scrolls the view under itself. Its text is built out of one
         // block (`holds`), so the block is stretched over it rather than the
         // copy being answered out of lines that are not here. Only when the
-        // window has left the block anyway: the ends of a selection cannot
+        // window needs another block anyway: the ends of a selection cannot
         // leave a block the window is still inside, since the end that moves
         // is the one under the pointer.
         if let Some(selection) = self.selection {
@@ -633,12 +650,14 @@ impl Scrollback {
             return None;
         }
         self.asked = Some(request.clone());
+        self.in_flight = true;
         Some(request)
     }
 
     /// Take a block the host sent, and learn from it where the ends are, and
     /// how far the newest line has moved since the last one.
     pub fn take(&mut self, window: Window) {
+        self.in_flight = false;
         self.trimming = moved(window.printed, self.printed) > 0 && window.total == self.total;
         self.follow(window.printed);
         self.total = window.total;
@@ -1539,13 +1558,18 @@ mod tests {
         let Some(request) = view.wanted() else {
             return false;
         };
+        deliver(view, &request, printed, total);
+        true
+    }
+
+    fn deliver(view: &mut Scrollback, request: &ViewRequest, printed: u64, total: u64) {
         // What `node::session::Attachment::window` does before answering: the
         // question was asked in an older instant than the one it arrived in.
         let from = request.from + moved(printed, request.printed);
         let from = from.min(total.saturating_sub(1));
         let bottom = total - from;
         let top = bottom.saturating_sub(u64::from(request.lines));
-        let trimmed = printed - total;
+        let trimmed = printed.saturating_sub(total);
         view.take(Window {
             from,
             total,
@@ -1554,7 +1578,6 @@ mod tests {
                 .map(|i| format!("line {}", trimmed + i))
                 .collect(),
         });
-        true
     }
 
     /// The lines the window is showing, out of the block in hand.
@@ -1714,6 +1737,72 @@ mod tests {
         let wanted = view.wanted().expect("the window has left the block");
         assert_eq!(wanted.lines, 72);
         assert_eq!(wanted.from, 72 - 24, "half a block below the window");
+    }
+
+    #[test]
+    fn a_fast_scroll_waits_for_one_reply_then_asks_for_where_it_landed() {
+        let mut view = view(1000);
+        view.up(100);
+        let first = view.wanted().expect("the next block is needed");
+        for _ in 0..20 {
+            view.up(WHEEL);
+            assert!(view.wanted().is_none(), "one request is already in flight");
+        }
+        deliver(&mut view, &first, 1000, 1000);
+        assert!(answer_at(&mut view, 1000, 1000), "fetch the final position");
+        assert_eq!(showing(&view).last().map(String::as_str), Some("line 839"));
+        assert!(!view.paint().is_empty(), "the final position can be drawn");
+        assert!(view.wanted().is_none());
+    }
+
+    #[test]
+    fn the_next_block_is_fetched_while_the_current_window_can_still_be_drawn() {
+        let mut view = view(1000);
+        view.up(39);
+        assert!(!view.paint().is_empty());
+        let next = view
+            .wanted()
+            .expect("fetch before reaching the block's edge");
+        assert!(next.from > 0, "the next block reaches further back");
+        view.up(WHEEL);
+        assert!(
+            !view.paint().is_empty(),
+            "scroll locally while the reply is in flight"
+        );
+        assert!(view.wanted().is_none());
+    }
+
+    #[test]
+    fn scrolling_down_fetches_before_reaching_the_lower_edge_too() {
+        let mut view = view(1000);
+        view.up(200);
+        answer(&mut view, 1000);
+        view.down(15);
+        let next = view.wanted().expect("fetch before reaching the lower edge");
+        assert!(!view.paint().is_empty());
+        assert!(next.from < 176, "fetch further toward the live screen");
+        deliver(&mut view, &next, 1000, 1000);
+        assert!(view.wanted().is_none(), "the reply needs no further fetch");
+        assert_eq!(showing(&view).last().map(String::as_str), Some("line 814"));
+    }
+
+    #[test]
+    fn reversing_a_fast_scroll_while_a_busy_host_answers_still_lands() {
+        for counts_printed in [false, true] {
+            let mut view = view(1000);
+            view.up(100);
+            let first = view.wanted().expect("fetch an older block");
+            view.up(200);
+            assert!(view.wanted().is_none());
+            view.down(290);
+            assert!(view.wanted().is_none());
+            let printed = if counts_printed { 1100 } else { 0 };
+            deliver(&mut view, &first, printed, 1000);
+            assert!(answer_at(&mut view, printed, 1000), "fetch where it landed");
+            assert!(!view.paint().is_empty());
+            assert_eq!(showing(&view).last().map(String::as_str), Some("line 989"));
+            assert!(view.wanted().is_none(), "settled after two replies");
+        }
     }
 
     /// A view at the top of what the host has keeps asking for lines that are
