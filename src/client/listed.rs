@@ -18,7 +18,8 @@
 //! same things even when Enter wins the race against drawing the answer.
 //! The attached session always has a row: a cached answer may predate its
 //! creation or rename, so its absence cannot move the opening highlight.
-//! Cached sessions stay visible for this attach run when an answer omits them.
+//! Cached sessions stay visible when their host does not answer. A successful
+//! answer removes sessions the host no longer lists.
 //! Only fresh answers drive switching and group pruning; cached rows are dimmed.
 
 use anyhow::Result;
@@ -42,7 +43,7 @@ use crate::term;
 #[derive(Clone, Default)]
 pub struct Snapshot {
     pub sessions: Vec<HostedSession>,
-    /// Last known sessions for this attach run, including unavailable ones.
+    /// Last known sessions for this attach run, retaining unreachable hosts.
     /// Kept apart from fresh answers so they cannot prevent group pruning.
     pub cached: Vec<HostedSession>,
     /// Which machines said so, this one included: it is what pruning is
@@ -58,8 +59,8 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
-    /// Keep the last picture while hosts are unavailable, updating sessions
-    /// in place when they answer again. A rename replaces its previous name.
+    /// Keep the last picture while hosts are unavailable. An answer replaces
+    /// that host's sessions, removing any it confirms have closed.
     pub fn following(mut self, previous: &Self) -> Self {
         let known = if self.cached.is_empty() {
             previous.known().to_vec()
@@ -68,6 +69,13 @@ impl Snapshot {
         };
         self.cached = self.sessions.clone();
         for hosted in known {
+            if self
+                .answered
+                .iter()
+                .any(|host| same_machine(host, &hosted.host))
+            {
+                continue;
+            }
             let member = Member::of(&hosted.host, &hosted.session);
             if !self.sessions.iter().any(|live| {
                 Member::of(&live.host, &live.session) == member
@@ -735,7 +743,7 @@ mod tests {
     }
 
     #[test]
-    fn sessions_missing_from_a_successful_answer_stay_cached_but_are_not_live() {
+    fn sessions_missing_from_a_successful_answer_are_removed_from_the_cache() {
         let mut ended = hosted_on("gpu-box", "test");
         ended.session.pid = 2;
         let build = hosted_on("gpu-box", "build");
@@ -752,15 +760,36 @@ mod tests {
         .following(&initial);
         let current = Located::new("gpu-box", "build");
         let listed = Listed::of(&fresh, &Groups::default(), &[], None, from_ref(&current));
-        let row = listed
-            .rows
-            .sessions
-            .iter()
-            .find(|row| row.label == "test")
-            .unwrap();
-        assert!(!row.available);
+        assert!(listed.rows.sessions.iter().all(|row| row.label != "test"));
+        assert_eq!(fresh.cached.len(), 1);
         assert_eq!(fresh.sessions.len(), 1);
         assert_eq!(fresh.entries(&Groups::default()).len(), 1);
+    }
+
+    #[test]
+    fn an_empty_host_answer_removes_closed_sessions_without_forgetting_unreachable_hosts() {
+        let initial = Snapshot {
+            sessions: vec![
+                hosted_on("build-box", "build"),
+                hosted_on("gpu-box", "train"),
+            ],
+            answered: vec!["build-box".into(), "gpu-box".into()],
+            ..Snapshot::default()
+        };
+        let offline = Snapshot::default().following(&initial);
+        let fresh = Snapshot {
+            answered: vec!["gpu-box".into()],
+            ..Snapshot::default()
+        }
+        .following(&offline);
+        let current = Located::new("build-box", "build");
+        let listed = Listed::of(&fresh, &Groups::default(), &[], None, from_ref(&current));
+        assert!(listed.rows.sessions.iter().all(|row| row.label != "train"));
+        assert_eq!(fresh.cached.len(), 1);
+        assert_eq!(fresh.cached[0].session.name, "build");
+        let failed_again = Snapshot::default().following(&fresh);
+        assert_eq!(failed_again.cached.len(), 1);
+        assert_eq!(failed_again.cached[0].session.name, "build");
     }
 
     #[test]
