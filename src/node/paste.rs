@@ -1,12 +1,14 @@
 //! Files pasted into a session from the clipboard of the machine the client is
 //! sitting at.
 //!
-//! The host end of it. The bytes arrive over the attached stream, get written
+//! The host end of it. The bytes arrive over an upload stream, get written
 //! down here, and what actually reaches the program is the path they were
 //! written to. That indirection is the whole trick: no terminal carries an
 //! image, but every program on the far side of one can open a file, and the
 //! ones worth pasting a screenshot into (`claude` above all) take a path in
 //! their prompt and read it themselves.
+//! Older clients can still upload on their attachment. New clients use a
+//! separate request so file transfer cannot hold up terminal input or pings.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};

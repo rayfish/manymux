@@ -8,6 +8,8 @@
 //! Capable nodes can release an attachment without closing its transport. A
 //! parked [`Connection`] drains the old output through an acknowledgement
 //! before accepting another attach; it keeps no session alive on the client.
+//! File uploads use a separate `Paste` request stream, leaving attach traffic
+//! free to carry keys and keepalives. Upload failures are never retried.
 
 pub mod attach;
 pub mod checkpoint;
@@ -516,6 +518,47 @@ impl Stream {
         match self.request(request).await? {
             Response::Error(message) => bail!(message),
             other => Ok(other),
+        }
+    }
+
+    /// Upload without occupying an attach stream. Never retry: once the final
+    /// frame is sent, a lost reply cannot say whether the path was inserted.
+    pub async fn paste(&mut self, name: &str, kind: &str, data: &[u8]) -> Result<()> {
+        if data.is_empty() || data.len() > proto::MAX_PASTE {
+            bail!("the image must contain 1 to {} bytes", proto::MAX_PASTE);
+        }
+        if !matches!(
+            self.call(&Request::Paste {
+                name: name.to_string()
+            })
+            .await?,
+            Response::Ok
+        ) {
+            bail!("unexpected response to image upload");
+        }
+        for chunk in data.chunks(proto::PASTE_CHUNK) {
+            proto::write_frame(&mut self.write, tag::PASTE, chunk).await?;
+        }
+        proto::write_msg(
+            &mut self.write,
+            tag::PASTE_END,
+            &PasteInfo {
+                kind: kind.to_string(),
+            },
+        )
+        .await?;
+        let frame = self
+            .read
+            .next()
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("image upload closed before its reply"))?;
+        if frame.tag != tag::RESPONSE {
+            bail!("unexpected frame after image upload");
+        }
+        match proto::decode(&frame.body)? {
+            Response::Ok => Ok(()),
+            Response::Error(message) => bail!(message),
+            _ => bail!("unexpected response after image upload"),
         }
     }
 
@@ -1041,6 +1084,37 @@ impl SessionWriter {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn an_older_node_refuses_an_upload_before_any_image_bytes_are_sent() {
+        let (client, server) = tokio::io::duplex(4096);
+        let (read, mut write) = tokio::io::split(server);
+        let server = tokio::spawn(async move {
+            let mut read = FrameReader::new(read);
+            let request = read.next().await.unwrap().unwrap();
+            assert!(matches!(
+                proto::decode::<Request>(&request.body).unwrap(),
+                Request::Paste { .. }
+            ));
+            proto::write_msg(
+                &mut write,
+                tag::RESPONSE,
+                &Response::Error("this node needs an update".into()),
+            )
+            .await
+            .unwrap();
+            assert!(
+                read.next().await.unwrap().is_none(),
+                "a refused upload sends no file data"
+            );
+        });
+        let (read, write) = tokio::io::split(client);
+        let mut stream = Stream::from_halves(Box::new(read), Box::new(write));
+        let error = stream.paste("build", "png", b"image").await.unwrap_err();
+        assert!(error.to_string().contains("needs an update"));
+        drop(stream);
+        server.await.unwrap();
+    }
+
     use std::time::Duration;
 
     use super::*;

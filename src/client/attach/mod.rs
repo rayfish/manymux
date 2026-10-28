@@ -26,6 +26,8 @@ use crate::client::{Attached, SessionHalves, Update};
 mod keys;
 #[cfg(feature = "desktop")]
 mod terminal;
+#[cfg(feature = "desktop")]
+mod upload;
 
 pub use keys::{
     Action, DEFAULT_PREFIX, Find, KeyFilter, Keystrokes, Mode, Motion, PASTE_KEY, Pick, Rename,
@@ -35,7 +37,11 @@ pub use keys::{
 use super::picker;
 
 #[cfg(feature = "desktop")]
-pub use terminal::{Held, PopupFeed, Run, Wait, hold, run, session_size, terminal_size, waiting};
+pub use terminal::{
+    Held, PopupFeed, Run, RunOptions, Wait, hold, run, session_size, terminal_size, waiting,
+};
+#[cfg(feature = "desktop")]
+pub use upload::Uploads;
 
 /// How long to wait before trying to reach a lost session again, by how many
 /// tries have failed.

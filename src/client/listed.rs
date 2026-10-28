@@ -16,11 +16,15 @@
 //! Reloads keep every issued id through [`Listed::following`], including rows
 //! that disappeared. A pending answer and the displayed rows can then name the
 //! same things even when Enter wins the race against drawing the answer.
+//! The attached session always has a row: a cached answer may predate its
+//! creation or rename, so its absence cannot move the opening highlight.
+//! Cached sessions stay visible for this attach run when an answer omits them.
+//! Only fresh answers drive switching and group pruning; cached rows are dimmed.
 
 use anyhow::Result;
 
 use crate::client::attach::Rows;
-use crate::client::groups::Groups;
+use crate::client::groups::{Groups, Member};
 use crate::client::picker::Row;
 use crate::client::switch::{Cycle, Entry, Located};
 use crate::hosts::{as_listed, is_this_machine, same_machine, this_machine};
@@ -35,9 +39,12 @@ use crate::term;
 /// group must consider only those: a machine that is asleep has said nothing
 /// about its sessions, and reading that silence as "they ended" would empty its
 /// groups while you were away from it.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Snapshot {
     pub sessions: Vec<HostedSession>,
+    /// Last known sessions for this attach run, including unavailable ones.
+    /// Kept apart from fresh answers so they cannot prevent group pruning.
+    pub cached: Vec<HostedSession>,
     /// Which machines said so, this one included: it is what pruning is
     /// allowed to act on, and it is `Listing::answering` rather than
     /// `Listing::reached`, which leaves this machine out for a different
@@ -51,6 +58,46 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
+    /// Keep the last picture while hosts are unavailable, updating sessions
+    /// in place when they answer again. A rename replaces its previous name.
+    pub fn following(mut self, previous: &Self) -> Self {
+        let known = if self.cached.is_empty() {
+            previous.known().to_vec()
+        } else {
+            self.cached
+        };
+        self.cached = self.sessions.clone();
+        for hosted in known {
+            let member = Member::of(&hosted.host, &hosted.session);
+            if !self.sessions.iter().any(|live| {
+                Member::of(&live.host, &live.session) == member
+                    || (live.host == hosted.host && live.session.name == hosted.session.name)
+            }) {
+                self.cached.push(hosted);
+            }
+        }
+        self.cached.sort_by(|a, b| {
+            a.host
+                .cmp(&b.host)
+                .then(a.session.started.cmp(&b.session.started))
+        });
+        self
+    }
+
+    fn known(&self) -> &[HostedSession] {
+        if self.cached.is_empty() {
+            &self.sessions
+        } else {
+            &self.cached
+        }
+    }
+
+    fn available(&self, located: &Located) -> bool {
+        self.sessions
+            .iter()
+            .any(|live| live.host == located.host && live.session.name == located.session)
+    }
+
     /// The listing as the switch keys want it: an address, and the group it is
     /// in.
     pub fn entries(&self, groups: &Groups) -> Vec<Entry> {
@@ -131,6 +178,14 @@ const CURRENT: usize = 0;
 const DIGITS: u8 = 9;
 
 impl Listed {
+    /// Whether a displayed session still accepts commands in this answer.
+    pub fn available(&self, id: usize) -> bool {
+        self.rows
+            .sessions
+            .iter()
+            .any(|row| !row.heading && row.id == id && row.available)
+    }
+
     /// Keep ids from earlier answers for the lifetime of this attach. Removed
     /// rows leave their ids reserved, since the keyboard may still choose one
     /// from the picture drawn before this answer arrived.
@@ -187,7 +242,7 @@ impl Listed {
         // first. Which makes each machine's sessions a run, and the run is what
         // the tree is built out of.
         let showing: Vec<(&HostedSession, Option<&str>)> = snapshot
-            .sessions
+            .known()
             .iter()
             .map(|hosted| (hosted, groups.group_of(&hosted.host, &hosted.session)))
             .filter(|(_, group)| focus.is_none_or(|focus| *group == Some(focus)))
@@ -242,23 +297,11 @@ impl Listed {
             Self::session(&mut rows, &mut at, hosted, current, 1);
         }
         // The cursor opens on the session you are looking out from, always.
-        // Where there is no row for it there is one made: a fan-out gets
-        // `LISTING_WAIT` and no more, so on a fleet slower than that the box
-        // opens on whatever landed first, and a machine that has not answered
-        // says nothing about the session the run is in. Opening on the first
-        // row instead put the cursor on a stranger's session with Enter as the
-        // next key, which is the same failure `as_listed` was written for.
-        //
-        // A machine that *did* answer and did not mention it is the other
-        // thing: the session has ended or been renamed, so there is nothing to
-        // point at and the first row is all there is.
+        // An answer can predate a successful attach, especially after starting
+        // or renaming a session. Keep a row for it until the listing catches
+        // up, even if its machine answered: the live attach is newer evidence.
         let listed_here = rows.iter().any(|row| !row.heading && row.id == CURRENT);
-        if !listed_here
-            && !snapshot
-                .answered
-                .iter()
-                .any(|host| same_machine(host, &current.host))
-        {
+        if !listed_here {
             // Under the machine it is on, in the shape the rest of the list
             // uses: a heading, and the session a step in from it.
             let deep = u16::from(focus.is_some());
@@ -271,6 +314,16 @@ impl Listed {
                     .note("●")
                     .indent(deep + 1),
             );
+        }
+        for row in rows
+            .iter_mut()
+            .filter(|row| !row.heading && row.id != CURRENT)
+        {
+            let located = &at[row.id];
+            row.available = snapshot.available(located);
+            if !row.available {
+                row.note = "n/a".to_string();
+            }
         }
         // The digits, handed out along the trail rather than down the box: the
         // list is in listing order, which is the order the sessions were
@@ -635,6 +688,99 @@ mod tests {
         }
     }
 
+    #[test]
+    fn unavailable_sessions_keep_their_rows_and_highlight_until_the_host_returns() {
+        let current = Located::new("build-box", "build");
+        let remote = hosted_on("gpu-box", "train");
+        let initial = Snapshot {
+            sessions: vec![hosted_on("build-box", "build"), remote.clone()],
+            answered: vec!["build-box".into(), "gpu-box".into()],
+            ..Snapshot::default()
+        };
+        let groups = Groups::default();
+        let displayed = Listed::of(&initial, &groups, &[], None, from_ref(&current));
+        let id = displayed
+            .at
+            .iter()
+            .position(|at| at.session == "train")
+            .unwrap();
+        let mut picker = Picker::new("sessions", "choose", displayed.rows.sessions.clone(), 0);
+        picker.point_at(id);
+
+        let missing = Snapshot::default().following(&initial);
+        assert!(missing.entries(&groups).is_empty());
+        let offline =
+            Listed::of(&missing, &groups, &[], None, from_ref(&current)).following(&displayed);
+        picker.replace(offline.rows.sessions.clone(), offline.rows.at);
+        assert_eq!(picker.chosen().unwrap().id, id);
+        assert_eq!(picker.chosen().unwrap().note, "n/a");
+        assert!(picker.actionable().is_none());
+        assert!(offline.rows.sessions[offline.rows.at].available);
+
+        let mut remote = remote;
+        remote.session.title = "training".into();
+        let returned = Snapshot {
+            sessions: vec![remote],
+            answered: vec!["gpu-box".into()],
+            ..Snapshot::default()
+        }
+        .following(&missing);
+        let online =
+            Listed::of(&returned, &groups, &[], None, from_ref(&current)).following(&offline);
+        picker.replace(online.rows.sessions.clone(), online.rows.at);
+        let row = picker.actionable().unwrap();
+        assert_eq!(row.id, id);
+        assert_eq!(row.detail, "training");
+        assert_eq!(returned.cached.len(), 2);
+    }
+
+    #[test]
+    fn sessions_missing_from_a_successful_answer_stay_cached_but_are_not_live() {
+        let mut ended = hosted_on("gpu-box", "test");
+        ended.session.pid = 2;
+        let build = hosted_on("gpu-box", "build");
+        let initial = Snapshot {
+            sessions: vec![build.clone(), ended],
+            answered: vec!["gpu-box".into()],
+            ..Snapshot::default()
+        };
+        let fresh = Snapshot {
+            sessions: vec![build],
+            answered: vec!["gpu-box".into()],
+            ..Snapshot::default()
+        }
+        .following(&initial);
+        let current = Located::new("gpu-box", "build");
+        let listed = Listed::of(&fresh, &Groups::default(), &[], None, from_ref(&current));
+        let row = listed
+            .rows
+            .sessions
+            .iter()
+            .find(|row| row.label == "test")
+            .unwrap();
+        assert!(!row.available);
+        assert_eq!(fresh.sessions.len(), 1);
+        assert_eq!(fresh.entries(&Groups::default()).len(), 1);
+    }
+
+    #[test]
+    fn renamed_and_replaced_sessions_do_not_leave_duplicate_cached_rows() {
+        let mut replaced = hosted_on("gpu-box", "test");
+        replaced.session.pid = 2;
+        let initial = Snapshot {
+            sessions: vec![hosted_on("gpu-box", "build"), replaced],
+            ..Snapshot::default()
+        };
+        let renamed = Snapshot {
+            sessions: vec![hosted_on("gpu-box", "test")],
+            ..Snapshot::default()
+        }
+        .following(&initial);
+        assert_eq!(renamed.cached.len(), 1);
+        assert_eq!(renamed.cached[0].session.name, "test");
+        assert_eq!(renamed.cached[0].session.pid, 1);
+    }
+
     /// What the switch keys walk: every session in the listing, in its order,
     /// each with the group it is in by the membership handed in rather than by
     /// any read before asking.
@@ -797,25 +943,36 @@ mod tests {
         assert_eq!(listed.hosts[row.id], "deploy@box");
     }
 
-    /// A machine that answered and did not mention it is a session that has
-    /// ended or been renamed, and a row for it would be a row Enter cannot
-    /// land on.
     #[test]
-    fn a_session_the_machine_no_longer_has_gets_no_row_of_its_own() {
+    fn a_cached_answer_cannot_move_the_cursor_off_the_attached_session() {
         let snapshot = Snapshot {
             sessions: vec![hosted("build")],
             answered: vec![this_machine().to_string()],
             ..Snapshot::default()
         };
-        let current = Located::new(as_listed(LOCAL), "gone");
+        // The attach succeeded after this answer was taken, as when a session
+        // was just started or renamed and the next fan-out is still running.
+        let current = Located::new(as_listed(LOCAL), "new");
         let listed = Listed::of(&snapshot, &Groups::default(), &[], None, from_ref(&current));
-        let landable = listed
-            .rows
-            .sessions
-            .iter()
-            .filter(|row| !row.heading)
-            .count();
-        assert_eq!(landable, 1, "a session that has ended got a row");
+        let mut popup = Picker::new(
+            "sessions",
+            "choose",
+            listed.rows.sessions.clone(),
+            listed.rows.at,
+        );
+        let row = popup.chosen().unwrap();
+        assert_eq!(listed.at[row.id], current);
+        assert_eq!(row.note, "●");
+        assert_eq!(row.number, Some(1));
+
+        let fresh = Snapshot {
+            sessions: vec![hosted("build"), hosted("new")],
+            ..snapshot
+        };
+        let updated = Listed::of(&fresh, &Groups::default(), &[], None, from_ref(&current))
+            .following(&listed);
+        popup.replace(updated.rows.sessions.clone(), updated.rows.at);
+        assert_eq!(updated.at[popup.chosen().unwrap().id], current);
     }
 
     /// The digit column, and the whole of what it means: the session you are in

@@ -12,6 +12,9 @@
 //! A closed popup feed stays dormant until the attachment ends.
 //! Switching releases the node attachment but keeps a capable host's transport.
 //! The caller caches that transport; this loop never keeps hidden attachments.
+//! Unavailable cached rows retain their highlight but accept no session commands.
+//! Clipboard uploads run separately, so keyboard input, output and pings keep
+//! flowing throughout a transfer. Leaving the attachment cancels its upload.
 
 use std::env;
 use std::fmt::Write as _;
@@ -29,13 +32,12 @@ use tokio::sync::mpsc;
 use tracing::debug;
 
 use super::keys::{interrupts, sequence, wheel_is_ours};
+use super::upload::{Update as UploadUpdate, Uploaded, Uploads};
 use super::{Action, Chose, Find, KeyFilter, Mode, Outcome, Pick, Rename, Rows, Scroll, Select};
 use crate::client::picker::Picker;
 use crate::client::scroll::{self, Chased, Owed, Scrollback, Selected};
 use crate::client::status::{self, Filter, Popped, Status};
-use crate::client::{
-    Attached, Connection, Gone, SessionHalves, SessionReader, SessionWriter, Update,
-};
+use crate::client::{Attached, Connection, Gone, SessionHalves, SessionWriter, Update};
 use crate::clipboard;
 use crate::notify;
 use crate::proto::{HostedEvent, Renamed, Size};
@@ -393,10 +395,14 @@ pub async fn run(
     held: &mut Held,
     session: Attached,
     target: &str,
-    mode: Mode,
-    notice: Option<&str>,
-    popup: PopupFeed<'_>,
+    options: RunOptions<'_>,
 ) -> Result<Run> {
+    let RunOptions {
+        mode,
+        notice,
+        popup,
+        uploads,
+    } = options;
     let PopupFeed {
         rows,
         group,
@@ -443,6 +449,7 @@ pub async fn run(
             asks,
             fresh,
             connection: &mut connection,
+            uploads,
         },
     )
     .await;
@@ -764,6 +771,13 @@ pub struct PopupFeed<'a> {
     pub fresh: tokio::sync::watch::Receiver<Rows>,
 }
 
+pub struct RunOptions<'a> {
+    pub mode: Mode,
+    pub notice: Option<&'a str>,
+    pub popup: PopupFeed<'a>,
+    pub uploads: Uploads,
+}
+
 /// What the pump paints on and what it paints there, which travel together
 /// because the screen mode decides how all three are used.
 struct Painting<'a> {
@@ -787,6 +801,7 @@ struct Painting<'a> {
     /// session.
     fresh: tokio::sync::watch::Receiver<Rows>,
     connection: &'a mut Option<Connection>,
+    uploads: Uploads,
 }
 
 /// The popup on the screen, and what the list in it is for.
@@ -841,6 +856,9 @@ impl Popup {
     /// would take.
     fn line(&self) -> String {
         match self.picker.chosen() {
+            Some(row) if !row.available => {
+                format!("{}: {} (offline)", self.picker.title(), row.label)
+            }
             Some(row) => format!("{}: {}", self.picker.title(), row.label),
             // A list with nothing in it still has to say which list it is, or
             // the row goes blank in a mode that is still holding the keyboard.
@@ -893,7 +911,7 @@ impl Popup {
     fn subject(&self) -> Option<usize> {
         match self.what {
             Showing::Moving { row } => Some(row),
-            Showing::Sessions => self.picker.chosen().map(|row| row.id),
+            Showing::Sessions => self.picker.actionable().map(|row| row.id),
             Showing::Narrowing | Showing::Hosting => None,
         }
     }
@@ -956,10 +974,10 @@ async fn pump(
         asks,
         mut fresh,
         connection,
+        mut uploads,
     } = painting;
     let reuse = session.reuse;
     let watching = session.read_only;
-    let takes_pastes = session.paste;
     let scrolls = session.scroll;
     let renames = session.rename;
     let SessionHalves {
@@ -1185,7 +1203,7 @@ async fn pump(
                             // rather than instead of it: Esc there comes back
                             // to where the gesture started.
                             Pick::Move | Pick::Groups => {
-                                let Some(row) = up.picker.chosen().map(|row| row.id) else {
+                                let Some(row) = up.picker.actionable().map(|row| row.id) else {
                                     // No row to act on, and the mode has
                                     // already moved: `KeyFilter::after` reads
                                     // the key, not what this arm decides about
@@ -1238,7 +1256,10 @@ async fn pump(
                                 return leave_for(SessionHalves { reader, writer }, reuse, connection, Outcome::Chose(Chose::Go(row))).await;
                             }
                             Pick::Go => {
-                                let Some(chosen) = up.picker.chosen().map(|row| row.id) else {
+                                let Some(chosen) = up.picker.actionable().map(|row| row.id) else {
+                                    let back = up.mode();
+                                    set_mode(keys, &mut status, back);
+                                    restate = true;
                                     continue;
                                 };
                                 let chose = match up.what {
@@ -1598,43 +1619,9 @@ async fn pump(
                         restate = true;
                     }
                     Some(Action::Paste) => {
-                        // The key as the terminal spelled it, since it goes
-                        // to the session unchanged when there turns out to
-                        // be nothing on the clipboard to paste.
-                        let key = keys.spelling().to_vec();
-                        let pasted = paste(
-                            &mut reader,
-                            &mut writer,
-                            &mut stdout,
-                            &mut output,
-                            &mut status,
-                            takes_pastes,
-                            &key,
-                        ).await?;
-                        drop_finished_releases(&mut output, keys);
-                        notice_until = Some(tokio::time::Instant::now() + NOTICE_FOR);
-                        // The paste had the writing half to itself, so a
-                        // switch swallowed while it ran is only now
-                        // answerable.
-                        if output.take_switched() {
-                            writer.resync().await?;
-                        }
-                        // The same discipline as everywhere else: never
-                        // into the middle of a sequence the session is
-                        // part way through.
-                        restate = true;
-                        if output.at_boundary() {
-                            stdout.write_all(status.repaint(terminal_size()).as_bytes()).await?;
-                            stdout.flush().await?;
-                            restate = false;
-                        }
-                        // A snapshot during the paste reset the terminal modes.
-                        // Reassert ownership even when the key flag did not change.
-                        keys.set_wheel(false);
-                        let ours = wheel_is_ours(history, output.session_mouse());
-                        own_the_wheel(&mut stdout, keys, ours).await?;
-                        if let Pasted::Ended(outcome) = pasted {
-                            return Ok(outcome);
+                        if let Err(e) = uploads.start(naming.called, keys.spelling()) {
+                            notice(&mut status, &mut notice_until, &format!("{e:#}"));
+                            restate = true;
                         }
                     }
                     None => {}
@@ -1673,9 +1660,28 @@ async fn pump(
                 }
                 }
             }
-            // A listing has landed. Swapped in under the highlight rather than
-            // reopening the popup, so a session ending three rows up does not
-            // move what Enter would take.
+            // Upload progress never takes the attach writer or reader away.
+            upload = uploads.next() => {
+                match upload {
+                    UploadUpdate::Started { bytes } => {
+                        notice(&mut status, &mut notice_until, &format!("pasting {}", clipboard::mb(bytes)));
+                    }
+                    UploadUpdate::Finished { result, key } => match result {
+                        Ok(Uploaded::NoImage) => writer.send_input(&key).await?,
+                        Ok(Uploaded::ClipboardFailed(e)) => {
+                            writer.send_input(&key).await?;
+                            notice(&mut status, &mut notice_until, &format!("{e:#}"));
+                        }
+                        Ok(Uploaded::Image { bytes }) => {
+                            notice(&mut status, &mut notice_until, &format!("pasted {}", clipboard::mb(bytes)));
+                        }
+                        Err(e) => notice(&mut status, &mut notice_until, &format!("image paste failed: {e:#}")),
+                    },
+                }
+                restate = true;
+                settle(&mut stdout, &output, &status, &mut pending, &mut restate).await?;
+            }
+            // A listing has landed. Keep the highlight on the same row.
             landed = changed_rows(&mut fresh) => {
                 rows = landed;
                 if let Some(up) = popup.as_mut() {
@@ -2171,107 +2177,6 @@ async fn expire(at: Option<tokio::time::Instant>) {
     match at {
         Some(at) => tokio::time::sleep_until(at).await,
         None => std::future::pending().await,
-    }
-}
-
-/// Whether the session was still there when the paste finished.
-enum Pasted {
-    Done,
-    Ended(Outcome),
-}
-
-/// Read this machine's clipboard and send what is on it to the session's
-/// host, which writes it down and pastes the path.
-///
-/// The key goes through untouched when there is nothing to paste, so a
-/// Ctrl-V that was meant for the program still reaches it. Everything else
-/// is said on the status row: this runs while a full-screen program owns the
-/// screen, and there is nowhere else to put a sentence.
-async fn paste(
-    reader: &mut SessionReader,
-    writer: &mut SessionWriter,
-    stdout: &mut Stdout,
-    output: &mut Filter,
-    status: &mut Status,
-    takes_pastes: bool,
-    key: &[u8],
-) -> Result<Pasted> {
-    let image = match clipboard::image().await {
-        Ok(Some(image)) => image,
-        // Text on the clipboard, or none at all. The ordinary case, and the
-        // one that must stay silent: the key belongs to the session.
-        Ok(None) => {
-            writer.send_input(key).await?;
-            return Ok(Pasted::Done);
-        }
-        // A missing helper program, or one that failed. Worth a sentence,
-        // and the key still goes through.
-        Err(e) => {
-            status.set_notice(&format!("{e:#}"));
-            writer.send_input(key).await?;
-            return Ok(Pasted::Done);
-        }
-    };
-    if !takes_pastes {
-        status.set_notice("this host is too old to take pasted files; `mm update` there");
-        writer.send_input(key).await?;
-        return Ok(Pasted::Done);
-    }
-
-    let size = clipboard::mb(image.data.len());
-    status.set_notice(&format!("pasting {size}"));
-    if output.at_boundary() {
-        stdout
-            .write_all(status.repaint(terminal_size()).as_bytes())
-            .await?;
-        stdout.flush().await?;
-    }
-
-    // The screen has to stay alive while the bytes go: a session still
-    // producing output would otherwise fill the connection nobody is
-    // reading, and both ends would sit there waiting for the other. The
-    // send is a single future polled to completion rather than one
-    // recreated per pass, so nothing is ever cancelled mid-frame.
-    let send = writer.send_paste(image.kind, &image.data);
-    tokio::pin!(send);
-    loop {
-        tokio::select! {
-            sent = &mut send => {
-                sent?;
-                status.set_notice(&format!("pasted {size}"));
-                return Ok(Pasted::Done);
-            }
-            update = reader.next() => match update? {
-                Update::Output(bytes) => {
-                    stdout.write_all(&output.feed(&bytes)).await?;
-                    stdout.flush().await?;
-                }
-                Update::Screen(bytes) => {
-                    stdout.write_all(&screen_repaint(output, &bytes, false, false)).await?;
-                    stdout.write_all(status.repaint(terminal_size()).as_bytes()).await?;
-                    stdout.flush().await?;
-                }
-                // Left unanswered: the writing half is busy with the paste,
-                // and every chunk of it is a frame the host counts as this
-                // client being alive.
-                Update::Ping => {}
-                // A bell during the second a paste takes. Dropped rather
-                // than queued: this row is showing the paste, and a bell is
-                // only worth anything while it is news.
-                Update::Event(_) => {}
-                // Unreachable: history comes at the start of an attach,
-                // before there has been a key to press, and neither the
-                // view, a search nor a rename is open while a paste is
-                // running.
-                Update::History(_)
-                | Update::View(_)
-                | Update::Found(_)
-                | Update::Renamed(_)
-                | Update::Resized(_) => {}
-                Update::Exited(code) => return Ok(Pasted::Ended(Outcome::Exited(code))),
-                Update::Disconnected => return Ok(Pasted::Ended(Outcome::Disconnected)),
-            },
-        }
     }
 }
 

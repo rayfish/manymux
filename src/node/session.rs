@@ -7,6 +7,8 @@
 //! project, and it is why the PTY is owned by the server rather than proxied.
 //! A replacement screen and its output subscription are taken under the same
 //! lock as an attach, so bytes already in the screen are never replayed over it.
+//! A separate image upload retains this session before receiving bytes, so a
+//! rename cannot redirect the completed paste to a replacement session.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -15,7 +17,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use avt::Vt;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{broadcast, mpsc, watch};
@@ -343,6 +345,19 @@ impl Drop for Attachment {
 }
 
 impl Session {
+    /// An upload is tied to this process before it starts, so a rename or a
+    /// replacement session cannot redirect its path while the bytes arrive.
+    pub(super) fn paste_file(&self, path: &Path) -> Result<()> {
+        if self.has_exited() {
+            bail!("the session ended before the image upload finished");
+        }
+        let bracketed = held(&self.state).scanner.bracketed_paste();
+        let bytes = super::paste::typed(path, bracketed).into_bytes();
+        self.input_tx
+            .send(Input::Bytes(bytes))
+            .map_err(|_| anyhow::anyhow!("the session stopped accepting input"))
+    }
+
     /// Spawn the child on a fresh PTY and start the three tasks that keep the
     /// session alive: PTY reader, PTY writer, and child reaper.
     pub fn spawn(

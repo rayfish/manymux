@@ -13,6 +13,8 @@
 //! desktop notifications.
 //! A screen replacing missed output uses `RESYNC`, and starts a fresh output
 //! subscription at that screen, so its switches and old bytes cannot replay.
+//! Image uploads have their own streams and never create attachments. At most
+//! four run at once; file writes run off the async workers before input is sent.
 
 pub mod events;
 mod history;
@@ -29,8 +31,8 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
-use tokio::sync::broadcast;
 use tokio::sync::broadcast::error::RecvError;
+use tokio::sync::{Semaphore, broadcast};
 use tokio::time::{Instant, timeout};
 use tracing::{debug, info, warn};
 
@@ -89,6 +91,7 @@ pub struct Node {
     /// replace the file. Asking again later would hash whatever now sits at
     /// that path, which is the new binary and not what this process is running.
     build: Option<String>,
+    uploads: Semaphore,
 }
 
 impl Node {
@@ -100,6 +103,7 @@ impl Node {
             notifier: Arc::new(Notifier::new(config.notifications)),
             events,
             build: own_build().await,
+            uploads: Semaphore::new(4),
         });
 
         node.watch_peers(&config.peers);
@@ -358,6 +362,27 @@ impl Node {
                     }
                 }
 
+                Request::Paste { name } => {
+                    let Ok(_slot) = self.uploads.try_acquire() else {
+                        return reply(&mut write, Err(anyhow::anyhow!("image uploads are busy")))
+                            .await;
+                    };
+                    let Some(session) = self.registry.get(&name) else {
+                        return reply(&mut write, Err(anyhow::anyhow!("no session named {name}")))
+                            .await;
+                    };
+                    proto::write_msg(&mut write, tag::RESPONSE, &Response::Ok).await?;
+                    let uploaded = receive_paste(&mut read).await;
+                    return reply(
+                        &mut write,
+                        uploaded.and_then(|path| {
+                            session.paste_file(&path)?;
+                            Ok(Response::Ok)
+                        }),
+                    )
+                    .await;
+                }
+
                 Request::Events => {
                     proto::write_msg(&mut write, tag::RESPONSE, &Response::Ok).await?;
                     return crate::ipc::pump_events(self.events.subscribe(), read, write).await;
@@ -406,7 +431,11 @@ impl Node {
             }),
             Request::Snapshot => Ok(Response::Snapshot(self.registry.doing())),
             Request::Peek { names } => Ok(Response::Peeked(self.registry.peek(&names))),
-            Request::Attach { .. } | Request::Events | Request::Stop | Request::Reached { .. } => {
+            Request::Attach { .. }
+            | Request::Paste { .. }
+            | Request::Events
+            | Request::Stop
+            | Request::Reached { .. } => {
                 unreachable!("handled before the single-response path")
             }
         }
@@ -633,6 +662,27 @@ where
         }
     }
     Ok(false)
+}
+
+/// A separate upload never touches a session until the whole file is committed.
+async fn receive_paste<R>(read: &mut FrameReader<R>) -> Result<PathBuf>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut incoming = Paste::default();
+    loop {
+        let frame = timeout(SILENT_FOR, read.next())
+            .await??
+            .ok_or_else(|| anyhow::anyhow!("image upload ended before the file was complete"))?;
+        match frame.tag {
+            tag::PASTE => incoming.take(frame.body),
+            tag::PASTE_END => {
+                let info: proto::PasteInfo = proto::decode(&frame.body)?;
+                return tokio::task::spawn_blocking(move || incoming.finish(&info.kind)).await?;
+            }
+            _ => bail!("unexpected frame during image upload"),
+        }
+    }
 }
 
 /// A pasted file arriving a frame at a time.

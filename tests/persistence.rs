@@ -5,7 +5,7 @@
 //! the same `Node::handle` path a Unix socket or an ssh agent takes.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use anyhow::Result;
 use manymux::client::{Gone, Stream, Update};
@@ -1349,6 +1349,106 @@ async fn a_pasted_image_is_written_on_the_host_and_its_path_typed_into_the_sessi
 
     std::fs::remove_file(written[0].path()).unwrap();
     registry.kill(&name).unwrap();
+}
+
+#[tokio::test]
+async fn a_separate_image_upload_leaves_the_terminal_responsive_and_survives_a_rename() {
+    let node = test_node().await;
+    let Spawned { name, .. } = spawn_session(&node, &["/bin/sh", "-c", "echo ready; cat"]).await;
+    let mut terminal = Client::connect(&node);
+    terminal
+        .send(&Request::Attach {
+            name: name.clone(),
+            size: Size::new(160, 24),
+            history: 0,
+            read_only: false,
+        })
+        .await
+        .unwrap();
+    terminal.read_until("ready").await;
+
+    let mut upload = Client::connect(&node);
+    assert!(matches!(
+        upload
+            .send(&Request::Paste { name: name.clone() })
+            .await
+            .unwrap(),
+        Response::Ok
+    ));
+    let mut png = b"\x89PNG\r\n\x1a\nseparate-upload-".to_vec();
+    png.extend(format!("{:?}", SystemTime::now()).as_bytes());
+    proto::write_frame(&mut upload.write, tag::PASTE, &png)
+        .await
+        .unwrap();
+    let session = node.registry.get(&name).unwrap();
+    assert_eq!(
+        session.info().attached,
+        1,
+        "uploading creates no attachment"
+    );
+    assert_eq!(session.info().size, Size::new(160, 24));
+    terminal.type_line("still-responsive").await.unwrap();
+    terminal.read_until("still-responsive").await;
+
+    tokio::time::pause();
+    tokio::time::advance(proto::PING_EVERY).await;
+    terminal.read_until_ping().await;
+    terminal.pong().await.unwrap();
+    tokio::time::resume();
+
+    let renamed = node.registry.rename(&name, "renamed").unwrap();
+    proto::write_msg(
+        &mut upload.write,
+        tag::PASTE_END,
+        &proto::PasteInfo { kind: "png".into() },
+    )
+    .await
+    .unwrap();
+    let response = upload.next_frame().await.unwrap();
+    assert_eq!(response.tag, tag::RESPONSE);
+    assert!(matches!(
+        proto::decode::<Response>(&response.body).unwrap(),
+        Response::Ok
+    ));
+    let seen = terminal.read_until(".png").await;
+    let paths: Vec<_> = std::fs::read_dir(manymux::node::paste::dir())
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| std::fs::read(path).is_ok_and(|data| data == png))
+        .collect();
+    assert_eq!(paths.len(), 1);
+    assert!(seen.contains(paths[0].file_name().unwrap().to_str().unwrap()));
+    std::fs::remove_file(&paths[0]).unwrap();
+    node.registry.kill(&renamed).unwrap();
+}
+
+#[tokio::test]
+async fn image_uploads_are_bounded_and_do_not_count_as_attached_clients() {
+    let node = test_node().await;
+    let Spawned { name, .. } = spawn_session(&node, &["/bin/cat"]).await;
+    let mut pending = Vec::new();
+    for _ in 0..4 {
+        let mut upload = Client::connect(&node);
+        assert!(matches!(
+            upload
+                .send(&Request::Paste { name: name.clone() })
+                .await
+                .unwrap(),
+            Response::Ok
+        ));
+        pending.push(upload);
+    }
+    let mut excess = Client::connect(&node);
+    assert!(matches!(
+        excess
+            .send(&Request::Paste { name: name.clone() })
+            .await
+            .unwrap(),
+        Response::Error(_)
+    ));
+    assert_eq!(node.registry.get(&name).unwrap().info().attached, 0);
+    drop(pending);
+    node.registry.kill(&name).unwrap();
 }
 
 /// The route a bell takes to somebody sitting in another session on the same

@@ -11,6 +11,8 @@
 //! program that does the job, manymux already shells out to ssh, and a
 //! clipboard crate would drag in the whole windowing stack of three platforms
 //! for something a pipe answers.
+//! File reads and macOS image decoding run off the async workers, so large
+//! screenshots cannot delay terminal input or keepalive processing.
 
 use std::path::Path;
 use std::process::Stdio;
@@ -161,10 +163,12 @@ async fn mac() -> Result<Option<Image>> {
 
     if let Some(class) = mac_class(&info) {
         let script = format!("the clipboard as «class {class}»");
-        if let Some(out) = run("osascript", &["-e", &script]).await?
-            && let Some(data) = unhex(&String::from_utf8_lossy(&out))
-        {
-            return as_image(data);
+        if let Some(out) = run("osascript", &["-e", &script]).await? {
+            let data =
+                tokio::task::spawn_blocking(move || unhex(&String::from_utf8_lossy(&out))).await?;
+            if let Some(data) = data {
+                return as_image(data);
+            }
         }
     }
     // A file copied in Finder, which is a location and not an image.
@@ -202,20 +206,18 @@ async fn copied_file(list: &str) -> Result<Option<Image>> {
     ) {
         return Ok(None);
     }
-    let size = std::fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
-    if size as usize > MAX {
-        bail!(
-            "{path} is {}, over the {} paste limit",
-            mb(size as usize),
-            mb(MAX)
-        );
-    }
-    match std::fs::read(&path) {
-        Ok(data) => as_image(data),
-        // Not ours to complain about: the clipboard may point at a file on a
-        // volume that has since gone away, and the key still has to work.
-        Err(_) => Ok(None),
-    }
+    tokio::task::spawn_blocking(move || {
+        let size = std::fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
+        if size > u64::try_from(MAX)? {
+            bail!("{path} is over the {} paste limit", mb(MAX));
+        }
+        match std::fs::read(&path) {
+            Ok(data) => as_image(data),
+            // A clipboard path can point at a volume that has gone away.
+            Err(_) => Ok(None),
+        }
+    })
+    .await?
 }
 
 /// The largest image worth carrying, kept in step with the protocol's own cap
@@ -327,6 +329,7 @@ fn hex_pair(high: u8, low: u8) -> Option<u8> {
 /// because that one the user can do something about.
 async fn run(program: &str, args: &[&str]) -> Result<Option<Vec<u8>>> {
     let output = Command::new(program)
+        .kill_on_drop(true)
         .args(args)
         .stdin(Stdio::null())
         .stderr(Stdio::null())

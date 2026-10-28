@@ -6,6 +6,8 @@
 //! `client::attach`'s; this is the half that knows hosts, groups and pids.
 //! A transport lost during the attach handshake is unreachable, rather than
 //! evidence that the session disappeared from a switch listing.
+//! Each attach run retains its last known sessions, dimming unavailable ones
+//! while only fresh answers drive switching and group pruning.
 
 use std::collections::HashSet;
 use std::fmt::{self, Display, Formatter};
@@ -234,6 +236,7 @@ pub(crate) async fn do_attach(
             let groups = groups.clone();
             let focus = cycle.focused().map(str::to_string);
             let recent = cycle.recent();
+            let mut cached = snapshot.clone();
             let latest = Arc::clone(&latest);
             let mut previous = listed.clone();
             // The listing already out there, handed over rather than left to
@@ -254,9 +257,8 @@ pub(crate) async fn do_attach(
                         None => survey(&socket).await,
                     };
                     let Ok(snapshot) = listing else { continue };
-                    if snapshot.is_empty() {
-                        continue;
-                    }
+                    let snapshot = snapshot.following(&cached);
+                    cached = snapshot.clone();
                     let held = Groups::load().unwrap_or_else(|_| groups.clone());
                     let machines = Hosts::load().map(|hosts| hosts.names()).unwrap_or_default();
                     let listed = Listed::of(&snapshot, &held, &machines, focus.as_deref(), &recent)
@@ -278,25 +280,55 @@ pub(crate) async fn do_attach(
                 }
             })
         };
+        let uploads = {
+            let socket = socket.to_path_buf();
+            let host = target.host.clone();
+            attach::Uploads::new(move |name, image| {
+                let socket = socket.clone();
+                let host = host.clone();
+                async move {
+                    let mut stream = reach(
+                        &socket,
+                        &host,
+                        Reach {
+                            start: false,
+                            hushed: true,
+                            install: false,
+                        },
+                    )
+                    .await?;
+                    stream.paste(&name, image.kind, &image.data).await
+                }
+            })
+        };
+        let ran = attach::run(
+            &mut held,
+            session,
+            &where_,
+            attach::RunOptions {
+                mode,
+                notice: notice.take().as_deref(),
+                popup: attach::PopupFeed {
+                    rows: listed.rows.clone(),
+                    group: cycle.focused(),
+                    asks,
+                    fresh,
+                },
+                uploads,
+            },
+        )
+        .await;
+        lister.abort();
+        if let Err(e) = lister.await
+            && !e.is_cancelled()
+        {
+            debug!("popup listing task failed: {e}");
+        }
         let attach::Run {
             outcome,
             renamed,
             connection,
-        } = attach::run(
-            &mut held,
-            session,
-            &where_,
-            mode,
-            notice.take().as_deref(),
-            attach::PopupFeed {
-                rows: listed.rows.clone(),
-                group: cycle.focused(),
-                asks,
-                fresh,
-            },
-        )
-        .await?;
-        lister.abort();
+        } = ran?;
         if let Some(connection) = connection {
             connections.insert(target.host.clone(), connection);
         }
@@ -346,6 +378,20 @@ pub(crate) async fn do_attach(
                 // on a session is the one that means go, and it is the one that
                 // sets this back to `Focus` below.
                 mode = Mode::Control;
+                let subject = match &chose {
+                    Chose::Go(row)
+                    | Chose::Move { session: row, .. }
+                    | Chose::NewGroup { session: row, .. }
+                    | Chose::Named { session: row, .. } => Some(*row),
+                    Chose::Focus(_) | Chose::On(_) => None,
+                };
+                // A refresh can mark the row unavailable after the key chose
+                // it but before the popup painted the answer.
+                if subject.is_some_and(|row| !listed.available(row)) {
+                    notice = Some("that session is offline".to_string());
+                    listing = Some(spawn_listing(socket));
+                    continue;
+                }
                 match chose {
                     // A hop like any other, so the way back is recorded the
                     // same way and `Motion::Last` reaches it.
@@ -886,6 +932,7 @@ async fn survey(socket: &Path) -> Result<Snapshot> {
         answered: listing.answering(),
         sessions: listing.sessions,
         before,
+        ..Snapshot::default()
     })
 }
 
@@ -930,11 +977,7 @@ async fn take_listing(
         return;
     };
     match tokio::time::timeout(LISTING_WAIT, &mut task).await {
-        Ok(Ok(landed)) => {
-            if !landed.is_empty() {
-                absorb(landed, snapshot, cycle, groups);
-            }
-        }
+        Ok(Ok(landed)) => absorb(landed, snapshot, cycle, groups),
         Ok(Err(e)) => debug!("the listing task did not finish: {e}"),
         Err(_) => *pending = Some(task),
     }
@@ -954,7 +997,7 @@ struct Fresh {
 /// one this run started with.
 fn absorb(landed: Snapshot, snapshot: &mut Snapshot, cycle: &mut Cycle, groups: &mut Groups) {
     let _ = landed.refresh(groups);
-    *snapshot = landed;
+    *snapshot = landed.following(snapshot);
     cycle.refresh(snapshot.entries(groups));
 }
 

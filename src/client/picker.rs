@@ -41,6 +41,7 @@
 //! A session search keeps the full listing beside the visible rows. It matches
 //! the name and the title even when the title is clipped in the box, and keeps
 //! the headings above matches so the machine and group remain visible.
+//! Unavailable rows keep their place and highlight, but cannot be activated.
 
 use crate::client::switch::wrapped;
 use crate::proto::Size;
@@ -125,6 +126,9 @@ pub struct Row {
     /// the sessions in it, or a machine's above the ones in no group. Skipped
     /// by the highlight, since Enter on one would have nothing to attach to.
     pub heading: bool,
+    /// A cached row whose session is unavailable stays visible and selectable
+    /// for navigation, but commands cannot act on it until it returns.
+    pub available: bool,
     /// How far in the row sits, in steps of [`STEP`] columns. The list is a
     /// tree two deep, and this is the only thing that says so.
     pub indent: u16,
@@ -139,6 +143,7 @@ impl Row {
             note: String::new(),
             number: None,
             heading: false,
+            available: true,
             indent: 0,
         }
     }
@@ -247,6 +252,11 @@ impl Picker {
         self.landable(self.at)
     }
 
+    /// The highlighted row only when it can accept a command.
+    pub fn actionable(&self) -> Option<&Row> {
+        self.chosen().filter(|row| row.available)
+    }
+
     pub fn up(&mut self) {
         self.step(false);
     }
@@ -311,7 +321,7 @@ impl Picker {
     pub fn at_number(&self, number: u8) -> Option<&Row> {
         self.rows
             .iter()
-            .find(|row| !row.heading && row.number == Some(number))
+            .find(|row| !row.heading && row.available && row.number == Some(number))
     }
 
     fn landable(&self, index: usize) -> Option<&Row> {
@@ -524,6 +534,18 @@ impl Picker {
         let label = fit(&format!("{inset}{}", row.label), layout.label);
         let detail = fit(&row.detail, detail_width);
         let note = right(&row.note, NOTE);
+
+        if !row.available && layout.colour {
+            let band = if here {
+                format!(";{}", ground())
+            } else {
+                String::new()
+            };
+            let point = if here { POINT } else { ' ' };
+            return format!(
+                "\x1b[0;38;5;240{band}m{point} {gutter}{label} {detail}  {note} \x1b[0m"
+            );
+        }
 
         if !here {
             return format!(
@@ -766,6 +788,23 @@ mod tests {
 
     fn one_row() -> Picker {
         picker(vec![Row::new(0, "build").detail("cargo").note("2m")], 0)
+    }
+
+    #[test]
+    fn an_unavailable_row_is_grey_and_keeps_its_highlight_without_accepting_commands() {
+        let mut row = Row::new(0, "build").number(2).note("n/a");
+        row.available = false;
+        let picker = picker(vec![row], 0);
+        assert_eq!(picker.chosen().unwrap().id, 0);
+        assert!(picker.actionable().is_none());
+        assert!(picker.at_number(2).is_none());
+        for selected in [true, false] {
+            let painted = row_of(&picker, true, selected);
+            assert!(painted.contains("38;5;240"));
+            assert!(!painted.contains(NAME));
+            assert!(painted.contains("n/a"));
+        }
+        assert!(row_of(&picker, false, true).contains("n/a"));
     }
 
     #[test]

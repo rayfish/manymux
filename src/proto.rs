@@ -23,6 +23,9 @@
 //! [`Request`] is answered with a complaint naming the version rather than a
 //! closed connection. Changing the framing itself has neither, and would need a
 //! way to tell the two apart before it could be done at all.
+//!
+//! `Paste` uploads use a separate request stream, acknowledged before any file
+//! bytes are sent. Older nodes refuse the request without disturbing an attach.
 
 use anyhow::{Result, bail};
 use bytes::{Buf, BytesMut};
@@ -267,6 +270,12 @@ pub struct SpawnSpec {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum Request {
     List,
+    /// Upload a file on this stream without attaching another client. After
+    /// `Ok`, send `PASTE` chunks and `PASTE_END`; the final response confirms
+    /// the file was written and its path inserted into this session.
+    Paste {
+        name: String,
+    },
     Spawn(SpawnSpec),
     Kill {
         name: String,
@@ -1334,6 +1343,15 @@ mod tests {
         assert!(
             decode::<Old>(&asked).is_err(),
             "an older node has no variant to decode this into"
+        );
+        assert!(
+            decode::<Old>(
+                &encode(&Request::Paste {
+                    name: "build".into()
+                })
+                .unwrap()
+            )
+            .is_err()
         );
 
         // The requests it does know still arrive as themselves, so adding the
