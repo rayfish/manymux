@@ -8,6 +8,8 @@
 //! evidence that the session disappeared from a switch listing.
 //! Each attach run retains its last known sessions, dimming unavailable ones
 //! while only fresh answers drive switching and group pruning.
+//! Listings refresh throughout an attachment, including while the menu is open.
+//! A confirmed exit is removed from the cache before falling back.
 
 use std::collections::HashSet;
 use std::fmt::{self, Display, Formatter};
@@ -38,6 +40,8 @@ use crate::{FAILED, OK, Reach, current_dir, open, open_hushed, reach, spawn};
 /// How long the first attach waits to learn its initial group. Switches
 /// collect only finished listings and do not spend this deadline.
 const LISTING_WAIT: Duration = Duration::from_millis(500);
+
+const LISTING_EVERY: Duration = Duration::from_secs(1);
 
 /// The screen to paint on: what was asked for, else what the settings say.
 ///
@@ -248,7 +252,13 @@ pub(crate) async fn do_attach(
             // box for as long as the second took.
             let mut running = listing.take();
             tokio::spawn(async move {
-                while wanted.recv().await.is_some() {
+                let mut refresh = tokio::time::interval(LISTING_EVERY);
+                refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    tokio::select! {
+                        request = wanted.recv() => if request.is_none() { return; },
+                        _ = refresh.tick() => {},
+                    }
                     let listing = match running.take() {
                         Some(task) => match task.await {
                             Ok(snapshot) => Ok(snapshot),
@@ -506,7 +516,7 @@ pub(crate) async fn do_attach(
                     }
                 }
                 // Whatever it was, what the machines are running may have moved
-                // under it, and a press is the only thing that ever asks.
+                // under it, so the next attachment needs fresh rows.
                 listing = Some(spawn_listing(socket));
             }
             Outcome::New => {
@@ -547,6 +557,7 @@ pub(crate) async fn do_attach(
             // screen that changes under somebody with nothing said about it
             // reads as a client that lost its place.
             Outcome::Exited(code) => {
+                snapshot.forget(cycle.current());
                 // The name and not the whole target, because the row it goes
                 // on is narrow and drops a notice that does not fit outright,
                 // and because the machine is the one named two columns to its

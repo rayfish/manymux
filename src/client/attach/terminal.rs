@@ -15,6 +15,7 @@
 //! Unavailable cached rows retain their highlight but accept no session commands.
 //! Clipboard uploads run separately, so keyboard input, output and pings keep
 //! flowing throughout a transfer. Leaving the attachment cancels its upload.
+//! Session lifecycle events request fresh menu rows without keyboard input.
 
 use std::env;
 use std::fmt::Write as _;
@@ -40,7 +41,7 @@ use crate::client::status::{self, Filter, Popped, Status};
 use crate::client::{Attached, Connection, Gone, SessionHalves, SessionWriter, Update};
 use crate::clipboard;
 use crate::notify;
-use crate::proto::{HostedEvent, Renamed, Size};
+use crate::proto::{EventKind, HostedEvent, Renamed, Size};
 use crate::settings::{Mouse, Screen, Settings};
 
 /// Sent before attaching.
@@ -790,11 +791,8 @@ struct Painting<'a> {
     /// Say the word and the caller goes and asks the machines what they are
     /// running again, answering on `fresh`.
     ///
-    /// A press is the only thing that ever asks, here as everywhere else: the
-    /// popup opens on whatever was true a moment ago and is corrected when the
-    /// answer lands, rather than sitting on a machine that is asleep. The one
-    /// that found nowhere to go asks too, or the first fruitless press would be
-    /// the last one that ever asked.
+    /// Keys and session lifecycle events request an early refresh alongside
+    /// the caller's background updates. Opening never waits for a host.
     asks: mpsc::Sender<()>,
     /// Rows as of the last answer. Swapped in under the highlight by id, so a
     /// listing landing under an open popup does not slide it onto a different
@@ -1079,8 +1077,8 @@ async fn pump(
                 // The mode key on its own, which is what control mode looks
                 // like: the popup is the mode rather than something the mode
                 // can show, so it goes up on the way in and not on the first
-                // key after it. Asked for again in the same breath, because a
-                // press is the only thing that ever asks.
+                // key after it. Asked for again in the same breath, because
+                // the background refresh may still be in flight.
                 if keystrokes.mode == Mode::Control && was != Mode::Control && popup.is_none() {
                     let _ = asks.try_send(());
                     popup = Some(Popup::sessions(&rows));
@@ -1898,6 +1896,9 @@ async fn pump(
                 // terminal is asked to raise it, and the row says which
                 // session it was, for a terminal that raises nothing.
                 Update::Event(hosted) => {
+                    if matches!(hosted.event.kind, EventKind::Started | EventKind::Exited(_)) {
+                        let _ = asks.try_send(());
+                    }
                     if let Some(rung) = bells.ring(&hosted) {
                         pending.push_str(&rung.escape);
                         notice(&mut status, &mut notice_until, &rung.notice);

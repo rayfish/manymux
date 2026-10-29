@@ -21,6 +21,7 @@
 //! Cached sessions stay visible when their host does not answer. A successful
 //! answer removes sessions the host no longer lists.
 //! Only fresh answers drive switching and group pruning; cached rows are dimmed.
+//! A confirmed exit also removes its cached row before the next listing arrives.
 
 use anyhow::Result;
 
@@ -59,6 +60,15 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
+    /// Remove a session whose exit was observed on its attach stream.
+    pub fn forget(&mut self, at: &Located) {
+        let keep = |hosted: &HostedSession| {
+            !same_machine(&hosted.host, &at.host) || hosted.session.name != at.session
+        };
+        self.sessions.retain(keep);
+        self.cached.retain(keep);
+    }
+
     /// Keep the last picture while hosts are unavailable. An answer replaces
     /// that host's sessions, removing any it confirms have closed.
     pub fn following(mut self, previous: &Self) -> Self {
@@ -764,6 +774,33 @@ mod tests {
         assert_eq!(fresh.cached.len(), 1);
         assert_eq!(fresh.sessions.len(), 1);
         assert_eq!(fresh.entries(&Groups::default()).len(), 1);
+    }
+
+    #[test]
+    fn a_confirmed_exit_is_removed_before_another_host_answer_arrives() {
+        let mut snapshot = Snapshot {
+            sessions: vec![
+                hosted_on("gpu-box", "build"),
+                hosted_on("gpu-box", "test"),
+                hosted_on("build-box", "test"),
+            ],
+            ..Snapshot::default()
+        }
+        .following(&Snapshot::default());
+        snapshot.forget(&Located::new("gpu-box", "test"));
+        let current = Located::new("gpu-box", "build");
+        let listed = Listed::of(&snapshot, &Groups::default(), &[], None, from_ref(&current));
+        assert!(!listed.at.contains(&Located::new("gpu-box", "test")));
+        assert!(listed.at.contains(&Located::new("build-box", "test")));
+        assert_eq!(snapshot.sessions.len(), 2);
+        let offline = Snapshot::default().following(&snapshot);
+        assert_eq!(offline.cached.len(), 2);
+        assert!(
+            offline
+                .cached
+                .iter()
+                .all(|hosted| { hosted.host != "gpu-box" || hosted.session.name != "test" })
+        );
     }
 
     #[test]

@@ -1757,7 +1757,7 @@ fn a_wheel_notch_opens_and_moves_the_history_view() {
     // The latest selection path opens a view for the first press, then sees a
     // second press before its history block returns. It must hand the session
     // back after the copy without giving the wheel back to the terminal.
-    pty.write_all(b"\x1b[<0;2;22M\x1b[<0;2;22m\x1b[<0;2;22M\x1b[<0;2;22m")
+    pty.write_all(b"\x1b[<0;2;22M\x1b[<32;2;22M\x1b[<0;2;22m\x1b[<0;2;22M\x1b[<0;2;22m")
         .unwrap();
     let deadline = Instant::now() + Duration::from_secs(20);
     while !seen.contains("copied") {
@@ -1769,6 +1769,10 @@ fn a_wheel_notch_opens_and_moves_the_history_view() {
             "the double click did not finish; saw: {seen:?}"
         );
     }
+    assert!(
+        seen.contains("\x1b]52;c;bGluZQ==\x07"),
+        "the whole word was not copied: {seen:?}"
+    );
 
     seen.clear();
     pty.write_all(b"\x1b[<64;1;1M").unwrap();
@@ -2186,10 +2190,8 @@ fn watched_name(world: &World, name: &str) -> bool {
 
 /// A switch key that finds nowhere to go has to ask where to go next time.
 ///
-/// The listing behind the keys is only ever asked for by a press, so a press
-/// that landed nowhere and did not ask was the last one that ever asked: a
-/// machine with one session on it when the run started stayed a machine with
-/// one session on it, however many were started beside it afterwards.
+/// The menu stays usable after a move that had nowhere to land. A session
+/// started afterwards arrives under the open menu and can be selected.
 #[test]
 fn a_switch_key_that_lands_nowhere_asks_where_to_go_again() {
     use std::io::{Read, Write};
@@ -2229,28 +2231,24 @@ fn a_switch_key_that_lands_nowhere_asks_where_to_go_again() {
     let mut seen = String::new();
     let deadline = Instant::now() + Duration::from_secs(60);
     let mut alone = false;
+    let mut created = false;
     let mut again = false;
     let mut taken = false;
     loop {
         if let Ok(chunk) = seen_rx.recv_timeout(Duration::from_millis(200)) {
             seen.push_str(&String::from_utf8_lossy(&chunk));
         }
-        // The second session is started before the key is pressed, so that the
-        // listing the press asks for is one that has it. What the press cannot
-        // use is the listing taken when the run started, which is the one with
-        // nowhere to go in it.
         if !alone && seen.contains("gpu-box/only") {
             alone = true;
-            world.ok("gpu-box", &["new", "-d", "-n", "second", "sleep", "300"]);
             (&pty).write_all(b"\x1d\t").unwrap();
             seen.clear();
         }
-        // The popup is up and control mode is still on, so the next key is
-        // still the client's. The second press is what asks again, and the
-        // answer is what puts `second` in the list; then Enter takes it.
-        // The popup is up and control mode is still on, so the next key is
-        // still the client's. The second press is what asks again, and the
-        // answer is what puts `second` in the list.
+        // Start only after the first move, so a background refresh cannot
+        // give that move somewhere to land before we make it.
+        if alone && !created && seen.contains("┌ sessions") {
+            created = true;
+            world.ok("gpu-box", &["new", "-d", "-n", "second", "sleep", "300"]);
+        }
         if alone && !again && seen.contains("second") {
             again = true;
             (&pty).write_all(b"\t").unwrap();
@@ -4022,4 +4020,82 @@ fn a_new_session_started_inside_a_group_widens_the_run() {
         seen.contains("┌ sessions ─"),
         "the popup is not the unnarrowed one: {seen:?}"
     );
+}
+
+#[test]
+fn a_session_menu_tracks_changes_without_more_keystrokes() {
+    use std::io::{Read, Write};
+    use std::os::fd::AsFd;
+    use std::sync::mpsc;
+
+    use avt::Vt;
+
+    let world = World::new("live-menu");
+    for name in ["anchor", "vanish-local"] {
+        world.ok("laptop", &["new", "-d", "-n", name, "sh"]);
+    }
+    world.ok("gpu-box", &["new", "-d", "-n", "vanish-remote", "sh"]);
+    world.ok("laptop", &["add", "gpu-box"]);
+
+    let (mut pty, pts) = pty_process::blocking::open().unwrap();
+    pty.resize(pty_process::Size::new(24, 80)).unwrap();
+    let mut client = pty_process::blocking::Command::new(MM)
+        .arg("--socket")
+        .arg(world.socket("laptop"))
+        .args(["attach", "anchor"])
+        .env("MM_CONFIG_DIR", world.dir.join("laptop"))
+        .env("MM_SSH", world.ssh_stub())
+        .env("MM_LOG", "manymux=warn")
+        .env("TERM", "xterm-256color")
+        .spawn(pts)
+        .expect("attaching on a terminal");
+
+    let (seen_tx, seen_rx) = mpsc::channel();
+    let mut reader = std::fs::File::from(pty.as_fd().try_clone_to_owned().unwrap());
+    std::thread::spawn(move || {
+        let mut buf = [0; 4096];
+        while let Ok(read @ 1..) = reader.read(&mut buf) {
+            if seen_tx.send(buf[..read].to_vec()).is_err() {
+                return;
+            }
+        }
+    });
+    let mut terminal = Vt::builder().size(80, 24).build();
+    let wait_for = |terminal: &mut Vt, ready: &dyn Fn(&str) -> bool| {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Ok(chunk) = seen_rx.recv_timeout(Duration::from_millis(100)) {
+                terminal.feed_str(&String::from_utf8_lossy(&chunk));
+            }
+            let screen = terminal
+                .lines()
+                .map(|line| line.text())
+                .collect::<Vec<_>>()
+                .join("\n");
+            if ready(&screen) {
+                return;
+            }
+            assert!(Instant::now() < deadline, "menu did not update: {screen}");
+        }
+    };
+    wait_for(&mut terminal, &|screen| screen.contains("anchor"));
+    pty.write_all(&[0x1d]).unwrap();
+    wait_for(&mut terminal, &|screen| {
+        screen.contains("sessions")
+            && screen.contains("vanish-local")
+            && screen.contains("vanish-remote")
+    });
+
+    world.ok("laptop", &["kill", "vanish-local"]);
+    world.ok("gpu-box", &["kill", "vanish-remote"]);
+    wait_for(&mut terminal, &|screen| {
+        screen.contains("sessions")
+            && !screen.contains("vanish-local")
+            && !screen.contains("vanish-remote")
+    });
+    world.ok("gpu-box", &["new", "-d", "-n", "appeared", "sh"]);
+    wait_for(&mut terminal, &|screen| screen.contains("appeared"));
+
+    let _ = client.kill();
+    let _ = client.wait();
 }

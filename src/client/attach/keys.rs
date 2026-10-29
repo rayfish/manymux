@@ -13,6 +13,7 @@
 //!
 //! In control mode, `n` chooses a host; `N` starts beside the attached session
 //! on its host and in its current directory, regardless of the highlighted row.
+//! Mouse motion cancels a click sequence only after it leaves the clicked cell.
 
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
@@ -1278,14 +1279,22 @@ impl KeyFilter {
             // made a new selection from the same cell, begun quickly after a
             // drag, become a word or line selection instead of the ordinary
             // drag the hand made.
-            self.clicked = None;
             let mut at = first.at;
+            if self.clicked.is_some_and(|(spot, _, _)| spot != at) {
+                self.clicked = None;
+            }
             while let Some(next) = Report::parse(&input[*i..]) {
                 if !next.motion || next.button != LEFT {
                     break;
                 }
                 *i += next.len;
                 at = next.at;
+                if self.clicked.is_some_and(|(spot, _, _)| spot != at) {
+                    self.clicked = None;
+                }
+            }
+            if self.clicked.is_some() {
+                return None;
             }
             return Some(Action::Select(Select::To(at)));
         }
@@ -2008,6 +2017,24 @@ mod tests {
             f.filter_at(b"\x1b[<0;10;5M", at + Duration::from_millis(100))
                 .action,
             Some(Action::Select(Select::From(spot)))
+        );
+    }
+
+    #[test]
+    fn motion_inside_the_clicked_cell_does_not_cancel_a_double_click() {
+        let mut f = KeyFilter::new(KEY);
+        f.set_scroll(true);
+        f.set_wheel(true);
+        let at = Instant::now();
+        let spot = Spot { col: 4, row: 2 };
+        f.filter_at(b"\x1b[<0;4;2M", at);
+        f.filter_at(b"\x1b[<32;4;2M", at + Duration::from_millis(20));
+        f.filter_at(b"\x1b[<0;4;2m", at + Duration::from_millis(30));
+        f.set_mode(Mode::Focus);
+        assert_eq!(
+            f.filter_at(b"\x1b[<0;4;2M", at + Duration::from_millis(120))
+                .action,
+            Some(Action::Select(Select::Word(spot)))
         );
     }
 
