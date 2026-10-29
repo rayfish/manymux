@@ -22,6 +22,7 @@ use russh::keys::ssh_key::PublicKey;
 use russh::keys::{Algorithm, HashAlg};
 use russh::{ChannelMsg, Disconnect, Error as SshError, MethodKind};
 use tokio::io::AsyncWriteExt;
+use tokio::task::spawn_blocking;
 use tokio::time::timeout;
 
 use crate::AsyncMutex;
@@ -481,15 +482,17 @@ impl client::Handler for Trusting {
     type Error = anyhow::Error;
 
     async fn check_server_key(&mut self, offered: &PublicKey) -> Result<bool> {
-        match self.known.verdict(&self.at, offered)? {
+        let known = self.known.clone();
+        let at = self.at.clone();
+        let key = offered.clone();
+        let verdict = spawn_blocking(move || known.trust(&at, &key))
+            .await
+            .context("checking the host key")??;
+        match verdict {
             // Written down before the connection is allowed to proceed, or a
             // machine accepted once and never recorded would be accepted with
             // a different key just as happily the next time.
-            Verdict::New => {
-                self.known.remember(&self.at, offered)?;
-                Ok(true)
-            }
-            Verdict::Known => Ok(true),
+            Verdict::New | Verdict::Known => Ok(true),
             // Not overwritten, and not prompted about here: whether this is a
             // machine that was reinstalled or somebody in the middle is not a
             // question this layer can answer, and the answer is `forget`.

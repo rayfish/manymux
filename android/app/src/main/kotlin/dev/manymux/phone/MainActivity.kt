@@ -102,7 +102,7 @@ class MainActivity : Activity() {
      * background whenever a session is opened, so the copy behind the button
      * is one listing old at worst rather than as old as the screen.
      */
-    private var seen: List<Running> = emptyList()
+    private val seen = mutableMapOf<Machine, List<Running>>()
 
     /**
      * The whole of the last answer, kept so the view can be redrawn from it.
@@ -476,7 +476,7 @@ class MainActivity : Activity() {
             val position = previous?.scrollY ?: 0
             val body = answer.fold(
                 onSuccess = { wall ->
-                    seen = wall.running
+                    seen[machine] = wall.running
                     answered = wall
                     sessions(machine, wall)
                 },
@@ -812,8 +812,12 @@ class MainActivity : Activity() {
             // offering nothing was a dead end too.
             is Trouble.HostKey -> addView(
                 secondary("it was reinstalled: forget the old key") {
-                    phone.forget(machine)
-                    listSessions(machine)
+                    val expected = surface
+                    ask({ phone.forget(machine) }) { answer ->
+                        if (isFinishing || gone || surface != expected) return@ask
+                        answer.onSuccess { listSessions(machine) }
+                            .onFailure { say(it.message ?: "could not forget the old key") }
+                    }
                 },
             )
             else -> Unit
@@ -998,7 +1002,7 @@ class MainActivity : Activity() {
      * the finger is therefore at most one listing old, which is what [refresh]
      * is for.
      */
-    private fun offerToSwitch(under: View, machine: Machine, current: String) {
+    private fun offerToSwitch(under: View, machine: Machine, current: String): PopupMenu {
         // The keyboard goes first. A menu opened over one is a menu with the
         // bottom of it behind the keys, and on a short phone that is most of
         // the list; the gesture is about where you are going and not about
@@ -1010,7 +1014,8 @@ class MainActivity : Activity() {
         refresh(machine)
 
         val menu = PopupMenu(this, under)
-        for (session in seen) {
+        val running = seen[machine].orEmpty()
+        for (session in running) {
             // The name and nothing else. A title is the last thing the program
             // set and a command is what it was started with, so a row carrying
             // one is a row of a length nobody chose, and what tells two rows
@@ -1029,10 +1034,11 @@ class MainActivity : Activity() {
                 }
             }
         }
-        if (seen.isEmpty()) {
+        if (running.isEmpty()) {
             menu.menu.add("nothing else answered").isEnabled = false
         }
         menu.show()
+        return menu
     }
 
     /**
@@ -1055,7 +1061,7 @@ class MainActivity : Activity() {
             // A failure says nothing: nobody asked for this, and the
             // session on the screen is the thing being used. The copy that
             // is already held stays, since a stale list beats no list.
-            answer.onSuccess { seen = it }
+            answer.onSuccess { seen[machine] = it }
         }
     }
 

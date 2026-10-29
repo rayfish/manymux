@@ -21,10 +21,12 @@
 //! proceed on a record with holes in it. The words all of this is reported in
 //! belong to the binary; what is decided is here, where it can be tested
 //! without a fleet.
+//! Only the same program resuming by directory can collide; explicit
+//! conversation selectors and different programs do not share that default.
 
 use std::collections::{HashMap, HashSet};
 
-use crate::client::checkpoint::{Kept, resumed, resumes_by_directory, still_wrapped};
+use crate::client::checkpoint::{Kept, directory_resume_program, resumed, still_wrapped};
 use crate::client::groups::Groups;
 use crate::client::switch::Located;
 use crate::hosts::{is_this_machine, same_machine};
@@ -290,13 +292,24 @@ pub fn take(taking: Taking<'_>) -> Taken {
 /// Pairs that would resume the same conversation, in the order they were
 /// written down. See [`Shared`].
 fn shared_directories(sessions: &[Kept]) -> Vec<Shared> {
+    #[derive(Hash, PartialEq, Eq)]
+    struct ResumeAt<'a> {
+        host: &'a str,
+        cwd: &'a str,
+        program: &'static str,
+    }
+
     let mut shared = Vec::new();
-    let mut seen: HashMap<(&str, &str), &Kept> = HashMap::new();
+    let mut seen: HashMap<ResumeAt<'_>, &Kept> = HashMap::new();
     for kept in sessions {
-        if !resumes_by_directory(&kept.command) {
+        let Some(program) = directory_resume_program(&kept.command) else {
             continue;
-        }
-        let key = (kept.host.as_str(), kept.cwd.as_str());
+        };
+        let key = ResumeAt {
+            host: &kept.host,
+            cwd: &kept.cwd,
+            program,
+        };
         match seen.get(&key) {
             Some(first) => shared.push(Shared {
                 first: first.name.clone(),
@@ -657,6 +670,31 @@ mod tests {
                 cwd: "/srv/project".to_string(),
             }]
         );
+    }
+
+    #[test]
+    fn different_programs_or_named_conversations_do_not_share_a_directory_resume() {
+        let mut first = kept("build-box", "one", "/srv/project");
+        let mut second = kept("build-box", "two", "/srv/project");
+        for (one, two) in [
+            (vec!["claude", "--continue"], vec!["pi", "--continue"]),
+            (
+                vec!["claude", "--resume", "first-id"],
+                vec!["claude", "--resume=second-id"],
+            ),
+            (
+                vec!["claude", "--continue"],
+                vec!["claude", "--session-id", "second-id"],
+            ),
+            (vec!["claude", "mcp", "serve"], vec!["claude", "--continue"]),
+        ] {
+            first.command = one.into_iter().map(str::to_string).collect();
+            second.command = two.into_iter().map(str::to_string).collect();
+            assert!(shared_directories(&[first.clone(), second.clone()]).is_empty());
+        }
+        first.command = vec!["claude".into(), "--continue".into()];
+        second.command = first.command.clone();
+        assert_eq!(shared_directories(&[first, second]).len(), 1);
     }
 
     /// Two sessions in one directory where neither resumes by directory is

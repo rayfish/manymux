@@ -9,6 +9,8 @@
 //! the admin configured. manymux keeps no allowlist of its own, so there is no
 //! second ACL to drift out of sync with the real one, and no way for manymux to
 //! grant access ssh would refuse.
+//! Every destination follows an option terminator, so a supplied host name
+//! cannot change ssh's options.
 
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -92,6 +94,7 @@ pub fn agent_quietly(host: &str, program: &str) -> Result<Agent> {
         .arg("BatchMode=yes")
         .arg("-o")
         .arg("ConnectTimeout=1")
+        .arg("--")
         .arg(host)
         .stderr(Stdio::null());
     spawn(command, host, program)
@@ -99,7 +102,6 @@ pub fn agent_quietly(host: &str, program: &str) -> Result<Agent> {
 
 fn spawn(mut command: Command, host: &str, program: &str) -> Result<Agent> {
     let mut child = command
-        .arg("--")
         // Never a probe first: working out where `mm` is by asking the far end
         // would mean either sourcing profiles, whose output would corrupt the
         // protocol on stdout, or a round trip before every command. Naming one
@@ -131,7 +133,6 @@ fn spawn(mut command: Command, host: &str, program: &str) -> Result<Agent> {
 /// commands that follow.
 pub async fn greet(host: &str) -> Result<()> {
     let status = command(host)
-        .arg("--")
         .arg("true")
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
@@ -161,8 +162,8 @@ pub async fn greet(host: &str) -> Result<()> {
 /// script somebody has to keep in step.
 pub async fn ask(host: &str, script: &str) -> Result<Vec<u8>> {
     let out = base(Tty::No)
-        .arg(host)
         .arg("--")
+        .arg(host)
         // One string, for the remote shell to read as a command rather than as
         // a program and its arguments, the way `install` does.
         .arg(script)
@@ -195,8 +196,8 @@ pub async fn ask(host: &str, script: &str) -> Result<Vec<u8>> {
 /// password on it would quietly take the per-user fallback instead.
 pub async fn install(host: &str) -> Result<()> {
     let status = base(Tty::Wanted)
-        .arg(host)
         .arg("--")
+        .arg(host)
         // One string, because it is a pipeline for the remote shell to read
         // rather than a program and its arguments.
         .arg(format!("curl -fsSL {INSTALLER} | sh"))
@@ -222,7 +223,7 @@ const INSTALLER: &str = "https://raw.githubusercontent.com/rayfish/manymux/maste
 /// machine without needing a real sshd.
 pub fn command(host: &str) -> Command {
     let mut command = base(Tty::No);
-    command.arg(host);
+    command.arg("--").arg(host);
     command
 }
 
@@ -279,4 +280,16 @@ fn control_path() -> PathBuf {
     let dir = crate::config::runtime_dir();
     let _ = crate::config::ensure_runtime_dir();
     dir.join("ssh-%C")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_ssh_destination_cannot_supply_options() {
+        let command = command("-V");
+        let args: Vec<_> = command.as_std().get_args().collect();
+        assert_eq!(&args[args.len() - 2..], ["--", "-V"]);
+    }
 }

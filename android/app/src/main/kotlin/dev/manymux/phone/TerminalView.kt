@@ -666,17 +666,24 @@ class TerminalView(context: Context) : View(context), Choreographer.FrameCallbac
     }
 
     override fun onKeyDown(code: Int, event: KeyEvent): Boolean {
+        val bytes = keyBytes(code, event) ?: return super.onKeyDown(code, event)
+        send(bytes)
+        return true
+    }
+
+    private fun keyBytes(code: Int, event: KeyEvent): ByteArray? {
         // Held for this key only, and only if the row was not already holding
         // it: a key this does not handle (Shift on its own, F1) must not leave
         // shift lit behind it for whatever is typed next.
         val shifted = event.isShiftPressed && !shift
+        val controlled = event.isCtrlPressed && !control
         if (shifted) shift = true
+        if (controlled) control = true
         try {
-            val bytes = encode(code, event) ?: return super.onKeyDown(code, event)
-            send(bytes)
-            return true
+            return encode(code, event)
         } finally {
             if (shifted) shift = false
+            if (controlled) control = false
         }
     }
 
@@ -698,7 +705,7 @@ class TerminalView(context: Context) : View(context), Choreographer.FrameCallbac
             ByteArray(0)
         }
         else -> {
-            val typed = event.unicodeChar
+            val typed = event.getUnicodeChar(event.metaState and KeyEvent.META_CTRL_MASK.inv())
             if (typed == 0) null else charOf(typed.toChar())
         }
     }

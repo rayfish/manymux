@@ -22,6 +22,10 @@
 //! answer removes sessions the host no longer lists.
 //! Only fresh answers drive switching and group pruning; cached rows are dimmed.
 //! A confirmed exit also removes its cached row before the next listing arrives.
+//! A confirmed rename updates both fresh and cached rows immediately, preserving
+//! the session's identity and group while the next listing is still pending.
+//! A rename received on an attach stream also keeps issued ids, and overrides
+//! older names in a listing by the session's stable membership identity.
 
 use anyhow::Result;
 
@@ -60,6 +64,24 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
+    /// Apply a confirmed rename without waiting for the next host listing.
+    pub fn renamed(&mut self, at: &Located, name: &str) {
+        for hosted in self.sessions.iter_mut().chain(&mut self.cached) {
+            if same_machine(&hosted.host, &at.host) && hosted.session.name == at.session {
+                hosted.session.name = name.to_string();
+            }
+        }
+    }
+
+    /// Keep an attach-confirmed name even when a pending listing predates it.
+    pub fn renamed_member(&mut self, member: &Member, name: &str) {
+        for hosted in self.sessions.iter_mut().chain(&mut self.cached) {
+            if Member::of(&hosted.host, &hosted.session) == *member {
+                hosted.session.name = name.to_string();
+            }
+        }
+    }
+
     /// Remove a session whose exit was observed on its attach stream.
     pub fn forget(&mut self, at: &Located) {
         let keep = |hosted: &HostedSession| {
@@ -146,6 +168,14 @@ impl Snapshot {
             .map(|hosted| &hosted.session)
     }
 
+    /// The current address of a known session, using fresh answers alone.
+    pub fn locate(&self, member: &Member) -> Option<Located> {
+        self.sessions
+            .iter()
+            .find(|hosted| Member::of(&hosted.host, &hosted.session) == *member)
+            .map(|hosted| Located::new(&hosted.host, &hosted.session.name))
+    }
+
     pub fn is_empty(&self) -> bool {
         self.sessions.is_empty()
     }
@@ -196,6 +226,20 @@ const CURRENT: usize = 0;
 const DIGITS: u8 = 9;
 
 impl Listed {
+    /// Keep issued row ids attached to the session across a confirmed rename.
+    pub fn renamed(&mut self, was: &Located, name: &str) {
+        for (id, at) in self.at.iter_mut().enumerate() {
+            if at == was {
+                at.session = name.to_string();
+                for row in &mut self.rows.sessions {
+                    if !row.heading && row.id == id {
+                        row.label = name.to_string();
+                    }
+                }
+            }
+        }
+    }
+
     /// Whether a displayed session still accepts commands in this answer.
     pub fn available(&self, id: usize) -> bool {
         self.rows
@@ -845,6 +889,107 @@ mod tests {
         assert_eq!(renamed.cached.len(), 1);
         assert_eq!(renamed.cached[0].session.name, "test");
         assert_eq!(renamed.cached[0].session.pid, 1);
+    }
+
+    #[test]
+    fn a_confirmed_rename_keeps_the_popup_row_in_its_group_before_a_reload() {
+        let session = hosted_on("gpu-box", "build");
+        let mut groups = Groups::default();
+        groups
+            .assign("work", &session.host, &session.session)
+            .unwrap();
+        let mut snapshot = Snapshot {
+            sessions: vec![session.clone()],
+            cached: vec![session],
+            ..Snapshot::default()
+        };
+        let mut cycle = Cycle::new(Located::new("gpu-box", "build"));
+        cycle.refresh(snapshot.entries(&groups));
+        cycle.focus(Some("work".to_string()));
+
+        snapshot.renamed(cycle.current(), "nightly");
+        cycle.renamed("nightly");
+        cycle.refresh(snapshot.entries(&groups));
+        let listed = Listed::new(&snapshot, &groups, &[], &cycle);
+        let rows = &listed.rows.sessions;
+        let row = &rows[listed.rows.at];
+        assert_eq!(row.label, "nightly");
+        assert_eq!(
+            row.indent, 2,
+            "the renamed row stays under its group and host"
+        );
+        assert_eq!(rows.len(), 3, "no old row or extra host heading remains");
+        assert_eq!(rows[0].label, "@work");
+        assert!(cycle.holds(cycle.current()));
+        assert_eq!(cycle.focused(), Some("work"));
+    }
+
+    #[test]
+    fn an_attached_rename_keeps_the_popup_highlight_when_an_older_listing_arrives() {
+        let session = hosted_on("gpu-box", "build");
+        let member = Member::of(&session.host, &session.session);
+        let mut groups = Groups::default();
+        groups
+            .assign("work", &session.host, &session.session)
+            .unwrap();
+        let mut snapshot = Snapshot {
+            sessions: vec![session],
+            ..Snapshot::default()
+        }
+        .following(&Snapshot::default());
+        let old = Located::new("gpu-box", "build");
+        let mut previous = Listed::of(&snapshot, &groups, &[], Some("work"), from_ref(&old));
+        let id = previous.rows.sessions[previous.rows.at].id;
+        let mut picker = Picker::new(
+            "sessions",
+            "choose",
+            previous.rows.sessions.clone(),
+            previous.rows.at,
+        );
+
+        snapshot.renamed_member(&member, "nightly");
+        previous.renamed(&old, "nightly");
+        let current = Located::new("gpu-box", "nightly");
+        let listed = Listed::of(&snapshot, &groups, &[], Some("work"), from_ref(&current))
+            .following(&previous);
+        picker.replace(listed.rows.sessions.clone(), listed.rows.at);
+        let selected = picker.chosen().unwrap();
+        assert_eq!(selected.id, id);
+        assert_eq!(selected.label, "nightly");
+        assert_eq!(listed.at[id], current);
+        assert_eq!(listed.rows.sessions.len(), 3);
+        assert_eq!(listed.rows.sessions[0].label, "@work");
+        assert_eq!(snapshot.info(&current).unwrap().pid, member.pid);
+    }
+
+    #[test]
+    fn renaming_another_popup_row_preserves_its_identity_and_other_hosts() {
+        let session = hosted_on("gpu-box", "build");
+        let other_host = hosted_on("build-box", "build");
+        let current = Located::new("gpu-box", "test");
+        let mut groups = Groups::default();
+        groups
+            .assign("work", &session.host, &session.session)
+            .unwrap();
+        let mut snapshot = Snapshot {
+            sessions: vec![session.clone(), other_host.clone()],
+            ..Snapshot::default()
+        }
+        .following(&Snapshot::default());
+
+        snapshot.renamed(&Located::new("gpu-box", "build"), "nightly");
+        let renamed = Located::new("gpu-box", "nightly");
+        let info = snapshot.info(&renamed).unwrap();
+        assert_eq!(info.pid, session.session.pid);
+        assert_eq!(info.started, session.session.started);
+        assert_eq!(info.title, session.session.title);
+        assert_eq!(groups.group_of("gpu-box", info), Some("work"));
+        assert!(snapshot.info(&Located::new("gpu-box", "build")).is_none());
+        assert_eq!(snapshot.sessions[1].session.name, other_host.session.name);
+
+        let listed = Listed::of(&snapshot, &groups, &[], None, from_ref(&current));
+        assert!(listed.at.contains(&renamed));
+        assert!(!listed.at.contains(&Located::new("gpu-box", "build")));
     }
 
     /// What the switch keys walk: every session in the listing, in its order,

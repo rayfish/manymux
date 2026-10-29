@@ -4,7 +4,7 @@ After=network-online.target
 
 [Service]
 ExecStart=@BIN@ @COMMAND@
-Environment=MM_CONFIG_DIR=@CONFIG@
+Environment=@CONFIG@
 Restart=always
 RestartSec=2
 

@@ -7,6 +7,8 @@
 //! where the repaint is rebuilt from the model: without this, coming back to a
 //! session would leave the mouse dead, bracketed paste off, and the window
 //! titled whatever it was before.
+//! A terminal reset also clears the saved input modes and cursor style, so a
+//! later attach cannot restore settings that the program has already reset.
 //!
 //! So this scans the same stream in parallel and keeps what `avt` drops: the
 //! title, the bells, the modes to switch back on when someone reattaches, and
@@ -192,6 +194,9 @@ impl Scanner {
                 // has a screen of its own after it has given it back.
                 (State::Escape, b'c') => {
                     self.on_alternate = false;
+                    self.modes.clear();
+                    self.cursor_style = None;
+                    self.keyboard = Keyboard::default();
                     self.state = State::Ground;
                 }
                 (State::Escape, _) => self.state = State::Ground,
@@ -473,6 +478,13 @@ mod tests {
             scanner.feed(off, |_| {});
             assert!(!scanner.on_alternate(), "{off:?}");
         }
+    }
+
+    #[test]
+    fn a_reset_does_not_replay_input_modes_or_cursor_style() {
+        let s = scanner_after(b"\x1b[?1000;1006;2004h\x1b[>7u\x1b[>4;2m\x1b[5 q\x1bc");
+        assert!(!s.bracketed_paste());
+        assert_eq!(s.replay(), "");
     }
 
     #[test]

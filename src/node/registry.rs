@@ -4,6 +4,8 @@
 //! node's, stamped with this machine's name, so one session's events reach
 //! every listener in the order it published them and there is no forwarding
 //! task between the two to fall behind.
+//! Attaching keeps name lookup and the rename subscription under the registry
+//! lock, so a rename cannot slip between finding a session and watching it.
 
 use std::collections::HashMap;
 use std::sync::atomic::AtomicUsize;
@@ -13,9 +15,11 @@ use anyhow::{Result, bail};
 use tokio::sync::broadcast;
 use tracing::info;
 
-use super::session::{Session, default_name};
+use super::session::{Attached, Session, default_name};
 use crate::lock::held;
-use crate::proto::{Doing, EventKind, HostedEvent, Peek, SessionInfo, SpawnSpec};
+use crate::proto::{
+    Doing, EventKind, HostedEvent, Peek, SessionInfo, Size, SpawnSpec, session_name as sanitize,
+};
 
 pub struct Registry {
     sessions: Mutex<HashMap<String, Arc<Session>>>,
@@ -75,6 +79,20 @@ impl Registry {
         let mut sessions = held(&self.sessions);
         prune(&mut sessions);
         sessions.get(name).cloned()
+    }
+
+    pub(super) fn attach(
+        &self,
+        name: &str,
+        size: Size,
+        history: u32,
+        read_only: bool,
+    ) -> Option<Attached> {
+        let mut sessions = held(&self.sessions);
+        prune(&mut sessions);
+        sessions
+            .get(name)
+            .map(|session| session.attach(size, history, read_only))
     }
 
     /// Every live session, for the callers that act on all of them at once
@@ -195,21 +213,6 @@ fn no_such(name: &str) -> anyhow::Error {
 /// child is gone must never be handed out for attach.
 fn prune(sessions: &mut HashMap<String, Arc<Session>>) {
     sessions.retain(|_, s| !s.has_exited());
-}
-
-/// Session names appear in `host/name` paths and in the terminal, so keep them
-/// to something unambiguous and safe to print.
-///
-/// A space becomes a dash rather than going the way of everything else that is
-/// dropped: two words typed at the rename prompt are two words, and running
-/// them together into `rayfishipv6` is nobody's idea of the name they asked
-/// for.
-fn sanitize(name: &str) -> String {
-    name.chars()
-        .map(|c| if c.is_whitespace() { '-' } else { c })
-        .filter(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | '.'))
-        .take(64)
-        .collect()
 }
 
 fn unique_name(base: &str, taken: impl Fn(&str) -> bool) -> String {

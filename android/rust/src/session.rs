@@ -19,16 +19,24 @@
 //! screen, and otherwise to the node's history.
 //! A grid changed during an attach attempt is sent once that attempt lands;
 //! the request in flight still carries the grid it started with.
+//! Rename notifications update the next reconnect target while the live attach
+//! stays in place, including renames made by another client.
+//! Reconnect listings also match the original pid and start time, so a rename
+//! while disconnected follows the same session. A replacement on the same node
+//! is refused; a fresh node may restore the original name under a new pid.
+//! Input is bounded by message count and queued bytes. Overflow cancels this
+//! client with an explicit failure, leaving the node's session running.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use manymux::client::attach::reconnect_after;
 use manymux::client::{Attached, SessionHalves, SessionWriter, Update};
 use manymux::lock::held;
-use manymux::proto::Size;
+use manymux::proto::{Renamed, SessionInfo, Size};
 use tokio::sync::{mpsc, watch};
+use tokio::task::JoinHandle;
 
 use crate::keys::{Identity, KnownHosts};
 use crate::machine::{Connection, Connections, Machine};
@@ -44,6 +52,8 @@ use crate::ssh::{ask, reach};
 /// into a grid of a fixed size, so this fills only when the app itself is
 /// stopped, which is exactly when it should.
 const BACKLOG: usize = 64;
+const INPUT_BACKLOG: usize = 64;
+const INPUT_BYTES: usize = 1024 * 1024;
 
 /// Where the client is with this session.
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Enum)]
@@ -84,6 +94,28 @@ enum Say {
     /// the move left the view short of, which may be nothing at all.
     Look,
     Detach,
+}
+
+impl Say {
+    fn bytes(&self) -> usize {
+        match self {
+            Self::Input(bytes) => bytes.len(),
+            _ => 0,
+        }
+    }
+}
+
+struct Inbox {
+    receiver: mpsc::Receiver<Say>,
+    bytes: Arc<Mutex<usize>>,
+}
+
+impl Inbox {
+    async fn recv(&mut self) -> Option<Say> {
+        let message = self.receiver.recv().await?;
+        *held(&self.bytes) -= message.bytes();
+        Some(message)
+    }
 }
 
 /// How long an attempt to get back to a session may take.
@@ -164,7 +196,10 @@ enum Paint {
 /// into a queue.
 pub struct Session {
     surfaces: Surfaces,
-    say: mpsc::UnboundedSender<Say>,
+    say: mpsc::Sender<Say>,
+    queued: Arc<Mutex<usize>>,
+    task: JoinHandle<()>,
+    forced: Mutex<Option<State>>,
     state: watch::Receiver<State>,
 }
 
@@ -180,14 +215,22 @@ impl Session {
             scrolling: Arc::new(Mutex::new(Scrolling::at(size))),
             scrolls: Arc::new(AtomicBool::new(false)),
         };
-        let (say, said) = mpsc::unbounded_channel();
+        let (say, receiver) = mpsc::channel(INPUT_BACKLOG);
+        let queued = Arc::new(Mutex::new(0));
+        let said = Inbox {
+            receiver,
+            bytes: Arc::clone(&queued),
+        };
         let (state, watching) = watch::channel(State::Reaching);
 
-        tokio::spawn(keep_attached(attaching, surfaces.clone(), said, state));
+        let task = tokio::spawn(keep_attached(attaching, surfaces.clone(), said, state));
 
         Self {
             surfaces,
             say,
+            queued,
+            task,
+            forced: Mutex::new(None),
             state: watching,
         }
     }
@@ -207,7 +250,7 @@ impl Session {
 
     /// Keystrokes, or anything else typed at the session.
     pub fn send(&self, bytes: Vec<u8>) {
-        let _ = self.say.send(Say::Input(bytes));
+        self.enqueue(Say::Input(bytes));
     }
 
     pub fn cursor_key(&self, final_byte: u8) {
@@ -220,7 +263,7 @@ impl Session {
 
     /// The phone's screen is a different shape now.
     pub fn resize(&self, size: Size) {
-        let _ = self.say.send(Say::Resize(size));
+        self.enqueue(Say::Resize(size));
     }
 
     /// A drag of whole lines, positive being back towards what came before.
@@ -256,7 +299,7 @@ impl Session {
         } else {
             held(&self.surfaces.scrolling).down(lines.unsigned_abs());
         }
-        let _ = self.say.send(Say::Look);
+        self.enqueue(Say::Look);
         Dragged::Looked
     }
 
@@ -290,11 +333,62 @@ impl Session {
 
     /// Leave, without ending anything.
     pub fn detach(&self) {
-        let _ = self.say.send(Say::Detach);
+        self.enqueue(Say::Detach);
     }
 
     pub fn state(&self) -> State {
+        if let Some(state) = held(&self.forced).as_ref() {
+            return state.clone();
+        }
         self.state.borrow().clone()
+    }
+
+    fn enqueue(&self, message: Say) {
+        if self.say.is_closed() || held(&self.forced).is_some() {
+            return;
+        }
+        let bytes = message.bytes();
+        let reserved = {
+            let mut queued = held(&self.queued);
+            match queued
+                .checked_add(bytes)
+                .filter(|total| *total <= INPUT_BYTES)
+            {
+                Some(total) => {
+                    *queued = total;
+                    true
+                }
+                None => false,
+            }
+        };
+        if !reserved {
+            self.overflowed();
+            return;
+        }
+        if let Err(error) = self.say.try_send(message) {
+            *held(&self.queued) -= bytes;
+            if let mpsc::error::TrySendError::Full(message) = error {
+                if matches!(message, Say::Detach) {
+                    *held(&self.forced) = Some(State::Detached);
+                    self.task.abort();
+                } else {
+                    self.overflowed();
+                }
+            }
+        }
+    }
+
+    fn overflowed(&self) {
+        *held(&self.forced) = Some(State::Failed {
+            why: "input queue is full; detached without ending the remote session".to_string(),
+        });
+        self.task.abort();
+    }
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        self.task.abort();
     }
 }
 
@@ -345,28 +439,49 @@ struct Riding {
     _connection: Arc<Connection>,
     attached: Attached,
     wanted: Size,
+    identity: Option<SessionId>,
+    name: String,
+}
+
+#[derive(Clone)]
+struct SessionId {
+    pid: u32,
+    started: SystemTime,
+    node: String,
+}
+
+impl SessionId {
+    fn of(session: &SessionInfo) -> Option<Self> {
+        (session.pid != 0).then_some(Self {
+            pid: session.pid,
+            started: session.started,
+            node: session.node.clone(),
+        })
+    }
+
+    fn matches(&self, session: &SessionInfo) -> bool {
+        self.pid == session.pid && self.started == session.started
+    }
+
+    fn same_node(&self, session: &SessionInfo) -> bool {
+        !self.node.is_empty() && self.node == session.node
+    }
 }
 
 /// Reach the session, attach, and keep doing so.
 async fn keep_attached(
     mut attaching: Attaching,
     surfaces: Surfaces,
-    mut said: mpsc::UnboundedReceiver<Say>,
+    mut said: Inbox,
     state: watch::Sender<State>,
 ) {
     let mut tries = 0u32;
     let mut ever = false;
+    let mut identity = None;
 
     loop {
         let _ = state.send(State::Reaching);
-        let reached = reaching(
-            attaching.clone(),
-            ever,
-            &surfaces,
-            &mut said,
-            &mut attaching.wanted,
-        )
-        .await;
+        let reached = reaching(&mut attaching, identity.clone(), ever, &surfaces, &mut said).await;
         match reached {
             // The back button, pressed while it was still trying.
             None => {
@@ -375,6 +490,8 @@ async fn keep_attached(
             }
             Some(Ok(riding)) => {
                 ever = true;
+                identity = riding.identity.clone();
+                attaching.name = riding.name.clone();
                 surfaces
                     .scrolls
                     .store(riding.attached.scroll, Ordering::Relaxed);
@@ -386,7 +503,7 @@ async fn keep_attached(
                 held(&surfaces.scrolling).close();
                 let _ = state.send(State::Attached);
                 let began = Instant::now();
-                match pump(riding, &surfaces, &mut said, &mut attaching.wanted).await {
+                match pump(riding, &surfaces, &mut said, &mut attaching).await {
                     Ending::Exited(code) => {
                         let _ = state.send(State::Ended { status: code });
                         return;
@@ -467,16 +584,16 @@ async fn keep_attached(
 /// state anybody should be stuck in, and what is typed at one is dropped
 /// rather than queued, or it arrives in a shell minutes after it was pressed.
 async fn reaching(
-    attaching: Attaching,
+    attaching: &mut Attaching,
+    identity: Option<SessionId>,
     ever: bool,
     surfaces: &Surfaces,
-    said: &mut mpsc::UnboundedReceiver<Say>,
-    wanted: &mut Size,
+    said: &mut Inbox,
 ) -> Option<Result<Riding, Missed>> {
     // Named before the attempt takes it, so the message a deadline produces
     // can still say which machine it was about.
     let at = attaching.machine.at();
-    let attempt = attach(attaching);
+    let attempt = attach(attaching.clone(), identity);
     tokio::pin!(attempt);
     let deadline = tokio::time::sleep(if ever { REACH_FOR } else { Duration::MAX });
     tokio::pin!(deadline);
@@ -497,7 +614,7 @@ async fn reaching(
                 Some(Say::Detach) | None => return None,
                 Some(Say::Input(_)) | Some(Say::Look) => {}
                 Some(Say::Resize(size)) => {
-                    *wanted = size;
+                    attaching.wanted = size;
                     held(&surfaces.scrolling).resize(size);
                 }
             },
@@ -517,7 +634,7 @@ async fn reaching(
 /// The listing costs nothing, being the same round trip that climbs the
 /// ladder, and it is unambiguous: a node that answered with the sessions it
 /// has and did not name this one has said the session is gone.
-async fn attach(attaching: Attaching) -> Result<Riding, Missed> {
+async fn attach(attaching: Attaching, identity: Option<SessionId>) -> Result<Riding, Missed> {
     let connection = attaching
         .connections
         .to(&attaching.machine, &attaching.identity, &attaching.known)
@@ -536,17 +653,31 @@ async fn attach(attaching: Attaching) -> Result<Riding, Missed> {
         }
     };
 
-    if !reached
-        .sessions
-        .iter()
-        .any(|session| session.name == attaching.name)
-    {
+    let session = identity
+        .as_ref()
+        .and_then(|identity| {
+            reached
+                .sessions
+                .iter()
+                .find(|session| identity.matches(session))
+        })
+        .or_else(|| {
+            reached.sessions.iter().find(|session| {
+                session.name == attaching.name
+                    && identity
+                        .as_ref()
+                        .is_none_or(|identity| !identity.same_node(session))
+            })
+        });
+    let Some(session) = session else {
         return Err(Missed::Gone(format!(
             "there is no session called {} on {} any more",
             attaching.name,
             attaching.machine.at()
         )));
-    }
+    };
+    let name = session.name.clone();
+    let identity = SessionId::of(session);
 
     // A stream of its own, because the listing spent the one it came on: a
     // node answers one request per connection and hangs up.
@@ -557,13 +688,15 @@ async fn attach(attaching: Attaching) -> Result<Riding, Missed> {
     // No history: the phone has no scrollback of its own to put it in, and the
     // node keeps the real one.
     let attached = stream
-        .attach(&attaching.name, attaching.wanted, 0, false)
+        .attach(&name, attaching.wanted, 0, false)
         .await
         .map_err(Missed::Machine)?;
     Ok(Riding {
         _connection: connection,
         attached,
         wanted: attaching.wanted,
+        identity,
+        name,
     })
 }
 
@@ -586,9 +719,10 @@ async fn look(scrolling: &Mutex<Scrolling>, writer: &mut SessionWriter) -> bool 
 async fn pump(
     riding: Riding,
     surfaces: &Surfaces,
-    said: &mut mpsc::UnboundedReceiver<Say>,
-    wanted: &mut Size,
+    said: &mut Inbox,
+    attaching: &mut Attaching,
 ) -> Ending {
+    let wanted = &mut attaching.wanted;
     let screen = &surfaces.screen;
     let settled = riding.attached.size;
     let mut pending_resize = (*wanted != riding.wanted).then_some(*wanted);
@@ -676,6 +810,7 @@ async fn pump(
                 }
                 Ok(Update::Exited(code)) => break Ending::Exited(code),
                 Ok(Update::Disconnected) => break Ending::Lost,
+                Ok(Update::Renamed(Renamed::Name(name))) => attaching.name = name,
                 // History was not asked for, and a bell in the session next
                 // door is a notification this version does not send.
                 Ok(_) => {}

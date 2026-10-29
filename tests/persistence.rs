@@ -430,7 +430,7 @@ async fn parking_acknowledges_after_releasing_size_and_notification_presence() {
     assert_eq!(session.info().attached, 1);
     assert_eq!(session.info().size, Size::new(80, 24));
     let input = session.attach(Size::new(80, 24), 0, false);
-    input.attachment.send_input(b"\n".to_vec());
+    input.attachment.send_input(b"\n".to_vec()).await.unwrap();
     drop(input);
     assert_eq!(events.read_until_bell().await.event.host_attached, 1);
     // A parked transport is not subscribed to session output or events.
@@ -1589,6 +1589,62 @@ async fn a_rename_that_cannot_be_done_is_refused_with_a_reason() {
 
     node.registry.kill(&name).unwrap();
     node.registry.kill(&next_door.name()).unwrap();
+}
+
+#[tokio::test]
+async fn an_external_rename_reaches_every_attached_client_without_changing_the_session() {
+    let node = test_node().await;
+    let Spawned { name, .. } = spawn_session(&node, &["/bin/sh", "-i"]).await;
+    let mut working = Client::connect(&node);
+    let mut watching = Client::connect(&node);
+    for (client, read_only) in [(&mut working, false), (&mut watching, true)] {
+        assert!(matches!(
+            client
+                .send(&Request::Attach {
+                    name: name.clone(),
+                    size: Size::new(120, 40),
+                    history: 0,
+                    read_only,
+                })
+                .await
+                .unwrap(),
+            Response::Attached { .. }
+        ));
+    }
+    let before = node.registry.get(&name).unwrap().info();
+    let mut renaming = Client::connect(&node);
+    assert!(matches!(
+        renaming
+            .send(&Request::Rename {
+                name: name.clone(),
+                to: "nightly bench!".to_string(),
+            })
+            .await
+            .unwrap(),
+        Response::Ok
+    ));
+    for client in [&mut working, &mut watching] {
+        let renamed = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let frame = client
+                    .next_frame()
+                    .await
+                    .expect("the attachment stays open");
+                if frame.tag == tag::RENAME {
+                    return proto::decode::<proto::Renamed>(&frame.body).unwrap();
+                }
+            }
+        })
+        .await
+        .expect("every attached client learns the session's new name");
+        assert_eq!(renamed, proto::Renamed::Name("nightly-bench".to_string()));
+    }
+    let after = node.registry.get("nightly-bench").unwrap().info();
+    assert_eq!(after.pid, before.pid);
+    assert_eq!(after.started, before.started);
+    assert_eq!(after.size, before.size);
+    assert_eq!(after.attached, before.attached);
+    node.registry.kill("nightly-bench").unwrap();
 }
 
 /// What makes `mm view` worth having: the node drops a watching client's input

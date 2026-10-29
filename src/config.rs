@@ -1,9 +1,13 @@
 //! Where things live on disk.
+//!
+//! File replacements use a private temporary file per writer, so concurrent
+//! saves cannot truncate or rename a temporary file another save still owns.
 
 use std::fs::{self, DirBuilder, OpenOptions};
-use std::io::Write;
+use std::io::{ErrorKind, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
@@ -169,6 +173,36 @@ pub fn save_toml<T: Serialize>(path: &Path, value: &T, what: &str) -> Result<()>
     write_private_file(path, text.as_bytes())
 }
 
+/// Serialize changes across processes, reading only after taking the lock.
+/// The lock has its own file because saving replaces the TOML file's inode.
+pub fn change_toml<T, R>(
+    path: &Path,
+    what: &str,
+    change: impl FnOnce(&mut T) -> Result<R>,
+) -> Result<R>
+where
+    T: Serialize + DeserializeOwned + Default,
+{
+    if let Some(parent) = path.parent() {
+        ensure_private_dir(parent)?;
+    }
+    let lock_path = path.with_extension("lock");
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(&lock_path)
+        .with_context(|| format!("opening {}", lock_path.display()))?;
+    lock.lock()
+        .with_context(|| format!("locking {}", lock_path.display()))?;
+    let mut value: T = load_toml(path)?;
+    let result = change(&mut value)?;
+    save_toml(path, &value, what)?;
+    Ok(result)
+}
+
 /// Write a file only its owner can read, replacing any existing one.
 ///
 /// The write goes to a temp file and is renamed into place, so a crash or a
@@ -177,24 +211,43 @@ pub fn write_private_file(path: &Path, contents: &[u8]) -> Result<()> {
     if let Some(dir) = path.parent() {
         ensure_private_dir(dir)?;
     }
-    let temp = path.with_extension("tmp");
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(&temp)
-        .with_context(|| format!("creating {}", temp.display()))?;
-    file.write_all(contents)
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let (temp, mut file) = loop {
+        let next = NEXT.fetch_add(1, Ordering::Relaxed);
+        let temp = path.with_extension(format!("{}-{next}.tmp", std::process::id()));
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temp)
+        {
+            Ok(file) => break (temp, file),
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(error).with_context(|| format!("creating {}", temp.display()));
+            }
+        }
+    };
+    let written = file
+        .write_all(contents)
         .and_then(|()| file.sync_all())
-        .with_context(|| format!("writing {}", temp.display()))?;
+        .with_context(|| format!("writing {}", temp.display()));
     drop(file);
-    fs::rename(&temp, path).with_context(|| format!("installing {}", path.display()))
+    let installed = written.and_then(|()| {
+        fs::rename(&temp, path).with_context(|| format!("installing {}", path.display()))
+    });
+    if installed.is_err() {
+        // Best effort: preserve the write error if cleanup also fails.
+        let _ = fs::remove_file(&temp);
+    }
+    installed
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Barrier};
+    use std::thread;
 
     /// The whole point of the uid-keyed path: an ssh login that set up an
     /// environment, one that set up none, and a service started at boot all
@@ -258,5 +311,35 @@ mod tests {
     #[test]
     fn the_socket_in_use_is_never_reported_as_one_left_behind() {
         assert!(!legacy_sockets().contains(&socket()));
+    }
+
+    #[test]
+    fn concurrent_writes_each_install_a_complete_private_file() {
+        let dir = std::env::temp_dir().join(format!("manymux-writes-{}", std::process::id()));
+        ensure_private_dir(&dir).unwrap();
+        let path = dir.join("settings.toml");
+        let start = Arc::new(Barrier::new(8));
+        let writers: Vec<_> = (0..8u8)
+            .map(|byte| {
+                let path = path.clone();
+                let start = Arc::clone(&start);
+                thread::spawn(move || {
+                    let contents = vec![byte; 256 * 1024];
+                    start.wait();
+                    write_private_file(&path, &contents)
+                })
+            })
+            .collect();
+        for writer in writers {
+            writer.join().unwrap().unwrap();
+        }
+        let contents = fs::read(&path).unwrap();
+        assert_eq!(contents.len(), 256 * 1024);
+        assert!(contents.iter().all(|byte| *byte == contents[0]));
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        fs::remove_dir_all(dir).unwrap();
     }
 }

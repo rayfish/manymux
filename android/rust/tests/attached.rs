@@ -47,6 +47,10 @@ enum How {
     /// Paints the screen and then goes away, which is a connection dropping in
     /// the middle of somebody working.
     Late,
+    Renamed,
+    RenamedOffline,
+    Replaced,
+    Restarted,
 }
 
 impl How {
@@ -58,6 +62,10 @@ impl How {
             How::Gone => "ok,drop,gone",
             How::Vanishes => "ok,drop,ok,vanish",
             How::Late => "ok,late",
+            How::Renamed => "ok,rename,renamed,renamed",
+            How::RenamedOffline => "ok,late,renamed,renamed",
+            How::Replaced => "ok,late,replaced",
+            How::Restarted => "ok,late,restarted,restarted",
         }
     }
 }
@@ -226,6 +234,102 @@ async fn what_is_typed_reaches_the_far_end() {
 
     let screen = until_it_says(&session, "hello there").await;
     assert!(screen.contains("hello there"), "{screen}");
+}
+
+#[tokio::test]
+async fn an_external_rename_updates_the_session_reconnected_to() {
+    let session = attached("attach-renamed", How::Renamed).await;
+    let screen = until_it_says(&session, "renamed-ready").await;
+    assert!(screen.contains("renamed-ready"));
+    assert_eq!(session.state(), State::Attached);
+    session.detach();
+}
+
+#[tokio::test]
+async fn a_rename_while_disconnected_reconnects_to_the_same_session() {
+    let session = attached("attach-offline-rename", How::RenamedOffline).await;
+    assert!(
+        until_it_says(&session, "renamed-ready")
+            .await
+            .contains("renamed-ready")
+    );
+    assert_eq!(session.state(), State::Attached);
+    session.detach();
+}
+
+#[tokio::test]
+async fn a_reused_name_cannot_reconnect_to_an_unrelated_session() {
+    let session = attached("attach-replaced", How::Replaced).await;
+    until_it_says(&session, "ready").await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let State::Failed { why } = session.state() {
+                assert!(why.contains("no session"));
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("a different session under the old name must be refused");
+}
+
+#[tokio::test]
+async fn a_session_restored_after_a_node_restart_can_be_reconnected_to() {
+    let session = attached("attach-restored", How::Restarted).await;
+    assert!(
+        until_it_says(&session, "restarted-ready")
+            .await
+            .contains("restarted-ready")
+    );
+    assert_eq!(session.state(), State::Attached);
+    session.detach();
+}
+
+#[tokio::test]
+async fn a_stalled_input_queue_reports_overflow_instead_of_growing() {
+    let session = attached("attach-queue-full", How::Steady).await;
+    // This current-thread runtime cannot consume messages until the test yields.
+    for _ in 0..128 {
+        session.send(b"x".to_vec());
+    }
+    assert!(
+        matches!(session.state(), State::Failed { why } if why.contains("input queue is full"))
+    );
+}
+
+#[tokio::test]
+async fn one_large_paste_cannot_exceed_the_input_byte_budget() {
+    let session = attached("attach-input-bytes", How::Steady).await;
+    session.send(vec![b'x'; 2 * 1024 * 1024]);
+    assert!(
+        matches!(session.state(), State::Failed { why } if why.contains("input queue is full"))
+    );
+}
+
+#[tokio::test]
+async fn detaching_does_not_wait_for_room_in_a_full_input_queue() {
+    let session = attached("attach-detach-full", How::Steady).await;
+    for _ in 0..64 {
+        session.send(b"x".to_vec());
+    }
+    session.detach();
+    assert_eq!(session.state(), State::Detached);
+}
+
+#[tokio::test]
+async fn bounded_input_preserves_the_order_of_accepted_keystrokes() {
+    let session = attached("attach-ordered-input", How::Steady).await;
+    until_it_says(&session, "ready").await;
+    session.send(b"first ".to_vec());
+    session.send(b"second ".to_vec());
+    session.send(b"third".to_vec());
+    assert!(
+        until_it_says(&session, "first second third")
+            .await
+            .contains("first second third")
+    );
+    session.detach();
 }
 
 #[tokio::test]

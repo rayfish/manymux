@@ -15,6 +15,14 @@
 //! subscription at that screen, so its switches and old bytes cannot replay.
 //! Image uploads have their own streams and never create attachments. At most
 //! four run at once; file writes run off the async workers before input is sent.
+//! The final output drain also recovers a lagged subscription from its screen,
+//! so an exit cannot skip the session's last buffered picture.
+//! Renames are sent on every affected attach stream, including when a CLI or
+//! another attached client made the change.
+//! A full session input queue pauses frame reads while output and pings keep
+//! flowing. Bytes stay with the attachment until a queue slot is reserved.
+//! Unread pong frames behind that pause cannot count against client liveness;
+//! accepting the pending input starts a fresh window for reading them.
 
 pub mod events;
 mod history;
@@ -31,7 +39,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
-use tokio::sync::broadcast::error::RecvError;
+use tokio::sync::broadcast::error::{RecvError, TryRecvError};
 use tokio::sync::{Semaphore, broadcast};
 use tokio::time::{Instant, timeout};
 use tracing::{debug, info, warn};
@@ -324,11 +332,11 @@ impl Node {
                     history,
                     read_only,
                 } => {
-                    let Some(session) = self.registry.get(&name) else {
+                    let Some(attached) = self.registry.attach(&name, size, history, read_only)
+                    else {
                         return reply(&mut write, Err(anyhow::anyhow!("no session named {name}")))
                             .await;
                     };
-                    let attached = session.attach(size, history, read_only);
                     let response = Response::Attached {
                         size: attached.size,
                         paste: true,
@@ -373,14 +381,14 @@ impl Node {
                     };
                     proto::write_msg(&mut write, tag::RESPONSE, &Response::Ok).await?;
                     let uploaded = receive_paste(&mut read).await;
-                    return reply(
-                        &mut write,
-                        uploaded.and_then(|path| {
-                            session.paste_file(&path)?;
-                            Ok(Response::Ok)
-                        }),
-                    )
-                    .await;
+                    let pasted = match uploaded {
+                        Ok(path) => match timeout(SILENT_FOR, session.paste_file(&path)).await {
+                            Ok(pasted) => pasted.map(|()| Response::Ok),
+                            Err(_) => Err(anyhow::anyhow!("the session stopped accepting input")),
+                        },
+                        Err(error) => Err(error),
+                    };
+                    return reply(&mut write, pasted).await;
                 }
 
                 Request::Events => {
@@ -515,6 +523,7 @@ where
     send(&mut write, tag::DATA, repaint.as_bytes()).await?;
 
     let mut exit_rx = attachment.exit_rx();
+    let mut names = attachment.name_changes();
     // A whole interval before the first probe: a client that just attached has
     // nothing to prove yet.
     let start = tokio::time::Instant::now();
@@ -527,14 +536,19 @@ where
     // Cleared if the bus ever closes, so a closed channel returning at once
     // cannot turn this loop into a spin.
     let mut watching = true;
+    let mut pending_input = None;
 
     loop {
         tokio::select! {
-            frame = read.next() => {
+            frame = read.next(), if pending_input.is_none() => {
                 let Some(frame) = frame? else { break };
                 last_heard = tokio::time::Instant::now();
                 match frame.tag {
-                    tag::DATA => attachment.send_input(frame.body),
+                    tag::DATA => {
+                        if !attachment.read_only() {
+                            pending_input = Some(frame.body);
+                        }
+                    }
                     // Answered with the size the session took, which is not
                     // always the one asked for: the smallest across every
                     // attached client wins. A client keeping a screen of its
@@ -589,6 +603,12 @@ where
                                 }
                             }
                         };
+                        if let Renamed::Name(name) = &answer {
+                            let current = names.borrow_and_update().clone();
+                            if current != *name {
+                                names.mark_changed();
+                            }
+                        }
                         proto::write_msg(&mut write, tag::RENAME, &answer).await?;
                     }
                     tag::PASTE => incoming.take(frame.body),
@@ -602,7 +622,9 @@ where
                             Ok(path) => {
                                 debug!(path = %path.display(), "pasted a file into the session");
                                 let typed = paste::typed(&path, attachment.bracketed_paste());
-                                attachment.send_input(typed.into_bytes());
+                                if !attachment.read_only() {
+                                    pending_input = Some(typed.into_bytes());
+                                }
                             }
                             Err(e) => warn!("dropping a paste: {e:#}"),
                         }
@@ -610,6 +632,12 @@ where
                     tag::DETACH => break,
                     tag::PARK => return Ok(true),
                     other => warn!("ignoring unexpected tag {other:#x} while attached"),
+                }
+            }
+            space = attachment.input_space(), if pending_input.is_some() => {
+                if let Some(bytes) = pending_input.take() {
+                    space?.send(bytes);
+                    last_heard = tokio::time::Instant::now();
                 }
             }
             chunk = output.recv() => match chunk {
@@ -622,6 +650,11 @@ where
                 }
                 Err(RecvError::Closed) => break,
             },
+            changed = names.changed() => {
+                changed.context("the session's name subscription closed")?;
+                let name = names.borrow_and_update().clone();
+                send(&mut write, tag::RENAME, &proto::encode(&Renamed::Name(name))?).await?;
+            }
             event = events.recv(), if watching => match event {
                 // This machine's own sessions only, and never the one already
                 // on the screen. What a watched peer is doing is the desktop
@@ -644,18 +677,17 @@ where
                 Err(RecvError::Closed) => watching = false,
             },
             _ = ping.tick() => {
-                if answers_pings && last_heard.elapsed() > SILENT_FOR {
+                if pending_input.is_none() && answers_pings && last_heard.elapsed() > SILENT_FOR {
                     bail!("client stopped answering {:?} ago", last_heard.elapsed());
                 }
                 send(&mut write, tag::PING, &[]).await?;
             }
             _ = exit_rx.changed() => {
                 let Some(code) = *exit_rx.borrow() else { continue };
-                // The child's last words are still in flight: the reader task
-                // may not have drained the PTY yet, and select! could have
-                // picked this branch over a ready chunk. Flush both before
-                // telling the client it is over.
-                drain_output(&mut output, &mut write).await?;
+                // The reader drained the PTY before publishing the exit, but
+                // select! can pick this branch ahead of its queued chunks.
+                // Flush them before telling the client it is over.
+                drain_output(&attachment, &mut output, &mut write).await?;
                 send(&mut write, tag::EXIT, &proto::encode(&code)?).await?;
                 break;
             }
@@ -750,14 +782,23 @@ where
 
 /// Write every chunk already queued for this client, so nothing that landed
 /// during the handover is lost.
-async fn drain_output<W>(output: &mut broadcast::Receiver<Arc<[u8]>>, write: &mut W) -> Result<()>
+async fn drain_output<W>(
+    attachment: &session::Attachment,
+    output: &mut broadcast::Receiver<Arc<[u8]>>,
+    write: &mut W,
+) -> Result<()>
 where
     W: AsyncWrite + Unpin + Send,
 {
-    while let Ok(bytes) = output.try_recv() {
-        send(write, tag::DATA, &bytes).await?;
+    loop {
+        match output.try_recv() {
+            Ok(bytes) => send(write, tag::DATA, &bytes).await?,
+            Err(TryRecvError::Lagged(_)) => {
+                send(write, tag::RESYNC, attachment.resync(output).as_bytes()).await?;
+            }
+            Err(TryRecvError::Empty | TryRecvError::Closed) => return Ok(()),
+        }
     }
-    Ok(())
 }
 
 /// How long to wait for a node we just started to come up.

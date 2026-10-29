@@ -6,6 +6,8 @@
 //! and a note of the host key each machine presented the first time. The
 //! departure is the app's and stops here: nothing about it reaches the wire
 //! or the library.
+//! Writers lock a separate file across each read, change and rename, so
+//! concurrent opens share one identity and cannot discard remembered host keys.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Write};
@@ -52,6 +54,7 @@ impl Identity {
     /// locked out of every machine the first one had been let into, with
     /// nothing anywhere saying why.
     pub fn kept_at(path: &Path) -> Result<Self> {
+        let _lock = lock_file(path)?;
         match fs::read_to_string(path) {
             Ok(text) => {
                 let key = PrivateKey::from_openssh(&text)
@@ -151,6 +154,17 @@ impl KnownHosts {
         }
     }
 
+    /// Check and record first use in one transaction, leaving a changed key alone.
+    pub(crate) fn trust(&self, at: &str, offered: &PublicKey) -> Result<Verdict> {
+        let _lock = lock_file(&self.path)?;
+        let verdict = self.verdict(at, offered)?;
+        if verdict == Verdict::New {
+            let line = format!("{at} {}", offered.to_openssh()?);
+            self.rewrite_locked(at, Some(&line))?;
+        }
+        Ok(verdict)
+    }
+
     /// Write down the key `at` presented, replacing anything already there.
     pub fn remember(&self, at: &str, key: &PublicKey) -> Result<()> {
         let line = format!("{at} {}", key.to_openssh()?);
@@ -187,6 +201,11 @@ impl KnownHosts {
 
     /// Rewrite the file with `at`'s line replaced by `line`, or dropped.
     fn rewrite(&self, at: &str, line: Option<&str>) -> Result<()> {
+        let _lock = lock_file(&self.path)?;
+        self.rewrite_locked(at, line)
+    }
+
+    fn rewrite_locked(&self, at: &str, line: Option<&str>) -> Result<()> {
         let mut kept: Vec<String> = match fs::read_to_string(&self.path) {
             Ok(text) => text
                 .lines()
@@ -206,6 +225,24 @@ impl KnownHosts {
         write_privately(&self.path, text.as_bytes())
             .with_context(|| format!("writing {}", self.path.display()))
     }
+}
+
+fn lock_file(path: &Path) -> Result<File> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let path = path.with_extension("lock");
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(&path)
+        .with_context(|| format!("opening {}", path.display()))?;
+    file.lock()
+        .with_context(|| format!("locking {}", path.display()))?;
+    Ok(file)
 }
 
 /// Write a file nobody else on the device can read, all at once or not at all.
@@ -249,7 +286,120 @@ fn write_privately(path: &Path, bytes: &[u8]) -> Result<()> {
 /// that has to keep working for a machine to be told what to let in.
 #[cfg(test)]
 mod tests {
-    use super::{KnownHosts, Verdict, generate};
+    use super::{Identity, KnownHosts, Verdict, generate};
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+
+    #[test]
+    fn concurrent_first_contacts_cannot_replace_each_others_host_key() {
+        let dir = std::env::temp_dir().join(format!("mm-first-contact-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let known = KnownHosts::at(dir.join("known_hosts"));
+        let keys: Vec<_> = (0..2).map(|_| generate().unwrap()).collect();
+        let ready = Arc::new(Barrier::new(keys.len()));
+        let answers = thread::scope(|scope| {
+            let threads: Vec<_> = keys
+                .iter()
+                .map(|key| {
+                    let ready = Arc::clone(&ready);
+                    let known = &known;
+                    scope.spawn(move || {
+                        ready.wait();
+                        known.trust("host", key.public_key()).unwrap()
+                    })
+                })
+                .collect();
+            threads
+                .into_iter()
+                .map(|thread| thread.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(
+            answers
+                .iter()
+                .filter(|answer| **answer == Verdict::New)
+                .count(),
+            1
+        );
+        assert_eq!(
+            answers
+                .iter()
+                .filter(|answer| matches!(answer, Verdict::Changed { .. }))
+                .count(),
+            1
+        );
+        for (key, answer) in keys.iter().zip(answers) {
+            let stored = known.verdict("host", key.public_key()).unwrap();
+            if answer == Verdict::New {
+                assert_eq!(stored, Verdict::Known);
+            } else {
+                assert!(matches!(stored, Verdict::Changed { .. }));
+            }
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn concurrent_first_opens_share_one_device_identity() {
+        let dir = std::env::temp_dir().join(format!("mm-identity-race-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("id_ed25519");
+        let ready = Arc::new(Barrier::new(8));
+        let identities = thread::scope(|scope| {
+            let threads: Vec<_> = (0..8)
+                .map(|_| {
+                    let ready = Arc::clone(&ready);
+                    let path = &path;
+                    scope.spawn(move || {
+                        ready.wait();
+                        Identity::kept_at(path).map(|identity| identity.authorized_line())
+                    })
+                })
+                .collect();
+            threads
+                .into_iter()
+                .map(|thread| thread.join().unwrap().unwrap())
+                .collect::<Vec<_>>()
+        });
+        let stored = Identity::kept_at(&path).unwrap().authorized_line();
+        assert!(identities.iter().all(|identity| identity == &stored));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn concurrent_host_key_writes_preserve_every_machine() {
+        let dir = std::env::temp_dir().join(format!("mm-host-key-race-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let known = KnownHosts::at(dir.join("known_hosts"));
+        let keys: Vec<_> = (0..8).map(|_| generate().unwrap()).collect();
+        let ready = Arc::new(Barrier::new(keys.len()));
+        thread::scope(|scope| {
+            let threads: Vec<_> = keys
+                .iter()
+                .enumerate()
+                .map(|(index, key)| {
+                    let ready = Arc::clone(&ready);
+                    let known = &known;
+                    scope.spawn(move || {
+                        ready.wait();
+                        known.remember(&format!("host-{index}"), key.public_key())
+                    })
+                })
+                .collect();
+            for thread in threads {
+                thread.join().unwrap().unwrap();
+            }
+        });
+        for (index, key) in keys.iter().enumerate() {
+            assert_eq!(
+                known
+                    .verdict(&format!("host-{index}"), key.public_key())
+                    .unwrap(),
+                Verdict::Known
+            );
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn a_key_written_down_is_the_key_read_back() {

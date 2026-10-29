@@ -8,6 +8,8 @@
 //!
 //! A screen snapshot starts a new parser stream, since lost output can leave
 //! the previous stream inside an unfinished escape sequence.
+//! Oversized control sequences pass through without buffering or declaring a
+//! safe drawing boundary before their final byte arrives.
 //!
 //! Everything here is string building and parsing, kept out of
 //! [`super::attach`] so it can be tested without a terminal.
@@ -333,14 +335,14 @@ impl Status {
             _ => String::new(),
         };
         let mut width = columns(&format!("● {prefix}{}", self.target));
-        if width + GUTTER > size.cols {
+        if width > size.cols.saturating_sub(GUTTER) {
             prefix.clear();
             width = columns(&format!("● {}", self.target));
         }
         // Right-aligned, and dropped rather than wrapped on a terminal too
         // narrow to hold it and its gutter: a wrapped mark would scroll the
         // screen.
-        if width + GUTTER > size.cols {
+        if width > size.cols.saturating_sub(GUTTER) {
             return String::new();
         }
         let column = size.cols - width + 1 - GUTTER;
@@ -382,7 +384,7 @@ impl Status {
         // this row that changes a keystroke at a time.
         if let Some((label, prompt)) = &self.prompt {
             let typed = format!("{label}{prompt}");
-            return if columns(&typed) + 1 + mark + GUTTER > size.cols {
+            return if columns(&typed) > size.cols.saturating_sub(mark).saturating_sub(1 + GUTTER) {
                 String::new()
             } else {
                 // The label is the client talking, and stays the colour every
@@ -419,7 +421,7 @@ impl Status {
             (None, None, mode @ (Mode::Control | Mode::Picking))
                 if self.popped != Popped::Drawn =>
             {
-                let room = size.cols.saturating_sub(1 + mark + GUTTER);
+                let room = size.cols.saturating_sub(mark).saturating_sub(1 + GUTTER);
                 let text = self.without_a_box(mode, room);
                 return if text.is_empty() {
                     String::new()
@@ -436,7 +438,7 @@ impl Status {
             ) => return String::new(),
         };
         // A blank column between the two, so they never run together.
-        if columns(text) + 1 + mark + GUTTER > size.cols {
+        if columns(text) > size.cols.saturating_sub(mark).saturating_sub(1 + GUTTER) {
             return String::new();
         }
         styled(text)
@@ -458,7 +460,9 @@ impl Status {
         if columns(showing) > room {
             return String::new();
         }
-        let left = room.saturating_sub(columns(showing) + columns(HINT_GAP));
+        let left = room
+            .saturating_sub(columns(showing))
+            .saturating_sub(columns(HINT_GAP));
         let keys = match mode {
             Mode::Picking if columns(PICK_HINTS) <= left => PICK_HINTS.to_string(),
             Mode::Picking => String::new(),
@@ -662,6 +666,7 @@ enum State {
     Ground,
     Escape,
     Csi,
+    CsiPass,
     Osc,
     OscEscape,
     /// DCS, SOS, PM and APC: opaque payloads that run until a string
@@ -678,7 +683,7 @@ enum State {
     },
 }
 
-/// The longest title kept. A sequence longer than this is passed through
+/// The longest control sequence kept. A sequence longer than this is passed through
 /// unrewritten rather than buffered without limit.
 const MAX_OSC: usize = 4096;
 
@@ -755,6 +760,9 @@ impl Filter {
                     }
                 },
                 State::Escape => {
+                    if b == 0x1b {
+                        self.flush(&mut out);
+                    }
                     self.held.push(b);
                     match b {
                         b'[' => self.state = State::Csi,
@@ -788,6 +796,15 @@ impl Filter {
                             self.held.clear();
                             self.state = State::Ground;
                         }
+                    } else if self.held.len() > MAX_OSC {
+                        self.flush(&mut out);
+                        self.state = State::CsiPass;
+                    }
+                }
+                State::CsiPass => {
+                    out.push(b);
+                    if (0x40..=0x7e).contains(&b) {
+                        self.state = State::Ground;
                     }
                 }
                 State::Osc => match b {
@@ -812,7 +829,16 @@ impl Filter {
                     _ => {
                         self.held.push(0x1b);
                         self.held.push(b);
-                        self.state = State::Osc;
+                        self.state = if self.held.len() > MAX_OSC {
+                            self.flush(&mut out);
+                            if b == 0x1b {
+                                State::StrEscape { bel_ends: true }
+                            } else {
+                                State::Str { bel_ends: true }
+                            }
+                        } else {
+                            State::Osc
+                        };
                     }
                 },
                 State::Str { bel_ends } => {
@@ -1035,6 +1061,63 @@ fn remove_key_release_flag(sequence: &mut Vec<u8>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn oversized_control_sequences_stream_without_becoming_a_safe_boundary() {
+        let mut filter = Filter::default();
+        let mut input = b"\x1b[".to_vec();
+        input.extend(vec![b'1'; MAX_OSC * 2]);
+        let mut output = filter.feed(&input);
+        assert!(
+            !output.is_empty(),
+            "an unfinished CSI must not keep growing in memory"
+        );
+        assert!(!filter.at_boundary());
+        output.extend(filter.feed(b"mtext"));
+        input.extend_from_slice(b"mtext");
+        assert_eq!(output, input);
+        assert!(filter.at_boundary());
+    }
+
+    #[test]
+    fn repeated_escapes_do_not_accumulate_before_the_next_sequence() {
+        let mut filter = Filter::default();
+        let mut input = vec![0x1b; MAX_OSC * 2];
+        let mut output = filter.feed(&input);
+        assert!(
+            !output.is_empty(),
+            "abandoned escapes must be passed through"
+        );
+        assert!(!filter.at_boundary());
+        output.extend(filter.feed(b"[31mtext"));
+        input.extend_from_slice(b"[31mtext");
+        assert_eq!(output, input);
+        assert!(filter.at_boundary());
+    }
+
+    #[test]
+    fn escapes_inside_an_oversized_osc_do_not_bypass_the_buffer_bound() {
+        let mut filter = Filter::default();
+        let mut input = b"\x1b]9;".to_vec();
+        input.extend(vec![0x1b; MAX_OSC * 2]);
+        let mut output = filter.feed(&input);
+        assert!(!output.is_empty(), "OSC escapes must obey the buffer bound");
+        assert!(!filter.at_boundary());
+        output.extend(filter.feed(b"\\text"));
+        input.extend_from_slice(b"\\text");
+        assert_eq!(output, input);
+        assert!(filter.at_boundary(), "ST must finish the oversized OSC");
+    }
+
+    #[test]
+    fn oversized_group_names_and_prompts_do_not_overflow_the_mark_width() {
+        let wide = "x".repeat(usize::from(u16::MAX));
+        let mut status = Status::new("build-box/build");
+        status.set_group(Some(&wide));
+        status.set_renaming(Some(wide));
+        let painted = status.repaint(Size::new(80, 24));
+        assert!(painted.contains("build-box/build"));
+    }
 
     fn through(filter: &mut Filter, input: &str) -> String {
         String::from_utf8(filter.feed(input.as_bytes())).unwrap()

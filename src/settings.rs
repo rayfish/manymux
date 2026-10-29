@@ -7,8 +7,10 @@
 //!
 //! An unknown key is an error rather than a line written to the file. A typo
 //! that saves cleanly and changes nothing is the worst outcome available here.
+//! Mutations lock across reading and writing, so two commands changing different
+//! keys preserve both changes.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
@@ -132,6 +134,14 @@ impl Settings {
         config::save_toml(&Self::path(), self, "the settings")
     }
 
+    pub fn change<T>(change: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
+        Self::change_at(&Self::path(), change)
+    }
+
+    fn change_at<T>(path: &Path, change: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
+        config::change_toml(path, "the settings", change)
+    }
+
     pub fn path() -> PathBuf {
         config::config_dir().join("settings.toml")
     }
@@ -221,6 +231,8 @@ fn list() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Barrier};
+    use std::thread;
 
     #[test]
     fn a_setting_is_written_the_way_people_write_one() {
@@ -299,5 +311,31 @@ mod tests {
         assert_eq!(settings.mouse, Mouse::Terminal);
 
         assert!(settings.set("mouse", "off").is_err());
+    }
+
+    #[test]
+    fn concurrent_changes_preserve_both_settings() {
+        let dir =
+            std::env::temp_dir().join(format!("manymux-setting-changes-{}", std::process::id()));
+        let path = dir.join("settings.toml");
+        let start = Arc::new(Barrier::new(2));
+        let writers: Vec<_> = [("notify", "off"), ("screen", "inline")]
+            .into_iter()
+            .map(|(key, value)| {
+                let path = path.clone();
+                let start = Arc::clone(&start);
+                thread::spawn(move || {
+                    start.wait();
+                    Settings::change_at(&path, |settings| settings.set(key, value))
+                })
+            })
+            .collect();
+        for writer in writers {
+            writer.join().unwrap().unwrap();
+        }
+        let settings: Settings = config::load_toml(&path).unwrap();
+        assert!(!settings.notify);
+        assert_eq!(settings.screen, Screen::Inline);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

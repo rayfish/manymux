@@ -15,12 +15,13 @@ desc="@DESC@"
 
 load_rc_config $name
 : ${@RCNAME@_enable:="NO"}
-: ${@RCNAME@_user:="@USER@"}
+: ${@RCNAME@_user:=@USER@}
 
 pidfile="/var/run/${name}.pid"
-procname="@BIN@"
+procname=@BIN@
+export MM_CONFIG_DIR=@CONFIG@
 command="/usr/sbin/daemon"
 command_args="-P ${pidfile} -r -f -u ${@RCNAME@_user} \
-	/usr/bin/env MM_CONFIG_DIR=@CONFIG@ @BIN@ @COMMAND@"
+	@BIN_ARG@ @COMMAND@"
 
 run_rc_command "$1"

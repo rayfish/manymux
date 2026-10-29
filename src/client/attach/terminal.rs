@@ -409,6 +409,7 @@ pub async fn run(
         group,
         asks,
         fresh,
+        renamed,
     } = popup;
     let watching = session.read_only;
     let mut status = Status::new(target);
@@ -449,6 +450,7 @@ pub async fn run(
             rows,
             asks,
             fresh,
+            renamed,
             connection: &mut connection,
             uploads,
         },
@@ -770,6 +772,8 @@ pub struct PopupFeed<'a> {
     pub group: Option<&'a str>,
     pub asks: mpsc::Sender<()>,
     pub fresh: tokio::sync::watch::Receiver<Rows>,
+    /// Confirmed names for rebuilding the current row without ending the UI.
+    pub renamed: tokio::sync::watch::Sender<Option<String>>,
 }
 
 pub struct RunOptions<'a> {
@@ -798,6 +802,7 @@ struct Painting<'a> {
     /// listing landing under an open popup does not slide it onto a different
     /// session.
     fresh: tokio::sync::watch::Receiver<Rows>,
+    renamed: tokio::sync::watch::Sender<Option<String>>,
     connection: &'a mut Option<Connection>,
     uploads: Uploads,
 }
@@ -971,6 +976,7 @@ async fn pump(
         mut rows,
         asks,
         mut fresh,
+        renamed,
         connection,
         mut uploads,
     } = painting;
@@ -1880,6 +1886,7 @@ async fn pump(
                 Update::Renamed(answer) => {
                     let said = match answer {
                         Renamed::Name(name) => {
+                            renamed.send_replace(Some(name.clone()));
                             *naming.called = name;
                             status.set_target(&naming.target());
                             pending.push_str(&status.retitle());

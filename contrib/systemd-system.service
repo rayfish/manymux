@@ -7,7 +7,7 @@ After=network-online.target
 # fills in HOME, USER and SHELL from that account's passwd entry.
 User=@USER@
 ExecStart=@BIN@ @COMMAND@
-Environment=MM_CONFIG_DIR=@CONFIG@
+Environment=@CONFIG@
 Restart=always
 RestartSec=2
 

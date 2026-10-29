@@ -9,8 +9,17 @@
 //! lock as an attach, so bytes already in the screen are never replayed over it.
 //! A separate image upload retains this session before receiving bytes, so a
 //! rename cannot redirect the completed paste to a replacement session.
+//! The reaper stops the PTY reader and drains buffered bytes before reporting
+//! exit. Descendants holding a slave fd cannot retain a dead session forever.
+//! The name's watch channel owns its current value and notifies every attach,
+//! so a rename made by another client also changes the name used to reconnect.
+//! Input queues at most sixteen protocol frames before applying backpressure.
+//! Resizes keep only the latest geometry and share the same PTY writer.
 
 use std::collections::HashMap;
+use std::fs::File;
+use std::io::{ErrorKind, Read};
+use std::os::fd::AsFd;
 use std::path::Path;
 use std::slice;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -20,6 +29,7 @@ use std::time::{Instant, SystemTime};
 use anyhow::{Context, Result, bail};
 use avt::Vt;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::mpsc::Permit;
 use tokio::sync::{broadcast, mpsc, watch};
 use tracing::{debug, warn};
 
@@ -42,26 +52,22 @@ const SCROLLBACK: usize = 10_000;
 /// A lagging client is resynced from the screen dump rather than disconnected.
 const OUTPUT_BACKLOG: usize = 256;
 
-/// Sent to the single task that owns the PTY write half. Input and resizes go
-/// through one channel because both touch the same fd and must not interleave.
-enum Input {
-    Bytes(Vec<u8>),
-    Resize(Size),
-}
+/// Each queued frame is bounded by `MAX_FRAME`, including library callers.
+const INPUT_BACKLOG: usize = 16;
 
 pub struct Session {
     /// What the session is addressed by, in `host/name` and everywhere else.
-    /// Behind a lock because a rename changes it under whatever is reading it:
-    /// the registry's key moves with it, but an event published from the PTY
-    /// reader carries the name too.
-    name: Mutex<String>,
+    /// The watch channel keeps its readers and attached clients on the same
+    /// value when the registry moves the name.
+    name: watch::Sender<String>,
     pub command: String,
     pub pid: u32,
     /// When this was opened. Outside the lock above because it is the one
     /// thing about a session that nothing changes, which is exactly why every
     /// listing is ordered by it.
     pub started: SystemTime,
-    input_tx: mpsc::UnboundedSender<Input>,
+    input_tx: mpsc::Sender<Vec<u8>>,
+    size_tx: watch::Sender<Size>,
     output_tx: broadcast::Sender<Arc<[u8]>>,
     state: Mutex<State>,
     /// Resolves to the child's exit code once it exits.
@@ -237,6 +243,7 @@ pub struct Attached {
 /// A client's handle on an attached session. Dropping it detaches.
 pub struct Attachment {
     session: Arc<Session>,
+    names: watch::Receiver<String>,
     id: u64,
     /// A client watching rather than working. Enforced here rather than trusted
     /// to the client: the promise is what makes `mm view` safe to point at a
@@ -245,11 +252,21 @@ pub struct Attachment {
 }
 
 impl Attachment {
-    pub fn send_input(&self, bytes: Vec<u8>) {
+    pub async fn send_input(&self, bytes: Vec<u8>) -> Result<()> {
         if self.read_only {
-            return;
+            return Ok(());
         }
-        let _ = self.session.input_tx.send(Input::Bytes(bytes));
+        self.session.send_input(bytes).await
+    }
+
+    /// Reserving is cancel safe: the pump retains the bytes until it obtains
+    /// a slot, while output and liveness probes keep running beside this wait.
+    pub(super) async fn input_space(&self) -> Result<Permit<'_, Vec<u8>>> {
+        self.session
+            .input_tx
+            .reserve()
+            .await
+            .map_err(|_| anyhow::anyhow!("the session stopped accepting input"))
     }
 
     /// Whether this client only watches, for the paths that answer rather than
@@ -329,6 +346,12 @@ impl Attachment {
         self.session.name()
     }
 
+    /// Subscribed when the attachment was made, so a rename during the
+    /// handshake or initial repaint remains pending until the pump reads it.
+    pub(super) fn name_changes(&self) -> watch::Receiver<String> {
+        self.names.clone()
+    }
+
     pub fn exit_rx(&self) -> watch::Receiver<Option<i32>> {
         self.session.exit_rx.clone()
     }
@@ -347,14 +370,22 @@ impl Drop for Attachment {
 impl Session {
     /// An upload is tied to this process before it starts, so a rename or a
     /// replacement session cannot redirect its path while the bytes arrive.
-    pub(super) fn paste_file(&self, path: &Path) -> Result<()> {
+    pub(super) async fn paste_file(&self, path: &Path) -> Result<()> {
         if self.has_exited() {
             bail!("the session ended before the image upload finished");
         }
         let bracketed = held(&self.state).scanner.bracketed_paste();
         let bytes = super::paste::typed(path, bracketed).into_bytes();
+        self.send_input(bytes).await
+    }
+
+    async fn send_input(&self, bytes: Vec<u8>) -> Result<()> {
+        if bytes.len() > proto::MAX_FRAME {
+            bail!("input exceeds the {} byte frame limit", proto::MAX_FRAME);
+        }
         self.input_tx
-            .send(Input::Bytes(bytes))
+            .send(bytes)
+            .await
             .map_err(|_| anyhow::anyhow!("the session stopped accepting input"))
     }
 
@@ -371,6 +402,11 @@ impl Session {
 
         let (pty, pts) = pty_process::open().context("opening pty")?;
         pty.resize(size.into()).context("sizing pty")?;
+        let mut final_output = File::from(
+            pty.as_fd()
+                .try_clone_to_owned()
+                .context("retaining the pty for its final output")?,
+        );
 
         let mut cmd = pty_process::Command::new(&argv[0]);
         cmd = cmd.args(&argv[1..]);
@@ -396,16 +432,18 @@ impl Session {
             .with_context(|| format!("spawning {}", argv[0]))?;
         let pid = child.id().unwrap_or(0);
 
-        let (input_tx, mut input_rx) = mpsc::unbounded_channel();
+        let (input_tx, mut input_rx) = mpsc::channel(INPUT_BACKLOG);
+        let (size_tx, mut sizes) = watch::channel(size);
         let (output_tx, _) = broadcast::channel(OUTPUT_BACKLOG);
         let (exit_tx, exit_rx) = watch::channel(None);
 
         let session = Arc::new(Session {
-            name: Mutex::new(name.clone()),
+            name: watch::channel(name).0,
             command: label,
             pid,
             started: SystemTime::now(),
             input_tx,
+            size_tx,
             output_tx: output_tx.clone(),
             state: Mutex::new(State::new(size)),
             exit_rx,
@@ -418,7 +456,7 @@ impl Session {
 
         // PTY -> screen model -> attached clients.
         let s = Arc::clone(&session);
-        tokio::spawn(async move {
+        let reader = tokio::spawn(async move {
             let mut buf = vec![0u8; 16 * 1024];
             loop {
                 match pty_read.read(&mut buf).await {
@@ -430,20 +468,23 @@ impl Session {
             }
         });
 
-        // Attached clients -> PTY, with resizes interleaved on the same fd.
+        // One writer owns the fd. Resize bursts keep only their latest value,
+        // so resizing or dropping an attachment never waits for input space.
         tokio::spawn(async move {
             let mut pty_write = pty_write;
-            while let Some(msg) = input_rx.recv().await {
-                match msg {
-                    Input::Bytes(b) => {
-                        if pty_write.write_all(&b).await.is_err() {
-                            break;
-                        }
-                    }
-                    Input::Resize(size) => {
+            loop {
+                tokio::select! {
+                    biased;
+                    changed = sizes.changed() => {
+                        if changed.is_err() { break; }
+                        let size = *sizes.borrow_and_update();
                         if let Err(e) = pty_write.resize(size.into()) {
                             debug!("resize failed: {e}");
                         }
+                    }
+                    bytes = input_rx.recv() => {
+                        let Some(bytes) = bytes else { break };
+                        if pty_write.write_all(&bytes).await.is_err() { break; }
                     }
                 }
             }
@@ -459,11 +500,42 @@ impl Session {
                     -1
                 }
             };
+            reader.abort();
+            if let Err(error) = reader.await
+                && !error.is_cancelled()
+            {
+                warn!(session = %s.name(), "pty reader failed: {error}");
+            }
+            s.drain_final_output(&mut final_output);
             s.publish(EventKind::Exited(code));
             let _ = exit_tx.send(Some(code));
         });
 
         Ok(session)
+    }
+
+    /// The fd remains nonblocking after duplication. Stop once its queued
+    /// output is exhausted, with a bound for a surviving descendant that keeps
+    /// printing. Waiting for EOF would let that descendant hold the exit open.
+    fn drain_final_output(&self, output: &mut File) {
+        let mut buffer = [0u8; 16 * 1024];
+        for _ in 0..16 {
+            match output.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(read) => self.ingest(&buffer[..read]),
+                Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+                Err(error)
+                    if error.kind() == ErrorKind::WouldBlock
+                        || error.raw_os_error() == Some(libc::EIO) =>
+                {
+                    break;
+                }
+                Err(error) => {
+                    debug!(session = %self.name(), "reading final pty output failed: {error}");
+                    break;
+                }
+            }
+        }
     }
 
     /// Feed a chunk of PTY output into the screen model and fan it out.
@@ -550,6 +622,7 @@ impl Session {
         Attached {
             attachment: Attachment {
                 session: Arc::clone(self),
+                names: self.name.subscribe(),
                 id,
                 read_only,
             },
@@ -567,18 +640,18 @@ impl Session {
         }
         state.size = size;
         state.resize(size);
-        let _ = self.input_tx.send(Input::Resize(size));
+        self.size_tx.send_replace(size);
     }
 
     pub fn name(&self) -> String {
-        held(&self.name).clone()
+        self.name.borrow().clone()
     }
 
     /// Answer to a different name from now on. The registry does the deciding,
     /// since it owns the names and is the only place a clash can be seen; this
     /// is the session's half of what it decided.
     pub fn set_name(&self, name: &str) {
-        *held(&self.name) = name.to_string();
+        self.name.send_replace(name.to_string());
     }
 
     /// Ask the child to go away. SIGHUP to the whole process group, the way a
@@ -747,21 +820,27 @@ pub fn default_name(spec: &SpawnSpec) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::duplex;
+    use std::future::Future;
+    use std::io::Result as IoResult;
+    use std::pin::Pin;
+    use std::task::{Context as TaskContext, Poll, Waker};
+    use std::time::Duration;
+    use tokio::io::{AsyncRead, ReadBuf, duplex};
 
     use crate::node::registry::Registry;
     use crate::proto::{FrameReader, tag};
 
     fn quiet_session(exit_rx: watch::Receiver<Option<i32>>) -> Arc<Session> {
-        let (input_tx, _input_rx) = mpsc::unbounded_channel();
+        let (input_tx, _input_rx) = mpsc::channel(INPUT_BACKLOG);
         let (output_tx, _) = broadcast::channel(OUTPUT_BACKLOG);
         let (events, _) = broadcast::channel(16);
         Arc::new(Session {
-            name: Mutex::new("build".into()),
+            name: watch::channel("build".to_string()).0,
             command: "shell".into(),
             pid: 0,
             started: SystemTime::now(),
             input_tx,
+            size_tx: watch::channel(Size::new(80, 24)).0,
             output_tx,
             state: Mutex::new(State::new(Size::new(80, 24))),
             exit_rx,
@@ -769,6 +848,168 @@ mod tests {
             host_clients: Arc::new(AtomicUsize::new(0)),
             next_client: AtomicU64::new(0),
         })
+    }
+
+    #[tokio::test]
+    async fn stalled_input_applies_backpressure_and_keeps_bytes_in_order() {
+        let (_exit_tx, exit_rx) = watch::channel(None);
+        let mut session = quiet_session(exit_rx);
+        let (input_tx, mut input_rx) = mpsc::channel(INPUT_BACKLOG);
+        Arc::get_mut(&mut session).unwrap().input_tx = input_tx;
+        let attached = session.attach(Size::default(), 0, false);
+        for byte in 0..16u8 {
+            attached.attachment.send_input(vec![byte]).await.unwrap();
+        }
+        let pending = attached.attachment.send_input(vec![16]);
+        tokio::pin!(pending);
+        let mut context = TaskContext::from_waker(Waker::noop());
+        assert!(
+            pending.as_mut().poll(&mut context).is_pending(),
+            "a full input queue must stop accepting more bytes"
+        );
+        let first = input_rx.recv().await.expect("the first input stays queued");
+        assert_eq!(first, [0]);
+        pending.await.unwrap();
+        for expected in 1..=16u8 {
+            let bytes = input_rx.recv().await.expect("queued input stays available");
+            assert_eq!(bytes, [expected]);
+        }
+    }
+
+    #[tokio::test]
+    async fn full_input_does_not_block_viewers_resizes_or_detach() {
+        let (_exit_tx, exit_rx) = watch::channel(None);
+        let mut session = quiet_session(exit_rx);
+        let (input_tx, input_rx) = mpsc::channel(INPUT_BACKLOG);
+        Arc::get_mut(&mut session).unwrap().input_tx = input_tx;
+        let working = session.attach(Size::default(), 0, false);
+        for _ in 0..INPUT_BACKLOG {
+            working.attachment.send_input(vec![1]).await.unwrap();
+        }
+        let watching = session.attach(Size::new(10, 5), 0, true);
+        let viewed = watching.attachment.send_input(vec![2]);
+        tokio::pin!(viewed);
+        let mut context = TaskContext::from_waker(Waker::noop());
+        assert!(matches!(
+            viewed.as_mut().poll(&mut context),
+            Poll::Ready(Ok(()))
+        ));
+        assert_eq!(input_rx.len(), INPUT_BACKLOG, "a viewer enqueues no input");
+
+        let mut sizes = session.size_tx.subscribe();
+        let smaller = session.attach(Size::new(40, 12), 0, false);
+        working.attachment.resize(Size::new(120, 40));
+        drop(smaller);
+        let last_size = *sizes.borrow_and_update();
+        assert_eq!(last_size, Size::new(120, 40));
+        assert_eq!(session.info().size, last_size);
+        assert!(
+            !sizes.has_changed().unwrap(),
+            "resize bursts keep one latest size"
+        );
+    }
+
+    #[tokio::test]
+    async fn library_input_cannot_bypass_the_frame_size_bound() {
+        let (_exit_tx, exit_rx) = watch::channel(None);
+        let session = quiet_session(exit_rx);
+        let error = session
+            .send_input(vec![0; proto::MAX_FRAME + 1])
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("frame limit"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stalled_input_keeps_a_responsive_client_connected() {
+        struct TrackingRead<R> {
+            inner: R,
+            total: usize,
+            count: watch::Sender<usize>,
+        }
+        impl<R: AsyncRead + Unpin> AsyncRead for TrackingRead<R> {
+            fn poll_read(
+                self: Pin<&mut Self>,
+                context: &mut TaskContext<'_>,
+                buffer: &mut ReadBuf<'_>,
+            ) -> Poll<IoResult<()>> {
+                let this = self.get_mut();
+                let before = buffer.filled().len();
+                let result = Pin::new(&mut this.inner).poll_read(context, buffer);
+                if matches!(result, Poll::Ready(Ok(()))) {
+                    this.total += buffer.filled().len() - before;
+                    this.count.send_replace(this.total);
+                }
+                result
+            }
+        }
+
+        let (_exit_tx, exit_rx) = watch::channel(None);
+        let mut session = quiet_session(exit_rx);
+        let (input_tx, mut input_rx) = mpsc::channel(INPUT_BACKLOG);
+        Arc::get_mut(&mut session).unwrap().input_tx = input_tx;
+        let attached = session.attach(Size::default(), 0, false);
+        for _ in 0..INPUT_BACKLOG {
+            attached.attachment.send_input(vec![0]).await.unwrap();
+        }
+        let (client, server) = duplex(64 * 1024);
+        let (read, mut write) = tokio::io::split(server);
+        let (count, mut read_count) = watch::channel(0);
+        let events = session.events.clone();
+        let registry = Registry::new(events.clone());
+        let task = tokio::spawn(async move {
+            super::super::pump_attachment(
+                attached,
+                &registry,
+                events.subscribe(),
+                &mut FrameReader::new(TrackingRead {
+                    inner: read,
+                    total: 0,
+                    count,
+                }),
+                &mut write,
+            )
+            .await
+        });
+        let (read, mut write) = tokio::io::split(client);
+        let mut frames = FrameReader::new(read);
+        proto::write_frame(&mut write, tag::PONG, &[])
+            .await
+            .unwrap();
+        proto::write_msg(&mut write, tag::RESIZE, &Size::default())
+            .await
+            .unwrap();
+        while frames.next().await.unwrap().unwrap().tag != tag::SIZE {}
+        let before = *read_count.borrow();
+        proto::write_frame(&mut write, tag::DATA, &[1])
+            .await
+            .unwrap();
+        read_count
+            .wait_for(|count| *count >= before + 6)
+            .await
+            .unwrap();
+
+        for _ in 0..4 {
+            tokio::time::advance(proto::PING_EVERY).await;
+            let frame = frames
+                .next()
+                .await
+                .unwrap()
+                .expect("a backpressured client stays connected");
+            assert_eq!(frame.tag, tag::PING);
+            proto::write_frame(&mut write, tag::PONG, &[])
+                .await
+                .unwrap();
+        }
+        assert_eq!(input_rx.recv().await.unwrap(), [0]);
+        proto::write_msg(&mut write, tag::RESIZE, &Size::new(100, 30))
+            .await
+            .unwrap();
+        while frames.next().await.unwrap().unwrap().tag != tag::SIZE {}
+        proto::write_frame(&mut write, tag::DETACH, &[])
+            .await
+            .unwrap();
+        assert!(!task.await.unwrap().unwrap());
     }
 
     #[test]
@@ -824,6 +1065,88 @@ mod tests {
             .await
             .unwrap();
         assert!(!task.await.unwrap().unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_final_output_drain_recovers_a_lagged_clients_screen() {
+        let (_exit_tx, exit_rx) = watch::channel(None);
+        let session = quiet_session(exit_rx);
+        let mut attached = session.attach(Size::default(), 0, false);
+        for _ in 0..OUTPUT_BACKLOG * 2 {
+            session.ingest(b"old\r\n");
+        }
+        session.ingest(b"final output");
+        let mut wire = Vec::new();
+        super::super::drain_output(&attached.attachment, &mut attached.output, &mut wire)
+            .await
+            .unwrap();
+        let frame = FrameReader::new(wire.as_slice())
+            .next()
+            .await
+            .unwrap()
+            .expect("the last screen is sent even when the client lagged");
+        assert_eq!(frame.tag, tag::RESYNC);
+        assert!(String::from_utf8_lossy(&frame.body).contains("final output"));
+    }
+
+    #[tokio::test]
+    async fn a_session_releases_its_reader_when_a_descendant_keeps_the_terminal_open() {
+        let dir = std::env::temp_dir().join(format!("manymux-reader-{}", std::process::id()));
+        crate::config::ensure_private_dir(&dir).unwrap();
+        let child_file = dir.join("child");
+        let (events, _) = broadcast::channel(16);
+        let session = Session::spawn(
+            &SpawnSpec {
+                command: vec![
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    "trap '' HUP; sleep 300 & echo $! > \"$1\"; echo ready; read go; printf 'final output'".into(),
+                    "sh".into(),
+                    child_file.to_str().unwrap().to_string(),
+                ],
+                ..SpawnSpec::default()
+            },
+            "build".to_string(),
+            events,
+            Arc::new(AtomicUsize::new(0)),
+        )
+        .unwrap();
+        let retained = Arc::downgrade(&session);
+        let mut attached = session.attach(Size::default(), 0, false);
+        let mut seen = attached.repaint.clone();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !seen.contains("ready") {
+                seen.push_str(&String::from_utf8_lossy(
+                    &attached.output.recv().await.unwrap(),
+                ));
+            }
+        })
+        .await
+        .unwrap();
+        let descendant: i32 = std::fs::read_to_string(&child_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let mut exited = session.exit_rx();
+        attached
+            .attachment
+            .send_input(b"go\n".to_vec())
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), exited.wait_for(Option::is_some))
+            .await
+            .unwrap()
+            .unwrap();
+        let final_output_received = session.peek().screen.contains("final output");
+        drop(attached);
+        drop(session);
+        let released = retained.upgrade().is_none();
+        // SAFETY: this pid names the background child created by this test.
+        unsafe { libc::kill(descendant, libc::SIGKILL) };
+        std::fs::remove_dir_all(dir).unwrap();
+        assert!(final_output_received, "buffered output precedes the exit");
+        assert!(released, "an exited session must not retain its PTY reader");
     }
 
     #[test]

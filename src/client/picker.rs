@@ -42,6 +42,10 @@
 //! the name and the title even when the title is clipped in the box, and keeps
 //! the headings above matches so the machine and group remain visible.
 //! Unavailable rows keep their place and highlight, but cannot be activated.
+//! Column measurements and clipping use terminal cell widths, so wide names
+//! and titles cannot overwrite a column or wrap past the box.
+
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::client::switch::wrapped;
 use crate::proto::Size;
@@ -668,7 +672,7 @@ fn at(row: u16, col: u16) -> String {
 }
 
 fn columns(text: &str) -> u16 {
-    u16::try_from(text.chars().count()).unwrap_or(u16::MAX)
+    u16::try_from(text.width()).unwrap_or(u16::MAX)
 }
 
 /// Cut to `width` columns, with an ellipsis where something was dropped.
@@ -677,13 +681,22 @@ fn columns(text: &str) -> u16 {
 /// gets longer is a box that moves under the hand reading it.
 fn clip(text: &str, width: u16) -> String {
     let width = usize::from(width);
-    if text.chars().count() <= width {
+    if text.width() <= width {
         return text.to_string();
     }
     if width == 0 {
         return String::new();
     }
-    let mut out: String = text.chars().take(width.saturating_sub(1)).collect();
+    let mut out = String::new();
+    let mut used = 0;
+    for character in text.chars() {
+        let next = used + character.width().unwrap_or(0);
+        if next >= width {
+            break;
+        }
+        out.push(character);
+        used = next;
+    }
     out.push('…');
     out
 }
@@ -788,6 +801,22 @@ mod tests {
 
     fn one_row() -> Picker {
         picker(vec![Row::new(0, "build").detail("cargo").note("2m")], 0)
+    }
+
+    #[test]
+    fn wide_names_and_titles_stay_inside_the_popup_columns() {
+        let picker = picker(
+            vec![Row::new(0, "作業作業作業作業").detail("構築中構築中構築中構築中")],
+            0,
+        );
+        for colour in [false, true] {
+            for selected in [false, true] {
+                let row = plain(&row_of(&picker, colour, selected));
+                assert_eq!(unicode_width::UnicodeWidthStr::width(row.as_str()), 40);
+            }
+        }
+        assert_eq!(fit("作業", 3), "作…");
+        assert_eq!(fit("e\u{301}", 2), "e\u{301} ");
     }
 
     #[test]

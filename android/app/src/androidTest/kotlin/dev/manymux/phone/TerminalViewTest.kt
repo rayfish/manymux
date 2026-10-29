@@ -6,6 +6,7 @@ import android.os.SystemClock
 import android.graphics.Rect
 import android.view.ViewGroup
 import android.widget.TextView
+import android.widget.PopupMenu
 import androidx.test.core.app.ActivityScenario
 import androidx.test.platform.app.InstrumentationRegistry
 import androidx.test.ext.junit.runners.AndroidJUnit4
@@ -29,6 +30,36 @@ import uniffi.manymux_android.Run
 @RunWith(AndroidJUnit4::class)
 class TerminalViewTest {
     private val instrumentation = InstrumentationRegistry.getInstrumentation()
+
+    @Test
+    fun switchingMachinesDoesNotOfferThePreviousHostsSessions() {
+        val scenario = ActivityScenario.launch(MainActivity::class.java)
+        try {
+            scenario.onActivity { activity ->
+                val first = Machine("gpu-box.example", 22u, "user")
+                val second = Machine("build-box.example", 22u, "user")
+                val cache = MainActivity::class.java.getDeclaredField("seen").apply { isAccessible = true }
+                @Suppress("UNCHECKED_CAST")
+                val seen = cache.get(activity) as MutableMap<Machine, List<Running>>
+                seen[first] = listOf(Running("build", "", "shell", 0u, 0u))
+                val anchor = TextView(activity)
+                MainActivity::class.java.getDeclaredMethod("show", View::class.java)
+                    .apply { isAccessible = true }.invoke(activity, anchor)
+                val menu = MainActivity::class.java.getDeclaredMethod(
+                    "offerToSwitch", View::class.java, Machine::class.java, String::class.java,
+                ).apply { isAccessible = true }.invoke(activity, anchor, second, "shell") as PopupMenu
+                try {
+                    assertEquals(1, menu.menu.size())
+                    assertEquals("nothing else answered", menu.menu.getItem(0).title)
+                    assertTrue(!menu.menu.getItem(0).isEnabled)
+                } finally {
+                    menu.dismiss()
+                }
+            }
+        } finally {
+            scenario.close()
+        }
+    }
 
     @Test
     fun longPressAndDragCopiesWideText() {
@@ -129,9 +160,7 @@ class TerminalViewTest {
         try {
             lateinit var keys: ViewGroup
             scenario.onActivity { activity ->
-                val method = MainActivity::class.java.getDeclaredMethod("extraKeys", TerminalView::class.java)
-                method.isAccessible = true
-                keys = method.invoke(activity, TerminalView(activity)) as ViewGroup
+                keys = extraKeys(activity, TerminalView(activity))
                 val show = MainActivity::class.java.getDeclaredMethod("show", View::class.java)
                 show.isAccessible = true
                 show.invoke(activity, keys)
@@ -171,9 +200,7 @@ class TerminalViewTest {
         try {
             scenario.onActivity { activity ->
                 val terminal = TerminalView(activity)
-                val method = MainActivity::class.java.getDeclaredMethod("extraKeys", TerminalView::class.java)
-                method.isAccessible = true
-                val keys = method.invoke(activity, terminal) as View
+                val keys = extraKeys(activity, terminal)
                 val ctrl = descendants(keys).filterIsInstance<TextView>().single { it.text == "ctrl" }
                 val normal = ctrl.currentTextColor
                 fun arm() {
@@ -212,9 +239,7 @@ class TerminalViewTest {
         try {
             scenario.onActivity { activity ->
                 val terminal = TerminalView(activity)
-                val method = MainActivity::class.java.getDeclaredMethod("extraKeys", TerminalView::class.java)
-                method.isAccessible = true
-                val keys = method.invoke(activity, terminal) as View
+                val keys = extraKeys(activity, terminal)
                 val shift = descendants(keys).filterIsInstance<TextView>().single { it.text == "shift" }
                 val charOf = TerminalView::class.java.getDeclaredMethod("charOf", Char::class.javaPrimitiveType)
                 charOf.isAccessible = true
@@ -252,9 +277,7 @@ class TerminalViewTest {
         try {
             scenario.onActivity { activity ->
                 val terminal = TerminalView(activity)
-                val method = MainActivity::class.java.getDeclaredMethod("extraKeys", TerminalView::class.java)
-                method.isAccessible = true
-                val keys = method.invoke(activity, terminal) as View
+                val keys = extraKeys(activity, terminal)
                 val shift = descendants(keys).filterIsInstance<TextView>().single { it.text == "shift" }
                 fun press(code: Int) {
                     val now = SystemClock.uptimeMillis()
@@ -285,6 +308,52 @@ class TerminalViewTest {
     private fun descendants(view: View): List<View> = listOf(view) +
         if (view is ViewGroup) (0 until view.childCount).flatMap { descendants(view.getChildAt(it)) }
         else emptyList()
+
+    @Test
+    fun hardwareControlProducesChordsWithoutLatchingTheToolbar() {
+        val scenario = ActivityScenario.launch(MainActivity::class.java)
+        try {
+            scenario.onActivity { activity ->
+                val terminal = TerminalView(activity)
+                val bytes = TerminalView::class.java.getDeclaredMethod(
+                    "keyBytes", Int::class.javaPrimitiveType, KeyEvent::class.java,
+                ).apply { isAccessible = true }
+                fun press(code: Int, modifiers: Int = KeyEvent.META_CTRL_ON): ByteArray? {
+                    val now = SystemClock.uptimeMillis()
+                    val event = KeyEvent(now, now, KeyEvent.ACTION_DOWN, code, 0, modifiers)
+                    return bytes.invoke(terminal, code, event) as ByteArray?
+                }
+                assertEquals("\u0003", press(KeyEvent.KEYCODE_C)?.toString(Charsets.UTF_8))
+                assertEquals("\u001d", press(KeyEvent.KEYCODE_RIGHT_BRACKET)?.toString(Charsets.UTF_8))
+                assertTrue(!terminal.control)
+                assertNull(press(KeyEvent.KEYCODE_CTRL_LEFT))
+                assertNull(press(KeyEvent.KEYCODE_F1))
+                assertTrue(!terminal.control)
+                assertEquals("c", press(KeyEvent.KEYCODE_C, 0)?.toString(Charsets.UTF_8))
+                assertEquals(
+                    "\u001b[1;6Z",
+                    press(KeyEvent.KEYCODE_TAB, KeyEvent.META_CTRL_ON or KeyEvent.META_SHIFT_ON)
+                        ?.toString(Charsets.UTF_8),
+                )
+                assertTrue(!terminal.control)
+                assertTrue(!terminal.shift)
+                terminal.control = true
+                press(KeyEvent.KEYCODE_F1)
+                assertTrue("An unhandled key preserves the toolbar's held ctrl", terminal.control)
+            }
+        } finally {
+            scenario.close()
+        }
+    }
+
+    private fun extraKeys(activity: MainActivity, terminal: TerminalView): ViewGroup {
+        val method = MainActivity::class.java.getDeclaredMethod(
+            "extraKeys", TerminalView::class.java, Boolean::class.javaPrimitiveType,
+            Function1::class.java,
+        )
+        method.isAccessible = true
+        return method.invoke(activity, terminal, false, { _: View -> }) as ViewGroup
+    }
 
     private fun field(view: TerminalView, name: String): Any? {
         val field = TerminalView::class.java.getDeclaredField(name)

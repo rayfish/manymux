@@ -546,7 +546,7 @@ async fn run(cli: Cli) -> Result<u8> {
             let answer = match answer_from(&socket, &host).await {
                 Ok(answer) => answer,
                 Err(e) => {
-                    hosts.save()?;
+                    Hosts::change(|hosts| hosts.add(&host))?;
                     eprintln!("mm: added {host}, but could not reach it: {e:#}");
                     return Ok(FAILED);
                 }
@@ -578,7 +578,7 @@ async fn run(cli: Cli) -> Result<u8> {
                     "`{host}` and `{already}` are the same machine, which is on the list already"
                 );
             }
-            hosts.save()?;
+            Hosts::change(|hosts| hosts.add(&host))?;
             println!("watching {host} ({} sessions)", answer.sessions.len());
             Ok(OK)
         }
@@ -595,16 +595,17 @@ async fn run(cli: Cli) -> Result<u8> {
         }
 
         Command::Rm { host } => {
-            let mut hosts = Hosts::load()?;
-            if !hosts.remove(&host) {
-                bail!("{host} is not being watched");
-            }
-            hosts.save()?;
+            Hosts::change(|hosts| {
+                if !hosts.remove(&host) {
+                    bail!("{host} is not being watched");
+                }
+                Ok(())
+            })?;
             Ok(OK)
         }
 
         Command::Config { key, value } => {
-            let mut settings = Settings::load()?;
+            let settings = Settings::load()?;
             match (key, value) {
                 (None, _) => {
                     for (key, value) in settings.all() {
@@ -613,11 +614,13 @@ async fn run(cli: Cli) -> Result<u8> {
                 }
                 (Some(key), None) => println!("{}", settings.get(&key)?),
                 (Some(key), Some(value)) => {
-                    settings.set(&key, &value)?;
-                    settings.save()?;
+                    let saved = Settings::change(|settings| {
+                        settings.set(&key, &value)?;
+                        settings.get(&key)
+                    })?;
                     // A node already running reads the file when it next has
                     // something to say, so there is nothing to restart.
-                    println!("{key} {}", settings.get(&key)?);
+                    println!("{key} {saved}");
                 }
             }
             Ok(OK)
@@ -1153,13 +1156,13 @@ fn remember(host: &str) -> Result<bool> {
     if is_this_machine(host) {
         return Ok(false);
     }
-    let mut hosts = Hosts::load()?;
-    if hosts.has(host) {
-        return Ok(false);
-    }
-    hosts.add(host)?;
-    hosts.save()?;
-    Ok(true)
+    Hosts::change(|hosts| {
+        if hosts.has(host) {
+            return Ok(false);
+        }
+        hosts.add(host)?;
+        Ok(true)
+    })
 }
 
 fn current_dir() -> Option<String> {

@@ -5,12 +5,12 @@
 # @USER@ before running: sessions still belong to that user's account.
 
 description="@DESC@"
-command="@BIN@"
+command=@BIN@
 command_args="@COMMAND@"
-command_user="@USER@"
+command_user=@USER@
 command_background=true
 pidfile="/run/@NAME@.pid"
-export MM_CONFIG_DIR="@CONFIG@"
+export MM_CONFIG_DIR=@CONFIG@
 
 depend() {
 	need net

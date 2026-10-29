@@ -239,12 +239,15 @@ fetch_and_verify() {
       || die "download failed: no release asset at $url
 (does a published release exist yet for this platform?)"
 
+    if [ "$SKIP_VERIFY" = "1" ]; then
+      info "MM_SKIP_VERIFY=1, installing without checksum verification"
+      return 0
+    fi
+
     if ! curl -fsSL "${url}.sha256" -o "$TMP/$BIN.sha256" 2>/dev/null; then
-      [ "$SKIP_VERIFY" = "1" ] || die "no checksum published at ${url}.sha256
+      die "no checksum published at ${url}.sha256
 Every manymux release ships a .sha256 sidecar, so this should not happen.
 Refusing to install an unverified binary. Set MM_SKIP_VERIFY=1 to override."
-      info "no .sha256 sidecar found; MM_SKIP_VERIFY=1, installing unverified"
-      return 0
     fi
 
     if verify_sha256 "$TMP/$BIN" "$TMP/$BIN.sha256"; then
@@ -359,7 +362,7 @@ Run this as root, then \`mm service install\`:
 # ("wrote"), already spelled out ("told"), or not raised at all ("").
 PATH_ADVICE=""
 ensure_path() {
-  local file="${ZDOTDIR:-$HOME}/.zshenv"
+  local file="${ZDOTDIR:-$HOME}/.zshenv" escaped
   [ "$OS" = "macos" ] || return 0
   [ "${MM_SKIP_PATH:-0}" = "1" ] && return 0
 
@@ -392,8 +395,10 @@ login nor an interactive shell, or \`ssh <thishost> mm agent\` will not find mm:
     PATH_ADVICE="wrote"
     return 0
   fi
+  # Keep the directory literal when zsh reads the line back.
+  escaped="$(printf '%s' "$INSTALL_DIR" | sed 's/[\\$"`]/\\&/g')"
   # shellcheck disable=SC2016  # $PATH is for the file to expand, not this script
-  if ! printf '\n# manymux: also read by the non-interactive `zsh -c` behind `ssh host mm agent`\nexport PATH="%s:$PATH"\n' "$INSTALL_DIR" >> "$file"; then
+  if ! printf '\n# manymux: also read by the non-interactive `zsh -c` behind `ssh host mm agent`\nexport PATH="%s:$PATH"\n' "$escaped" >> "$file"; then
     PATH_ADVICE="told"
     err "could not write ${file}; add this to it yourself:
     export PATH=\"${INSTALL_DIR}:\$PATH\""

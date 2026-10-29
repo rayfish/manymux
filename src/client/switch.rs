@@ -25,6 +25,8 @@
 //! whole of it, which is what the popup's digits are numbered off. It is the
 //! run's own memory and nothing else's; nothing on disk says which session you
 //! were in half an hour ago, and a fresh attach starts with a trail of one.
+//! A confirmed rename updates every remembered address, including sessions
+//! renamed from another popup row, so recent keys keep reaching the same work.
 
 use crate::client::attach::Motion;
 
@@ -311,16 +313,23 @@ impl Cycle {
     /// listing is not the same as being at its start, so the next tab would
     /// have gone back to the first session on the machine.
     pub fn renamed(&mut self, name: &str) {
-        let was = std::mem::replace(&mut self.current.session, name.to_string());
+        self.renamed_at(&self.current.clone(), name);
+    }
+
+    /// Update a session's address, whether it is current or in the trail.
+    pub fn renamed_at(&mut self, was: &Located, name: &str) {
+        if self.current == *was {
+            self.current.session = name.to_string();
+        }
         for entry in &mut self.sessions {
-            if entry.at.host == self.current.host && entry.at.session == was {
+            if entry.at == *was {
                 entry.at.session = name.to_string();
             }
         }
         // And in the trail, for the same reason: it is a list of addresses, and
         // one under the old name is a row the numbering cannot find.
         for at in &mut self.trail {
-            if at.host == self.current.host && at.session == was {
+            if at == was {
                 at.session = name.to_string();
             }
         }
@@ -424,6 +433,17 @@ mod tests {
         cycle.renamed("nightly");
         assert_eq!(cycle.current().session, "nightly");
         assert_eq!(step(&cycle, Motion::Last).as_deref(), Some("api"));
+    }
+
+    #[test]
+    fn renaming_another_popup_session_updates_the_recent_keys() {
+        let mut cycle = cycle(&["api", "build", "web"], "api");
+        cycle.moved_to(Located::new("here", "build"));
+        cycle.renamed_at(&Located::new("here", "api"), "service");
+        assert_eq!(cycle.current().session, "build");
+        assert_eq!(step(&cycle, Motion::Last).as_deref(), Some("service"));
+        assert_eq!(recent(&cycle), vec!["build", "service"]);
+        assert_eq!(step(&cycle, Motion::Previous).as_deref(), Some("service"));
     }
 
     #[test]

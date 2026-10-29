@@ -38,6 +38,8 @@
 //! not tidiness: a shell script that worked out which process was in front,
 //! or what a ` (deleted)` suffix meant, would be a second implementation of
 //! rules that took three review rounds to get right, and it would drift.
+//! Directory collision warnings compare the same program's unnamed resumes;
+//! explicit conversation selectors already say which work to reopen.
 
 pub mod taking;
 
@@ -256,7 +258,7 @@ pub fn resumed(foreground: &[String]) -> Vec<String> {
         && !a_subcommand(resumable, &argv)
     {
         match resuming(resumable, &argv) {
-            Resuming::Named => {}
+            Resuming::Named | Resuming::Directory => {}
             Resuming::Fresh => argv.push(resumable.flag.to_string()),
             Resuming::Chosen(at) => {
                 argv.remove(at);
@@ -271,6 +273,8 @@ pub fn resumed(foreground: &[String]) -> Vec<String> {
 enum Resuming {
     /// It says which one, so nothing here may argue with it.
     Named,
+    /// It explicitly requests the newest conversation in this directory.
+    Directory,
     /// It asks for one to be chosen by hand, at the word given. A restore has
     /// nobody to ask, so this is taken out and replaced.
     Chosen(usize),
@@ -305,12 +309,17 @@ enum Resuming {
 /// is not another flag.
 fn resuming(resumable: &Resumable, argv: &[String]) -> Resuming {
     let mut chooser = None;
+    let mut directory = false;
     for (at, arg) in argv.iter().enumerate().skip(1) {
         let (name, valued) = match arg.split_once('=') {
             Some((name, _)) => (name, true),
             None => (arg.as_str(), false),
         };
         if !resumable.already.contains(&name) {
+            continue;
+        }
+        if matches!(name, "--continue" | "-c") {
+            directory = true;
             continue;
         }
         if !resumable.picks.contains(&name) {
@@ -324,7 +333,11 @@ fn resuming(resumable: &Resumable, argv: &[String]) -> Resuming {
         }
         chooser = Some(at);
     }
-    chooser.map_or(Resuming::Fresh, Resuming::Chosen)
+    if directory {
+        Resuming::Directory
+    } else {
+        chooser.map_or(Resuming::Fresh, Resuming::Chosen)
+    }
 }
 
 /// Whether this run is one of the program's subcommands rather than a
@@ -419,11 +432,17 @@ fn resumable(argv: &[String]) -> Option<&'static Resumable> {
 /// Whether a command picks up its conversation from the directory it is run
 /// in, which is what makes two of them in one directory a collision.
 ///
-/// Both of the programs known here do, so this is "is it one of them" today.
-/// It is asked as its own question because that is the property that matters,
-/// and a program that resumed by some other means would answer differently.
+/// A named conversation does not depend on which one is newest in a directory.
 pub fn resumes_by_directory(command: &[String]) -> bool {
-    resumable(command).is_some()
+    directory_resume_program(command).is_some()
+}
+
+fn directory_resume_program(command: &[String]) -> Option<&'static str> {
+    let resumable = resumable(command)?;
+    if a_subcommand(resumable, command) || matches!(resuming(resumable, command), Resuming::Named) {
+        return None;
+    }
+    Some(resumable.program)
 }
 
 /// The program out of a path, with the leading `-` a login shell is given.

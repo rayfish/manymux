@@ -10,6 +10,12 @@
 //! while only fresh answers drive switching and group pruning.
 //! Listings refresh throughout an attachment, including while the menu is open.
 //! A confirmed exit is removed from the cache before falling back.
+//! Confirmed renames update the snapshot before rebuilding the popup, so its
+//! current row keeps its group while a fresh listing is pending.
+//! Popup actions use bounded, hushed connections and never offer installation
+//! while the terminal owns stdin.
+//! Reconnects recover an unacknowledged rename only when a fresh listing finds
+//! the same stable session identity under another name.
 
 use std::collections::HashSet;
 use std::fmt::{self, Display, Formatter};
@@ -24,18 +30,18 @@ use tracing::debug;
 
 use manymux::client::attach::{self, Chose, Mode, Motion, Outcome, Wait};
 use manymux::client::connections::Connections;
-use manymux::client::groups::Groups;
+use manymux::client::groups::{Groups, Member};
 use manymux::client::listed::{Listed, Snapshot};
 use manymux::client::switch::{Cycle, Located};
 use manymux::client::{Attached, Gone};
 use manymux::hosts::{Hosts, as_listed, is_this_machine, qualified};
 use manymux::lock::held as held_lock;
-use manymux::proto::{Request, Response, SpawnSpec};
+use manymux::proto::{Request, Response, SessionInfo, SpawnSpec, session_name};
 use manymux::settings::{Screen, Settings};
 use manymux::style;
 
-use crate::target::{everywhere, sessions_on};
-use crate::{FAILED, OK, Reach, current_dir, open, open_hushed, reach, spawn};
+use crate::target::survey_everywhere;
+use crate::{FAILED, OK, Reach, current_dir, open_hushed, reach, spawn};
 
 /// How long the first attach waits to learn its initial group. Switches
 /// collect only finished listings and do not spend this deadline.
@@ -99,7 +105,21 @@ pub(crate) async fn do_attach(
     // from, kept because that fall-back can fail: a session that ended is the
     // end of the run after all if there is no longer anywhere to land.
     let mut ended: Option<(Outcome, String)> = None;
+    let mut known: Option<KnownSession> = None;
     let (outcome, where_) = loop {
+        if known
+            .as_ref()
+            .is_some_and(|known| known.at != *cycle.current())
+        {
+            known = None;
+        }
+        if known.is_none() {
+            known = KnownSession::of(&snapshot, cycle.current());
+        }
+        take_listing(&mut listing, &mut cycle, &mut snapshot, &mut groups, false).await;
+        if let Some(known) = &mut known {
+            known.recover(&snapshot, &mut cycle, &mut seeded);
+        }
         let target = cycle.current().clone();
         let mut where_ = qualified(&target.host, &target.session);
         let history = if seeded.insert(where_.clone()) {
@@ -144,6 +164,9 @@ pub(crate) async fn do_attach(
             // to the one the command line named.
             Err(e) if attached => {
                 debug!("could not get back to {where_}: {e:#}");
+                if listing.is_none() {
+                    listing = Some(spawn_listing(socket));
+                }
                 match wait_to_reconnect(&mut held, &where_, &mut lost, &mut mode).await {
                     Wait::Retry => continue,
                     Wait::GiveUp => break (Outcome::Disconnected, where_),
@@ -180,6 +203,9 @@ pub(crate) async fn do_attach(
             first_attach,
         )
         .await;
+        if let Some(found) = KnownSession::of(&snapshot, cycle.current()) {
+            known = Some(found);
+        }
         // Narrowing to the group of the session you arrived in, which is a
         // thing to decide on the way in and never afterwards. It used to wait
         // for a listing that said anything, and on a fleet slower than
@@ -235,12 +261,16 @@ pub(crate) async fn do_attach(
         // will not read rather than the answer.
         let (asks, mut wanted) = tokio::sync::mpsc::channel::<()>(1);
         let (answered, fresh) = tokio::sync::watch::channel(listed.rows.clone());
+        let (renamed, mut names) = tokio::sync::watch::channel(None::<String>);
         let lister = {
             let socket = socket.to_path_buf();
             let groups = groups.clone();
             let focus = cycle.focused().map(str::to_string);
-            let recent = cycle.recent();
+            let mut recent = cycle.recent();
             let mut cached = snapshot.clone();
+            let mut member = snapshot
+                .info(cycle.current())
+                .map(|info| Member::of(&target.host, info));
             let latest = Arc::clone(&latest);
             let mut previous = listed.clone();
             // The listing already out there, handed over rather than left to
@@ -255,19 +285,49 @@ pub(crate) async fn do_attach(
                 let mut refresh = tokio::time::interval(LISTING_EVERY);
                 refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 loop {
-                    tokio::select! {
-                        request = wanted.recv() => if request.is_none() { return; },
-                        _ = refresh.tick() => {},
-                    }
-                    let listing = match running.take() {
-                        Some(task) => match task.await {
-                            Ok(snapshot) => Ok(snapshot),
-                            Err(_) => continue,
+                    let reload = tokio::select! {
+                        request = wanted.recv() => {
+                            if request.is_none() { return; }
+                            true
                         },
-                        None => survey(&socket).await,
+                        _ = refresh.tick() => true,
+                        changed = names.changed() => {
+                            if changed.is_err() { return; }
+                            false
+                        },
                     };
-                    let Ok(snapshot) = listing else { continue };
-                    let snapshot = snapshot.following(&cached);
+                    let mut snapshot = if reload {
+                        let listing = match running.take() {
+                            Some(task) => match task.await {
+                                Ok(snapshot) => Ok(snapshot),
+                                Err(_) => continue,
+                            },
+                            None => survey(&socket).await,
+                        };
+                        let Ok(snapshot) = listing else { continue };
+                        snapshot.following(&cached)
+                    } else {
+                        cached.clone()
+                    };
+                    let confirmed = names.borrow_and_update().clone();
+                    if let Some(current) = recent.first_mut() {
+                        let now = Located::new(
+                            &current.host,
+                            confirmed.as_deref().unwrap_or(&current.session),
+                        );
+                        if member.is_none() {
+                            member = snapshot.info(&now).map(|info| Member::of(&now.host, info));
+                        }
+                        if let Some(name) = confirmed {
+                            if let Some(member) = &member {
+                                snapshot.renamed_member(member, &name);
+                            } else {
+                                snapshot.renamed(current, &name);
+                            }
+                            previous.renamed(current, &name);
+                            current.session = name;
+                        }
+                    }
                     cached = snapshot.clone();
                     let held = Groups::load().unwrap_or_else(|_| groups.clone());
                     let machines = Hosts::load().map(|hosts| hosts.names()).unwrap_or_default();
@@ -323,6 +383,7 @@ pub(crate) async fn do_attach(
                     group: cycle.focused(),
                     asks,
                     fresh,
+                    renamed,
                 },
                 uploads,
             },
@@ -371,7 +432,16 @@ pub(crate) async fn do_attach(
             if seeded.remove(&was) {
                 seeded.insert(where_.clone());
             }
+            if let Some(known) = &known {
+                snapshot.renamed_member(&known.member, &name);
+            } else {
+                snapshot.renamed(&target, &name);
+            }
             cycle.renamed(&name);
+            if let Some(known) = &mut known {
+                known.renamed(&target, &name);
+            }
+            cancel_listing(&mut listing).await;
         }
         match outcome {
             // Everything the popup chose, in its own row ids. The lookups are
@@ -410,7 +480,7 @@ pub(crate) async fn do_attach(
                         // leaves you in the session rather than over it.
                         mode = Mode::Focus;
                         if let Some(there) = listed.at.get(row)
-                            && *there != target
+                            && there != cycle.current()
                         {
                             cycle.moved_to(there.clone());
                             hopped = true;
@@ -427,7 +497,7 @@ pub(crate) async fn do_attach(
                         };
                         cycle.focus(group);
                         if let Some(next) = cycle.step(Motion::Next)
-                            && !cycle.holds(&target)
+                            && !cycle.holds(cycle.current())
                         {
                             cycle.moved_to(next);
                             hopped = true;
@@ -444,7 +514,7 @@ pub(crate) async fn do_attach(
                         // has no machine behind it. An ssh to nowhere says less
                         // than staying where you are and saying so.
                         None => notice = Some("that machine is no longer listed".to_string()),
-                        Some(host) => match starting(start_on(socket, &host, None)).await {
+                        Some(host) => match interacting(start_on(socket, &host, None)).await {
                             Ok(name) => {
                                 // The one that goes somewhere, so it leaves you
                                 // in the session rather than over it, the way
@@ -496,19 +566,25 @@ pub(crate) async fn do_attach(
                     // design, so this goes over a connection to its machine.
                     Chose::Named { session, to } => {
                         let at = listed.at.get(session);
-                        let pid = at.and_then(|at| snapshot.info(at)).map(|i| i.pid);
-                        match rename_at(socket, at, pid.unwrap_or_default(), &to).await {
+                        match rename_at(socket, at, &to).await {
                             Ok(name) => {
+                                let was_current = at.is_some_and(|at| at == cycle.current());
+                                if let Some(at) = at {
+                                    snapshot.renamed(at, &name);
+                                    cycle.renamed_at(at, &name);
+                                    if let Some(known) = &mut known {
+                                        known.renamed(at, &name);
+                                    }
+                                }
                                 if let Some(at) = at
                                     && seeded.remove(&qualified(&at.host, &at.session))
                                 {
                                     seeded.insert(qualified(&at.host, &name));
                                 }
                                 if let Some(at) = at
-                                    && *at == target
+                                    && was_current
                                 {
                                     where_ = qualified(&at.host, &name);
-                                    cycle.renamed(&name);
                                 }
                             }
                             Err(e) => notice = Some(format!("{e:#}")),
@@ -524,7 +600,7 @@ pub(crate) async fn do_attach(
                 mode = Mode::Control;
                 // A rename during this attach has already updated the cycle.
                 let at = cycle.current().clone();
-                match starting(start_beside(socket, &at)).await {
+                match interacting(start_beside(socket, &at)).await {
                     Ok(name) => {
                         cycle.started(Located::new(&at.host, &name));
                         hopped = true;
@@ -583,6 +659,9 @@ pub(crate) async fn do_attach(
             // shell. The screen stays exactly as the session painted it and
             // the mark row says what is happening.
             Outcome::Disconnected => {
+                if listing.is_none() {
+                    listing = Some(spawn_listing(socket));
+                }
                 match wait_to_reconnect(&mut held, &where_, &mut lost, &mut mode).await {
                     Wait::Retry => continue,
                     Wait::GiveUp => break (Outcome::Disconnected, where_),
@@ -591,6 +670,7 @@ pub(crate) async fn do_attach(
             outcome => break (outcome, where_),
         }
     };
+    cancel_listing(&mut listing).await;
     // Before the message, which belongs on the screen the shell gets back.
     held.release().await;
     drop(held);
@@ -662,6 +742,50 @@ async fn wait_to_reconnect(
         lost.since.elapsed(),
     )
     .await
+}
+
+/// The identity last listed for the current session, retained while offline.
+struct KnownSession {
+    at: Located,
+    member: Member,
+}
+
+impl KnownSession {
+    fn of(snapshot: &Snapshot, at: &Located) -> Option<Self> {
+        Some(Self {
+            at: at.clone(),
+            member: Member::of(&at.host, snapshot.info(at)?),
+        })
+    }
+
+    fn renamed(&mut self, at: &Located, name: &str) {
+        if self.at == *at {
+            self.at.session = name.to_string();
+        }
+    }
+
+    fn recover(
+        &mut self,
+        snapshot: &Snapshot,
+        cycle: &mut Cycle,
+        seeded: &mut HashSet<String>,
+    ) -> bool {
+        if self.at != *cycle.current() {
+            return false;
+        }
+        let Some(now) = snapshot.locate(&self.member) else {
+            return false;
+        };
+        if now == self.at {
+            return false;
+        }
+        if seeded.remove(&qualified(&self.at.host, &self.at.session)) {
+            seeded.insert(qualified(&now.host, &now.session));
+        }
+        cycle.renamed_at(&self.at, &now.session);
+        self.at = now;
+        true
+    }
 }
 
 /// A connection that has gone, for as long as it is gone.
@@ -759,8 +883,8 @@ async fn reaching(
     }
 }
 
-/// One attempt at starting a session somewhere, with the same deadline a
-/// reconnect gets and for a sharper version of the same reason.
+/// One popup action against a host, with the same deadline a
+/// reconnect gets. No keyboard is read while a popup action is pending.
 ///
 /// The list the new key opens offers every machine you watch, whether or not it
 /// answered the last listing, so the row under the highlight may well be one
@@ -772,7 +896,7 @@ async fn reaching(
 /// connecting to a wedged control socket has no deadline of any kind.
 ///
 /// Dropping the attempt is what ends it, `ssh::spawn` setting `kill_on_drop`.
-async fn starting(attempt: impl Future<Output = Result<String>>) -> Result<String> {
+async fn interacting<T>(attempt: impl Future<Output = Result<T>>) -> Result<T> {
     match tokio::time::timeout(REACH_FOR, attempt).await {
         Ok(started) => started,
         Err(_) => bail!("no answer in {}s", REACH_FOR.as_secs()),
@@ -885,8 +1009,8 @@ async fn start_beside(socket: &Path, at: &Located) -> Result<String> {
 /// Put the session on `row` in a group, or take it out of one.
 ///
 /// The pid and the start time membership is keyed on come from the snapshot the
-/// popup was drawn from, and that snapshot can be a few seconds old. One
-/// `sessions_on` to the machine holding it refreshes them first, because a
+/// popup was drawn from, and that snapshot can be a few seconds old. A fresh
+/// listing from the machine holding it refreshes them first, because a
 /// stale pid puts the wrong session in a group, which is worse than a round
 /// trip on a key nobody presses in a hurry.
 async fn regroup(
@@ -896,49 +1020,70 @@ async fn regroup(
     group: Option<String>,
     groups: &mut Groups,
 ) -> Result<()> {
-    let at = listed
-        .at
-        .get(row)
-        .ok_or_else(|| anyhow!("that session is no longer listed"))?;
-    let sessions = sessions_on(socket, &at.host).await?;
-    let session = sessions
-        .iter()
-        .find(|s| s.name == at.session)
-        .ok_or_else(|| anyhow!("{} is no longer running", at.session))?;
-    groups.update(|groups| groups.set(group.as_deref(), &at.host, session))
+    interacting(async {
+        let at = listed
+            .at
+            .get(row)
+            .ok_or_else(|| anyhow!("that session is no longer listed"))?;
+        let sessions = popup_sessions(socket, &at.host).await?;
+        let session = sessions
+            .iter()
+            .find(|s| s.name == at.session)
+            .ok_or_else(|| anyhow!("{} is no longer running", at.session))?;
+        groups.update(|groups| groups.set(group.as_deref(), &at.host, session))
+    })
+    .await
 }
 
 /// Rename the session on a popup row, wherever it is running, and answer with
 /// the name that stuck.
 ///
-/// `Request::Rename` answers `Ok` and throws that name away, and it cannot be
-/// made to say more without a node old enough to be out there failing to
-/// decode it. So the session is looked up again afterwards by the one thing a
-/// rename does not move: its pid. What was typed and what it ended up called
-/// are not always the same string, since the node sanitises it, and the mark
-/// row is about to draw one of them.
-async fn rename_at(socket: &Path, at: Option<&Located>, pid: u32, to: &str) -> Result<String> {
-    let at = at.ok_or_else(|| anyhow!("that session is no longer listed"))?;
-    open(socket, &at.host)
+/// Canonicalise the outgoing name with the node's own rule. Its `Ok` confirms
+/// that address immediately, without a second listing that could fail after
+/// the session has already moved.
+async fn rename_at(socket: &Path, at: Option<&Located>, to: &str) -> Result<String> {
+    interacting(async {
+        let at = at.ok_or_else(|| anyhow!("that session is no longer listed"))?;
+        let name = session_name(to);
+        match reach(socket, &at.host, popup_reach())
+            .await?
+            .call(&Request::Rename {
+                name: at.session.clone(),
+                to: name.clone(),
+            })
+            .await?
+        {
+            Response::Ok => Ok(name),
+            other => bail!("unexpected response to rename: {other:?}"),
+        }
+    })
+    .await
+}
+
+fn popup_reach() -> Reach {
+    Reach {
+        start: false,
+        hushed: true,
+        install: false,
+    }
+}
+
+async fn popup_sessions(socket: &Path, host: &str) -> Result<Vec<SessionInfo>> {
+    match reach(socket, host, popup_reach())
         .await?
-        .call(&Request::Rename {
-            name: at.session.clone(),
-            to: to.to_string(),
-        })
-        .await?;
-    let sessions = sessions_on(socket, &at.host).await?;
-    Ok(sessions
-        .iter()
-        .find(|s| s.pid == pid)
-        .map(|s| s.name.clone())
-        .unwrap_or_else(|| to.to_string()))
+        .call(&Request::List)
+        .await?
+    {
+        Response::Sessions(sessions) => Ok(sessions),
+        other => bail!("unexpected response to list: {other:?}"),
+    }
 }
 
 /// Every machine's sessions, with the memberships read before asking, which
 /// are all a listing that lands late is old enough to prune.
 async fn survey(socket: &Path) -> Result<Snapshot> {
     let before = Groups::load().unwrap_or_default();
-    let listing = everywhere(socket).await?;
+    let listing = survey_everywhere(socket).await?;
     Ok(Snapshot {
         answered: listing.answering(),
         sessions: listing.sessions,
@@ -959,6 +1104,17 @@ fn spawn_listing(socket: &Path) -> JoinHandle<Snapshot> {
             }
         }
     })
+}
+
+async fn cancel_listing(pending: &mut Option<JoinHandle<Snapshot>>) {
+    if let Some(task) = pending.take() {
+        task.abort();
+        if let Err(error) = task.await
+            && !error.is_cancelled()
+        {
+            debug!("the cancelled listing failed: {error}");
+        }
+    }
 }
 
 /// Collect a finished listing without holding up a switch. Only the first
@@ -1017,10 +1173,112 @@ mod tests {
     use super::*;
     use manymux::client::Stream;
     use manymux::hosts::LOCAL;
-    use manymux::proto::{self, FrameReader, Size, tag};
+    use manymux::proto::{self, FrameReader, HostedSession, Size, tag};
     use std::time::SystemTime;
     use tokio::io::split;
     use tokio::net::UnixListener;
+
+    fn listed_session(name: &str, pid: u32) -> HostedSession {
+        HostedSession {
+            host: as_listed(LOCAL).to_string(),
+            session: SessionInfo {
+                name: name.to_string(),
+                title: "shell".into(),
+                command: "sh".into(),
+                pid,
+                size: Size::default(),
+                attached: 0,
+                idle: 0,
+                bells: 0,
+                started: SystemTime::UNIX_EPOCH,
+                node: String::new(),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn a_rename_with_a_lost_reply_is_recovered_by_session_identity() {
+        let suffix = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("mm-rename-lost-reply-{suffix}.sock"));
+        let listener = UnixListener::bind(&path).unwrap();
+        let host = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut read = FrameReader::new(stream);
+            let frame = read.next().await.unwrap().unwrap();
+            let Request::Rename { to, .. } = proto::decode(&frame.body).unwrap() else {
+                panic!("the popup must request a rename");
+            };
+            to
+        });
+        let before = Snapshot {
+            sessions: vec![listed_session("build", 7)],
+            ..Snapshot::default()
+        };
+        let current = Located::new(as_listed(LOCAL), "build");
+        let mut known = KnownSession::of(&before, &current).unwrap();
+        assert!(rename_at(&path, Some(&current), "nightly").await.is_err());
+        let name = host.await.unwrap();
+        std::fs::remove_file(path).unwrap();
+        let landed = Snapshot {
+            sessions: vec![listed_session(&name, 7)],
+            ..Snapshot::default()
+        };
+        let mut cycle = Cycle::new(current.clone());
+        let mut seeded = HashSet::from([qualified(&current.host, &current.session)]);
+        assert!(known.recover(&landed, &mut cycle, &mut seeded));
+        assert_eq!(cycle.current().session, "nightly");
+        assert_eq!(seeded, HashSet::from([qualified(&current.host, "nightly")]));
+    }
+
+    #[test]
+    fn reconnects_do_not_guess_a_renamed_session_from_replacement_or_cached_rows() {
+        let before = Snapshot {
+            sessions: vec![listed_session("build", 7)],
+            ..Snapshot::default()
+        };
+        let current = Located::new(as_listed(LOCAL), "build");
+        let mut known = KnownSession::of(&before, &current).unwrap();
+        let mut cycle = Cycle::new(current.clone());
+        let mut seeded = HashSet::new();
+        let mut replacement = listed_session("nightly", 7);
+        replacement.session.started += Duration::from_secs(1);
+        let landed = Snapshot {
+            sessions: vec![replacement, listed_session("other", 8)],
+            ..Snapshot::default()
+        };
+        assert!(!known.recover(&landed, &mut cycle, &mut seeded));
+        let cached = Snapshot {
+            cached: vec![listed_session("nightly", 7)],
+            ..Snapshot::default()
+        };
+        assert!(!known.recover(&cached, &mut cycle, &mut seeded));
+        assert_eq!(cycle.current(), &current);
+    }
+
+    #[tokio::test]
+    async fn a_confirmed_name_discards_a_pending_older_listing() {
+        let before = Snapshot {
+            sessions: vec![listed_session("build", 7)],
+            ..Snapshot::default()
+        };
+        let current = Located::new(as_listed(LOCAL), "build");
+        let mut known = KnownSession::of(&before, &current).unwrap();
+        let mut cycle = Cycle::new(current.clone());
+        let mut snapshot = before.clone();
+        let mut pending = Some(tokio::spawn(async move { before }));
+        let mut seeded = HashSet::new();
+
+        snapshot.renamed_member(&known.member, "newest");
+        cycle.renamed("newest");
+        known.renamed(&current, "newest");
+        cancel_listing(&mut pending).await;
+        assert!(pending.is_none());
+        assert!(!known.recover(&snapshot, &mut cycle, &mut seeded));
+        assert_eq!(cycle.current().session, "newest");
+    }
 
     #[tokio::test]
     async fn a_switch_does_not_wait_for_a_pending_listing() {
@@ -1156,6 +1414,64 @@ mod tests {
         assert!(at.elapsed() >= REACH_FOR, "it waited {:?}", at.elapsed());
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn a_popup_rename_cannot_wait_forever_for_the_host() {
+        let suffix = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("mm-rename-deadline-{suffix}.sock"));
+        let listener = UnixListener::bind(&path).unwrap();
+        let host = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut read = FrameReader::new(stream);
+            let request = read.next().await.unwrap().unwrap();
+            assert!(matches!(
+                proto::decode::<Request>(&request.body).unwrap(),
+                Request::Rename { .. }
+            ));
+            std::future::pending::<()>().await;
+        });
+        let at = Located::new(LOCAL, "build");
+        let answer = tokio::time::timeout(REACH_FOR * 2, rename_at(&path, Some(&at), "test")).await;
+        host.abort();
+        std::fs::remove_file(path).unwrap();
+        assert!(
+            answer
+                .expect("the rename must return before the outer deadline")
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_confirmed_popup_rename_survives_the_host_disconnecting() {
+        let suffix = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("mm-rename-confirmed-{suffix}.sock"));
+        let listener = UnixListener::bind(&path).unwrap();
+        let host = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read, mut write) = split(stream);
+            let mut read = FrameReader::new(read);
+            let frame = read.next().await.unwrap().unwrap();
+            let Request::Rename { to, .. } = proto::decode(&frame.body).unwrap() else {
+                panic!("the popup must request a rename");
+            };
+            proto::write_msg(&mut write, tag::RESPONSE, &Response::Ok)
+                .await
+                .unwrap();
+            to
+        });
+        let at = Located::new(LOCAL, "build");
+        let answer = rename_at(&path, Some(&at), "nightly build/").await;
+        let requested = host.await.unwrap();
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(answer.unwrap(), "nightly-build");
+        assert_eq!(requested, "nightly-build");
+    }
+
     /// A session started on a machine that never answers must not take the
     /// terminal with it. The list offers every machine you watch, so a row
     /// marked `no answer` is one you would press Enter on, and the attempt
@@ -1170,7 +1486,7 @@ mod tests {
         // tokio's clock, so the ten seconds cost nothing. The outer wait is
         // there to fail rather than hang if the deadline goes.
         let at = tokio::time::Instant::now();
-        let ended = tokio::time::timeout(REACH_FOR * 10, starting(never())).await;
+        let ended = tokio::time::timeout(REACH_FOR * 10, interacting(never())).await;
         assert!(
             ended.expect("the attempt was never given up on").is_err(),
             "a machine that said nothing was read as a session started"

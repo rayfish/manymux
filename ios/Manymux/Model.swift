@@ -67,13 +67,17 @@ final class AppModel {
     /// Whether a listing nobody is waiting for is already out.
     private var asking = false
 
-    init() {
+    init(openPhone: (() throws -> Phone)? = nil) {
         hosts = store.all()
         tiles = UserDefaults.standard.object(forKey: "tiles") as? Bool ?? true
         let stored = UserDefaults.standard.double(forKey: "textSize")
         textSize = stored > 0 ? TextSize.clamped(stored) : TextSize.normal
         do {
-            phone = try Phone.keptIn(dir: try AppModel.keptIn().path)
+            if let openPhone {
+                phone = try openPhone()
+            } else {
+                phone = try Phone.keptIn(dir: try AppModel.keptIn().path)
+            }
             trouble = nil
         } catch {
             phone = nil
@@ -135,7 +139,13 @@ final class AppModel {
         _ work: @escaping (Phone) throws -> T,
         then: @escaping (Result<T, Error>) -> Void
     ) {
-        guard let phone else { return }
+        guard let phone else {
+            then(.failure(NSError(
+                domain: "manymux", code: 1,
+                userInfo: [NSLocalizedDescriptionKey: trouble ?? "the client could not start"]
+            )))
+            return
+        }
         elsewhere.async {
             let answer = Result { try work(phone) }
             DispatchQueue.main.async { then(answer) }

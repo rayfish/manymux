@@ -83,10 +83,11 @@ while [ $# -gt 0 ]; do
     case "$1" in
         -T|-t) shift ;;
         -o) shift 2 ;;
-        --) shift; break ;;
+        --) shift; if [ -z "$host" ]; then host="$1"; shift; fi; break ;;
         *) host="$1"; shift ;;
     esac
 done
+if [ "${{1:-}}" = "--" ]; then shift; fi
 # A destination can name the user as well as the machine, and ssh lands on the
 # same machine either way. Which is how one machine comes to be in a host list
 # twice.
@@ -385,6 +386,72 @@ fn sessions(table: &str) -> Vec<String> {
             None => target,
         })
         .collect()
+}
+
+#[test]
+fn concurrent_add_commands_keep_both_hosts() {
+    use std::fs::File;
+    use std::io::{Read, Write};
+    use std::process::Stdio;
+
+    let world = World::new("concurrent-add");
+    let original = std::fs::read_to_string(world.ssh_stub()).unwrap();
+    std::fs::write(
+        world.ssh_stub(),
+        format!(
+            r#"#!/bin/sh
+case "$*" in
+    *' true')
+        printf x > "$MM_ADD_GATE.ready"
+        read -r release < "$MM_ADD_GATE.release"
+        ;;
+esac
+{original}"#
+        ),
+    )
+    .unwrap();
+    let mut pending = Vec::new();
+    for host in ["build-box", "gpu-box"] {
+        let gate = world.dir.join(host);
+        let ready = gate.with_extension("ready");
+        let release = gate.with_extension("release");
+        assert!(
+            Command::new("mkfifo")
+                .args([&ready, &release])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let child = Command::new(MM)
+            .arg("--socket")
+            .arg(world.socket("laptop"))
+            .args(["add", host])
+            .env("MM_CONFIG_DIR", world.dir.join("laptop"))
+            .env("MM_SSH", world.ssh_stub())
+            .env("MM_ADD_GATE", &gate)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        pending.push((child, gate));
+    }
+    for (_, gate) in &pending {
+        let mut ready = File::open(gate.with_extension("ready")).unwrap();
+        ready.read_exact(&mut [0]).unwrap();
+    }
+    for (_, gate) in &pending {
+        File::create(gate.with_extension("release"))
+            .unwrap()
+            .write_all(b"go\n")
+            .unwrap();
+    }
+    for (child, _) in pending {
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+    }
+    let hosts = world.ok("laptop", &["hosts"]);
+    assert!(hosts.lines().any(|host| host == "build-box"), "{hosts}");
+    assert!(hosts.lines().any(|host| host == "gpu-box"), "{hosts}");
 }
 
 #[test]

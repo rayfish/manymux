@@ -13,7 +13,12 @@
 //! for something a pipe answers.
 //! File reads and macOS image decoding run off the async workers, so large
 //! screenshots cannot delay terminal input or keepalive processing.
+//! File URLs are decoded only for the local machine; bare paths retain literal
+//! percent signs, and URI-list comments are skipped.
 
+use std::fs::OpenOptions;
+use std::io::Read;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::process::Stdio;
 
@@ -196,10 +201,16 @@ fn mac_class(info: &str) -> Option<&'static str> {
 /// Only for something that is already an image: a copied PDF or folder is not
 /// an image paste, and reading it would send the far end a file it cannot use.
 async fn copied_file(list: &str) -> Result<Option<Image>> {
-    let Some(path) = list.lines().map(str::trim).find(|line| !line.is_empty()) else {
+    let Some(path) = list
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && !line.starts_with('#'))
+    else {
         return Ok(None);
     };
-    let path = unfile(path);
+    let Some(path) = unfile(path) else {
+        return Ok(None);
+    };
     if !matches!(
         extension(Path::new(&path)).as_deref(),
         Some("png" | "jpg" | "jpeg" | "gif" | "webp")
@@ -207,13 +218,27 @@ async fn copied_file(list: &str) -> Result<Option<Image>> {
         return Ok(None);
     }
     tokio::task::spawn_blocking(move || {
-        let size = std::fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
-        if size > u64::try_from(MAX)? {
+        // Nonblocking open keeps a copied FIFO from retaining this worker.
+        let file = match OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&path)
+        {
+            Ok(file) => file,
+            // A clipboard path can point at a volume that has gone away.
+            Err(_) => return Ok(None),
+        };
+        let metadata = file.metadata()?;
+        if !metadata.is_file() {
+            return Ok(None);
+        }
+        let limit = u64::try_from(MAX)?;
+        if metadata.len() > limit {
             bail!("{path} is over the {} paste limit", mb(MAX));
         }
-        match std::fs::read(&path) {
-            Ok(data) => as_image(data),
-            // A clipboard path can point at a volume that has gone away.
+        let mut data = Vec::new();
+        match file.take(limit + 1).read_to_end(&mut data) {
+            Ok(_) => as_image(data),
             Err(_) => Ok(None),
         }
     })
@@ -269,12 +294,14 @@ pub fn mb(bytes: usize) -> String {
 
 /// `file:///home/me/a%20shot.png` as a path. Anything that is not a `file:`
 /// URL is handed back unchanged, since some clipboards put a bare path there.
-fn unfile(entry: &str) -> String {
-    let path = entry.strip_prefix("file://").unwrap_or(entry);
+fn unfile(entry: &str) -> Option<String> {
+    let Some(path) = entry.strip_prefix("file://") else {
+        return Some(entry.to_string());
+    };
     // A `file://host/path` from another machine is not ours to read; the
     // localhost form is the only one anyone puts on a clipboard.
     let path = path.strip_prefix("localhost").unwrap_or(path);
-    percent_decoded(path)
+    path.starts_with('/').then(|| percent_decoded(path))
 }
 
 fn percent_decoded(text: &str) -> String {
@@ -529,15 +556,65 @@ mod tests {
 
     #[test]
     fn a_copied_files_url_becomes_a_path() {
-        assert_eq!(unfile("file:///home/me/shot.png"), "/home/me/shot.png");
+        assert_eq!(
+            unfile("file:///path/to/shot.png"),
+            Some("/path/to/shot.png".into())
+        );
         assert_eq!(
             unfile("file://localhost/Users/me/a%20shot.png"),
-            "/Users/me/a shot.png"
+            Some("/Users/me/a shot.png".into())
         );
         // A bare path, which some clipboards put there instead.
-        assert_eq!(unfile("/tmp/shot.png"), "/tmp/shot.png");
+        assert_eq!(unfile("/tmp/shot.png"), Some("/tmp/shot.png".into()));
         // A stray percent is a percent, not the start of an escape.
-        assert_eq!(unfile("/tmp/100%.png"), "/tmp/100%.png");
+        assert_eq!(unfile("/tmp/100%.png"), Some("/tmp/100%.png".into()));
+    }
+
+    #[test]
+    fn bare_clipboard_paths_keep_literal_url_escapes() {
+        assert_eq!(
+            unfile("/path/to/a%20shot.png"),
+            Some("/path/to/a%20shot.png".into())
+        );
+        assert_eq!(unfile("localhost.png"), Some("localhost.png".into()));
+        assert_eq!(unfile("file://build-box/path/to/shot.png"), None);
+        assert_eq!(unfile("file://localhost.invalid/path/to/shot.png"), None);
+    }
+
+    #[tokio::test]
+    async fn a_copied_uri_list_can_start_with_a_comment() {
+        let path = std::env::temp_dir().join(format!("mm-uri-list-{}.png", std::process::id()));
+        std::fs::write(&path, b"\x89PNG\r\n\x1a\nimage").unwrap();
+        let list = format!("# copied image\r\nfile://{}\r\n", path.display());
+        assert!(copied_file(&list).await.unwrap().is_some());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_copied_fifo_is_not_an_image_file() {
+        use std::process::Command;
+
+        let path =
+            std::env::temp_dir().join(format!("mm-clipboard-pipe-{}.png", std::process::id()));
+        assert!(
+            Command::new("mkfifo")
+                .arg(&path)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let mut writer = Command::new("sh")
+            .args(["-c", "printf '\\211PNG\\r\\n\\032\\nimage' > \"$1\"", "sh"])
+            .arg(&path)
+            .spawn()
+            .unwrap();
+        let result = copied_file(path.to_str().unwrap()).await;
+        if writer.try_wait().unwrap().is_none() {
+            writer.kill().unwrap();
+        }
+        writer.wait().unwrap();
+        std::fs::remove_file(path).unwrap();
+        assert!(result.unwrap().is_none());
     }
 
     #[test]

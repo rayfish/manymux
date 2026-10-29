@@ -7,13 +7,16 @@
 //! It shells out to `curl` and `shasum`/`sha256sum` rather than linking an HTTP
 //! stack and a hash: an update path is not worth doubling the dependency tree
 //! over, and this is a tool that already delegates its transport to `ssh`.
+//! Each update stages into its own file, removed on failure or cancellation,
+//! so concurrent updates cannot overwrite bytes another process is verifying.
 
 use std::env::current_exe;
 use std::ffi::CString;
-use std::fs::{self, Permissions};
+use std::fs::{self, OpenOptions, Permissions};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result, bail};
 use tokio::process::Command;
@@ -176,28 +179,68 @@ pub async fn apply(available: &Available) -> Result<PathBuf> {
     // Staged beside the binary rather than in /tmp, so the rename below is
     // within one filesystem and therefore atomic. Renaming over a running
     // executable is fine on Unix: the old inode stays alive for this process.
-    let staged = dir.join(format!(".{}.new", file_name(&binary)));
+    let staged = Staged::beside(&binary)?;
     let url = download_url(&available.tag, &available.asset);
 
-    let downloaded = curl(&url, &staged).await;
-    if let Err(e) = downloaded {
-        let _ = fs::remove_file(&staged);
-        return Err(e.context(format!("downloading {url}")));
-    }
+    curl(&url, &staged.path)
+        .await
+        .with_context(|| format!("downloading {url}"))?;
 
-    let actual = sha256_of(&staged).await?;
+    let actual = sha256_of(&staged.path).await?;
     if actual != available.checksum {
-        let _ = fs::remove_file(&staged);
         bail!(
             "checksum mismatch, refusing to install\n  expected: {}\n  got:      {actual}",
             available.checksum
         );
     }
 
-    fs::set_permissions(&staged, Permissions::from_mode(0o755))
+    fs::set_permissions(&staged.path, Permissions::from_mode(0o755))
         .context("making the new binary executable")?;
-    fs::rename(&staged, &binary).with_context(|| format!("replacing {}", binary.display()))?;
+    fs::rename(&staged.path, &binary).with_context(|| format!("replacing {}", binary.display()))?;
     Ok(binary)
+}
+
+struct Staged {
+    path: PathBuf,
+}
+
+impl Staged {
+    fn beside(binary: &Path) -> Result<Self> {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let dir = binary.parent().unwrap_or(Path::new("."));
+        for _ in 0..1024 {
+            let id = NEXT.fetch_add(1, Ordering::Relaxed);
+            let path = dir.join(format!(
+                ".{}.new-{}-{id}",
+                file_name(binary),
+                std::process::id()
+            ));
+            match OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&path)
+            {
+                Ok(_) => return Ok(Self { path }),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e).context("staging the new binary"),
+            }
+        }
+        bail!("no unused filename for staging the new binary")
+    }
+}
+
+impl Drop for Staged {
+    fn drop(&mut self) {
+        if let Err(e) = fs::remove_file(&self.path)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            debug!(
+                "could not remove staged update {}: {e}",
+                self.path.display()
+            );
+        }
+    }
 }
 
 /// Whether this process can create and rename files in a directory.
@@ -272,6 +315,7 @@ fn download_url(tag: &str, asset: &str) -> String {
 /// A small published file, or `None` if the release has no such thing.
 async fn fetched(url: &str) -> Option<String> {
     let out = Command::new("curl")
+        .kill_on_drop(true)
         .args(["-fsSL", url])
         .output()
         .await
@@ -296,6 +340,7 @@ async fn curl(url: &str, to: &Path) -> Result<()> {
     // terminal before we get to say anything, so its half-sentence lands above
     // ours and the two read as one confused message.
     let out = Command::new("curl")
+        .kill_on_drop(true)
         .arg("-fsSL")
         .arg(url)
         .arg("-o")
@@ -317,7 +362,13 @@ async fn curl(url: &str, to: &Path) -> Result<()> {
 /// SHA-256 of a file, via whichever tool this machine has.
 pub(crate) async fn sha256_of(path: &Path) -> Result<String> {
     for (program, args) in [("sha256sum", &[][..]), ("shasum", &["-a", "256"][..])] {
-        let Ok(out) = Command::new(program).args(args).arg(path).output().await else {
+        let Ok(out) = Command::new(program)
+            .kill_on_drop(true)
+            .args(args)
+            .arg(path)
+            .output()
+            .await
+        else {
             continue;
         };
         if !out.status.success() {
@@ -341,6 +392,24 @@ fn file_name(path: &Path) -> String {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn concurrent_updates_keep_separate_staged_files() {
+        let binary = std::env::temp_dir().join("mm-staged-test");
+        let first = Staged::beside(&binary).unwrap();
+        let second = Staged::beside(&binary).unwrap();
+        assert_ne!(first.path, second.path);
+        fs::write(&first.path, b"first update").unwrap();
+        fs::write(&second.path, b"second update").unwrap();
+        assert_eq!(fs::read(&first.path).unwrap(), b"first update");
+        let first_path = first.path.clone();
+        let second_path = second.path.clone();
+        drop(first);
+        assert!(!first_path.exists());
+        assert_eq!(fs::read(&second_path).unwrap(), b"second update");
+        drop(second);
+        assert!(!second_path.exists());
+    }
 
     #[test]
     fn the_asset_matches_what_ci_publishes() {

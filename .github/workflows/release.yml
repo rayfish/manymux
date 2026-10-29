@@ -105,6 +105,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.create-release.outputs.tag }}
 
       # rustup rather than an action, as in `ci.yml`, which explains why. It
       # matters most here: a release builds six targets at once, and a tag that
@@ -219,6 +221,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.create-release.outputs.tag }}
 
       - name: Install Rust
         run: |

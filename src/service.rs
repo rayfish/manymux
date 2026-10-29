@@ -10,6 +10,8 @@
 //! session to hang a unit off, so it goes where the machine's units go and
 //! names the account to run as. OpenRC, SysV init and BSD rc.d have no per-user
 //! services at all, so they are always the second shape and always need root.
+//! Template values are escaped for each manager's format, since paths may
+//! contain spaces, shell metacharacters, XML text, or systemd specifiers.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -183,7 +185,7 @@ pub fn install() -> Result<Installed> {
     if scope == Scope::User {
         std::fs::create_dir_all(&fields.logs).ok();
     }
-    write_unit(&path, &fields.render(manager.template(scope)), manager)?;
+    write_unit(&path, &fields.render(manager, scope), manager)?;
 
     match manager {
         Manager::Launchd => {
@@ -321,18 +323,53 @@ impl Fields {
         })
     }
 
-    fn render(&self, template: &str) -> String {
-        template
+    fn render(&self, manager: Manager, scope: Scope) -> String {
+        let escape = |value: &str| match manager {
+            Manager::Launchd => value
+                .replace('&', "&amp;")
+                .replace('<', "&lt;")
+                .replace('>', "&gt;"),
+            Manager::Systemd => systemd_word(value),
+            _ => crate::shell::quote(value),
+        };
+        let config = if manager == Manager::Systemd {
+            escape(&format!("MM_CONFIG_DIR={}", self.config))
+        } else {
+            escape(&self.config)
+        };
+        manager
+            .template(scope)
             .replace("@LABEL@", LAUNCHD_LABEL)
             .replace("@NAME@", NAME)
             .replace("@RCNAME@", RC_NAME)
             .replace("@COMMAND@", COMMAND)
             .replace("@DESC@", DESCRIPTION)
-            .replace("@BIN@", &self.bin)
-            .replace("@USER@", &self.user)
-            .replace("@CONFIG@", &self.config)
-            .replace("@LOGS@", &self.logs.display().to_string())
+            .replace("@BIN_ARG@", &double_quoted(&crate::shell::quote(&self.bin)))
+            .replace("@BIN@", &escape(&self.bin))
+            .replace("@USER@", &escape(&self.user))
+            .replace("@CONFIG@", &config)
+            .replace("@LOGS@", &escape(&self.logs.display().to_string()))
     }
+}
+
+fn systemd_word(value: &str) -> String {
+    let value = value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+        .replace('\t', "\\t")
+        .replace('%', "%%");
+    format!("\"{value}\"")
+}
+
+/// A shell word kept inside a double-quoted rc.d command string until eval.
+fn double_quoted(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('$', "\\$")
+        .replace('`', "\\`")
 }
 
 fn write_unit(path: &Path, contents: &str, manager: Manager) -> Result<()> {
@@ -467,6 +504,72 @@ mod tests {
         Manager::Rc,
     ];
 
+    fn unusual_paths() -> Fields {
+        Fields {
+            bin: "/path/to/bin with 'quotes' & $value%/mm".into(),
+            user: "service-user".into(),
+            config: "/path/to/config with \"quotes\" & $value%".into(),
+            logs: PathBuf::from("/path/to/logs & <output>"),
+        }
+    }
+
+    #[test]
+    fn shell_services_keep_paths_literal() {
+        let fields = unusual_paths();
+        for manager in [Manager::OpenRc, Manager::SysVInit, Manager::Rc] {
+            let rendered = fields.render(manager, Scope::System);
+            let definitions = match manager {
+                Manager::SysVInit => rendered.split("case \"$1\"").next().unwrap().to_string(),
+                Manager::Rc => rendered.replace(
+                    ". /etc/rc.subr",
+                    "load_rc_config() { :; }; run_rc_command() { :; }",
+                ),
+                _ => rendered,
+            };
+            let binary = if manager == Manager::SysVInit {
+                "$BIN"
+            } else if manager == Manager::Rc {
+                "$procname"
+            } else {
+                "$command"
+            };
+            let script = format!("{definitions}\nprintf '%s\\0' \"{binary}\" \"$MM_CONFIG_DIR\"");
+            let output = Command::new("sh").args(["-c", &script]).output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}: {:?}",
+                manager.label(),
+                output.stderr
+            );
+            let expected = format!("{}\0{}\0", fields.bin, fields.config);
+            assert_eq!(output.stdout, expected.as_bytes(), "{}", manager.label());
+            if manager == Manager::Rc {
+                let script = format!(
+                    "{definitions}\neval \"set -- $command_args\"\nprintf '%s\\0' \"$7\" \"$8\""
+                );
+                let output = Command::new("sh").args(["-c", &script]).output().unwrap();
+                assert!(output.status.success());
+                assert_eq!(
+                    output.stdout,
+                    format!("{}\0daemon\0", fields.bin).as_bytes()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn declarative_services_escape_paths_for_their_own_formats() {
+        let fields = unusual_paths();
+        let plist = fields.render(Manager::Launchd, Scope::User);
+        assert!(plist.contains("<string>/path/to/logs &amp; &lt;output&gt;/manymux.out</string>"));
+        assert!(plist.contains("&amp; $value%"));
+        let unit = fields.render(Manager::Systemd, Scope::User);
+        assert!(unit.contains("ExecStart=\"/path/to/bin with 'quotes' & $value%%/mm\" daemon"));
+        assert!(unit.contains(
+            "Environment=\"MM_CONFIG_DIR=/path/to/config with \\\"quotes\\\" & $value%%\""
+        ));
+    }
+
     /// A template that lost a placeholder would install a unit pointing at
     /// nothing, and the failure would only show up on the machine it was
     /// installed on.
@@ -496,7 +599,7 @@ mod tests {
         for scope in [Scope::User, Scope::System] {
             let fields = Fields::new(scope).unwrap();
             for manager in MANAGERS {
-                let rendered = fields.render(manager.template(scope));
+                let rendered = fields.render(manager, scope);
                 assert!(
                     !rendered.contains('@'),
                     "{} left a placeholder: {rendered}",

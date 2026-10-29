@@ -18,14 +18,15 @@
 //!   ending; `late` paints the screen and then goes away, which is a
 //!   connection dropping mid-session; `gone` leaves the session out of the
 //!   listing and refuses the
-//!   attach, which is one that ended. Anything past the end of the script, and
-//!   any other word, behaves.
+//!   attach, which is one that ended. `rename` sends a new name before dropping;
+//!   `renamed` lists that name and paints a distinct screen so a test can observe
+//!   the reconnect. Anything past the end of the script, and any other word, behaves.
 //! - `STUB_COUNT`: the file the script is counted through. Each connection is
 //!   a fresh process, so a file is the only memory there is.
 
 use std::time::SystemTime;
 
-use manymux::proto::{self, Request, Response, SessionInfo, Size, tag};
+use manymux::proto::{self, Renamed, Request, Response, SessionInfo, Size, tag};
 use tokio::io::{AsyncWriteExt, stdin, stdout};
 
 /// What the one session is called, and what a test attaches to.
@@ -59,7 +60,18 @@ async fn main() -> anyhow::Result<()> {
                     // without it, which is the answer a client reads to tell a
                     // session that went from a machine that never spoke.
                     Request::List if doing == "gone" => Response::Sessions(Vec::new()),
-                    Request::List => Response::Sessions(vec![listed()]),
+                    Request::List => {
+                        let mut session = listed();
+                        if doing == "renamed" {
+                            session.name = "nightly".to_string();
+                        } else if doing == "replaced" {
+                            session.pid = 2;
+                        } else if doing == "restarted" {
+                            session.pid = 2;
+                            session.node = "node-after".to_string();
+                        }
+                        Response::Sessions(vec![session])
+                    }
                     // Named after the command with a counter, the way a node
                     // names one, so a test can see that what came back is the
                     // node's answer rather than what was asked for.
@@ -98,13 +110,26 @@ async fn main() -> anyhow::Result<()> {
                     if doing == "keys" {
                         proto::write_frame(&mut out, tag::DATA, b"\x1b[?1049h\x1b[?1h").await?;
                     }
-                    proto::write_frame(&mut out, tag::DATA, painted().as_bytes()).await?;
+                    let text = match doing.as_str() {
+                        "renamed" => "renamed-ready",
+                        "restarted" => "restarted-ready",
+                        _ => "ready",
+                    };
+                    proto::write_frame(&mut out, tag::DATA, painted(text).as_bytes()).await?;
+                    if doing == "rename" {
+                        proto::write_msg(
+                            &mut out,
+                            tag::RENAME,
+                            &Renamed::Name("nightly".to_string()),
+                        )
+                        .await?;
+                    }
                     proto::write_frame(&mut out, tag::PING, &[]).await?;
                     out.flush().await?;
                     // Gone after painting, which is a connection that went
                     // rather than one that never worked: what was on the
                     // screen is what the client is left holding.
-                    if doing == "late" {
+                    if matches!(doing.as_str(), "late" | "rename") {
                         std::process::exit(0);
                     }
                 } else {
@@ -177,15 +202,15 @@ fn listed() -> SessionInfo {
         idle: 0,
         bells: 0,
         started: SystemTime::UNIX_EPOCH,
-        node: String::new(),
+        node: "node-before".to_string(),
     }
 }
 
 /// The screen a client is given on attach: `avt`'s own dump, which is what a
 /// node sends and is nothing like a plain line of text.
-fn painted() -> String {
+fn painted(text: &str) -> String {
     let mut screen = avt::Vt::builder().size(80, 24).build();
-    screen.feed_str("ready");
+    screen.feed_str(text);
     screen.dump()
 }
 

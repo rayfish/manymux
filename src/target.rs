@@ -5,6 +5,8 @@
 //! answer separate from the ones with nothing to say, deciding whether a bare
 //! word is a session, a machine or a command, and telling this machine's node
 //! which machines turned out to be up.
+//! Background surveys never ask to install software. Every query in a fan-out,
+//! including the local node, has a deadline and shares a concurrency limit.
 //!
 //! Kept apart from the commands themselves because it answers a different
 //! question. `mm attach`, `mm kill` and `mm rename` all want the same thing
@@ -24,7 +26,7 @@ use manymux::client::switch::Located;
 use manymux::hosts::{Hosts, LOCAL, Named, Target, is_this_machine, same_machine, this_machine};
 use manymux::proto::{HostedSession, Request, Response, SessionInfo};
 
-use crate::open_hushed;
+use crate::{Reach, reach};
 
 /// Sessions found, and machines that could not be asked. One being asleep must
 /// not hide the others.
@@ -211,8 +213,10 @@ pub(crate) async fn note_reached(socket: &Path, hosts: Vec<String>) {
             .call(&Request::Reached { hosts })
             .await
     };
-    if let Err(e) = told.await {
-        debug!("could not tell the node what answered: {e:#}");
+    match timeout(Duration::from_millis(300), told).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => debug!("could not tell the node what answered: {e:#}"),
+        Err(_) => debug!("the local node did not acknowledge the reached hosts"),
     }
 }
 
@@ -236,34 +240,50 @@ struct Asked {
 /// wait for rather than something you go away from.
 const HOST_DEADLINE: Duration = Duration::from_secs(5);
 
+const MAX_QUERIES: usize = 16;
+
 /// Sessions on this machine and on every watched one, asked all at once.
 pub(crate) async fn everywhere(socket: &Path) -> Result<Listing> {
-    let mut listing = Listing::default();
+    list_hosts(socket, Hosts::load()?.names(), true).await
+}
 
-    // No node here is ordinary on a machine you only use to reach others, so it
-    // is not worth a complaint.
-    match answer_from(socket, LOCAL).await {
-        Ok(answer) => listing.add(this_machine(), Ok(answer)),
-        Err(e) => debug!("no node here: {e:#}"),
-    }
+/// The attached client's survey, with no terminal available for consent.
+pub(crate) async fn survey_everywhere(socket: &Path) -> Result<Listing> {
+    list_hosts(socket, Hosts::load()?.names(), false).await
+}
 
-    let mut asked = tokio::task::JoinSet::new();
-    for host in Hosts::load()?.names() {
-        let socket = socket.to_path_buf();
-        asked.spawn(async move {
-            // Giving up drops the query, and with it the ssh carrying it, so a
-            // machine that never answers leaves nothing behind.
-            let found = match timeout(HOST_DEADLINE, answer_from(&socket, &host)).await {
-                Ok(found) => found,
-                Err(_) => Err(anyhow!("no answer in {}s", HOST_DEADLINE.as_secs())),
-            };
-            Asked { host, found }
+async fn list_hosts(socket: &Path, hosts: Vec<String>, install: bool) -> Result<Listing> {
+    let mut queries = std::iter::once(this_machine().to_string())
+        .chain(hosts)
+        .map(|host| {
+            let socket = socket.to_path_buf();
+            async move {
+                // Giving up drops the query, and with it the ssh carrying it, so a
+                // machine that never answers leaves nothing behind.
+                let found = match timeout(
+                    HOST_DEADLINE,
+                    answer_from_with_install(&socket, &host, install),
+                )
+                .await
+                {
+                    Ok(found) => found,
+                    Err(_) => Err(anyhow!("no answer in {}s", HOST_DEADLINE.as_secs())),
+                };
+                Asked { host, found }
+            }
         });
+    let mut listing = Listing::default();
+    let mut asked = tokio::task::JoinSet::new();
+    for query in queries.by_ref().take(MAX_QUERIES) {
+        asked.spawn(query);
     }
     while let Some(answer) = asked.join_next().await {
         match answer {
             Ok(Asked { host, found }) => listing.add(&host, found),
             Err(e) => debug!("a host query did not finish: {e}"),
+        }
+        if let Some(query) = queries.next() {
+            asked.spawn(query);
         }
     }
     note_reached(socket, listing.reached()).await;
@@ -316,6 +336,10 @@ pub(crate) struct Answer {
 /// second ssh, on a listing the popup redoes at every keypress. See
 /// [`SessionInfo::node`].
 pub(crate) async fn answer_from(socket: &Path, host: &str) -> Result<Answer> {
+    answer_from_with_install(socket, host, true).await
+}
+
+async fn answer_from_with_install(socket: &Path, host: &str, install: bool) -> Result<Answer> {
     // No node here means no sessions here, which is an answer rather than a
     // failure. Starting one just to be told that would be rude.
     if is_this_machine(host) && !socket.exists() {
@@ -327,10 +351,18 @@ pub(crate) async fn answer_from(socket: &Path, host: &str) -> Result<Answer> {
             node: None,
         });
     }
-    let sessions = match open_hushed(socket, host)
-        .await?
-        .call(&Request::List)
-        .await?
+    let sessions = match reach(
+        socket,
+        host,
+        Reach {
+            start: false,
+            hushed: true,
+            install,
+        },
+    )
+    .await?
+    .call(&Request::List)
+    .await?
     {
         Response::Sessions(sessions) => sessions,
         other => bail!("unexpected response to list: {other:?}"),
@@ -554,6 +586,57 @@ fn runnable(program: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use manymux::proto::{self, FrameReader};
+    use tokio::net::UnixListener;
+
+    #[tokio::test(start_paused = true)]
+    async fn a_local_node_that_stops_answering_cannot_stall_a_survey() {
+        let path = std::env::temp_dir().join(format!("mm-survey-{}.sock", std::process::id()));
+        let listener = UnixListener::bind(&path).unwrap();
+        let survey_path = path.clone();
+        let survey = tokio::spawn(async move { list_hosts(&survey_path, Vec::new(), false).await });
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut reader = FrameReader::new(stream);
+        let frame = reader.next().await.unwrap().unwrap();
+        assert!(matches!(
+            proto::decode::<Request>(&frame.body).unwrap(),
+            Request::List
+        ));
+
+        tokio::time::advance(HOST_DEADLINE).await;
+        let listing = tokio::time::timeout(Duration::from_secs(1), survey)
+            .await
+            .expect("a survey must stop waiting for the local node")
+            .unwrap()
+            .unwrap();
+        assert_eq!(listing.unreachable.len(), 1);
+        assert_eq!(listing.unreachable[0].host, this_machine());
+        assert!(listing.answering().is_empty());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn telling_the_node_what_answered_has_a_deadline() {
+        let path = std::env::temp_dir().join(format!("mm-reached-{}.sock", std::process::id()));
+        let listener = UnixListener::bind(&path).unwrap();
+        let telling_path = path.clone();
+        let telling =
+            tokio::spawn(async move { note_reached(&telling_path, vec!["gpu-box".into()]).await });
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut reader = FrameReader::new(stream);
+        let frame = reader.next().await.unwrap().unwrap();
+        assert!(matches!(
+            proto::decode::<Request>(&frame.body).unwrap(),
+            Request::Reached { .. }
+        ));
+
+        tokio::time::advance(Duration::from_millis(300)).await;
+        tokio::time::timeout(Duration::from_secs(1), telling)
+            .await
+            .expect("a stale watcher must not stall the client")
+            .unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
 
     fn session(name: &str) -> SessionInfo {
         SessionInfo {

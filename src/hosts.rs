@@ -10,12 +10,14 @@
 //! two destinations that ssh lands in the same place. Nothing here can tell:
 //! resolving a destination is ssh's business, and the strings say nothing. So
 //! the node says instead, and [`node_id`] is what it says.
+//! Mutating commands use [`Hosts::change`] so concurrent additions and removals
+//! apply to the file as it stands, rather than replacing an earlier snapshot.
 
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::fs::File;
 use std::io::Read as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use anyhow::{Context, Result, bail};
@@ -181,6 +183,14 @@ impl Hosts {
         config::save_toml(&Self::path(), self, "the host list")
     }
 
+    pub fn change<T>(change: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
+        Self::change_at(&Self::path(), change)
+    }
+
+    fn change_at<T>(path: &Path, change: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
+        config::change_toml(path, "the host list", change)
+    }
+
     pub fn path() -> PathBuf {
         config::config_dir().join("hosts.toml")
     }
@@ -282,6 +292,8 @@ impl Target {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Barrier};
+    use std::thread;
 
     #[test]
     fn a_bare_name_is_a_local_session() {
@@ -365,6 +377,30 @@ mod tests {
         let text = toml::to_string_pretty(&hosts).unwrap();
         let back: Hosts = toml::from_str(&text).unwrap();
         assert!(back.has("box"));
+    }
+
+    #[test]
+    fn concurrent_additions_keep_both_hosts() {
+        let dir = std::env::temp_dir().join(format!("manymux-host-changes-{}", std::process::id()));
+        let path = dir.join("hosts.toml");
+        let start = Arc::new(Barrier::new(2));
+        let writers: Vec<_> = ["gpu-box", "build-box"]
+            .into_iter()
+            .map(|host| {
+                let path = path.clone();
+                let start = Arc::clone(&start);
+                thread::spawn(move || {
+                    start.wait();
+                    Hosts::change_at(&path, |hosts| hosts.add(host))
+                })
+            })
+            .collect();
+        for writer in writers {
+            writer.join().unwrap().unwrap();
+        }
+        let hosts: Hosts = config::load_toml(&path).unwrap();
+        assert_eq!(hosts.names(), ["build-box", "gpu-box"]);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

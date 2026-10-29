@@ -26,6 +26,8 @@
 //!
 //! `Paste` uploads use a separate request stream, acknowledged before any file
 //! bytes are sent. Older nodes refuse the request without disturbing an attach.
+//! Session-name sanitizing is shared by nodes and clients, so a confirmed rename
+//! can update a client's address even when a follow-up listing fails.
 
 use anyhow::{Result, bail};
 use bytes::{Buf, BytesMut};
@@ -265,6 +267,17 @@ pub struct SpawnSpec {
     /// session in the wrong place.
     #[serde(default)]
     pub label: Option<String>,
+}
+
+/// The spelling a node accepts for a session name, safe in `host/name` and
+/// terminal text. Kept shared so a client can retain a confirmed rename even
+/// when the listing it asks for afterwards is unavailable.
+pub fn session_name(name: &str) -> String {
+    name.chars()
+        .map(|c| if c.is_whitespace() { '-' } else { c })
+        .filter(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        .take(64)
+        .collect()
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
