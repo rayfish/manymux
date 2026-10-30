@@ -35,6 +35,7 @@ to the session list detaches and removes the notification. A failed attach or
 ended session stops the service too.
 
 Long press freezes the visible text for selection; drag to extend it, then Copy.
+Paste is in the same menu and in the extra-key row on both mobile apps.
 Groups and session event notifications are still pending.
 
 What is running is a wall of tiles rather than a list of names, each showing

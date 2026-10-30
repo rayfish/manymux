@@ -1156,9 +1156,7 @@ class MainActivity : Activity() {
             return button
         }
         fun paste(row: LinearLayout) = key(row, "paste") {
-            val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-            val text = clipboard.primaryClip?.getItemAt(0)?.coerceToText(this)?.toString()
-            if (!text.isNullOrEmpty()) screen.paste(text)
+            screen.pasteClipboard()
         }
         fun keyboard(row: LinearLayout) = key(row, "⌨", "keyboard") { screen.openKeyboard() }
         fun left(row: LinearLayout) = key(row, "←", "left") { screen.cursorKey(Direction.LEFT) }

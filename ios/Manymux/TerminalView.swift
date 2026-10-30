@@ -341,7 +341,7 @@ final class TerminalView: UIView, UIKeyInput {
         }
     }
 
-    /// Long press freezes the picture; dragging selects cells until Copy.
+    /// Long press freezes the picture for selection, Copy and Paste.
     @objc private func pressed(_ press: UILongPressGestureRecognizer) {
         if press.state == .began {
             stopFling()
@@ -569,6 +569,7 @@ final class TerminalView: UIView, UIKeyInput {
     }
 
     func paste(_ text: String) {
+        guard !text.isEmpty else { return }
         leaveHistory()
         attach?.paste(text: text)
     }
@@ -594,6 +595,10 @@ extension TerminalView: UIEditMenuInteractionDelegate {
         return UIMenu(children: [
             UIAction(title: "Copy") { [weak self] _ in self?.copySelection() },
             UIAction(title: "Select All") { [weak self] _ in self?.selectAll() },
+            UIAction(title: "Paste", attributes: UIPasteboard.general.hasStrings ? [] : .disabled) { [weak self] _ in
+                guard let text = UIPasteboard.general.string else { return }
+                self?.paste(text)
+            },
         ])
     }
 }

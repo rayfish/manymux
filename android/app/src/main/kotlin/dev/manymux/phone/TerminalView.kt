@@ -434,7 +434,7 @@ class TerminalView(context: Context) : View(context), Choreographer.FrameCallbac
     private var selectionEnd = At(0u, 0u)
     private var selectionMode: ActionMode? = null
 
-    /** Long press freezes the picture; dragging selects cells until Copy. */
+    /** Long press freezes the picture for selection, Copy and Paste. */
     private fun beginSelection(at: At) {
         speed = 0f
         pending = 0f
@@ -445,12 +445,17 @@ class TerminalView(context: Context) : View(context), Choreographer.FrameCallbac
             override fun onCreateActionMode(mode: ActionMode, menu: Menu): Boolean {
                 menu.add(0, 1, 0, "Copy").setShowAsAction(MenuItem.SHOW_AS_ACTION_ALWAYS)
                 menu.add(0, 2, 1, "Select all")
+                menu.add(0, android.R.id.paste, 2, "Paste").isEnabled = clipboard.hasPrimaryClip()
                 return true
             }
 
             override fun onPrepareActionMode(mode: ActionMode, menu: Menu) = false
 
             override fun onActionItemClicked(mode: ActionMode, item: MenuItem): Boolean {
+                if (item.itemId == android.R.id.paste) {
+                    pasteClipboard()
+                    return true
+                }
                 if (item.itemId == 2) {
                     val grid = told ?: return false
                     selectionStart = At(0u, 0u)
@@ -463,7 +468,6 @@ class TerminalView(context: Context) : View(context), Choreographer.FrameCallbac
                     frozen.map { (at, runs) -> Row(at.toUShort(), runs) },
                     selectionStart, selectionEnd,
                 )
-                val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
                 clipboard.setPrimaryClip(ClipData.newPlainText("Terminal", text))
                 mode.finish()
                 return true
@@ -772,8 +776,19 @@ class TerminalView(context: Context) : View(context), Choreographer.FrameCallbac
     }
 
     fun paste(text: String) {
+        if (text.isEmpty()) return
         leaveHistory()
         attach?.paste(text)
+    }
+
+    private val clipboard: ClipboardManager
+        get() = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+
+    fun pasteClipboard() {
+        val clip = clipboard.primaryClip ?: return
+        if (clip.itemCount == 0) return
+        val text = clip.getItemAt(0).coerceToText(context)?.toString() ?: return
+        paste(text)
     }
 
     private fun leaveHistory() {
