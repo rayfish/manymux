@@ -179,7 +179,7 @@ async fn windows_commands_preserve_arguments_and_the_requested_directory() {
     let marker = node.config.join("folder with spaces");
     std::fs::create_dir_all(&marker).unwrap();
     let script = marker.join("test.ps1");
-    std::fs::write(&script, "param([string]$value)\n[Console]::WriteLine('argument:' + $value)\n[Console]::WriteLine('directory:' + (Get-Location).Path)\n$null = [Console]::ReadLine()\nexit 13\n").unwrap();
+    std::fs::write(&script, "param([string]$value)\n[Console]::WriteLine('argument:' + $value)\n[Console]::WriteLine('directory:' + ((Get-Location).Path -eq $PSScriptRoot))\n$null = [Console]::ReadLine()\nexit 13\n").unwrap();
     let Response::Spawned { name } = node
         .call(Request::Spawn(SpawnSpec {
             name: Some("arguments".into()),
@@ -201,13 +201,8 @@ async fn windows_commands_preserve_arguments_and_the_requested_directory() {
         panic!("a spawned session")
     };
     let mut session = node.attach(&name, Size::new(200, 40), false).await;
-    let output = output_until(&mut session, "directory:").await;
+    let output = output_until(&mut session, "directory:True").await;
     assert!(output.contains("argument:a b & c"), "{output:?}");
-    // Ask for another screen if the directory arrived in a later chunk.
-    let expected = marker.to_string_lossy();
-    if !output.contains(expected.as_ref()) {
-        output_until(&mut session, expected.as_ref()).await;
-    }
     session.writer.send_input(b"\r").await.unwrap();
     assert_eq!(exit_code(&mut session).await, 13);
 }
