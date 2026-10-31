@@ -99,7 +99,7 @@ jobs:
         run: cargo clippy -q --all-targets --locked -- -D warnings
       - name: Native Windows persistence
         timeout-minutes: 5
-        run: cargo test -q --locked --test windows
+        run: cargo test -q --locked --test windows -- --nocapture
       - name: Client core
         run: cargo check -q --lib --no-default-features --locked
 
