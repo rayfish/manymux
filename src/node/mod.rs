@@ -26,6 +26,8 @@
 
 pub mod events;
 mod history;
+#[cfg(windows)]
+mod launch;
 pub mod paste;
 pub mod peers;
 pub mod registry;
@@ -1005,9 +1007,14 @@ async fn start_node(socket: &Path) -> Result<()> {
             | windows_sys::Win32::System::Threading::CREATE_NEW_PROCESS_GROUP
             | windows_sys::Win32::System::Threading::CREATE_BREAKAWAY_FROM_JOB,
     );
-    command
-        .spawn()
-        .with_context(|| format!("starting {}", binary.display()))?;
+    match command.spawn() {
+        Ok(_) => {}
+        #[cfg(windows)]
+        Err(error) if error.raw_os_error() == Some(5) && launch::job_forbids_breakaway()? => {
+            launch::outside_job(&binary, socket).await?;
+        }
+        Err(error) => return Err(error).with_context(|| format!("starting {}", binary.display())),
+    }
 
     if wait_until(socket, Listening::Yes, START_TIMEOUT).await {
         return Ok(());

@@ -34,10 +34,13 @@ for pipelines and shell builtins. A node starts automatically and keeps its
 ConPTY sessions alive after clients disconnect or their terminals close.
 Sessions do not survive a reboot or Windows sign-out.
 
-Remote access uses Windows OpenSSH Server with `mm.exe` on its PATH:
-`mm attach build-box/work`. Installation on Windows is manual; automatic SSH
-bootstrap, `mm service`, self-update and foreground checkpoint inspection are
-not supported yet. Local connections use named pipes restricted to your
+Remote access uses Windows OpenSSH Server. `mm new build-box powershell.exe`
+offers to install `mm.exe` when it is missing, just as on Unix hosts. The
+installer verifies the download's SHA-256 checksum and installs under the SSH
+account's local application-data directory, without administrator rights.
+`mm setup build-box` installs it ahead of time. A fresh SSH login is not required.
+`mm service`, self-update and foreground checkpoint inspection are not supported
+yet on Windows. Local connections use named pipes restricted to your
 Windows account, with no listening network port.
 
 ## A first session

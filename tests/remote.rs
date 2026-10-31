@@ -24,6 +24,11 @@ const MM: &str = env!("CARGO_BIN_EXE_mm");
 /// not. That difference is the whole reason the client has more than one name
 /// to try.
 enum Mm {
+    WindowsMissing,
+    WindowsInHome,
+    WindowsAgentFails,
+    WindowsInstallFails,
+    WindowsStillMissing,
     /// Installed with root, on the PATH every ssh gets.
     OnPath,
     /// Installed without root, reachable only by naming the path outright.
@@ -69,6 +74,11 @@ impl World {
         // Exit 127 is what a shell says about a command it cannot find, and is
         // the only signal the client gets that a machine has no `mm`.
         let answers_to = match mm {
+            Mm::WindowsMissing
+            | Mm::WindowsInHome
+            | Mm::WindowsAgentFails
+            | Mm::WindowsInstallFails
+            | Mm::WindowsStillMissing => "*) exit 127 ;;",
             Mm::OnPath => "mm) ;;",
             Mm::InHome => "*/mm) ;;",
             Mm::Missing => r#"*/mm) [ -f "$installed" ] || exit 127 ;;"#,
@@ -77,6 +87,33 @@ impl World {
             Mm::Unreachable => {
                 r#"*) echo "ssh: connect to host $host port 22: No route to host" >&2; exit 255 ;;"#
             }
+        };
+        let windows_agent = match mm {
+            Mm::WindowsInHome => "true",
+            Mm::WindowsAgentFails => "echo agent-failed >&2; exit 1",
+            Mm::WindowsStillMissing => "exit 127",
+            _ => r#"[ -f "$installed" ] || exit 127"#,
+        };
+        let windows_install = if matches!(mm, Mm::WindowsInstallFails) {
+            "exit 1"
+        } else {
+            "exit 0"
+        };
+        let is_windows = matches!(
+            mm,
+            Mm::WindowsMissing
+                | Mm::WindowsInHome
+                | Mm::WindowsAgentFails
+                | Mm::WindowsInstallFails
+                | Mm::WindowsStillMissing
+        );
+        let platform_probe = if is_windows {
+            r#"if [ "$1" = "uname -s" ]; then echo 'uname is not recognized' >&2; exit 1; fi
+case "$1" in *manymux-windows*) printf manymux-windows; exit 0 ;; esac"#
+        } else if matches!(mm, Mm::Unreachable) {
+            r#"if [ "$1" = "uname -s" ]; then echo "ssh: No route to host" >&2; exit 255; fi"#
+        } else {
+            r#"if [ "$1" = "uname -s" ]; then echo Linux; exit 0; fi"#
         };
         let script = format!(
             r#"#!/bin/sh
@@ -95,10 +132,22 @@ if [ "${{1:-}}" = "--" ]; then shift; fi
 # twice.
 host="${{host#*@}}"
 
-# `greet` runs `true` to get prompts out of the way; nothing to do for that.
-if [ "$1" = "true" ]; then exit 0; fi
+# `greet` exits successfully to get SSH prompts out of the way.
+if [ "$1" = "true" ] || [ "$1" = "exit 0" ]; then exit 0; fi
+
+{platform_probe}
 
 installed="{dir}/$host.installed"
+case "$1" in
+    powershell.exe*)
+        script=$(python3 -c 'import base64,sys; print(base64.b64decode(sys.argv[1].split()[-1]).decode("utf-16-le"))' "$1") || exit 1
+        case "$script" in
+            *install.ps1*) printf '%s' "$script" > "$installed"; {windows_install} ;;
+        esac
+        printf 'agent\n' >> "{dir}/$host.agent-attempts"
+        {windows_agent}
+        exec env MM_CONFIG_DIR="{dir}/$host" "{mm}" --socket "{dir}/$host.sock" agent ;;
+esac
 
 # The installer, which lands in the home directory when it has no root.
 case "$1" in
@@ -403,7 +452,7 @@ fn concurrent_add_commands_keep_both_hosts() {
         format!(
             r#"#!/bin/sh
 case "$*" in
-    *' true')
+    *' true'|*' exit 0')
         printf x > "$MM_ADD_GATE.ready"
         read -r release < "$MM_ADD_GATE.release"
         ;;
@@ -871,7 +920,7 @@ fn ssh_is_invoked_with_the_destination_and_nothing_surprising() {
     std::fs::write(
         world.ssh_stub(),
         format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\nexit 255\n",
+            "#!/bin/sh\nfor arg in \"$@\"; do if [ \"$arg\" = \"uname -s\" ]; then echo Linux; exit 0; fi; done\nprintf '%s\\n' \"$@\" > {}\nexit 255\n",
             recorded.display()
         ),
     )
@@ -4167,4 +4216,83 @@ fn a_session_menu_tracks_changes_without_more_keystrokes() {
 
     let _ = client.kill();
     let _ = client.wait();
+}
+
+#[test]
+fn saying_yes_installs_windows_and_retries_the_original_spawn_once() {
+    let world = World::where_mm_is("windows-bootstrap", Mm::WindowsMissing);
+    let (ok, seen) = world.on_a_terminal(
+        "laptop",
+        &["new", "-d", "-n", "api", "gpu-box", "sleep", "60"],
+        "y\n",
+    );
+    assert!(ok, "{seen}");
+    assert!(seen.contains("gpu-box/api"), "{seen}");
+    assert!(!seen.contains("not recognized"), "{seen}");
+    let installer = world
+        .installer_ran_on("gpu-box")
+        .expect("the Windows installer ran");
+    assert!(installer.contains("install.ps1"));
+    assert!(!installer.contains("install.sh"));
+    let listed = world.ok("laptop", &["ls", "gpu-box"]);
+    assert_eq!(sessions(&listed), ["api"]);
+}
+
+#[test]
+fn windows_in_the_user_directory_needs_no_install_or_refreshed_path() {
+    let world = World::where_mm_is("windows-existing", Mm::WindowsInHome);
+    let started = world.ok(
+        "laptop",
+        &["new", "-d", "-n", "api", "gpu-box", "sleep", "60"],
+    );
+    assert_eq!(started.trim(), "gpu-box/api");
+    assert!(world.installer_ran_on("gpu-box").is_none());
+}
+
+#[test]
+fn a_windows_agent_failure_is_not_retried_as_a_missing_program() {
+    let world = World::where_mm_is("windows-error", Mm::WindowsAgentFails);
+    let output = world.run("laptop", &["new", "-d", "gpu-box", "sleep", "60"]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("agent-failed"));
+    assert!(world.installer_ran_on("gpu-box").is_none());
+    assert_eq!(
+        std::fs::read_to_string(world.dir.join("gpu-box.agent-attempts")).unwrap(),
+        "agent\n"
+    );
+}
+
+#[test]
+fn windows_bootstrap_requires_consent_and_stops_after_a_failed_install() {
+    for (id, mm, answer, installed) in [
+        ("declined", Mm::WindowsMissing, "n\n", false),
+        ("failed", Mm::WindowsInstallFails, "y\n", true),
+        ("still-missing", Mm::WindowsStillMissing, "y\n", true),
+    ] {
+        let world = World::where_mm_is(&format!("windows-{id}"), mm);
+        let (ok, seen) =
+            world.on_a_terminal("laptop", &["new", "-d", "gpu-box", "sleep", "60"], answer);
+        assert!(!ok, "{seen}");
+        assert_eq!(world.installer_ran_on("gpu-box").is_some(), installed);
+        let attempts = std::fs::read_to_string(world.dir.join("gpu-box.agent-attempts")).unwrap();
+        assert_eq!(
+            attempts.lines().count(),
+            if id == "still-missing" { 2 } else { 1 }
+        );
+    }
+}
+
+#[test]
+fn windows_completion_and_noninteractive_calls_never_install() {
+    let world = World::where_mm_is("windows-quiet", Mm::WindowsInHome);
+    world.ok("laptop", &["add", "gpu-box"]);
+    world.write_stub_ssh(Mm::WindowsMissing);
+    assert!(world.complete("laptop", &["a", "gpu-box/"]).is_empty());
+    assert!(
+        !world
+            .run("laptop", &["new", "-d", "gpu-box", "sleep", "60"])
+            .status
+            .success()
+    );
+    assert!(world.installer_ran_on("gpu-box").is_none());
 }

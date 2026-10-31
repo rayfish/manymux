@@ -8,6 +8,8 @@
 //! Capable nodes can release an attachment without closing its transport. A
 //! parked [`Connection`] drains the old output through an acknowledgement
 //! before accepting another attach; it keeps no session alive on the client.
+//! Remote OS discovery runs before a request. The Windows launcher reports
+//! 127 only when neither PATH nor the per-user install contains mm.exe.
 //! File uploads use a separate `Paste` request stream, leaving attach traffic
 //! free to carry keys and keepalives. Upload failures are never retried.
 
@@ -231,7 +233,8 @@ async fn say(text: &[u8]) {
 pub const PROGRAMS: [&str; 2] = ["mm", "~/.local/bin/mm"];
 
 /// What a shell exits with for a command it could not find, and the only sign
-/// the far end gives that it has no `mm` on it.
+/// the far end gives that it has no `mm` on it. The Windows launcher reserves
+/// this status for a failed executable lookup before starting the agent.
 pub const NOT_FOUND: i32 = 127;
 
 /// Whether to put `mm` on a machine that turns out not to have it, asked of
@@ -247,11 +250,22 @@ struct Ssh {
     /// The quiet spawn for questions nobody asked, the loud one otherwise.
     open: fn(&str, &str) -> Result<crate::ssh::Agent>,
     consent: Option<Consent>,
+    platform: crate::ssh::Platform,
+    quiet: bool,
     /// Which of [`PROGRAMS`] the open stream is using.
     program: usize,
     /// Whether the installer has already been run, so a machine that still has
     /// no `mm` afterwards is answered with an error rather than a second go.
     installed: bool,
+}
+
+impl Ssh {
+    fn connect(&self) -> Result<crate::ssh::Agent> {
+        match self.platform {
+            crate::ssh::Platform::Unix => (self.open)(&self.host, PROGRAMS[self.program]),
+            crate::ssh::Platform::Windows => crate::ssh::windows_agent(&self.host, self.quiet),
+        }
+    }
 }
 
 /// One request/response exchange, which an `Attach` extends into a byte pipe.
@@ -294,7 +308,7 @@ impl Stream {
     /// A machine with no `mm` on it is offered one, if `consent` says so; see
     /// [`Consent`] and [`PROGRAMS`].
     pub async fn over_ssh(host: &str, consent: Option<Consent>) -> Result<Self> {
-        Self::carried_by(host, crate::ssh::agent, consent, Heard::Aloud)
+        Self::carried_by(host, crate::ssh::agent, consent, Heard::Aloud, false).await
     }
 
     /// Like [`Stream::over_ssh`], but for a caller that is holding a terminal:
@@ -305,7 +319,7 @@ impl Stream {
     /// reach comes out, and see [`Heard::Kept`] for why that is worth a second
     /// way in.
     pub async fn over_ssh_hushed(host: &str, consent: Option<Consent>) -> Result<Self> {
-        Self::carried_by(host, crate::ssh::agent, consent, Heard::Kept)
+        Self::carried_by(host, crate::ssh::agent, consent, Heard::Kept, false).await
     }
 
     /// Like [`Stream::over_ssh`], but ssh stays silent and does not prompt.
@@ -314,23 +328,27 @@ impl Stream {
     /// a password prompt or a host-key warning would land in the middle of the
     /// line they are typing. Nothing gets installed on a keystroke either.
     pub async fn over_ssh_quietly(host: &str) -> Result<Self> {
-        Self::carried_by(host, crate::ssh::agent_quietly, None, Heard::Aloud)
+        Self::carried_by(host, crate::ssh::agent_quietly, None, Heard::Aloud, true).await
     }
 
-    fn carried_by(
+    async fn carried_by(
         host: &str,
         open: fn(&str, &str) -> Result<crate::ssh::Agent>,
         consent: Option<Consent>,
         heard: Heard,
+        quiet: bool,
     ) -> Result<Self> {
+        let platform = crate::ssh::detect(host, quiet).await?;
         let ssh = Ssh {
+            platform,
+            quiet,
             host: host.to_string(),
             open,
             consent,
             program: 0,
             installed: false,
         };
-        let agent = (ssh.open)(&ssh.host, PROGRAMS[ssh.program])?;
+        let agent = ssh.connect()?;
         Ok(Self {
             read: FrameReader::new(Box::new(agent.stdout)),
             write: Box::new(agent.stdin),
@@ -431,10 +449,10 @@ impl Stream {
             return Ok(false);
         }
 
-        if ssh.program + 1 < PROGRAMS.len() {
+        if matches!(ssh.platform, crate::ssh::Platform::Unix) && ssh.program + 1 < PROGRAMS.len() {
             ssh.program += 1;
         } else if !ssh.installed && ssh.consent.as_ref().is_some_and(|ask| ask(&ssh.host)) {
-            crate::ssh::install(&ssh.host).await?;
+            crate::ssh::install_on(&ssh.host, ssh.platform).await?;
             // Back to the top of the ladder: the installer takes root when it
             // can get it, and where it landed is its decision rather than ours.
             ssh.installed = true;
@@ -446,7 +464,7 @@ impl Stream {
             );
         }
 
-        let agent = (ssh.open)(&ssh.host, PROGRAMS[ssh.program])?;
+        let agent = ssh.connect()?;
         self.read = FrameReader::new(Box::new(agent.stdout));
         self.write = Box::new(agent.stdin);
         // The old carrier goes here, taking the "command not found" it earned

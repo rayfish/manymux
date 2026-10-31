@@ -308,3 +308,59 @@ async fn listing_an_absent_node_does_not_start_one() {
         std::fs::remove_dir_all(config).unwrap();
     }
 }
+
+#[tokio::test]
+async fn the_powershell_launcher_preserves_binary_protocol_and_finds_the_user_install() {
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD;
+    use std::process::Stdio;
+    use tokio::process::Command as AsyncCommand;
+    let node = Node::start().await;
+    let install = node.config.join("manymux");
+    std::fs::create_dir_all(&install).unwrap();
+    std::fs::copy(MM, install.join("mm.exe")).unwrap();
+    let directory = node.config.to_string_lossy().replace('\'', "''");
+    let socket = node.socket.to_string_lossy().replace('\'', "''");
+    let script = include_str!("../src/ssh/windows-agent.ps1")
+        .replace(
+            "([Environment]::GetFolderPath('LocalApplicationData'))",
+            &format!("'{directory}'"),
+        )
+        .replace(
+            "$start.Arguments = 'agent'",
+            &format!("$start.Arguments = '--socket \"{socket}\" agent'"),
+        );
+    let bytes: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    let mut child = AsyncCommand::new("powershell.exe")
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-EncodedCommand",
+            &STANDARD.encode(bytes),
+        ])
+        .env("MM_CONFIG_DIR", &node.config)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let mut stream = Stream::from_halves(
+        Box::new(child.stdout.take().unwrap()),
+        Box::new(child.stdin.take().unwrap()),
+    );
+    let reply = tokio::time::timeout(Duration::from_secs(20), stream.call(&Request::Version))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(reply, Response::Version { .. }));
+    drop(stream);
+    assert!(
+        tokio::time::timeout(Duration::from_secs(10), child.wait())
+            .await
+            .unwrap()
+            .unwrap()
+            .success()
+    );
+}

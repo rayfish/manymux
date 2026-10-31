@@ -97,6 +97,9 @@ jobs:
         run: cargo fmt -q --check
       - name: Clippy
         run: cargo clippy -q --all-targets --locked -- -D warnings
+      - name: Windows installer
+        shell: powershell
+        run: ./tests/install-windows.ps1
       - name: Native Windows persistence
         timeout-minutes: 5
         run: cargo test -q --locked --test windows -- --nocapture

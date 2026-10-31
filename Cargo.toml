@@ -45,6 +45,7 @@ await_holding_invalid_type = "deny"
 
 [dependencies]
 anyhow = "1.0.104"
+base64 = "0.22"
 avt = "0.18.0"
 bytes = "1.12.1"
 # `unstable-ext` is what `#[arg(add = ...)]` goes through, and is how the
@@ -91,7 +92,7 @@ pty-process = { version = "0.5.3", features = ["async"], optional = true }
 [target.'cfg(windows)'.dependencies]
 portable-pty = { version = "0.9", optional = true }
 sha2 = { version = "0.11", optional = true }
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Threading", "Win32_System_Memory", "Win32_System_Console", "Win32_System_Pipes", "Win32_System_SystemInformation", "Win32_Security_Cryptography", "Win32_Storage_FileSystem"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Threading", "Win32_System_JobObjects", "Win32_System_Memory", "Win32_System_Console", "Win32_System_Pipes", "Win32_System_SystemInformation", "Win32_Security_Cryptography", "Win32_Storage_FileSystem"] }
 
 [target.'cfg(unix)'.dev-dependencies]
 pty-process = "0.5.3"

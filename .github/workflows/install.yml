@@ -10,10 +10,14 @@ on:
       - master
     paths:
       - install.sh
+      - install.ps1
+      - tests/install-windows.ps1
       - .github/workflows/install.yml
   pull_request:
     paths:
       - install.sh
+      - install.ps1
+      - tests/install-windows.ps1
       - .github/workflows/install.yml
 
 jobs:
@@ -91,3 +95,11 @@ jobs:
           sudo useradd -m nosudo
           sudo -H -u nosudo env MM_SKIP_LINGER=1 sh /tmp/install.sh
           sudo test -x /home/nosudo/.local/bin/mm
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify Windows installer
+        shell: powershell
+        run: ./tests/install-windows.ps1

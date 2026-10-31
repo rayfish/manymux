@@ -11,7 +11,12 @@
 //! grant access ssh would refuse.
 //! Every destination follows an option terminator, so a supplied host name
 //! cannot change ssh's options. Windows OpenSSH runs without ControlMaster,
-//! which its native client does not support.
+//! which its native client does not support. A read-only OS probe selects the
+//! agent launcher and installer before any request is sent. Windows launches
+//! the agent with inherited byte streams, never through a PowerShell pipeline.
+
+pub(crate) mod bootstrap;
+pub(crate) use bootstrap::{Platform, detect};
 
 #[cfg(unix)]
 use std::path::PathBuf;
@@ -104,13 +109,24 @@ pub fn agent_quietly(host: &str, program: &str) -> Result<Agent> {
 }
 
 fn spawn(mut command: Command, host: &str, program: &str) -> Result<Agent> {
+    command.arg(program).arg("agent");
+    spawn_command(command, host)
+}
+
+pub(crate) fn windows_agent(host: &str, quiet: bool) -> Result<Agent> {
+    let mut command = base(Tty::No);
+    if quiet {
+        command.args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=1"]);
+    }
+    command.arg("--").arg(host).arg(bootstrap::agent());
+    command.stderr(if quiet { Stdio::null() } else { Stdio::piped() });
+    spawn_command(command, host)
+}
+
+fn spawn_command(mut command: Command, host: &str) -> Result<Agent> {
     let mut child = command
-        // Never a probe first: working out where `mm` is by asking the far end
-        // would mean either sourcing profiles, whose output would corrupt the
-        // protocol on stdout, or a round trip before every command. Naming one
-        // and reading the exit status costs nothing when the guess is right.
-        .arg(program)
-        .arg("agent")
+        // The OS probe carried no protocol. This process owns the request's
+        // byte streams and is killed if its connection attempt is cancelled.
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .kill_on_drop(true)
@@ -136,7 +152,7 @@ fn spawn(mut command: Command, host: &str, program: &str) -> Result<Agent> {
 /// commands that follow.
 pub async fn greet(host: &str) -> Result<()> {
     let status = command(host)
-        .arg("true")
+        .arg("exit 0")
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
@@ -192,18 +208,27 @@ pub async fn ask(host: &str, script: &str) -> Result<Vec<u8>> {
 /// Put `mm` on a machine you can already ssh into, by running the published
 /// installer there.
 ///
-/// With a terminal, unlike everything else here. The installer takes root when
+/// Unix installers get a terminal. The installer takes root when
 /// it can, because `/usr/local/bin` is the only directory on the PATH sshd
 /// hands a command and so the only place an install is reachable from another
 /// machine. Without a tty, sudo has no way to ask, and every machine with a
-/// password on it would quietly take the per-user fallback instead.
+/// password on it would quietly take the per-user fallback instead. Windows
+/// installs for the current account through PowerShell without a terminal.
 pub async fn install(host: &str) -> Result<()> {
-    let status = base(Tty::Wanted)
+    install_on(host, detect(host, false).await?).await
+}
+
+pub(crate) async fn install_on(host: &str, platform: Platform) -> Result<()> {
+    let (tty, script) = match platform {
+        Platform::Unix => (Tty::Wanted, format!("curl -fsSL {INSTALLER} | sh")),
+        Platform::Windows => (Tty::No, bootstrap::installer()),
+    };
+    let status = base(tty)
         .arg("--")
         .arg(host)
         // One string, because it is a pipeline for the remote shell to read
         // rather than a program and its arguments.
-        .arg(format!("curl -fsSL {INSTALLER} | sh"))
+        .arg(script)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
