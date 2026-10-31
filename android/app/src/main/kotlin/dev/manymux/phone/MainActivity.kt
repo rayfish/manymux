@@ -177,6 +177,22 @@ class MainActivity : Activity() {
 
     }
 
+    private var wasStopped = false
+
+    override fun onStop() {
+        super.onStop()
+        wasStopped = true
+    }
+
+    override fun onStart() {
+        super.onStart()
+        if (wasStopped) {
+            wasStopped = false
+            val active = client.session?.attach
+            if (active != null) active.resume() else phone.resume()
+        }
+    }
+
     override fun onDestroy() {
         super.onDestroy()
         // SessionService owns the background lifetime; only release these views.

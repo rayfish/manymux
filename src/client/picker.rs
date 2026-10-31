@@ -55,9 +55,8 @@ use crate::style;
 /// screen rather than something welded to its edges.
 const MARGIN: u16 = 2;
 
-/// Rows the box spends on its frame: the title, the rule above the hints, the
-/// hints, and the bottom edge.
-const FURNITURE: u16 = 4;
+/// Frame rows excluding the variable-height keyboard guide.
+const FRAME: u16 = 5;
 
 /// The narrowest box worth drawing. Below this the columns collide and the
 /// popup says less than the mark row does.
@@ -405,7 +404,9 @@ impl Picker {
             colour: style::coloured(),
         };
         let width = layout.width;
-        let height = u16::try_from(shape.visible).unwrap_or(u16::MAX) + FURNITURE;
+        let height = u16::try_from(shape.visible).unwrap_or(u16::MAX)
+            + FRAME
+            + u16::try_from(shape.hints.len()).unwrap_or(u16::MAX);
         out.push_str(&self.cleared(&shape, height));
         self.drawn = Some((shape.row, height));
         let mut line = shape.row;
@@ -415,15 +416,25 @@ impl Picker {
             out.push_str(&piece);
         };
 
-        // The title sits in the rule rather than on a row of blanks. Padded
-        // with spaces it read as an unfinished edge next to the solid one above
-        // the hints, which is the same box drawn two ways.
         put(
             line,
-            &style::faint(&format!(
-                "┌{}┐",
-                rule(&format!(" {} ", self.title()), width)
-            )),
+            &style::faint(&format!("┌{}┐", "─".repeat(usize::from(width)))),
+        );
+        line += 1;
+        let title = fit(&format!("  {}", self.title()), width);
+        put(
+            line,
+            &format!(
+                "{}{}{}",
+                style::faint("│"),
+                style::value(&title),
+                style::faint("│")
+            ),
+        );
+        line += 1;
+        put(
+            line,
+            &style::faint(&format!("├{}┤", "─".repeat(usize::from(width)))),
         );
         line += 1;
 
@@ -446,11 +457,13 @@ impl Picker {
             &style::faint(&format!("├{}┤", "─".repeat(usize::from(width)))),
         );
         line += 1;
-        put(
-            line,
-            &style::faint(&format!("│{}│", fit(&format!(" {} ", self.hints), width))),
-        );
-        line += 1;
+        for hint in &shape.hints {
+            put(
+                line,
+                &style::faint(&format!("│{}│", fit(&format!(" {hint}"), width))),
+            );
+            line += 1;
+        }
         put(
             line,
             &style::faint(&format!("└{}┘", "─".repeat(usize::from(width)))),
@@ -586,10 +599,12 @@ impl Picker {
             .cols
             .saturating_sub(MARGIN * 2 + 2)
             .clamp(MIN_COLS, WIDEST);
-        if inner + MARGIN * 2 + 2 > size.cols || size.rows < FURNITURE + 3 {
+        let hints = wrap_hints(&self.hints, inner.saturating_sub(2));
+        let furniture = FRAME + u16::try_from(hints.len()).unwrap_or(u16::MAX);
+        if inner + MARGIN * 2 + 2 > size.cols || size.rows < furniture + 3 {
             return None;
         }
-        let room = size.rows.saturating_sub(FURNITURE + 2);
+        let room = size.rows.saturating_sub(furniture + 2);
         let visible = usize::from(room).min(self.rows.len()).max(1);
         // Scrolled just far enough to keep the highlight on screen, rather than
         // centred: a list that slides under every keypress is harder to read
@@ -599,7 +614,7 @@ impl Picker {
         } else {
             self.at + 1 - visible
         };
-        let height = u16::try_from(visible).unwrap_or(u16::MAX) + FURNITURE;
+        let height = u16::try_from(visible).unwrap_or(u16::MAX) + furniture;
         let row = (size.rows.saturating_sub(height)) / 2 + 1;
         let col = (size.cols.saturating_sub(inner + 2)) / 2 + 1;
         Some(Shape {
@@ -608,6 +623,7 @@ impl Picker {
             inner,
             top,
             visible,
+            hints,
         })
     }
 }
@@ -665,6 +681,29 @@ struct Shape {
     inner: u16,
     top: usize,
     visible: usize,
+    hints: Vec<String>,
+}
+
+fn wrap_hints(hints: &str, width: u16) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    for hint in hints.split("  ").filter(|hint| !hint.is_empty()) {
+        let next = if line.is_empty() {
+            hint.to_string()
+        } else {
+            format!("{line}  {hint}")
+        };
+        if !line.is_empty() && columns(&next) > width {
+            lines.push(line);
+            line = hint.to_string();
+        } else {
+            line = next;
+        }
+    }
+    if !line.is_empty() {
+        lines.push(line);
+    }
+    lines
 }
 
 fn at(row: u16, col: u16) -> String {
@@ -706,14 +745,6 @@ fn fit(text: &str, width: u16) -> String {
     let text = clip(text, width);
     let short = usize::from(width.saturating_sub(columns(&text)));
     format!("{text}{}", " ".repeat(short))
-}
-
-/// The same, but what is left over is the box's own edge rather than blank, so
-/// a title sits in the rule instead of in a gap in it.
-fn rule(text: &str, width: u16) -> String {
-    let text = clip(text, width);
-    let short = usize::from(width.saturating_sub(columns(&text)));
-    format!("{text}{}", "─".repeat(short))
 }
 
 /// The same, padded on the left instead.
@@ -801,6 +832,19 @@ mod tests {
 
     fn one_row() -> Picker {
         picker(vec![Row::new(0, "build").detail("cargo").note("2m")], 0)
+    }
+
+    #[test]
+    fn keyboard_guide_wraps_without_losing_actions() {
+        let hints = "enter go  / search  1-9 recent  r rename  m group  g show  n new";
+        let mut picker = Picker::new("sessions", hints, vec![Row::new(0, "build")], 0);
+        let lines = seen(&mut picker, Size { cols: 48, rows: 24 });
+        for action in hints.split("  ") {
+            assert!(
+                lines.iter().any(|line| line.contains(action)),
+                "missing {action}: {lines:?}"
+            );
+        }
     }
 
     #[test]

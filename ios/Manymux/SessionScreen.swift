@@ -37,6 +37,7 @@ final class Attachment {
 struct SessionScreen: View {
     @Environment(AppModel.self) private var model
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.scenePhase) private var phase
     @Environment(\.verticalSizeClass) private var verticalSize
     let machine: Machine
     let name: String
@@ -45,6 +46,7 @@ struct SessionScreen: View {
     @SwiftUI.State private var held = Held()
     @SwiftUI.State private var terminal: TerminalView?
     @SwiftUI.State private var toast = Toast()
+    @SwiftUI.State private var wasBackgrounded = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -102,6 +104,14 @@ struct SessionScreen: View {
             while !Task.isCancelled {
                 model.refresh(machine)
                 try? await Task.sleep(for: .seconds(15))
+            }
+        }
+        .onChange(of: phase) { _, now in
+            if now == .background {
+                wasBackgrounded = true
+            } else if now == .active && wasBackgrounded {
+                wasBackgrounded = false
+                attachment.attach?.resume()
             }
         }
         .onDisappear {

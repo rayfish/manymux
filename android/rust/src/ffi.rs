@@ -13,6 +13,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use manymux::proto::{SessionInfo, Size, SpawnSpec};
 use tokio::runtime::Runtime;
@@ -206,6 +207,13 @@ impl Phone {
         }))
     }
 
+    /// Discard a pooled connection that may have gone stale in the background.
+    pub fn resume(&self) {
+        let connections = Arc::clone(&self.connections);
+        self.runtime
+            .spawn(async move { connections.forget().await });
+    }
+
     /// The line to paste into a machine's `authorized_keys`.
     pub fn authorized_line(&self) -> String {
         self.identity.authorized_line()
@@ -249,9 +257,15 @@ impl Phone {
             // Named rather than left empty, so a session started between the
             // two requests is not a screen the app has no row to put under.
             let names = running.iter().map(|one| one.name.clone()).collect();
-            let peeked = peek(&*connection, reached.program, names).await;
-            let previews = peeked.is_ok();
+            let peeked = tokio::time::timeout(
+                Duration::from_secs(10),
+                peek(&*connection, reached.program, names),
+            )
+            .await;
+            let previews = matches!(peeked, Ok(Ok(_)));
             let screens = peeked
+                .ok()
+                .and_then(Result::ok)
                 .unwrap_or_default()
                 .into_iter()
                 .map(|one| {
@@ -352,15 +366,21 @@ impl Phone {
 
     /// What is running there, with the ladder climbed to find out.
     async fn listing(&self, connection: &Connection) -> Result<Reached, Trouble> {
-        match reach(connection).await {
-            Ok(reached) => Ok(reached),
-            Err(error) => {
+        match tokio::time::timeout(Duration::from_secs(10), reach(connection)).await {
+            Ok(Ok(reached)) => Ok(reached),
+            outcome => {
                 // Held connections go stale silently on a phone, so a failure
                 // on one is a failure of the pool as much as of the request:
                 // dropped here, the retry somebody makes by pressing the
                 // button again opens a fresh one.
                 self.connections.forget().await;
-                Err(error.into())
+                match outcome {
+                    Ok(Err(error)) => Err(error.into()),
+                    Err(_) => Err(Trouble::Reaching {
+                        why: "listing sessions timed out".into(),
+                    }),
+                    Ok(Ok(_)) => unreachable!("successful listings are handled above"),
+                }
             }
         }
     }
@@ -425,6 +445,11 @@ impl Attach {
 
     pub fn resize(&self, grid: Grid) {
         self.session.resize(grid.into());
+    }
+
+    /// Refresh the connection after the app returns from the background.
+    pub fn resume(&self) {
+        self.session.resume();
     }
 
     /// Leave, without ending anything on the machine.

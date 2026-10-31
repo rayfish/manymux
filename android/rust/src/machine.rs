@@ -386,7 +386,14 @@ impl Connections {
         {
             return Ok(Arc::clone(&held.connection));
         }
-        let connection = Arc::new(Connection::open(machine, identity, known).await?);
+        let connection = Arc::new(
+            timeout(
+                Duration::from_secs(10),
+                Connection::open(machine, identity, known),
+            )
+            .await
+            .context("connection timed out")??,
+        );
         *holding = Some(Held {
             machine: machine.clone(),
             connection: Arc::clone(&connection),

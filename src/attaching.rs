@@ -280,35 +280,58 @@ pub(crate) async fn do_attach(
             // the popup opens, and the popup then started a second one from
             // scratch: two ssh commands per host for one keypress, and an empty
             // box for as long as the second took.
-            let mut running = listing.take();
+            let mut running = AbortListing(listing.take());
             tokio::spawn(async move {
                 let mut refresh = tokio::time::interval(LISTING_EVERY);
                 refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 loop {
-                    let reload = tokio::select! {
+                    let landed = tokio::select! {
                         request = wanted.recv() => {
                             if request.is_none() { return; }
-                            true
+                            if running.0.is_none() {
+                                running.0 = Some(spawn_listing(&socket));
+                            }
+                            continue;
                         },
-                        _ = refresh.tick() => true,
+                        _ = refresh.tick() => {
+                            if running.0.is_none() {
+                                running.0 = Some(spawn_listing(&socket));
+                            }
+                            continue;
+                        },
                         changed = names.changed() => {
                             if changed.is_err() { return; }
-                            false
+                            None
+                        },
+                        result = async { running.0.as_mut().expect("guarded by is_some").await }, if running.0.is_some() => {
+                            running.0 = None;
+                            match result {
+                                Ok(snapshot) => Some(snapshot),
+                                Err(error) => {
+                                    debug!("popup listing task failed: {error}");
+                                    continue;
+                                }
+                            }
                         },
                     };
-                    let mut snapshot = if reload {
-                        let listing = match running.take() {
-                            Some(task) => match task.await {
-                                Ok(snapshot) => Ok(snapshot),
-                                Err(_) => continue,
-                            },
-                            None => survey(&socket).await,
-                        };
-                        let Ok(snapshot) = listing else { continue };
-                        snapshot.following(&cached)
-                    } else {
-                        cached.clone()
+                    let mut snapshot = match landed {
+                        Some(snapshot) => snapshot.following(&cached),
+                        None => cached.clone(),
                     };
+                    for change in snapshot.renames_since(&cached) {
+                        let was = change.was;
+                        let name = change.name;
+                        // The attach stream owns the current session's name.
+                        if recent.first() == Some(&was) {
+                            continue;
+                        }
+                        previous.renamed(&was, &name);
+                        for at in &mut recent {
+                            if *at == was {
+                                at.session = name.clone();
+                            }
+                        }
+                    }
                     let confirmed = names.borrow_and_update().clone();
                     if let Some(current) = recent.first_mut() {
                         let now = Located::new(
@@ -469,6 +492,17 @@ pub(crate) async fn do_attach(
                 // it but before the popup painted the answer.
                 if subject.is_some_and(|row| !listed.available(row)) {
                     notice = Some("that session is offline".to_string());
+                    listing = Some(spawn_listing(socket));
+                    continue;
+                }
+                // A cached name can be tried for an attach, but it cannot
+                // safely identify a session for a mutating action.
+                if !matches!(chose, Chose::Go(_))
+                    && subject
+                        .and_then(|row| listed.at.get(row))
+                        .is_some_and(|at| at != cycle.current() && snapshot.info(at).is_none())
+                {
+                    notice = Some("refresh the session before changing it".to_string());
                     listing = Some(spawn_listing(socket));
                     continue;
                 }
@@ -1150,11 +1184,30 @@ async fn take_listing(
     }
 }
 
+/// Abort an outstanding survey when its owning popup task ends.
+struct AbortListing(Option<JoinHandle<Snapshot>>);
+
+impl Drop for AbortListing {
+    fn drop(&mut self) {
+        if let Some(task) = &self.0 {
+            task.abort();
+        }
+    }
+}
+
 /// What the popup's lister last found: the rows it handed the popup, and the
 /// snapshot they were built from.
 struct Fresh {
     listed: Listed,
     snapshot: Snapshot,
+}
+
+fn reconcile_cycle(landed: &Snapshot, previous: &Snapshot, cycle: &mut Cycle) {
+    for change in landed.renames_since(previous) {
+        if &change.was != cycle.current() {
+            cycle.renamed_at(&change.was, &change.name);
+        }
+    }
 }
 
 /// Take a listing that landed as the one the switch keys walk.
@@ -1164,6 +1217,7 @@ struct Fresh {
 /// one this run started with.
 fn absorb(landed: Snapshot, snapshot: &mut Snapshot, cycle: &mut Cycle, groups: &mut Groups) {
     let _ = landed.refresh(groups);
+    reconcile_cycle(&landed, snapshot, cycle);
     *snapshot = landed.following(snapshot);
     cycle.refresh(snapshot.entries(groups));
 }
@@ -1194,6 +1248,35 @@ mod tests {
                 node: String::new(),
             },
         }
+    }
+
+    #[test]
+    fn a_rename_in_another_client_keeps_the_recent_shortcut() {
+        let host = as_listed(LOCAL);
+        let mut old = listed_session("test", 7);
+        old.session.started += Duration::from_secs(1);
+        let mut renamed = old.clone();
+        renamed.session.name = "check".into();
+        let before = Snapshot {
+            sessions: vec![old],
+            ..Snapshot::default()
+        };
+        let after = Snapshot {
+            sessions: vec![renamed],
+            ..Snapshot::default()
+        };
+        let mut cycle = Cycle::new(Located::new(host, "test"));
+        cycle.moved_to(Located::new(host, "build"));
+        reconcile_cycle(&after, &before, &mut cycle);
+        let listed = Listed::new(&after, &Groups::default(), &[], &cycle);
+        let row = listed
+            .rows
+            .sessions
+            .iter()
+            .find(|row| row.label == "check")
+            .unwrap();
+        assert_eq!(row.number, Some(2));
+        assert_eq!(cycle.step(Motion::Last), Some(Located::new(host, "check")));
     }
 
     #[tokio::test]

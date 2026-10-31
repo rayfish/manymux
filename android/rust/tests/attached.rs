@@ -212,6 +212,27 @@ async fn the_screen_comes_back_painted_with_what_the_session_had_on_it() {
 }
 
 #[tokio::test]
+async fn returning_to_the_app_reconnects_and_keeps_the_session_usable() {
+    let reaching = reaching("attach-resumed", How::Steady, Serving::forever()).await;
+    until_it_says(&reaching.session, "ready").await;
+    reaching.session.resume();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while served(&reaching.connections) < 4 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the session reconnects on return");
+    until_it_says(&reaching.session, "ready").await;
+    reaching.session.send(b"after resume".to_vec());
+    assert!(
+        until_it_says(&reaching.session, "after resume")
+            .await
+            .contains("after resume")
+    );
+}
+
+#[tokio::test]
 async fn a_probe_is_answered_without_anything_asking_for_a_frame() {
     let session = attached("attach-ping", How::Steady).await;
     // Nothing is drawing: no `take_frame` until the assertion below, which is

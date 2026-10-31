@@ -24,6 +24,7 @@
 //! Reconnect listings also match the original pid and start time, so a rename
 //! while disconnected follows the same session. A replacement on the same node
 //! is refused; a fresh node may restore the original name under a new pid.
+//! Returning from the background replaces a potentially stale connection.
 //! Input is bounded by message count and queued bytes. Overflow cancels this
 //! client with an explicit failure, leaving the node's session running.
 
@@ -127,9 +128,8 @@ impl Inbox {
 /// that reaches something which never sends a banner will sit there for as
 /// long as the network lets it.
 ///
-/// It applies to reconnects alone: the first attach of a run is a thing
-/// somebody asked for, and may legitimately be a cold ssh, a node starting, or
-/// an install being answered.
+/// It also bounds the first attach, so a stale pooled connection cannot leave
+/// the app waiting indefinitely.
 const REACH_FOR: Duration = Duration::from_secs(10);
 
 /// How long an attach has to last before it counts as having worked.
@@ -201,6 +201,7 @@ pub struct Session {
     task: JoinHandle<()>,
     forced: Mutex<Option<State>>,
     state: watch::Receiver<State>,
+    resume: watch::Sender<u64>,
 }
 
 impl Session {
@@ -223,7 +224,14 @@ impl Session {
         };
         let (state, watching) = watch::channel(State::Reaching);
 
-        let task = tokio::spawn(keep_attached(attaching, surfaces.clone(), said, state));
+        let (resume, resumed) = watch::channel(0);
+        let task = tokio::spawn(keep_attached(
+            attaching,
+            surfaces.clone(),
+            said,
+            state,
+            resumed,
+        ));
 
         Self {
             surfaces,
@@ -232,6 +240,7 @@ impl Session {
             task,
             forced: Mutex::new(None),
             state: watching,
+            resume,
         }
     }
 
@@ -329,6 +338,12 @@ impl Session {
     /// The view as it should now look, taken the way a frame is.
     pub fn take_window(&self) -> Window {
         held(&self.surfaces.scrolling).take_window()
+    }
+
+    /// Reconnect after the app returns from the background.
+    pub fn resume(&self) {
+        self.resume
+            .send_modify(|generation| *generation = generation.wrapping_add(1));
     }
 
     /// Leave, without ending anything.
@@ -468,12 +483,21 @@ impl SessionId {
     }
 }
 
+struct Painter(JoinHandle<()>);
+
+impl Drop for Painter {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// Reach the session, attach, and keep doing so.
 async fn keep_attached(
     mut attaching: Attaching,
     surfaces: Surfaces,
     mut said: Inbox,
     state: watch::Sender<State>,
+    mut resumed: watch::Receiver<u64>,
 ) {
     let mut tries = 0u32;
     let mut ever = false;
@@ -481,7 +505,16 @@ async fn keep_attached(
 
     loop {
         let _ = state.send(State::Reaching);
-        let reached = reaching(&mut attaching, identity.clone(), ever, &surfaces, &mut said).await;
+        let reached = tokio::select! {
+            reached = reaching(&mut attaching, identity.clone(), &surfaces, &mut said) => reached,
+            changed = resumed.changed() => {
+                if changed.is_ok() {
+                    attaching.connections.forget().await;
+                    continue;
+                }
+                return;
+            }
+        };
         match reached {
             // The back button, pressed while it was still trying.
             None => {
@@ -503,7 +536,19 @@ async fn keep_attached(
                 held(&surfaces.scrolling).close();
                 let _ = state.send(State::Attached);
                 let began = Instant::now();
-                match pump(riding, &surfaces, &mut said, &mut attaching).await {
+                let (ending, resumed_now) = tokio::select! {
+                    ending = pump(riding, &surfaces, &mut said, &mut attaching) => (ending, false),
+                    changed = resumed.changed() => {
+                        if changed.is_err() { return; }
+                        (Ending::Lost, true)
+                    }
+                };
+                if resumed_now {
+                    attaching.connections.forget().await;
+                    tries = 0;
+                    continue;
+                }
+                match ending {
                     Ending::Exited(code) => {
                         let _ = state.send(State::Ended { status: code });
                         return;
@@ -532,6 +577,7 @@ async fn keep_attached(
                 return;
             }
             Some(Err(Missed::Machine(error))) => {
+                attaching.connections.forget().await;
                 // The first attach is a thing somebody asked for, and its
                 // failure is an answer: the machine is not reachable. Every
                 // failure after it is a connection that went, and the session
@@ -552,6 +598,11 @@ async fn keep_attached(
         loop {
             tokio::select! {
                 _ = &mut waiting => break,
+                changed = resumed.changed() => {
+                    if changed.is_err() { return; }
+                    attaching.connections.forget().await;
+                    break;
+                }
                 asked = said.recv() => match asked {
                     // The back button, pressed while the screen says the
                     // connection went. There is nothing to detach from, so it
@@ -586,7 +637,6 @@ async fn keep_attached(
 async fn reaching(
     attaching: &mut Attaching,
     identity: Option<SessionId>,
-    ever: bool,
     surfaces: &Surfaces,
     said: &mut Inbox,
 ) -> Option<Result<Riding, Missed>> {
@@ -595,7 +645,7 @@ async fn reaching(
     let at = attaching.machine.at();
     let attempt = attach(attaching.clone(), identity);
     tokio::pin!(attempt);
-    let deadline = tokio::time::sleep(if ever { REACH_FOR } else { Duration::MAX });
+    let deadline = tokio::time::sleep(REACH_FOR);
     tokio::pin!(deadline);
 
     loop {
@@ -732,9 +782,9 @@ async fn pump(
     } = riding.attached.split();
 
     let (painting, mut to_paint) = mpsc::channel::<Paint>(BACKLOG);
-    let painter = {
+    let mut painter = {
         let screen = Arc::clone(screen);
-        tokio::spawn(async move {
+        Painter(tokio::spawn(async move {
             while let Some(paint) = to_paint.recv().await {
                 let mut screen = held(&screen);
                 match paint {
@@ -743,7 +793,7 @@ async fn pump(
                     Paint::Resized(size) => screen.resize(size),
                 }
             }
-        })
+        }))
     };
 
     // The size the session settled on, which with a desktop attached may be
@@ -881,6 +931,6 @@ async fn pump(
     };
 
     drop(painting);
-    let _ = painter.await;
+    let _ = (&mut painter.0).await;
     ending
 }

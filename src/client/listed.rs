@@ -20,12 +20,15 @@
 //! creation or rename, so its absence cannot move the opening highlight.
 //! Cached sessions stay visible when their host does not answer. A successful
 //! answer removes sessions the host no longer lists.
-//! Only fresh answers drive switching and group pruning; cached rows are dimmed.
+//! Only fresh answers drive group pruning. Cached rows on the attached host can
+//! still be selected; the attach attempt checks whether they exist.
 //! A confirmed exit also removes its cached row before the next listing arrives.
 //! A confirmed rename updates both fresh and cached rows immediately, preserving
 //! the session's identity and group while the next listing is still pending.
 //! A rename received on an attach stream also keeps issued ids, and overrides
 //! older names in a listing by the session's stable membership identity.
+
+use std::time::UNIX_EPOCH;
 
 use anyhow::Result;
 
@@ -61,6 +64,12 @@ pub struct Snapshot {
     /// answer can arrive long after it was asked for, and a session moved into
     /// a group while it was out must not be taken out again by it.
     pub before: Groups,
+}
+
+/// A session address that changed in a fresh listing.
+pub struct SessionRename {
+    pub was: Located,
+    pub name: String,
 }
 
 impl Snapshot {
@@ -136,6 +145,42 @@ impl Snapshot {
         self.sessions
             .iter()
             .any(|live| live.host == located.host && live.session.name == located.session)
+    }
+
+    /// Match names across fresh answers only when the session identity is unique.
+    pub fn renames_since(&self, previous: &Self) -> Vec<SessionRename> {
+        let mut changes = Vec::new();
+        for old in previous
+            .known()
+            .iter()
+            .filter(|row| row.session.pid != 0 && row.session.started > UNIX_EPOCH)
+        {
+            let member = Member::of(&old.host, &old.session);
+            let mut before = previous
+                .known()
+                .iter()
+                .filter(|row| Member::of(&row.host, &row.session) == member);
+            if before.next().is_none() || before.next().is_some() {
+                continue;
+            }
+            let mut after = self
+                .sessions
+                .iter()
+                .filter(|row| Member::of(&row.host, &row.session) == member);
+            if let Some(now) = after.next()
+                && after.next().is_none()
+                && old.session.name != now.session.name
+                && (old.session.node.is_empty()
+                    || now.session.node.is_empty()
+                    || old.session.node == now.session.node)
+            {
+                changes.push(SessionRename {
+                    was: Located::new(&old.host, &old.session.name),
+                    name: now.session.name.clone(),
+                });
+            }
+        }
+        changes
     }
 
     /// The listing as the switch keys want it: an address, and the group it is
@@ -382,9 +427,10 @@ impl Listed {
             .filter(|row| !row.heading && row.id != CURRENT)
         {
             let located = &at[row.id];
-            row.available = snapshot.available(located);
-            if !row.available {
-                row.note = "n/a".to_string();
+            let fresh = snapshot.available(located);
+            row.available = fresh || same_machine(&located.host, &current.host);
+            if !fresh {
+                row.note = if row.available { "cached" } else { "n/a" }.to_string();
             }
         }
         // The digits, handed out along the trail rather than down the box: the
@@ -794,6 +840,67 @@ mod tests {
         assert_eq!(row.id, id);
         assert_eq!(row.detail, "training");
         assert_eq!(returned.cached.len(), 2);
+    }
+
+    #[test]
+    fn a_fresh_listing_matches_renamed_sessions_by_identity() {
+        let mut old = hosted_on("build-box", "test");
+        old.session.pid = 12;
+        old.session.started = UNIX_EPOCH + std::time::Duration::from_secs(1);
+        let mut renamed = old.clone();
+        renamed.session.name = "check".into();
+        let previous = Snapshot {
+            sessions: vec![old.clone()],
+            ..Snapshot::default()
+        };
+        let fresh = Snapshot {
+            sessions: vec![renamed],
+            ..Snapshot::default()
+        };
+        let changes = fresh.renames_since(&previous);
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].was, Located::new("build-box", "test"));
+        assert_eq!(changes[0].name, "check");
+
+        let mut restarted = fresh.clone();
+        old.session.node = "first-node".into();
+        restarted.sessions[0].session.node = "new-node".into();
+        let before_restart = Snapshot {
+            sessions: vec![old.clone()],
+            ..Snapshot::default()
+        };
+        assert!(restarted.renames_since(&before_restart).is_empty());
+
+        let mut ambiguous = old.clone();
+        ambiguous.session.name = "other".into();
+        let previous = Snapshot {
+            sessions: vec![old, ambiguous],
+            ..Snapshot::default()
+        };
+        assert!(fresh.renames_since(&previous).is_empty());
+    }
+
+    #[test]
+    fn cached_sessions_on_the_attached_machine_can_be_selected() {
+        let current = Located::new("build-box", "build");
+        let initial = Snapshot {
+            sessions: vec![
+                hosted_on("build-box", "build"),
+                hosted_on("build-box", "test"),
+            ],
+            answered: vec!["build-box".into()],
+            ..Snapshot::default()
+        };
+        let missing = Snapshot::default().following(&initial);
+        let listed = Listed::of(&missing, &Groups::default(), &[], None, from_ref(&current));
+        let row = listed
+            .rows
+            .sessions
+            .iter()
+            .find(|row| row.label == "test")
+            .unwrap();
+        assert!(row.available);
+        assert_eq!(row.note, "cached");
     }
 
     #[test]

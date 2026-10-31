@@ -2371,7 +2371,7 @@ fn a_switch_key_that_lands_nowhere_asks_where_to_go_again() {
         }
         // Start only after the first move, so a background refresh cannot
         // give that move somewhere to land before we make it.
-        if alone && !created && seen.contains("┌ sessions") {
+        if alone && !created && seen.contains("│  sessions") {
             created = true;
             world.ok("gpu-box", &["new", "-d", "-n", "second", "sleep", "300"]);
         }
@@ -3090,7 +3090,7 @@ fn the_new_key_is_refused_in_a_viewing_run_and_hands_the_keyboard_back() {
     // up on the way into control mode, and it is what the refusal below has to
     // hand the keyboard back to.
     (&pty).write_all(b"\x1d").unwrap();
-    wait_for(&mut seen, "┌ sessions");
+    wait_for(&mut seen, "│  sessions");
     for &key in b"nN" {
         seen.clear();
         (&pty).write_all(&[key]).unwrap();
@@ -4131,7 +4131,7 @@ fn a_new_session_started_inside_a_group_widens_the_run() {
 
     // And the popup over it, which is where the narrowing shows.
     writer.write_all(&[0x1d, b'\t']).unwrap();
-    wait_for(&mut seen, "┌ sessions");
+    wait_for(&mut seen, "│  sessions");
     let _ = client.kill();
     let _ = client.wait();
 
@@ -4143,7 +4143,7 @@ fn a_new_session_started_inside_a_group_widens_the_run() {
     // unnarrowed box paints, and it is the only row of the box the run's own
     // shell cannot spell by accident.
     assert!(
-        seen.contains("┌ sessions ─"),
+        seen.contains("│  sessions "),
         "the popup is not the unnarrowed one: {seen:?}"
     );
 }

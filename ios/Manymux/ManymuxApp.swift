@@ -6,6 +6,7 @@ struct ManymuxApp: App {
     @SwiftUI.State private var model = AppModel()
     @Environment(\.scenePhase) private var phase
     @SwiftUI.State private var lingering: UIBackgroundTaskIdentifier = .invalid
+    @SwiftUI.State private var wasBackgrounded = false
 
     var body: some Scene {
         WindowGroup {
@@ -47,15 +48,21 @@ struct ManymuxApp: App {
     private func linger(_ now: ScenePhase) {
         switch now {
         case .background:
+            wasBackgrounded = true
             guard lingering == .invalid else { return }
             lingering = UIApplication.shared.beginBackgroundTask(withName: "attached") {
                 UIApplication.shared.endBackgroundTask(lingering)
                 lingering = .invalid
             }
         case .active:
-            guard lingering != .invalid else { return }
-            UIApplication.shared.endBackgroundTask(lingering)
-            lingering = .invalid
+            if lingering != .invalid {
+                UIApplication.shared.endBackgroundTask(lingering)
+                lingering = .invalid
+            }
+            guard wasBackgrounded else { return }
+            wasBackgrounded = false
+            if case .session = model.path.last { return }
+            model.phone?.resume()
         default:
             break
         }
