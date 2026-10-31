@@ -9,7 +9,8 @@
 //! parked [`Connection`] drains the old output through an acknowledgement
 //! before accepting another attach; it keeps no session alive on the client.
 //! Remote OS discovery runs before a request. The Windows launcher reports
-//! 127 only when neither PATH nor the per-user install contains mm.exe.
+//! availability explicitly before sending any request, since a PowerShell SSH
+//! default shell can turn the missing-program exit status 127 into 1.
 //! File uploads use a separate `Paste` request stream, leaving attach traffic
 //! free to carry keys and keepalives. Upload failures are never retried.
 
@@ -338,15 +339,21 @@ impl Stream {
         heard: Heard,
         quiet: bool,
     ) -> Result<Self> {
-        let platform = crate::ssh::detect(host, quiet).await?;
+        let detected = crate::ssh::detect(host, quiet).await?;
+        if detected.missing {
+            if !consent.as_ref().is_some_and(|ask| ask(host)) {
+                bail!("{host}: no mm there, or none on the PATH a non-interactive ssh gets");
+            }
+            crate::ssh::install_on(host, detected.platform).await?;
+        }
         let ssh = Ssh {
-            platform,
+            platform: detected.platform,
             quiet,
             host: host.to_string(),
             open,
             consent,
             program: 0,
-            installed: false,
+            installed: detected.missing,
         };
         let agent = ssh.connect()?;
         Ok(Self {

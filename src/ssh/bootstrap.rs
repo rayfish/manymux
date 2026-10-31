@@ -15,9 +15,12 @@ pub(crate) enum Platform {
     Windows,
 }
 
-const WINDOWS_PROBE: &str = "powershell.exe -NoLogo -NoProfile -NonInteractive -Command \"if ([Environment]::OSVersion.Platform -eq 'Win32NT') { [Console]::Write('manymux-windows') } else { exit 1 }\"";
+pub(crate) struct Detected {
+    pub(crate) platform: Platform,
+    pub(crate) missing: bool,
+}
 
-pub(crate) async fn detect(host: &str, quiet: bool) -> Result<Platform> {
+pub(crate) async fn detect(host: &str, quiet: bool) -> Result<Detected> {
     let unix = probe(host, "uname -s", quiet).await?;
     if unix.status.code() == Some(255) {
         bail!(
@@ -28,16 +31,33 @@ pub(crate) async fn detect(host: &str, quiet: bool) -> Result<Platform> {
     if unix.status.success() {
         let os = String::from_utf8_lossy(&unix.stdout);
         match os.trim() {
-            "Linux" | "Darwin" | "FreeBSD" | "OpenBSD" | "NetBSD" => return Ok(Platform::Unix),
+            "Linux" | "Darwin" | "FreeBSD" | "OpenBSD" | "NetBSD" => {
+                return Ok(Detected {
+                    platform: Platform::Unix,
+                    missing: false,
+                });
+            }
             name if name.starts_with("MINGW")
                 || name.starts_with("MSYS")
                 || name.starts_with("CYGWIN") => {}
             other => bail!("{host}: unsupported remote platform {other:?}"),
         }
     }
-    let windows = probe(host, WINDOWS_PROBE, quiet).await?;
-    if windows.status.success() && windows.stdout == b"manymux-windows" {
-        return Ok(Platform::Windows);
+    let script = format!(
+        "$manymuxProbe=$true;\n{}",
+        include_str!("windows-agent.ps1")
+    );
+    let windows = probe(host, &powershell(&script), quiet).await?;
+    if windows.status.success() {
+        match windows.stdout.as_slice() {
+            b"manymux-windows" | b"manymux-windows-missing" => {
+                return Ok(Detected {
+                    platform: Platform::Windows,
+                    missing: windows.stdout == b"manymux-windows-missing",
+                });
+            }
+            _ => {}
+        }
     }
     bail!(
         "{host}: cannot identify the remote platform: {}",
@@ -65,6 +85,7 @@ async fn probe(host: &str, script: &str, quiet: bool) -> Result<Output> {
 }
 
 pub(crate) fn powershell(script: &str) -> String {
+    let script = format!("$ProgressPreference='SilentlyContinue';\n{script}");
     let bytes: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
     format!(
         "powershell.exe -NoLogo -NoProfile -NonInteractive -EncodedCommand {}",
@@ -101,6 +122,9 @@ mod tests {
             .iter()
             .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
             .collect();
-        assert_eq!(String::from_utf16(&units).unwrap(), script);
+        assert_eq!(
+            String::from_utf16(&units).unwrap(),
+            format!("$ProgressPreference='SilentlyContinue';\n{script}")
+        );
     }
 }

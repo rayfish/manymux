@@ -1,6 +1,7 @@
 # PowerShell must not decode the protocol as text. The child inherits the SSH
 # handles directly, without entering a PowerShell pipeline.
 $ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
 try {
     $command = Get-Command mm.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($command) {
@@ -8,7 +9,15 @@ try {
     } else {
         $binary = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'manymux\mm.exe'
     }
-    if (-not [IO.File]::Exists($binary)) { exit 127 }
+    $exists = [IO.File]::Exists($binary)
+    # A PowerShell SSH default shell can turn native exit 127 into exit 1.
+    # Discovery reports availability on stdout before any request is sent.
+    if ($manymuxProbe) {
+        if ($exists) { [Console]::Write('manymux-windows') }
+        else { [Console]::Write('manymux-windows-missing') }
+        exit 0
+    }
+    if (-not $exists) { exit 127 }
     $start = New-Object System.Diagnostics.ProcessStartInfo
     $start.FileName = $binary
     $start.Arguments = 'agent'

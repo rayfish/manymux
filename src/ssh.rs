@@ -215,7 +215,7 @@ pub async fn ask(host: &str, script: &str) -> Result<Vec<u8>> {
 /// password on it would quietly take the per-user fallback instead. Windows
 /// installs for the current account through PowerShell without a terminal.
 pub async fn install(host: &str) -> Result<()> {
-    install_on(host, detect(host, false).await?).await
+    install_on(host, detect(host, false).await?.platform).await
 }
 
 pub(crate) async fn install_on(host: &str, platform: Platform) -> Result<()> {

@@ -91,8 +91,13 @@ impl World {
         let windows_agent = match mm {
             Mm::WindowsInHome => "true",
             Mm::WindowsAgentFails => "echo agent-failed >&2; exit 1",
-            Mm::WindowsStillMissing => "exit 127",
-            _ => r#"[ -f "$installed" ] || exit 127"#,
+            Mm::WindowsStillMissing => "exit 1",
+            _ => r#"[ -f "$installed" ] || exit 1"#,
+        };
+        let windows_available = if matches!(mm, Mm::WindowsInHome | Mm::WindowsAgentFails) {
+            "true"
+        } else {
+            r#"[ -f "$installed" ]"#
         };
         let windows_install = if matches!(mm, Mm::WindowsInstallFails) {
             "exit 1"
@@ -109,7 +114,7 @@ impl World {
         );
         let platform_probe = if is_windows {
             r#"if [ "$1" = "uname -s" ]; then echo 'uname is not recognized' >&2; exit 1; fi
-case "$1" in *manymux-windows*) printf manymux-windows; exit 0 ;; esac"#
+"#
         } else if matches!(mm, Mm::Unreachable) {
             r#"if [ "$1" = "uname -s" ]; then echo "ssh: No route to host" >&2; exit 255; fi"#
         } else {
@@ -142,6 +147,9 @@ case "$1" in
     powershell.exe*)
         script=$(python3 -c 'import base64,sys; print(base64.b64decode(sys.argv[1].split()[-1]).decode("utf-16-le"))' "$1") || exit 1
         case "$script" in
+            *'$manymuxProbe=$true;'*)
+                if {windows_available}; then printf manymux-windows; else printf manymux-windows-missing; fi
+                exit 0 ;;
             *install.ps1*) printf '%s' "$script" > "$installed"; {windows_install} ;;
         esac
         printf 'agent\n' >> "{dir}/$host.agent-attempts"
@@ -4274,11 +4282,15 @@ fn windows_bootstrap_requires_consent_and_stops_after_a_failed_install() {
             world.on_a_terminal("laptop", &["new", "-d", "gpu-box", "sleep", "60"], answer);
         assert!(!ok, "{seen}");
         assert_eq!(world.installer_ran_on("gpu-box").is_some(), installed);
-        let attempts = std::fs::read_to_string(world.dir.join("gpu-box.agent-attempts")).unwrap();
-        assert_eq!(
-            attempts.lines().count(),
-            if id == "still-missing" { 2 } else { 1 }
-        );
+        let attempts = world.dir.join("gpu-box.agent-attempts");
+        if id == "still-missing" {
+            assert_eq!(std::fs::read_to_string(attempts).unwrap(), "agent\n");
+        } else {
+            assert!(
+                !attempts.exists(),
+                "no request may be sent before installation"
+            );
+        }
     }
 }
 

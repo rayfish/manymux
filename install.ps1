@@ -6,6 +6,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 if ([Environment]::OSVersion.Platform -ne 'Win32NT' -or [Environment]::OSVersion.Version.Build -lt 17763 -or -not [Environment]::Is64BitOperatingSystem) {
     throw 'manymux requires 64-bit Windows 10 version 1809 or newer.'
