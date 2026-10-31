@@ -25,6 +25,8 @@ default = ["desktop"]
 # renders the session with its own terminal widget.
 desktop = [
     "dep:pty-process",
+    "dep:portable-pty",
+    "dep:sha2",
     "dep:crossterm",
     "dep:clap",
     "dep:clap_complete",
@@ -60,7 +62,6 @@ dirs = "6.0.0"
 # that is usually skipped is not a check.
 ed25519-dalek = { version = "3.0.0", default-features = false, optional = true }
 libc = "0.2.189"
-pty-process = { version = "0.5.3", features = ["async"], optional = true }
 rmp-serde = "1.3.1"
 serde = { version = "1.0.229", features = ["derive"] }
 tokio = { version = "1.53.1", features = [
@@ -84,9 +85,18 @@ tracing-subscriber = { version = "0.3.23", features = [
 ], optional = true }
 unicode-width = "0.1.14"
 
-[dev-dependencies]
-# A terminal to run the binary on, for the prompts it only puts to a person.
+[target.'cfg(unix)'.dependencies]
+pty-process = { version = "0.5.3", features = ["async"], optional = true }
+
+[target.'cfg(windows)'.dependencies]
+portable-pty = { version = "0.9", optional = true }
+sha2 = { version = "0.11", optional = true }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Threading", "Win32_System_Memory", "Win32_System_Console", "Win32_System_Pipes", "Win32_System_SystemInformation", "Win32_Security_Cryptography", "Win32_Storage_FileSystem"] }
+
+[target.'cfg(unix)'.dev-dependencies]
 pty-process = "0.5.3"
+
+[dev-dependencies]
 # `start_paused`, so a test can sit out the client-liveness deadline without
 # spending three quarters of a minute of real time on it.
 tokio = { version = "1.53.1", features = ["test-util"] }

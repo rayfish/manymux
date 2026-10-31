@@ -1,0 +1,15 @@
+allow-branch = ["master"]
+pre-release-commit-message = "chore: release {{crate_name}} {{version}}"
+tag-message = "release {{version}}"
+
+[[pre-release-replacements]]
+file = "android/rust/Cargo.lock"
+search = 'name = "manymux"\nversion = "[^"]+"'
+replace = "name = \"manymux\"\nversion = \"{{version}}\""
+exactly = 1
+
+[[pre-release-replacements]]
+file = "ios/project.yml"
+search = 'MARKETING_VERSION: "[^"]+"'
+replace = 'MARKETING_VERSION: "{{version}}"'
+exactly = 1

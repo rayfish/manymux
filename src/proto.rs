@@ -237,7 +237,7 @@ impl Default for Size {
 
 // A PTY is a host-side concept, so this conversion does not exist in the
 // client-only build a mobile app links against.
-#[cfg(feature = "desktop")]
+#[cfg(all(feature = "desktop", unix))]
 impl From<Size> for pty_process::Size {
     fn from(s: Size) -> Self {
         pty_process::Size::new(s.rows, s.cols)

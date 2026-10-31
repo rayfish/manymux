@@ -1168,7 +1168,7 @@ fn absorb(landed: Snapshot, snapshot: &mut Snapshot, cycle: &mut Cycle, groups: 
     cycle.refresh(snapshot.entries(groups));
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use manymux::client::Stream;

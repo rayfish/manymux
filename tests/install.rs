@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 use std::process::{Command, Output};
 
 fn installer_function(script: &str) -> Output {

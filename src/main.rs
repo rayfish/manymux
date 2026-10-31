@@ -5,6 +5,7 @@ use std::sync::Arc;
 use anyhow::{Result, anyhow, bail};
 use clap::{Args, Parser, Subcommand, ValueHint};
 use clap_complete::Shell;
+#[cfg(unix)]
 use tokio::signal::unix::{SignalKind, signal};
 use tracing::debug;
 
@@ -353,7 +354,7 @@ async fn cli() -> ExitCode {
     // Only the node writes a log file. A command that prints and exits has the
     // terminal for that, and the agent must leave stdout strictly alone.
     let _log = log::init(match cli.command {
-        Command::Daemon { .. } => Some(manymux::service::NAME),
+        Command::Daemon { .. } => Some("manymux"),
         _ => None,
     });
 
@@ -682,6 +683,11 @@ async fn run(cli: Cli) -> Result<u8> {
             .await
         }
 
+        #[cfg(windows)]
+        Command::Service { .. } => {
+            bail!("Windows nodes start on demand; service installation is not supported yet")
+        }
+        #[cfg(unix)]
         Command::Service { action } => {
             match action {
                 ServiceAction::Install => {
@@ -857,6 +863,10 @@ async fn restart(
 /// never runs. Nothing comes back, and the flag that promised it would is the
 /// reason nobody was watching.
 async fn ran_from_a_session_here(socket: &Path) -> Option<String> {
+    #[cfg(windows)]
+    if let Some(name) = std::env::var_os("MM_SESSION") {
+        return Some(name.to_string_lossy().into_owned());
+    }
     let ours = manymux::foreground::our_session()?;
     sessions_on(socket, LOCAL)
         .await
@@ -1062,6 +1072,7 @@ fn offer_to_install(host: &str) -> bool {
 /// SIGINT is whoever ran `mm daemon` in a terminal. Untreated, both take every
 /// session down without a word to any of them; see [`Node::shutdown`] for what
 /// that costs.
+#[cfg(unix)]
 async fn stop_when_signalled(node: Arc<Node>) {
     let mut term = match signal(SignalKind::terminate()) {
         Ok(term) => term,
@@ -1082,6 +1093,16 @@ async fn stop_when_signalled(node: Arc<Node>) {
     tokio::select! {
         _ = term.recv() => debug!("SIGTERM"),
         _ = interrupt.recv() => debug!("SIGINT"),
+    }
+    node.shutdown(manymux::node::GRACE).await;
+    std::process::exit(0);
+}
+
+#[cfg(windows)]
+async fn stop_when_signalled(node: Arc<Node>) {
+    if let Err(error) = tokio::signal::ctrl_c().await {
+        debug!("cannot listen for Ctrl-C: {error}");
+        return;
     }
     node.shutdown(manymux::node::GRACE).await;
     std::process::exit(0);

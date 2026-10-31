@@ -6,8 +6,9 @@
 //! the difference between a session that feels like logging in and one that
 //! does not. So the account details come from the passwd database, the way
 //! `login` and `sshd` find them, rather than from whatever the service manager
-//! happened to pass down.
+//! happened to pass down. Windows uses the account profile and COMSPEC instead.
 
+#[cfg(unix)]
 use std::ffi::{CStr, CString};
 use std::sync::OnceLock;
 
@@ -36,7 +37,7 @@ pub fn shell() -> String {
         // caller deliberately set SHELL.
         .or_else(|| std::env::var("SHELL").ok())
         .filter(|shell| !shell.is_empty())
-        .unwrap_or_else(|| "/bin/sh".to_string())
+        .unwrap_or_else(|| if cfg!(windows) { "cmd.exe" } else { "/bin/sh" }.to_string())
 }
 
 /// The account named `name`, or `None` if the passwd database has no entry.
@@ -44,6 +45,7 @@ pub fn shell() -> String {
 /// Installing a system-wide service as root has to fill in someone else's
 /// account: the sessions belong to whoever ran `sudo`, not to root, so the unit
 /// needs that user's home rather than `/root`.
+#[cfg(unix)]
 pub fn named(name: &str) -> Option<User> {
     let name = CString::new(name).ok()?;
     // SAFETY: getpwnam returns null or a pointer into static storage, valid
@@ -52,6 +54,7 @@ pub fn named(name: &str) -> Option<User> {
     unsafe { copied(libc::getpwnam(name.as_ptr())) }
 }
 
+#[cfg(unix)]
 fn lookup() -> Option<User> {
     let passwd = from_passwd();
     if !cfg!(target_os = "android") {
@@ -85,6 +88,7 @@ fn var(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|value| !value.is_empty())
 }
 
+#[cfg(unix)]
 fn from_passwd() -> Option<User> {
     // SAFETY: getpwuid returns null or a pointer into static storage, valid
     // until the next getpw* call. This runs once, behind a OnceLock, and it is
@@ -96,6 +100,7 @@ fn from_passwd() -> Option<User> {
 ///
 /// SAFETY: `entry` must be null or point to a valid passwd entry that no other
 /// getpw* call overwrites while this runs.
+#[cfg(unix)]
 unsafe fn copied(entry: *const libc::passwd) -> Option<User> {
     // SAFETY: the caller's promise, checked for null first.
     let entry = unsafe { entry.as_ref() }?;
@@ -110,6 +115,7 @@ unsafe fn copied(entry: *const libc::passwd) -> Option<User> {
 }
 
 /// SAFETY: `ptr` must be null or a valid NUL-terminated C string.
+#[cfg(unix)]
 unsafe fn string(ptr: *const libc::c_char) -> String {
     if ptr.is_null() {
         return String::new();
@@ -119,7 +125,21 @@ unsafe fn string(ptr: *const libc::c_char) -> String {
         .into_owned()
 }
 
-#[cfg(test)]
+#[cfg(windows)]
+fn lookup() -> Option<User> {
+    Some(User {
+        name: var("USERNAME")?,
+        home: dirs::home_dir()?.to_string_lossy().into_owned(),
+        shell: var("COMSPEC").unwrap_or_else(|| "cmd.exe".into()),
+    })
+}
+
+#[cfg(windows)]
+pub fn named(name: &str) -> Option<User> {
+    current().filter(|user| user.name == name).cloned()
+}
+
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 

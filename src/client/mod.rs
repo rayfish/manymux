@@ -1,7 +1,7 @@
 //! The client half.
 //!
 //! Everything here is transport-agnostic and terminal-agnostic: a [`Stream`] is
-//! a Unix-socket connection to the node on this machine, or the pipes of an
+//! a Unix socket or Windows named pipe to the node on this machine, or the pipes of an
 //! `ssh <host> mm agent` running on another one. An [`Attached`] session
 //! hands out bytes rather than driving a terminal. The CLI is one consumer; a
 //! mobile app rendering the session with its own terminal widget is another.
@@ -29,10 +29,10 @@ use std::io::{Error, ErrorKind};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
+use crate::local::Stream as LocalStream;
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::UnixStream;
 use tokio::process::{Child, ChildStderr};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
@@ -270,7 +270,7 @@ pub struct Stream {
 impl Stream {
     /// Connect to the node on this machine.
     pub async fn local(socket: &Path) -> Result<Self> {
-        let stream = UnixStream::connect(socket).await.with_context(|| {
+        let stream = LocalStream::connect(socket).await.with_context(|| {
             format!(
                 "connecting to {}: is `mm daemon` running?",
                 socket.display()

@@ -11,10 +11,15 @@
 //! so concurrent updates cannot overwrite bytes another process is verifying.
 
 use std::env::current_exe;
+#[cfg(unix)]
 use std::ffi::CString;
-use std::fs::{self, OpenOptions, Permissions};
+#[cfg(unix)]
+use std::fs::Permissions;
+use std::fs::{self, OpenOptions};
+#[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -22,6 +27,7 @@ use anyhow::{Context, Result, bail};
 use tokio::process::Command;
 use tracing::debug;
 
+use crate::config::PrivateOptions;
 use crate::signature;
 
 /// Where the release binaries are published, the same repo `install.sh` reads.
@@ -64,6 +70,7 @@ pub fn asset_name() -> Result<String> {
     let os = match std::env::consts::OS {
         "linux" => "linux",
         "macos" => "macos",
+        "windows" => "windows",
         // Termux. Android is its own asset rather than a Linux one: the binary
         // is linked against bionic, so the glibc and musl builds are both wrong
         // here even though `uname` says Linux.
@@ -80,7 +87,10 @@ pub fn asset_name() -> Result<String> {
     } else {
         ""
     };
-    Ok(format!("mm-{os}-{arch}{libc}"))
+    Ok(format!(
+        "mm-{os}-{arch}{libc}{}",
+        if cfg!(windows) { ".exe" } else { "" }
+    ))
 }
 
 /// Which release to take a binary from.
@@ -138,6 +148,11 @@ pub async fn check(channel: Channel) -> Result<Available> {
 
 /// Download the published asset, verify it, and swap it in.
 pub async fn apply(available: &Available) -> Result<PathBuf> {
+    if cfg!(windows) {
+        bail!(
+            "replace mm.exe manually after stopping the node; Windows self-update is not supported yet"
+        );
+    }
     let binary = current_exe().context("finding the running binary")?;
     let dir = binary.parent().unwrap_or(Path::new("."));
 
@@ -194,6 +209,7 @@ pub async fn apply(available: &Available) -> Result<PathBuf> {
         );
     }
 
+    #[cfg(unix)]
     fs::set_permissions(&staged.path, Permissions::from_mode(0o755))
         .context("making the new binary executable")?;
     fs::rename(&staged.path, &binary).with_context(|| format!("replacing {}", binary.display()))?;
@@ -218,7 +234,7 @@ impl Staged {
             match OpenOptions::new()
                 .write(true)
                 .create_new(true)
-                .mode(0o600)
+                .private_mode()
                 .open(&path)
             {
                 Ok(_) => return Ok(Self { path }),
@@ -248,12 +264,18 @@ impl Drop for Staged {
 /// `access` rather than reading the mode bits, because the mode is not the
 /// whole answer: macOS ACLs can grant or deny past it, and root ignores it
 /// entirely. Asking the kernel gets all three right.
+#[cfg(unix)]
 pub fn writable(dir: &Path) -> bool {
     let Ok(path) = CString::new(dir.as_os_str().as_bytes()) else {
         return false;
     };
     // SAFETY: access reads the path and returns; the CString outlives the call.
     unsafe { libc::access(path.as_ptr(), libc::W_OK | libc::X_OK) == 0 }
+}
+
+#[cfg(windows)]
+pub fn writable(_dir: &Path) -> bool {
+    false
 }
 
 /// What the node on this machine is doing, so an update knows whether
@@ -360,6 +382,7 @@ async fn curl(url: &str, to: &Path) -> Result<()> {
 }
 
 /// SHA-256 of a file, via whichever tool this machine has.
+#[cfg(unix)]
 pub(crate) async fn sha256_of(path: &Path) -> Result<String> {
     for (program, args) in [("sha256sum", &[][..]), ("shasum", &["-a", "256"][..])] {
         let Ok(out) = Command::new(program)
@@ -380,6 +403,31 @@ pub(crate) async fn sha256_of(path: &Path) -> Result<String> {
         }
     }
     bail!("no sha256sum or shasum on this machine, so a download cannot be verified")
+}
+
+#[cfg(windows)]
+pub(crate) async fn sha256_of(path: &Path) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let mut file = fs::File::open(path)?;
+        let mut hash = Sha256::new();
+        let mut buffer = [0u8; 16 * 1024];
+        loop {
+            let n = file.read(&mut buffer)?;
+            if n == 0 {
+                break;
+            }
+            hash.update(&buffer[..n]);
+        }
+        Ok(hash
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect())
+    })
+    .await?
 }
 
 fn file_name(path: &Path) -> String {
@@ -418,6 +466,7 @@ mod tests {
         let asset = asset_name().unwrap();
         assert!(asset.starts_with("mm-"), "{asset}");
         let published = [
+            "mm-windows-x86_64.exe",
             "mm-linux-x86_64",
             "mm-linux-aarch64",
             "mm-linux-x86_64-musl",
@@ -450,6 +499,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn a_root_owned_install_dir_is_not_writable() {
         // The case every macOS install hits: /usr/local/bin is root-owned
         // there, so `mm update` has to say so instead of downloading first and
@@ -482,7 +532,7 @@ mod tests {
             async move { node.serve(&socket).await }
         });
         for _ in 0..100 {
-            if tokio::net::UnixStream::connect(&socket).await.is_ok() {
+            if crate::local::Stream::connect(&socket).await.is_ok() {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;

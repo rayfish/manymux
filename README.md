@@ -16,6 +16,30 @@ Run that here. The machines you reach over ssh get it when you first name one:
 ahead of time. There is nothing else to set up: no pairing, no keys to exchange,
 no hosts to register. If you can `ssh` it, you can `mm` it.
 
+## Windows
+
+Native Windows sessions require Windows 10 version 1809 or newer, or Windows 11.
+Download `mm-windows-x86_64.exe` from a release, rename it to `mm.exe`, and put
+it on your PATH. From PowerShell or Windows Terminal:
+
+```powershell
+mm new --name work
+mm new --detached --name build powershell.exe
+mm attach build
+```
+
+The default shell is `cmd.exe`. Name `powershell.exe` or `pwsh.exe` to use
+PowerShell. Commands run directly with their arguments; use an explicit shell
+for pipelines and shell builtins. A node starts automatically and keeps its
+ConPTY sessions alive after clients disconnect or their terminals close.
+Sessions do not survive a reboot or Windows sign-out.
+
+Remote access uses Windows OpenSSH Server with `mm.exe` on its PATH:
+`mm attach build-box/work`. Installation on Windows is manual; automatic SSH
+bootstrap, `mm service`, self-update and foreground checkpoint inspection are
+not supported yet. Local connections use named pipes restricted to your
+Windows account, with no listening network port.
+
 ## A first session
 
 Start something on another machine and attach to it:

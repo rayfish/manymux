@@ -23,11 +23,15 @@ use std::io::IsTerminal;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+#[cfg(windows)]
+use tokio::time::Interval;
 
 use anyhow::{Result, bail};
 use crossterm::terminal;
+#[cfg(unix)]
 use libc::{POLLIN, STDIN_FILENO, poll, pollfd};
 use tokio::io::{AsyncWriteExt, Stdout};
+#[cfg(unix)]
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::mpsc;
 use tracing::debug;
@@ -224,7 +228,10 @@ pub fn hold(screen: Screen) -> Result<Held> {
         give_back(screen, flagged.load(Ordering::Relaxed));
         previous(panic);
     }));
+    #[cfg(unix)]
     terminal::enable_raw_mode()?;
+    #[cfg(windows)]
+    crate::windows::enable_terminal()?;
     write_now(&setup(screen));
     Ok(Held {
         keys: keyboard(),
@@ -256,10 +263,8 @@ impl Held {
         .await
         .unwrap_or(false);
         while self.keys.try_recv().is_ok() {}
-        unsafe {
-            libc::tcflush(libc::STDIN_FILENO, libc::TCIFLUSH);
-        }
-        let _ = terminal::disable_raw_mode();
+        flush_input();
+        restore_terminal();
         self.released = true;
         if !fenced {
             debug!("the terminal did not answer the cleanup fence");
@@ -279,10 +284,8 @@ fn give_back(screen: Screen, on_alternate: bool) {
     // Turn off keyboard event reporting before restoring the shell's input
     // mode. A release already queued while it was on must not reach the shell.
     write_now(&reset(screen, on_alternate));
-    unsafe {
-        libc::tcflush(libc::STDIN_FILENO, libc::TCIFLUSH);
-    }
-    let _ = terminal::disable_raw_mode();
+    flush_input();
+    restore_terminal();
 }
 
 /// Write straight to the real stdout: the async handle may have buffered
@@ -701,6 +704,7 @@ fn complete_input_len(input: &[u8]) -> usize {
     at
 }
 
+#[cfg(unix)]
 fn input_ready() -> bool {
     let mut fd = pollfd {
         fd: STDIN_FILENO,
@@ -710,6 +714,53 @@ fn input_ready() -> bool {
     // A terminal writes one report at once, but a PTY read may split it.
     // Standalone Esc waits this long before it is treated as a key.
     unsafe { poll(&mut fd, 1, 30) > 0 }
+}
+
+fn restore_terminal() {
+    #[cfg(unix)]
+    let _ = terminal::disable_raw_mode();
+    #[cfg(windows)]
+    crate::windows::restore_terminal();
+}
+
+fn flush_input() {
+    #[cfg(unix)]
+    // SAFETY: tcflush operates on stdin without accessing Rust memory.
+    unsafe {
+        libc::tcflush(libc::STDIN_FILENO, libc::TCIFLUSH);
+    }
+    #[cfg(windows)]
+    crate::windows::flush_input();
+}
+
+#[cfg(windows)]
+fn input_ready() -> bool {
+    crate::windows::input_ready()
+}
+
+#[cfg(windows)]
+struct WindowsResize {
+    previous: Option<(u16, u16)>,
+    tick: Interval,
+}
+#[cfg(windows)]
+impl WindowsResize {
+    fn new() -> Self {
+        Self {
+            previous: terminal::size().ok(),
+            tick: tokio::time::interval(Duration::from_millis(100)),
+        }
+    }
+    async fn recv(&mut self) {
+        loop {
+            self.tick.tick().await;
+            let size = terminal::size().ok();
+            if size.is_some() && size != self.previous {
+                self.previous = size;
+                return;
+            }
+        }
+    }
 }
 
 fn contains_device_attributes(input: &[u8]) -> bool {
@@ -989,7 +1040,10 @@ async fn pump(
         mut writer,
     } = session.split();
     let mut stdout = tokio::io::stdout();
+    #[cfg(unix)]
     let mut winch = signal(SignalKind::window_change())?;
+    #[cfg(windows)]
+    let mut winch = WindowsResize::new();
     keys.begin_attach(mode, screen.owns_the_screen());
     // The key is the client's on a screen the client owns, whether or not
     // the host can answer for a window: a host that cannot is worth saying

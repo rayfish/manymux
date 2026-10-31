@@ -1144,6 +1144,7 @@ mod tests {
     /// `SHELL` is a program that exits, since the wrapper ends by exec'ing a
     /// login shell and this is not a terminal.
     #[test]
+    #[cfg(unix)]
     fn the_line_that_is_printed_is_the_line_that_runs() {
         let words = argv(&["printf", "%s|", "a b", r#"c'd"#, "--flag=x y"]);
         let line = crate::shell::join(&to_spawn(&words));

@@ -15,19 +15,29 @@
 //! so a rename made by another client also changes the name used to reconnect.
 //! Input queues at most sixteen protocol frames before applying backpressure.
 //! Resizes keep only the latest geometry and share the same PTY writer.
+//! Windows owns a ConPTY instead, with dedicated blocking reader and writer
+//! threads joined by the reaper. Disconnecting never drops the console.
 
 use std::collections::HashMap;
+#[cfg(unix)]
 use std::fs::File;
+#[cfg(unix)]
 use std::io::{ErrorKind, Read};
+#[cfg(unix)]
 use std::os::fd::AsFd;
+#[cfg(windows)]
+use std::os::windows::io::OwnedHandle;
 use std::path::Path;
 use std::slice;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime};
 
-use anyhow::{Context, Result, bail};
+#[cfg(unix)]
+use anyhow::Context;
+use anyhow::{Result, bail};
 use avt::Vt;
+#[cfg(unix)]
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc::Permit;
 use tokio::sync::{broadcast, mpsc, watch};
@@ -40,6 +50,7 @@ use crate::proto::{
     self, Doing, EventKind, Found, HostedEvent, Peek, SessionEvent, SessionInfo, Size, SpawnSpec,
     View, ViewRequest,
 };
+#[cfg(unix)]
 use crate::shell;
 use crate::user;
 use crate::utf8::Utf8Decoder;
@@ -55,7 +66,12 @@ const OUTPUT_BACKLOG: usize = 256;
 /// Each queued frame is bounded by `MAX_FRAME`, including library callers.
 const INPUT_BACKLOG: usize = 16;
 
+#[cfg(windows)]
+mod windows;
+
 pub struct Session {
+    #[cfg(windows)]
+    process: Option<OwnedHandle>,
     /// What the session is addressed by, in `host/name` and everywhere else.
     /// The watch channel keeps its readers and attached clients on the same
     /// value when the registry moves the name.
@@ -391,6 +407,7 @@ impl Session {
 
     /// Spawn the child on a fresh PTY and start the three tasks that keep the
     /// session alive: PTY reader, PTY writer, and child reaper.
+    #[cfg(unix)]
     pub fn spawn(
         spec: &SpawnSpec,
         name: String,
@@ -517,6 +534,7 @@ impl Session {
     /// The fd remains nonblocking after duplication. Stop once its queued
     /// output is exhausted, with a bound for a surviving descendant that keeps
     /// printing. Waiting for EOF would let that descendant hold the exit open.
+    #[cfg(unix)]
     fn drain_final_output(&self, output: &mut File) {
         let mut buffer = [0u8; 16 * 1024];
         for _ in 0..16 {
@@ -656,6 +674,7 @@ impl Session {
 
     /// Ask the child to go away. SIGHUP to the whole process group, the way a
     /// terminal closing would, so shells and their children both get it.
+    #[cfg(unix)]
     pub fn kill(&self) {
         self.signal(libc::SIGHUP);
     }
@@ -674,6 +693,7 @@ impl Session {
     /// reached while the child is unreaped: [`Session::has_exited`] is false
     /// until the reaper has waited on it, and until then the pid is still this
     /// child's.
+    #[cfg(unix)]
     pub fn kill_now(&self) {
         if self.pid == 0 {
             return;
@@ -684,6 +704,7 @@ impl Session {
         }
     }
 
+    #[cfg(unix)]
     fn signal(&self, signal: libc::c_int) {
         if self.pid == 0 {
             return;
@@ -758,6 +779,7 @@ impl Session {
 /// What to exec, and what to call it in a listing. The two differ because a
 /// command runs *through* the login shell, and a listing should show the
 /// command rather than the wrapper.
+#[cfg(unix)]
 struct Launch {
     argv: Vec<String>,
     label: String,
@@ -770,6 +792,7 @@ struct Launch {
 /// environment the user's own profile sets up. A node started as a service has
 /// neither, so exec'ing the command directly would fail to find half the
 /// programs worth running.
+#[cfg(unix)]
 fn launch(spec: &SpawnSpec) -> Launch {
     let shell = user::shell();
     // A caller that says what this is called is answering for the row in a
@@ -824,6 +847,7 @@ mod tests {
     use std::io::Result as IoResult;
     use std::pin::Pin;
     use std::task::{Context as TaskContext, Poll, Waker};
+    #[cfg(unix)]
     use std::time::Duration;
     use tokio::io::{AsyncRead, ReadBuf, duplex};
 
@@ -835,6 +859,8 @@ mod tests {
         let (output_tx, _) = broadcast::channel(OUTPUT_BACKLOG);
         let (events, _) = broadcast::channel(16);
         Arc::new(Session {
+            #[cfg(windows)]
+            process: None,
             name: watch::channel("build".to_string()).0,
             command: "shell".into(),
             pid: 0,
@@ -1090,6 +1116,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn a_session_releases_its_reader_when_a_descendant_keeps_the_terminal_open() {
         let dir = std::env::temp_dir().join(format!("manymux-reader-{}", std::process::id()));
         crate::config::ensure_private_dir(&dir).unwrap();
@@ -1150,6 +1177,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn a_bare_session_is_an_interactive_login_shell() {
         let launched = launch(&SpawnSpec::default());
         assert_eq!(launched.argv, vec![user::shell(), "-l".to_string()]);
@@ -1159,6 +1187,7 @@ mod tests {
     /// almost no `PATH`, so a session would land you in `/bin/sh` unable to
     /// find half the programs worth running.
     #[test]
+    #[cfg(unix)]
     fn a_command_runs_through_the_login_shell() {
         let spec = SpawnSpec {
             command: vec!["claude".into(), "--resume".into()],

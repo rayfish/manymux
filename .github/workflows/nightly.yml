@@ -66,6 +66,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            name: mm-windows-x86_64.exe
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-22.04
             name: mm-linux-x86_64
@@ -95,6 +98,10 @@ jobs:
           - target: aarch64-linux-android
             runner: ubuntu-22.04
             name: mm-android-aarch64
+
+    defaults:
+      run:
+        shell: bash
 
     runs-on: ${{ matrix.runner }}
 
@@ -147,6 +154,7 @@ jobs:
       - name: Package for release
         run: |
           BINARY=target/${{ matrix.target }}/release/mm
+          if [[ "${{ matrix.target }}" == *windows* ]]; then BINARY="$BINARY.exe"; fi
           cp "$BINARY" ${{ matrix.name }}
           if command -v sha256sum >/dev/null 2>&1; then
             sha256sum ${{ matrix.name }} > ${{ matrix.name }}.sha256

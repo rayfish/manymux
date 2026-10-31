@@ -44,9 +44,9 @@
 //! under the word typed matched no listing row, so it was in no group anyone
 //! could see and was never pruned.
 
+use crate::config::PrivateOptions;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -161,7 +161,7 @@ impl Groups {
             .write(true)
             .create(true)
             .truncate(false)
-            .mode(0o600)
+            .private_mode()
             .open(&path)
             .with_context(|| format!("opening {}", path.display()))?;
         file.lock()

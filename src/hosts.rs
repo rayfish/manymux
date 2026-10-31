@@ -15,12 +15,16 @@
 
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
+#[cfg(unix)]
 use std::fs::File;
+#[cfg(unix)]
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-use anyhow::{Context, Result, bail};
+#[cfg(unix)]
+use anyhow::Context;
+use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::config;
@@ -37,16 +41,21 @@ pub const LOCAL: &str = "local";
 pub fn this_machine() -> &'static str {
     static NAME: OnceLock<String> = OnceLock::new();
     NAME.get_or_init(|| {
-        let mut buf = [0u8; 256];
-        // SAFETY: gethostname writes at most `len` bytes into a buffer we own,
-        // and we only read up to the first NUL it wrote.
-        let ok = unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) } == 0;
-        let name = if ok {
-            let end = buf.iter().position(|b| *b == 0).unwrap_or(buf.len());
-            String::from_utf8_lossy(&buf[..end]).into_owned()
-        } else {
-            String::new()
+        #[cfg(unix)]
+        let name = {
+            let mut buf = [0u8; 256];
+            // SAFETY: gethostname writes at most `len` bytes into a buffer we own,
+            // and we only read up to the first NUL it wrote.
+            let ok = unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) } == 0;
+            if ok {
+                let end = buf.iter().position(|b| *b == 0).unwrap_or(buf.len());
+                String::from_utf8_lossy(&buf[..end]).into_owned()
+            } else {
+                String::new()
+            }
         };
+        #[cfg(windows)]
+        let name = crate::windows::hostname().unwrap_or_default();
         // `laptop.local` and `box.example.com` both read better short.
         let short = name.split('.').next().unwrap_or("").trim();
         if short.is_empty() {
@@ -156,9 +165,12 @@ pub fn node_id() -> Option<String> {
 /// unique. The id is not a secret, and nothing is authorised by knowing it.
 fn fresh_id() -> Result<String> {
     let mut bytes = [0u8; 16];
+    #[cfg(unix)]
     File::open("/dev/urandom")
         .and_then(|mut urandom| urandom.read_exact(&mut bytes))
         .context("reading /dev/urandom")?;
+    #[cfg(windows)]
+    crate::windows::random(&mut bytes)?;
     Ok(bytes.iter().fold(String::new(), |mut id, byte| {
         // Writing to a String cannot fail.
         let _ = write!(id, "{byte:02x}");

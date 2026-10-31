@@ -318,6 +318,7 @@ fn sessions(socket: &Path, host: &str, budget: Duration) -> Vec<SessionInfo> {
         // No node here means no sessions here. Starting one because someone
         // pressed tab would be rude, and slow.
         if is_this_machine(host) {
+            #[cfg(unix)]
             if !socket.exists() {
                 return Vec::new();
             }

@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 //! The node outlives whoever started it.
 //!
 //! A command that needs a node starts one, and from that moment the node owns

@@ -13,6 +13,8 @@
 //! from a word, and only differ in what they do once they have it.
 
 use std::collections::BTreeMap;
+#[cfg(windows)]
+use std::io::{Error, ErrorKind};
 use std::path::Path;
 use std::time::Duration;
 
@@ -342,6 +344,7 @@ pub(crate) async fn answer_from(socket: &Path, host: &str) -> Result<Answer> {
 async fn answer_from_with_install(socket: &Path, host: &str, install: bool) -> Result<Answer> {
     // No node here means no sessions here, which is an answer rather than a
     // failure. Starting one just to be told that would be rude.
+    #[cfg(unix)]
     if is_this_machine(host) && !socket.exists() {
         // Unless the sessions are all sitting in a node an older build left
         // somewhere else, in which case an empty table is a lie.
@@ -351,7 +354,7 @@ async fn answer_from_with_install(socket: &Path, host: &str, install: bool) -> R
             node: None,
         });
     }
-    let sessions = match reach(
+    let connection = reach(
         socket,
         host,
         Reach {
@@ -360,10 +363,21 @@ async fn answer_from_with_install(socket: &Path, host: &str, install: bool) -> R
             install,
         },
     )
-    .await?
-    .call(&Request::List)
-    .await?
+    .await;
+    #[cfg(windows)]
+    if is_this_machine(host)
+        && connection
+            .as_ref()
+            .err()
+            .and_then(|error| error.downcast_ref::<Error>())
+            .is_some_and(|error| error.kind() == ErrorKind::NotFound)
     {
+        return Ok(Answer {
+            sessions: Vec::new(),
+            node: None,
+        });
+    }
+    let sessions = match connection?.call(&Request::List).await? {
         Response::Sessions(sessions) => sessions,
         other => bail!("unexpected response to list: {other:?}"),
     };
@@ -573,17 +587,33 @@ pub(crate) fn where_to_start(mut args: Vec<String>) -> Result<Started> {
 /// A path or a shell snippet is taken at face value; a bare word has to be on
 /// `PATH`, which is what separates `mm new claude` from `mm new gpu-box`.
 fn runnable(program: &str) -> bool {
-    if program.contains('/') {
-        return Path::new(program).is_file();
+    if program.contains('/') || (cfg!(windows) && program.contains('\\')) {
+        return program_file(Path::new(program));
     }
     if program.contains(|c: char| c.is_whitespace() || "|&;<>()$`\\\"'".contains(c)) {
         return true;
     }
-    std::env::var_os("PATH")
-        .is_some_and(|paths| std::env::split_paths(&paths).any(|dir| dir.join(program).is_file()))
+    std::env::var_os("PATH").is_some_and(|paths| {
+        std::env::split_paths(&paths).any(|dir| program_file(&dir.join(program)))
+    })
 }
 
-#[cfg(test)]
+fn program_file(path: &Path) -> bool {
+    if path.is_file() {
+        return true;
+    }
+    #[cfg(windows)]
+    if path.extension().is_none() {
+        let extensions = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".into());
+        return extensions
+            .split(';')
+            .filter_map(|ext| ext.strip_prefix('.'))
+            .any(|ext| path.with_extension(ext).is_file());
+    }
+    false
+}
+
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use manymux::proto::{self, FrameReader};

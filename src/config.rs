@@ -2,16 +2,32 @@
 //!
 //! File replacements use a private temporary file per writer, so concurrent
 //! saves cannot truncate or rename a temporary file another save still owns.
+//! Windows files inherit their directory ACLs; the default config and runtime
+//! directories are in the account profile. Pipe access has its own SID ACL.
 
 use std::fs::{self, DirBuilder, OpenOptions};
 use std::io::{ErrorKind, Write};
+#[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use anyhow::{Context, Result, bail};
+#[cfg(unix)]
+use anyhow::bail;
+use anyhow::{Context, Result};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+
+pub(crate) trait PrivateOptions {
+    fn private_mode(&mut self) -> &mut Self;
+}
+impl PrivateOptions for OpenOptions {
+    fn private_mode(&mut self) -> &mut Self {
+        #[cfg(unix)]
+        self.mode(0o600);
+        self
+    }
+}
 
 /// Per-user runtime directory for sockets: `/tmp/manymux-<uid>`, worked out from
 /// the uid alone and from nothing else.
@@ -27,6 +43,7 @@ use serde::de::DeserializeOwned;
 ///
 /// It also stays short, which socket paths have to: they are capped at ~104
 /// bytes on macOS.
+#[cfg(unix)]
 pub fn runtime_dir() -> PathBuf {
     // Android has no `/tmp` at all: everything outside an app's own directories
     // is read-only, so the path below has nowhere to land. Termux makes one
@@ -41,6 +58,20 @@ pub fn runtime_dir() -> PathBuf {
 }
 
 /// Socket the node listens on for the owner of this machine.
+#[cfg(windows)]
+pub fn runtime_dir() -> PathBuf {
+    dirs::data_local_dir()
+        .unwrap_or_else(std::env::temp_dir)
+        .join("manymux")
+}
+
+#[cfg(windows)]
+pub fn socket() -> PathBuf {
+    // The transport adds the process token's SID, independent of environment.
+    PathBuf::from("manymux")
+}
+
+#[cfg(unix)]
 pub fn socket() -> PathBuf {
     runtime_dir().join("manymux.sock")
 }
@@ -55,11 +86,13 @@ pub fn socket() -> PathBuf {
 pub fn ensure_runtime_dir() -> Result<PathBuf> {
     let dir = runtime_dir();
     ensure_private_dir(&dir)?;
+    #[cfg(unix)]
     check_runtime_dir(&dir)?;
     Ok(dir)
 }
 
 /// Whether `dir` is a directory of ours that nobody else can reach into.
+#[cfg(unix)]
 fn check_runtime_dir(dir: &Path) -> Result<()> {
     // Not `metadata`: a symlink planted at that path is followed by the create
     // in the caller, which would land the socket wherever it points.
@@ -92,6 +125,7 @@ fn check_runtime_dir(dir: &Path) -> Result<()> {
 /// still running and still owns its sessions, and nothing will look for it at
 /// the path above, so it is worth naming when a new node is about to start
 /// beside it.
+#[cfg(unix)]
 pub fn legacy_sockets() -> Vec<PathBuf> {
     let current = socket();
     let mut dirs = Vec::new();
@@ -114,6 +148,12 @@ pub fn legacy_sockets() -> Vec<PathBuf> {
     sockets
 }
 
+#[cfg(windows)]
+pub fn legacy_sockets() -> Vec<PathBuf> {
+    Vec::new()
+}
+
+#[cfg(unix)]
 pub fn uid() -> u32 {
     // SAFETY: getuid always succeeds and touches no memory.
     unsafe { libc::getuid() }
@@ -150,9 +190,11 @@ pub fn config_dir_for(home: &Path) -> PathBuf {
 /// The mode applies to directories this creates, never to ones that already
 /// exist: a socket path of `/tmp/x.sock` must not lead us to chmod `/tmp`.
 pub fn ensure_private_dir(path: &Path) -> Result<()> {
-    DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
+    let mut builder = DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    builder.mode(0o700);
+    builder
         .create(path)
         .with_context(|| format!("creating {}", path.display()))
 }
@@ -192,7 +234,7 @@ where
         .write(true)
         .create(true)
         .truncate(false)
-        .mode(0o600)
+        .private_mode()
         .open(&lock_path)
         .with_context(|| format!("opening {}", lock_path.display()))?;
     lock.lock()
@@ -218,7 +260,7 @@ pub fn write_private_file(path: &Path, contents: &[u8]) -> Result<()> {
         match OpenOptions::new()
             .write(true)
             .create_new(true)
-            .mode(0o600)
+            .private_mode()
             .open(&temp)
         {
             Ok(file) => break (temp, file),
@@ -254,6 +296,7 @@ mod tests {
     /// have to reach the same node, or sessions come back only for whoever
     /// logged in the way the last one did.
     #[test]
+    #[cfg(unix)]
     fn the_socket_is_the_same_however_you_logged_in() {
         let socket = socket();
         assert_eq!(
@@ -265,6 +308,7 @@ mod tests {
         assert_eq!(socket, socket_the_long_way());
     }
 
+    #[cfg(unix)]
     fn socket_the_long_way() -> PathBuf {
         PathBuf::from(format!("/tmp/manymux-{}/manymux.sock", uid()))
     }
@@ -277,6 +321,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn a_runtime_directory_somebody_else_owns_is_refused() {
         let dir = std::env::temp_dir().join(format!("manymux-perm-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
@@ -296,6 +341,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn a_symlink_where_the_runtime_directory_should_be_is_refused() {
         let dir = std::env::temp_dir().join(format!("manymux-link-{}", std::process::id()));
         let _ = fs::remove_file(&dir);
@@ -336,6 +382,7 @@ mod tests {
         let contents = fs::read(&path).unwrap();
         assert_eq!(contents.len(), 256 * 1024);
         assert!(contents.iter().all(|byte| *byte == contents[0]));
+        #[cfg(unix)]
         assert_eq!(
             fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600

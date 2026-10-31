@@ -31,7 +31,11 @@ pub mod peers;
 pub mod registry;
 pub mod session;
 
+use crate::local::Stream as LocalStream;
+#[cfg(unix)]
 use std::os::unix::process::CommandExt;
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
@@ -419,7 +423,16 @@ impl Node {
                     return reply(&mut write, Ok(Response::Ok)).await;
                 }
 
-                request => return reply(&mut write, self.answer(request)).await,
+                request => {
+                    #[cfg(unix)]
+                    let response = self.answer(request);
+                    #[cfg(windows)]
+                    let response = {
+                        let node = Arc::clone(self);
+                        tokio::task::spawn_blocking(move || node.answer(request)).await?
+                    };
+                    return reply(&mut write, response).await;
+                }
             }
         }
     }
@@ -820,7 +833,7 @@ enum Listening {
 async fn wait_until(socket: &Path, wanted: Listening, limit: Duration) -> bool {
     let deadline = Instant::now() + limit;
     while Instant::now() < deadline {
-        let listening = if tokio::net::UnixStream::connect(socket).await.is_ok() {
+        let listening = if LocalStream::connect(socket).await.is_ok() {
             Listening::Yes
         } else {
             Listening::No
@@ -849,7 +862,7 @@ async fn wait_until(socket: &Path, wanted: Listening, limit: Duration) -> bool {
 /// channel. That left one behind for every remote command.
 pub async fn agent(socket: &Path) -> Result<()> {
     ensure_running(socket).await?;
-    let node = tokio::net::UnixStream::connect(socket)
+    let node = LocalStream::connect(socket)
         .await
         .with_context(|| format!("connecting to {}", socket.display()))?;
     let (mut from_node, mut to_node) = node.into_split();
@@ -876,7 +889,7 @@ pub async fn agent(socket: &Path) -> Result<()> {
 ///
 /// Cheap and idempotent when one is already up, which is the common case.
 pub async fn ensure_running(socket: &Path) -> Result<()> {
-    if tokio::net::UnixStream::connect(socket).await.is_ok() {
+    if LocalStream::connect(socket).await.is_ok() {
         return Ok(());
     }
     start_node(socket).await
@@ -928,8 +941,9 @@ async fn ask_to_stop(socket: &Path) -> Result<()> {
 /// SIGTERM rather than SIGKILL: the difference to the sessions is nil (they die
 /// with the node either way, being its children), but the node still gets to
 /// flush its log.
+#[cfg(unix)]
 async fn signal_node(socket: &Path) -> Result<()> {
-    let stream = tokio::net::UnixStream::connect(socket)
+    let stream = LocalStream::connect(socket)
         .await
         .context("connecting to the node")?;
     let pid = crate::ipc::peer_pid(&stream).context("asking the kernel who holds the socket")?;
@@ -955,6 +969,11 @@ async fn signal_node(socket: &Path) -> Result<()> {
 /// the whole foreground group: a Ctrl-C at the wrong moment, or the window
 /// closing, would reach the node along with the client and take every session
 /// down at once, without even leaving a line in the log to say so.
+#[cfg(windows)]
+async fn signal_node(_socket: &Path) -> Result<()> {
+    bail!("the node did not answer; stop it with Task Manager before restarting")
+}
+
 async fn start_node(socket: &Path) -> Result<()> {
     let binary = std::env::current_exe().context("finding the mm binary")?;
     info!("no node running, starting one");
@@ -973,12 +992,19 @@ async fn start_node(socket: &Path) -> Result<()> {
     // async-signal-safe calls are allowed. `setsid` is one, and it is the only
     // thing here. It cannot fail the one way it is documented to: that needs
     // the caller to already lead a process group, and a fresh child never does.
+    #[cfg(unix)]
     unsafe {
         command.pre_exec(|| {
             libc::setsid();
             Ok(())
         })
     };
+    #[cfg(windows)]
+    command.creation_flags(
+        windows_sys::Win32::System::Threading::DETACHED_PROCESS
+            | windows_sys::Win32::System::Threading::CREATE_NEW_PROCESS_GROUP
+            | windows_sys::Win32::System::Threading::CREATE_BREAKAWAY_FROM_JOB,
+    );
     command
         .spawn()
         .with_context(|| format!("starting {}", binary.display()))?;
@@ -1003,7 +1029,7 @@ pub async fn note_a_node_left_behind(socket: &Path) {
         return;
     }
     for old in crate::config::legacy_sockets() {
-        if tokio::net::UnixStream::connect(&old).await.is_ok() {
+        if LocalStream::connect(&old).await.is_ok() {
             warn!(
                 "a node from an older build is still listening on {old}, and \
                  the sessions it owns are still running. This build uses {new}. \
@@ -1019,7 +1045,9 @@ pub async fn note_a_node_left_behind(socket: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use crate::proto::{EventKind, SpawnSpec};
+    #[cfg(unix)]
     use tokio::sync::broadcast::error::TryRecvError;
 
     async fn watching_nothing() -> Arc<Node> {
@@ -1082,6 +1110,7 @@ mod tests {
     /// is a few missed events for a listener that fell behind. It must not be
     /// the last event that listener ever hears from this node's sessions.
     #[tokio::test]
+    #[cfg(unix)]
     async fn a_burst_of_events_does_not_stop_the_ones_after_it() {
         let node = watching_nothing().await;
         let session = node

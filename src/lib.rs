@@ -21,6 +21,7 @@ pub mod config;
 pub mod foreground;
 pub mod hosts;
 mod keyboard;
+mod local;
 pub mod lock;
 pub mod notify;
 pub mod proto;
@@ -31,6 +32,8 @@ pub mod style;
 pub mod term;
 pub mod user;
 pub mod utf8;
+#[cfg(windows)]
+mod windows;
 
 #[cfg(feature = "desktop")]
 pub mod clipboard;
@@ -40,7 +43,7 @@ pub mod ipc;
 pub mod log;
 #[cfg(feature = "desktop")]
 pub mod node;
-#[cfg(feature = "desktop")]
+#[cfg(all(feature = "desktop", unix))]
 pub mod service;
 #[cfg(feature = "desktop")]
 pub mod signature;

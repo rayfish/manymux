@@ -1,0 +1,218 @@
+//! The local Unix socket a node listens on.
+//!
+//! Whoever can reach one of these sockets can run commands as this user, so
+//! they are owner-only and there is no further authentication behind them.
+//! Reaching one from another machine means going through sshd first, which is
+//! where access is decided.
+
+use std::ffi::CString;
+use std::fs::{self, Permissions};
+use std::io;
+use std::os::fd::AsRawFd;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
+use std::ptr;
+use std::sync::Arc;
+use std::time::Duration;
+
+use anyhow::{Context, Result, bail};
+use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::net::{UnixListener, UnixStream};
+use tracing::{debug, info};
+
+/// Accept connections on `socket` forever, handling each in its own task.
+pub async fn serve<F, Fut>(socket: &Path, handle: F) -> Result<()>
+where
+    F: Fn(OwnedReadHalf, OwnedWriteHalf) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<()>> + Send + 'static,
+{
+    let listener = listen(socket).await?;
+    keep_alive(socket.to_path_buf());
+    let handle = Arc::new(handle);
+    loop {
+        let (stream, _) = listener.accept().await?;
+        let handle = Arc::clone(&handle);
+        tokio::spawn(async move {
+            let (read, write) = stream.into_split();
+            if let Err(e) = handle(read, write).await {
+                debug!("connection ended: {e:#}");
+            }
+        });
+    }
+}
+
+/// How often the socket's timestamps are pushed forward. Well inside the ten
+/// days a cleaner waits, and rare enough to be free.
+const TOUCH_EVERY: Duration = Duration::from_secs(6 * 60 * 60);
+
+/// Keep the socket looking like something in use.
+///
+/// It lives under `/tmp`, where `systemd-tmpfiles` deletes anything untouched
+/// for ten days on several distributions. A node holding a month-old session is
+/// exactly what that sweeps up: connecting to a socket does not change its
+/// timestamps, so a quiet one looks abandoned. Losing it is worse than it
+/// sounds, because the node binds once and never again, so the sessions would
+/// still be running with nothing left able to reach them.
+fn keep_alive(socket: PathBuf) {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(TOUCH_EVERY).await;
+            if let Err(e) = touch(&socket) {
+                debug!("could not touch {}: {e}", socket.display());
+            }
+        }
+    });
+}
+
+/// Set a path's times to now, without opening it: a socket cannot be opened.
+fn touch(path: &Path) -> io::Result<()> {
+    let path = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+    // SAFETY: the pointer is to a NUL-terminated string alive for the call, and
+    // a null `times` is utimensat's own way of saying "now".
+    let set = unsafe { libc::utimensat(libc::AT_FDCWD, path.as_ptr(), ptr::null(), 0) };
+    if set == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+/// The longest a Unix socket path may be: 104 bytes on macOS, 108 on Linux, so
+/// use the smaller and leave room for the NUL. Worth checking by hand, because
+/// the error the kernel gives instead is unhelpfully generic.
+const MAX_SOCKET_PATH: usize = 103;
+
+/// Bind the socket, clearing one left behind by a crash but never one that is
+/// still in use.
+async fn listen(socket: &Path) -> Result<UnixListener> {
+    if socket.as_os_str().len() > MAX_SOCKET_PATH {
+        bail!(
+            "{} is too long for a socket path ({} bytes, limit {MAX_SOCKET_PATH})",
+            socket.display(),
+            socket.as_os_str().len()
+        );
+    }
+    // The default socket sits in a world-writable `/tmp`, so the directory has
+    // to be ours before anything is bound in it. A socket named with `--socket`
+    // is the caller's business, and lives wherever they said.
+    if let Some(dir) = socket.parent() {
+        if dir == crate::config::runtime_dir() {
+            crate::config::ensure_runtime_dir()?;
+        } else {
+            crate::config::ensure_private_dir(dir)?;
+        }
+    }
+    if socket.exists() && UnixStream::connect(socket).await.is_ok() {
+        bail!("something is already listening on {}", socket.display());
+    }
+    fs::remove_file(socket).ok();
+
+    let listener =
+        UnixListener::bind(socket).with_context(|| format!("binding {}", socket.display()))?;
+    set_mode(socket)?;
+    info!(socket = %socket.display(), "listening");
+    Ok(listener)
+}
+
+/// The pid of the process on the other end of a connection.
+///
+/// The way to reach a node that will not answer: it is whatever process is
+/// holding this socket, and the kernel already knows which one that is. Only
+/// Linux and macOS are covered, which is what manymux publishes builds for.
+pub fn peer_pid(stream: &UnixStream) -> Option<u32> {
+    let fd = stream.as_raw_fd();
+    #[cfg(target_os = "linux")]
+    {
+        let mut cred = libc::ucred {
+            pid: 0,
+            uid: 0,
+            gid: 0,
+        };
+        let mut len = size_of::<libc::ucred>() as libc::socklen_t;
+        // SAFETY: the fd is open for the length of this call, and the buffer
+        // matches the size handed to the kernel.
+        let got = unsafe {
+            libc::getsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                (&raw mut cred).cast(),
+                &mut len,
+            )
+        };
+        (got == 0 && cred.pid > 0).then_some(cred.pid as u32)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let mut pid: libc::pid_t = 0;
+        let mut len = size_of::<libc::pid_t>() as libc::socklen_t;
+        // SAFETY: as above.
+        let got = unsafe {
+            libc::getsockopt(
+                fd,
+                libc::SOL_LOCAL,
+                libc::LOCAL_PEERPID,
+                (&raw mut pid).cast(),
+                &mut len,
+            )
+        };
+        (got == 0 && pid > 0).then_some(pid as u32)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = fd;
+        None
+    }
+}
+
+fn set_mode(socket: &Path) -> Result<()> {
+    fs::set_permissions(socket, Permissions::from_mode(0o600))
+        .with_context(|| format!("restricting {}", socket.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The fallback in `mm update` leans on this: a node that will not answer
+    /// is still identifiable by the socket it holds.
+    #[tokio::test]
+    async fn a_connection_names_the_process_on_the_other_end() {
+        let dir = std::env::temp_dir().join(format!("manymux-peer-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let socket = dir.join("t.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+
+        let client = UnixStream::connect(&socket).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+
+        // Both ends are this test process, so both readings have to name it.
+        assert_eq!(peer_pid(&client), Some(std::process::id()));
+        assert_eq!(peer_pid(&server), Some(std::process::id()));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The socket is the thing a `/tmp` cleaner would take, and it is also the
+    /// one kind of file that cannot simply be opened and written to.
+    #[tokio::test]
+    async fn a_bound_socket_can_be_kept_looking_used() {
+        let dir = std::env::temp_dir().join(format!("manymux-touch-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let socket = dir.join("t.sock");
+        let _listener = UnixListener::bind(&socket).unwrap();
+
+        let before = fs::metadata(&socket).unwrap().modified().unwrap();
+        touch(&socket).unwrap();
+        let after = fs::metadata(&socket).unwrap().modified().unwrap();
+        assert!(after >= before);
+        assert!(
+            after.elapsed().unwrap() < Duration::from_secs(5),
+            "the socket should look touched just now"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+}

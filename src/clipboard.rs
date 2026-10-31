@@ -18,6 +18,7 @@
 
 use std::fs::OpenOptions;
 use std::io::Read;
+#[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::process::Stdio;
@@ -219,11 +220,11 @@ async fn copied_file(list: &str) -> Result<Option<Image>> {
     }
     tokio::task::spawn_blocking(move || {
         // Nonblocking open keeps a copied FIFO from retaining this worker.
-        let file = match OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NONBLOCK)
-            .open(&path)
-        {
+        let mut options = OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        options.custom_flags(libc::O_NONBLOCK);
+        let file = match options.open(&path) {
             Ok(file) => file,
             // A clipboard path can point at a volume that has gone away.
             Err(_) => return Ok(None),
@@ -426,7 +427,7 @@ fn base64(bytes: &[u8]) -> String {
     out
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 

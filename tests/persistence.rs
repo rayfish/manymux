@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 //! End-to-end tests of the property the whole project exists for: a client
 //! going away must not disturb the process running in the session.
 //!

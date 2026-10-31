@@ -10,8 +10,10 @@
 //! second ACL to drift out of sync with the real one, and no way for manymux to
 //! grant access ssh would refuse.
 //! Every destination follows an option terminator, so a supplied host name
-//! cannot change ssh's options.
+//! cannot change ssh's options. Windows OpenSSH runs without ControlMaster,
+//! which its native client does not support.
 
+#[cfg(unix)]
 use std::path::PathBuf;
 use std::process::Stdio;
 
@@ -24,6 +26,7 @@ use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 /// pays for the handshake, the rest reuse it. Long enough to cover a working
 /// session, short enough that a laptop that moved network is not holding a dead
 /// master open.
+#[cfg(unix)]
 const PERSIST: &str = "5m";
 
 /// How ssh is made to notice a connection that died without closing.
@@ -240,14 +243,15 @@ enum Tty {
 fn base(tty: Tty) -> Command {
     let program = std::env::var("MM_SSH").unwrap_or_else(|_| "ssh".to_string());
     let mut command = Command::new(program);
+    command.arg(match tty {
+        // No PTY: this carries a framed protocol, and a PTY would mangle
+        // it. `-T` also wins over `-t` whichever order they arrive in, so
+        // this is a choice rather than a default to override later.
+        Tty::No => "-T",
+        Tty::Wanted => "-t",
+    });
+    #[cfg(unix)]
     command
-        .arg(match tty {
-            // No PTY: this carries a framed protocol, and a PTY would mangle
-            // it. `-T` also wins over `-t` whichever order they arrive in, so
-            // this is a choice rather than a default to override later.
-            Tty::No => "-T",
-            Tty::Wanted => "-t",
-        })
         // Share one connection per destination, so the second command to a
         // host skips the handshake entirely.
         .arg("-o")
@@ -255,7 +259,8 @@ fn base(tty: Tty) -> Command {
         .arg("-o")
         .arg(format!("ControlPath={}", control_path().display()))
         .arg("-o")
-        .arg(format!("ControlPersist={PERSIST}"))
+        .arg(format!("ControlPersist={PERSIST}"));
+    command
         // Notice a connection that went, rather than holding its pipes open
         // and silent forever. On the master this is what keeps one dead
         // connection from hanging every command that follows it.
@@ -272,6 +277,7 @@ fn base(tty: Tty) -> Command {
 /// destination so two hosts never share a master. `%C` is ssh's own hash of
 /// (host, port, user, proxy), which keeps the path short enough for the ~104
 /// byte limit on socket names.
+#[cfg(unix)]
 fn control_path() -> PathBuf {
     // ssh binds the master socket but will not create the directory holding it,
     // and on a machine that only ever talks to other machines no node has run to

@@ -99,10 +99,17 @@ pub fn of(_leader: u32) -> Foreground {
 ///
 /// `None` where there is nothing to compare, which is any process not in a
 /// session of the node's.
+#[cfg(unix)]
 pub fn our_session() -> Option<u32> {
     // Safe: `getsid` reads process state and touches nothing of ours.
     let sid = unsafe { libc::getsid(0) };
     (sid > 0).then_some(sid as u32)
+}
+
+#[cfg(windows)]
+pub fn our_session() -> Option<u32> {
+    // Windows has no POSIX session id; never guess a leader from a PID.
+    None
 }
 
 /// The `tpgid` field of a `/proc/<pid>/stat` line.

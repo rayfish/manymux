@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 //! End-to-end tests of managing another machine.
 //!
 //! These drive the real `manymux` binary and stand a second machine up in the

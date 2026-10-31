@@ -82,6 +82,27 @@ jobs:
       - name: Build the client core
         run: cargo check --lib --no-default-features --locked
 
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal -c clippy,rustfmt --no-self-update
+          rustup default stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-windows
+      - name: Format
+        run: cargo fmt -q --check
+      - name: Clippy
+        run: cargo clippy -q --all-targets --locked -- -D warnings
+      - name: Native Windows persistence
+        timeout-minutes: 5
+        run: cargo test -q --locked --test windows
+      - name: Client core
+        run: cargo check -q --lib --no-default-features --locked
+
   # A build for every target we ship, on every change, so a release is never
   # the first time a target is tried.
   cross:
