@@ -1,6 +1,8 @@
 //! ConPTY ownership stays with the session, never with an attachment.
 //! The reaper closes the console while the reader drains it, then joins both
 //! I/O threads before publishing exit. Closing ConPTY can block on its output.
+//! portable-pty enables cursor inheritance, so the node answers ConPTY's
+//! startup cursor query itself, even when no terminal is attached.
 use super::*;
 use anyhow::Context;
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
@@ -82,12 +84,44 @@ impl Session {
             next_client: AtomicU64::new(0),
         });
         let s = Arc::clone(&session);
+        let startup_input = session.input_tx.clone();
         let reading = thread::spawn(move || {
             let mut buffer = [0u8; 16 * 1024];
+            let mut query = 0;
+            let mut answered = false;
             loop {
                 match reader.read(&mut buffer) {
                     Ok(0) => break,
-                    Ok(n) => s.ingest(&buffer[..n]),
+                    Ok(n) => {
+                        let mut paint = Vec::with_capacity(n);
+                        for &byte in &buffer[..n] {
+                            const QUERY: &[u8] = b"\x1b[6n";
+                            if answered {
+                                paint.push(byte);
+                                continue;
+                            }
+                            if byte != QUERY[query] {
+                                paint.extend_from_slice(&QUERY[..query]);
+                                query = 0;
+                            }
+                            if byte == QUERY[query] {
+                                query += 1;
+                                if query == QUERY.len() {
+                                    if let Err(error) =
+                                        startup_input.blocking_send(b"\x1b[1;1R".to_vec())
+                                    {
+                                        debug!("ConPTY startup input ended: {error}");
+                                    }
+                                    answered = true;
+                                }
+                            } else {
+                                paint.push(byte);
+                            }
+                        }
+                        // Do not forward the startup query: an attached terminal
+                        // would answer it again and type its reply into the shell.
+                        s.ingest(&paint);
+                    }
                     Err(e) => {
                         debug!("ConPTY reader ended: {e}");
                         break;

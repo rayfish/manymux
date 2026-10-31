@@ -253,7 +253,7 @@ async fn resizing_reaches_the_console_and_killing_publishes_exit() {
 #[tokio::test]
 async fn closing_the_launchers_console_does_not_stop_the_node() {
     use portable_pty::{CommandBuilder, PtySize, native_pty_system};
-    use std::io::Read;
+    use std::io::{Read, Write};
     let config = std::env::temp_dir().join(format!("mm-windows-console-{}", std::process::id()));
     let socket = config.join("node");
     let pair = native_pty_system().openpty(PtySize::default()).unwrap();
@@ -272,9 +272,34 @@ async fn closing_the_launchers_console_does_not_stop_the_node() {
     ]);
     let mut launcher = pair.slave.spawn_command(command).unwrap();
     let mut output = pair.master.try_clone_reader().unwrap();
+    let mut input = pair.master.take_writer().unwrap();
     let reading = std::thread::spawn(move || {
         let mut bytes = Vec::new();
-        output.read_to_end(&mut bytes).unwrap();
+        let mut query = 0;
+        let mut answered = false;
+        let mut buffer = [0; 4096];
+        loop {
+            let count = output.read(&mut buffer).unwrap();
+            if count == 0 {
+                break;
+            }
+            bytes.extend_from_slice(&buffer[..count]);
+            if !answered {
+                for &byte in &buffer[..count] {
+                    const QUERY: &[u8] = b"\x1b[6n";
+                    query = if byte == QUERY[query] {
+                        query + 1
+                    } else {
+                        usize::from(byte == QUERY[0])
+                    };
+                    if query == QUERY.len() {
+                        input.write_all(b"\x1b[1;1R").unwrap();
+                        answered = true;
+                        break;
+                    }
+                }
+            }
+        }
         bytes
     });
     let status = launcher.wait().unwrap();
